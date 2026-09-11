@@ -1,0 +1,29 @@
+{
+  "name": "bitget-autonomous-trader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:paper": "node --import tsx tests/paper-integration.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "build": "wrangler deploy --dry-run",
+    "deploy:dry": "wrangler deploy --dry-run"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "3.0.47",
+    "@bitget-ai/bitget-agent-sdk": "3.3.0",
+    "agents": "0.23.0",
+    "ai": "7.0.97",
+    "zod": "4.6.2"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260911.1",
+    "@types/node": "24.3.0",
+    "tsx": "4.20.5",
+    "typescript": "7.0.2",
+    "vitest": "5.0.0",
+    "wrangler": "4.131.1"
+  }
+}

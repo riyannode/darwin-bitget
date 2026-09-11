@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="description" content="Autonomous paper futures trader journal">
+    <title>Darwin</title>
+    <link rel="stylesheet" href="/dashboard.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand"><span class="brand-mark">↗</span><span>DARWIN</span></div>
+        <nav class="nav" aria-label="Primary navigation">
+          <button class="nav-item active" data-page="dashboard">Dashboard</button>
+          <button class="nav-item" data-page="trades">Trade Log</button>
+          <button class="nav-item" data-page="learning-page">Learning</button>
+          <button class="nav-item" data-page="policy-page">Policy</button>
+        </nav>
+        <div class="sidebar-footer"><div class="identity"><span class="avatar">A</span><span><strong>Autonomous Agent</strong><small id="sidebar-model">Qwen</small></span></div><span class="pill pill-paper">PAPER</span></div>
+      </aside>
+      <main class="main-content">
+        <header class="topbar"><div><p class="eyebrow">BITGET / PERPETUAL FUTURES</p><h1 id="page-title">Dashboard</h1><p class="subtle">Overview of autonomous trading performance.</p></div><div class="actions"><span id="top-status" class="status-dot"><i></i> ONLINE</span><button data-action="START" class="button button-primary">Start</button><button data-action="PAUSE" class="button">Pause</button><button data-action="RESUME" class="button">Resume</button><button data-action="EMERGENCY_STOP" class="button button-danger">Stop</button></div></header>
+        <p id="error" class="banner banner-error" hidden></p>
+        <section id="page-dashboard" class="page">
+          <section class="agent-card panel"><div><span class="label">AGENT STATUS</span><strong id="agent-status">ONLINE</strong><span id="agent-stage" class="subtle">Stage —</span></div><div class="agent-facts"><span><small>MODE</small><b id="agent-mode">AUTONOMOUS / PAPER</b></span><span><small>MODEL</small><b id="agent-model">—</b></span><span><small>LAST SCAN</small><b id="last-scan">—</b></span><span><small>NEXT SCAN</small><b id="next-scan">—</b></span></div></section>
+          <section id="cooldown-notice" class="cooldown-notice" hidden></section>
+          <section id="performance" class="summary-grid" aria-label="Performance summary"></section>
+          <section id="portfolio" class="portfolio-rail panel" aria-label="Portfolio"></section>
+          <section class="panel positions-panel"><div class="panel-heading"><h2>Current Positions</h2><span class="label">PROVIDER READBACK</span></div><div id="positions" class="positions-list empty">No position readback yet.</div></section>
+          <div class="dashboard-grid top-grid"><section class="panel performance-panel"><div class="panel-heading"><h2>Monthly Performance</h2><span id="calendar-month" class="label">—</span></div><div id="calendar" class="calendar"></div></section><section class="panel recent-panel"><div class="panel-heading"><h2>Recent Trades</h2><button class="text-link" data-page-link="trades">View all</button></div><div id="recent-trades" class="recent-trades empty">No recent trades</div></section></div>
+          <div class="dashboard-grid lower-grid"><section class="panel"><div class="panel-heading"><h2>Latest Decision</h2><span id="decision-action" class="pill">—</span></div><div id="decision" class="detail-grid empty">No Qwen decision recorded yet.</div></section><section class="panel"><div class="panel-heading"><h2>Learning</h2><button class="text-link" data-page-link="learning-page">Open page</button></div><div id="learning" class="stack empty">No reflection recorded yet.</div></section></div>
+          <section class="panel"><div class="panel-heading"><h2>Recent Activity</h2><span class="label">LIVE READBACK</span></div><div id="activity" class="activity empty">No events recorded yet.</div></section>
+        </section>
+        <section id="page-trades" class="page" hidden><section class="panel"><div class="page-heading"><div><h2>Trade Log</h2><p class="subtle">Verified PAPER history and blocked proposals.</p></div><div id="trade-filters" class="filter-row"><button class="filter active" data-filter="ALL">All</button><button class="filter" data-filter="OPEN">Open</button><button class="filter" data-filter="CLOSED">Closed</button><button class="filter" data-filter="WIN">Win</button><button class="filter" data-filter="LOSS">Loss</button></div></div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Margin</th><th>Lev.</th><th>Notional</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Status</th></tr></thead><tbody id="trade-table"></tbody></table></div></section></section>
+        <section id="page-learning-page" class="page" hidden><div class="page-heading"><div><h2>Learning</h2><p class="subtle">Persisted reflections and bounded replay evidence.</p></div></div><section class="panel"><div class="table-wrap"><table><thead><tr><th>Lesson</th><th>Source</th><th>Scope</th><th>Confidence</th><th>Retrieved</th><th>Applied</th><th>Success</th><th>Failed</th><th>Status</th><th>Created</th></tr></thead><tbody id="lesson-table"></tbody></table></div></section><section id="replay-card" class="panel replay-panel" hidden></section></section>
+        <section id="page-policy-page" class="page" hidden><div class="page-heading"><div><h2>Policy</h2><p class="subtle">Owner boundaries with authenticated runtime controls.</p></div></div><section class="panel"><div id="policy" class="policy-grid large-policy"></div><div id="policy-editor" class="policy-editor"></div><p id="policy-status" class="subtle" role="status"></p></section></section>
+      </main>
+    </div>
+    <script type="module" src="/dashboard.js"></script>
+  </body>
+</html>

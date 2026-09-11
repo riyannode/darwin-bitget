@@ -1,0 +1,10 @@
+{
+  "framework": null,
+  "outputDirectory": "public",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://darwin-bitget.hpelong377.workers.dev/api/:path*"
+    }
+  ]
+}
