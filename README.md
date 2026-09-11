@@ -12,7 +12,7 @@ dynamic universe → lightweight scan → Qwen shortlist → deep evidence
 
 Qwen owns strategy selection, symbol selection, `OPEN_LONG` / `OPEN_SHORT` / `HOLD` / `REDUCE` / `CLOSE`, thesis, margin allocation, and leverage selection. `src/trading/policy.ts` and `src/trading/risk-gate.ts` own financial authority boundaries.
 
-The minimal frontend is a dark trading journal with Dashboard, Trade Log, Learning, and read-only Policy pages. It is an observability surface and has no manual trading controls.
+The minimal frontend is a dark trading journal with Dashboard, Agent Journal, Trade History, Learning, and Policy pages. It is an observability surface and has no manual trading controls.
 
 ## Local validation
 

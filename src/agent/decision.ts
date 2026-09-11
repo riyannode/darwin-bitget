@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { Decision, DecisionContext, MarketSnapshot, RuntimeConfig } from "../types.js";
-import { TRADING_MANDATE } from "./mandate.js";
+import { CANDIDATE_TASK_PROMPT, DECISION_TASK_PROMPT, TRADING_MANDATE } from "./mandate.js";
 import { generateQwenJson } from "./qwen.js";
 
 const decimalString = z.string().regex(/^\d+(?:\.\d{1,8})?$/);
@@ -43,7 +43,7 @@ const qwenDecisionSchema = z.object(decisionFields).superRefine(validateDecision
 export type DecisionInput = z.infer<typeof decisionSchema>;
 
 const candidateSchema = z.object({
-  symbols: z.array(z.string().min(1)).min(1).max(5),
+  symbols: z.array(z.string().min(1)).min(3).max(5).refine((symbols) => new Set(symbols).size === symbols.length, "DUPLICATE_CANDIDATE"),
   rationale: z.array(z.string().min(1).max(240)).max(8),
 });
 
@@ -136,14 +136,14 @@ export async function selectCandidates(
 ): Promise<string[]> {
   const candidateScan = scan.map((snapshot) => [snapshot.symbol, snapshot.lastPrice, snapshot.priceChange24h, snapshot.volume24h]);
   const candidatePool = scan.map((snapshot) => snapshot.symbol);
-  const result = await generateQwenJson(config, candidateSchema, `${TRADING_MANDATE}\nSelect 3 to 5 symbols from the candidate pool for deeper evidence. Return only the requested structured shortlist.`, JSON.stringify({ candidatePool, scan: candidateScan }), { maxOutputTokens: 700 });
+  const result = await generateQwenJson(config, candidateSchema, `${TRADING_MANDATE}\n${CANDIDATE_TASK_PROMPT}`, JSON.stringify({ candidatePool, scan: candidateScan }), { maxOutputTokens: 700, timeoutMs: 30_000 });
   const candidates = result.symbols;
   if (candidates.some((symbol) => !supportedUniverse.includes(symbol) || !candidatePool.includes(symbol))) throw new Error("SYMBOL_NOT_ALLOWED");
   return candidates;
 }
 
 export async function decide(config: RuntimeConfig, context: DecisionContext, cycleId: string): Promise<Decision> {
-  const generated = await generateQwenJson(config, qwenDecisionSchema, `${context.mandate}\nReturn only the trading fields. Keep every rationale concise. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: 700, timeoutMs: 60_000 });
+  const generated = await generateQwenJson(config, qwenDecisionSchema, `${context.mandate}\n${DECISION_TASK_PROMPT}\nReturn only the trading fields. Keep every rationale concise. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: 700, timeoutMs: 60_000 });
   const decision = decisionSchema.parse({ ...generated, decisionId: crypto.randomUUID(), cycleId, createdAt: new Date().toISOString() });
   const knownLessons = new Set(context.lessons.map((lesson) => lesson.lessonId));
   if (decision.lessonsUsed.some((lessonId) => !knownLessons.has(lessonId))) throw new Error("LESSON_REFERENCE_INVALID");

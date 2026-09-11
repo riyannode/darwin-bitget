@@ -8,6 +8,7 @@ import type {
   TradeExperience,
 } from "../types.js";
 import { generateQwenJson } from "../agent/qwen.js";
+import { REFLECTION_TASK_PROMPT } from "../agent/mandate.js";
 
 const reflectionModelSchema = z.object({
   summary: z.string().min(1).max(500),
@@ -175,9 +176,10 @@ export function reflect(input: ReflectionInput): { reflection: ReflectionResult;
 
 export async function reflectWithQwen(config: RuntimeConfig, input: ReflectionInput): Promise<{ reflection: ReflectionResult; lesson: Lesson; experience: TradeExperience }> {
   const local = reflect(input);
-  const model = await generateQwenJson(config, reflectionModelSchema, "Evaluate the completed trading experience. Return only structured fields. Do not expose chain-of-thought. Profit is not proof of a good decision and loss is not proof of a bad decision.", JSON.stringify({ decision: input.decision, experience: local.experience, outcome: input.outcome, failureCode: input.failureCode, marketRegime: input.marketRegime, lessonsUsed: input.lessonsUsed ?? [], lessons: input.lessons ?? [] }));
+  const model = await generateQwenJson(config, reflectionModelSchema, REFLECTION_TASK_PROMPT, JSON.stringify({ decision: input.decision, experience: local.experience, outcome: input.outcome, failureCode: input.failureCode, marketRegime: input.marketRegime, lessonsUsed: input.lessonsUsed ?? [], lessons: input.lessons ?? [] }));
   const knownLessons = new Set(input.lessonsUsed ?? []);
   if (model.lessonEvaluations.some((evaluation) => !knownLessons.has(evaluation.lessonId))) throw new Error("LESSON_REFERENCE_INVALID");
+  if ((input.lessonsUsed ?? []).some((lessonId) => !model.lessonEvaluations.some((evaluation) => evaluation.lessonId === lessonId))) throw new Error("LESSON_EVALUATION_MISSING");
   const reflection: ReflectionResult = {
     ...model,
     reflectionId: local.reflection.reflectionId,

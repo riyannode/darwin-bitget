@@ -1,8 +1,8 @@
 import { Agent } from "agents";
-import type { DashboardSnapshot, Env, ExecutionResult, OwnerPolicy, PositionSnapshot, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
+import type { DashboardSnapshot, Decision, Env, ExecutionResult, OwnerPolicy, PositionSnapshot, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
-import { TRADING_MANDATE } from "./mandate.js";
+import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
 import { decide, rankMarketCandidates, selectCandidates } from "./decision.js";
 import { scheduleTradingCycle } from "./scheduler.js";
 import { authorizeOwner } from "./owner-auth.js";
@@ -232,6 +232,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       performance: { totalPnl, winRate: totalTrades > 0 ? ((wins / totalTrades) * 100).toFixed(2) : "0", dailyDrawdown: drawdownPct, totalTrades, wins, losses, breakeven, dailyPnl },
       trades,
       latestDecision: journal?.decision ?? null,
+      decisions: journals.map((entry) => entry.decision).filter((decision): decision is Decision => Boolean(decision)).slice(0, 25),
       executionEvidence: journal?.executionResult && journal.reconciliationResult ? {
         provider: journal.executionResult.provider,
         action: journal.executionResult.action,
@@ -273,7 +274,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const nextScanAt = new Date(Date.now() + config.ownerPolicy.scanIntervalMinutes * 60_000).toISOString();
     this.setState({ ...this.state, lastCycleId: cycleId, lastScanAt: startedAt, nextScanAt, model: config.qwenModel, runtimeStatus: "SCANNING", currentStage: "SCANNING", lastStatus: "RUNNING", cycleStartedAt: startedAt });
     saveCycle(this, cycleId, "RUNNING", startedAt, null);
-    const journal: TradingJournal = { cycleId, agentVersion: config.version ?? "0.2.0", model: config.qwenModel, mode: config.agentMode, startedAt, retrievedLessons: [], createdLessons: [] };
+    const journal: TradingJournal = { cycleId, agentVersion: config.version ?? "0.2.0", promptVersion: MANDATE_VERSION, model: config.qwenModel, mode: config.agentMode, startedAt, retrievedLessons: [], createdLessons: [] };
     this.recordEvent("CYCLE_STARTED", cycleId);
     try {
       const client = new BitgetClient(config);
@@ -502,7 +503,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const previous = this.ensureActivePolicy();
     const next = updateOwnerPolicy(previous, value);
     this.persistPolicy(previous, next);
-    if (previous.scanIntervalMinutes !== next.scanIntervalMinutes && !this.state.paused) await scheduleTradingCycle(this, next.scanIntervalMinutes);
+    if (previous.scanIntervalMinutes !== next.scanIntervalMinutes && !this.state.paused && !next.emergencyStop) await scheduleTradingCycle(this, next.scanIntervalMinutes);
     this.setState({ ...this.state, emergencyStop: next.emergencyStop, nextScanAt: new Date(Date.now() + next.scanIntervalMinutes * 60_000).toISOString(), lastPolicyUpdateAt: new Date().toISOString() });
     return this.getDashboardSnapshot();
   }

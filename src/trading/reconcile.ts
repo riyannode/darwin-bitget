@@ -17,7 +17,7 @@ export function reconcileExecution(
   if (!["filled", "partially_filled"].includes(execution.status)) codes.push("EXECUTION_NOT_FILLED");
   if (!execution.providerOrderId && execution.status !== "not_found") codes.push("MISSING_PROVIDER_REFERENCE");
   if (request.tradeSide === "open" && positionAfter && Number(positionAfter.quantity) <= 0) codes.push("POSITION_OPEN_UNVERIFIED");
-  if (request.tradeSide === "close" && positionBefore && !positionAfter) codes.push("POSITION_READBACK_MISSING");
+  if (request.tradeSide === "close" && request.action === "REDUCE" && positionBefore && !positionAfter) codes.push("POSITION_READBACK_MISSING");
   if (request.tradeSide === "close" && positionBefore && positionAfter && request.action === "CLOSE" && Number(positionAfter.quantity) > 0) codes.push("POSITION_NOT_CLOSED");
   if (request.tradeSide === "close" && positionBefore && positionAfter && request.action === "REDUCE" && Number(positionAfter.quantity) >= Number(positionBefore.quantity)) codes.push("POSITION_NOT_REDUCED");
   const status = codes.includes("EXECUTION_UNKNOWN")

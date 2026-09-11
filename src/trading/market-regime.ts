@@ -39,5 +39,5 @@ export function classifyMarketRegime(market: MarketSnapshot, sourceBars: readonl
   if (Math.abs(totalReturn) >= 2 && negativeShare >= 0.62) return "TRENDING_DOWN";
   if (Math.abs(totalReturn) < 1 && volatility < 0.5 && Math.abs(tickerChange) < 3) return "RANGE_LOW_VOL";
   if (Math.abs(totalReturn) < 2 || volatility < 1.5) return "RANGE_HIGH_VOL";
-  return "UNKNOWN";
+  return totalReturn >= 0 ? "TRENDING_UP" : "TRENDING_DOWN";
 }

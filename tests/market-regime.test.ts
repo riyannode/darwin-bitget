@@ -16,4 +16,8 @@ describe("market regime", () => {
   it("returns unknown when history is insufficient", () => {
     expect(classifyMarketRegime(market, bars([100, 101, 100]))).toBe("UNKNOWN");
   });
+
+  it("returns a usable context regime when sufficient history is volatile but directional", () => {
+    expect(classifyMarketRegime(market, bars([100, 104, 98, 106, 101, 110]))).not.toBe("UNKNOWN");
+  });
 });

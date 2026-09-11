@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { BacktestReplay, HistoricalBar, Lesson, RuntimeConfig, TradeExperience } from "../types.js";
 import { generateQwenJson } from "../agent/qwen.js";
+import { BACKTEST_TASK_PROMPT } from "../agent/mandate.js";
 
 const actionSchema = z.enum(["OPEN_LONG", "OPEN_SHORT", "HOLD", "REDUCE", "CLOSE"]);
 
@@ -69,7 +70,7 @@ export async function runCooldownBacktest(
     })).min(1).max(3),
     selectedLesson: z.string().min(1).max(500),
   });
-  const parsed = await generateQwenJson(config, schema, "Propose bounded strategy hypotheses and replay actions. Do not install a strategy. Return structured output only.", JSON.stringify({ symbol: input.symbol, bars, experiences: input.experiences.slice(0, 20), baseline: "NO_TRADE_BASELINE" }));
+  const parsed = await generateQwenJson(config, schema, BACKTEST_TASK_PROMPT, JSON.stringify({ symbol: input.symbol, bars, experiences: input.experiences.slice(0, 20), baseline: "NO_TRADE_BASELINE" }));
   const metrics = [
     { hypothesis: "NO_TRADE_BASELINE", returnPct: "0.000000", maxDrawdownPct: "0.000000", trades: 0, wins: 0, losses: 0 },
     ...parsed.traces.map((trace) => metric(trace.hypothesis, trace.actions, bars)),

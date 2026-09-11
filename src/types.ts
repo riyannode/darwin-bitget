@@ -358,6 +358,7 @@ export interface ReflectionResult {
 export interface TradingJournal {
   cycleId: string;
   agentVersion: string;
+  promptVersion?: string;
   model: string;
   mode: AgentMode;
   startedAt: string;
@@ -414,6 +415,7 @@ export interface DashboardSnapshot {
   };
   trades: TradeLogEntry[];
   latestDecision: Decision | null;
+  decisions: Decision[];
   executionEvidence: {
     provider: string;
     action: Exclude<Action, "HOLD">;

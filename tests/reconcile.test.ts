@@ -8,6 +8,11 @@ function execution(overrides: Partial<ExecutionResult> = {}): ExecutionResult { 
 
 describe("execution reconciliation", () => {
   it("matches a verified provider readback", () => { expect(reconcileExecution(request, execution())).toMatchObject({ status: "MATCHED", codes: [] }); });
+  it("accepts a verified close when the provider position disappears", () => {
+    const closeRequest: ExecutionRequest = { ...request, action: "CLOSE", positionSide: "LONG", providerSide: "sell", tradeSide: "close", marginAllocated: "0", leverage: "2", positionNotional: "200", reductionPct: "100" };
+    const closeExecution = execution({ action: "CLOSE", providerSide: "sell", tradeSide: "close" });
+    expect(reconcileExecution(closeRequest, closeExecution, { symbol: "BTCUSDT", positionSide: "LONG", quantity: "2", notional: "200", marginAllocated: "100", leverage: "2", entryPrice: "100", unrealizedPnl: "0", realizedPnl: "0" })).toMatchObject({ status: "MATCHED", codes: [] });
+  });
   it("does not retry an ambiguous submission", () => { const result = reconcileExecution(request, execution({ status: "unknown" })); expect(result.status).toBe("UNKNOWN"); expect(result.codes).toContain("EXECUTION_UNKNOWN"); });
   it("detects provider/request mismatches", () => { const result = reconcileExecution(request, execution({ positionSide: "SHORT" })); expect(result.status).toBe("MISMATCH"); expect(result.codes).toContain("EXECUTION_MISMATCH"); });
 });
