@@ -40,7 +40,7 @@
     "QWEN_BASE_URL": "https://hackathon.bitgetops.com/v1",
     "QWEN_MODEL": "qwen3.8-max",
     "APP_VERSION": "0.2.0",
-    "GIT_COMMIT_SHA": "964a113",
+    "GIT_COMMIT_SHA": "1a0b8c7",
     "ENVIRONMENT": "production",
   }
 }
