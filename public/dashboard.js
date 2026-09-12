@@ -28,6 +28,7 @@ let pageLoadedAt = new Map();
 let tradeFilter = "ALL";
 let ownerToken = "";
 const judgeDemo = window.location.pathname === "/demo";
+const initialDemoBanner = $("judge-demo-banner"); if (initialDemoBanner) initialDemoBanner.hidden = !judgeDemo;
 
 function detail(label, value, wide = false) {
   const node = document.createElement("div");
@@ -214,7 +215,7 @@ function renderPolicy() {
   const version = document.createElement("span"); version.className = "subtle"; version.textContent = `Last update: ${when(snapshot.lastPolicyUpdate?.createdAt)} · ${snapshot.version} · ${snapshot.commit} · ${snapshot.environment}`; editor.append(version);
 }
 
-function render() { renderAgent(); renderPerformance(); renderCalendar(); renderPortfolio(); renderOpenPositions(); renderDecision(); renderDecisionHistory(); renderLearning(); renderRecentTrades(); renderLatestTrade(); renderActivity(); renderTradeTable(); renderLessons(); renderPolicy(); if (judgeDemo) { document.querySelectorAll("[data-action]").forEach((button) => { button.hidden = true; button.disabled = true; }); document.querySelectorAll(".label").forEach((node) => { if (node.textContent === "LIVE READBACK") node.textContent = "RECORDED REPLAY"; }); const banner = $("judge-demo-banner"); banner.hidden = false; banner.dataset.scenario = snapshot.demo?.title ?? "DETERMINISTIC REPLAY"; $("judge-demo-result").textContent = `RISK GATE ${snapshot.demoRiskGate?.status ?? "—"}${snapshot.demoRiskGate?.codes?.length ? ` · ${snapshot.demoRiskGate.codes.join(" / ")}` : ""}`; } }
+function render() { renderAgent(); renderPerformance(); renderCalendar(); renderPortfolio(); renderOpenPositions(); renderDecision(); renderDecisionHistory(); renderLearning(); renderRecentTrades(); renderLatestTrade(); renderActivity(); renderTradeTable(); renderLessons(); renderPolicy(); const banner = $("judge-demo-banner"); banner.hidden = !judgeDemo; if (judgeDemo) { document.querySelectorAll("[data-action]").forEach((button) => { button.hidden = true; button.disabled = true; }); document.querySelectorAll(".label").forEach((node) => { if (node.textContent === "LIVE READBACK") node.textContent = "RECORDED REPLAY"; }); banner.dataset.scenario = snapshot.demo?.title ?? "DETERMINISTIC REPLAY"; $("judge-demo-result").textContent = `RISK GATE ${snapshot.demoRiskGate?.status ?? "—"}${snapshot.demoRiskGate?.codes?.length ? ` · ${snapshot.demoRiskGate.codes.join(" / ")}` : ""}`; } }
 
 async function requestJson(path) { const response = await fetch(path, { cache: "no-store" }); if (!response.ok) throw new Error(`HTTP_${response.status}`); return response.json(); }
 async function refreshSnapshot() {
