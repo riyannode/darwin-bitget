@@ -11,6 +11,13 @@ export function buildOpenOrdersReadParams(category: string): Record<string, stri
   return { category };
 }
 
+export function executableIntersection(publicInstruments: readonly Instrument[], demoInstruments: readonly Instrument[], category: string): Instrument[] {
+  const valid = (instrument: Instrument) => instrument.category === category && instrument.status === "online" && instrument.symbolType === "stock";
+  const publicSymbols = new Set(publicInstruments.filter(valid).map((instrument) => instrument.symbol));
+  return demoInstruments.filter((instrument) => valid(instrument) && publicSymbols.has(instrument.symbol)
+    && instrument.minOrderQty !== "" && instrument.minOrderAmount !== "" && instrument.leverageMax !== "");
+}
+
 export type BitgetHoldingMode = "hedge_mode" | "one_way_mode";
 
 export interface ProviderErrorDetails {
@@ -101,6 +108,9 @@ export function buildUnresolvedExecution(
 export class BitgetClient {
   private readonly client: BitgetRestClient;
   private readonly category: string;
+  private readonly baseUrl: string;
+  private demoInstruments: Instrument[] = [];
+  private readonly secrets: string[];
 
   public constructor(config: RuntimeConfig) {
     const credentials = {
@@ -109,6 +119,8 @@ export class BitgetClient {
       ...(config.bitgetPassphrase ? { passphrase: config.bitgetPassphrase } : {}),
     };
     this.category = config.bitgetCategory;
+    this.baseUrl = config.bitgetApiBaseUrl;
+    this.secrets = [config.bitgetApiKey, config.bitgetSecretKey, config.bitgetPassphrase].filter((value): value is string => Boolean(value));
     const bitgetConfig = loadBitgetConfig({
       modules: "account,trade,market",
       baseUrl: config.bitgetApiBaseUrl,
@@ -125,16 +137,14 @@ export class BitgetClient {
   }
 
   public async getTradableInstruments(): Promise<Instrument[]> {
-    const instruments = await this.getInstruments();
-    return instruments.filter((instrument) => (
-      instrument.category.toUpperCase() === this.category
-      && instrument.symbolType.toLowerCase() === "stock"
-      && instrument.isRwa.toUpperCase() === "YES"
-      && instrument.status.toLowerCase() === "online"
-      && instrument.minOrderQty !== ""
-      && instrument.minOrderAmount !== ""
-      && instrument.leverageMax !== ""
-    ));
+    this.demoInstruments = [];
+    const url = new URL("/api/v3/market/instruments", this.baseUrl);
+    url.searchParams.set("category", this.category);
+    const response = await fetch(url, { headers: { paptrading: "1" }, signal: AbortSignal.timeout(15_000) });
+    const envelope = record(await response.json());
+    if (!response.ok || envelope.code !== "00000") throw new Error("DEMO_UNIVERSE_UNAVAILABLE");
+    this.demoInstruments = parseInstruments(envelope.data);
+    return executableIntersection(await this.getInstruments(), this.demoInstruments, this.category);
   }
 
   public async getOpenPositionSymbols(): Promise<string[]> {
@@ -167,7 +177,7 @@ export class BitgetClient {
   public async collectEvidence(symbols: readonly string[]): Promise<EvidenceBundle[]> {
     const instruments = await this.getInstruments();
     const selected = symbols.map((symbol) => {
-      const instrument = instruments.find((candidate) => candidate.symbol === symbol);
+      const instrument = this.demoInstruments.find((candidate) => candidate.symbol === symbol) ?? instruments.find((candidate) => candidate.symbol === symbol);
       if (!instrument) throw new Error("SYMBOL_NOT_ALLOWED");
       return instrument;
     });
@@ -204,10 +214,12 @@ export class BitgetClient {
 
   public async placePaperOrder(request: ExecutionRequest): Promise<ExecutionResult> {
     const submittedAt = new Date().toISOString();
+    let operation = "getAccountInfo";
     try {
       const accountInfo = await this.client.callOperation<unknown>("getAccountInfo", {});
       const holdingMode = parseHoldingMode(accountInfo.data);
       if (request.tradeSide === "open") {
+        operation = "setLeverage";
         await this.client.callOperation<unknown>("setLeverage", {
           category: this.category,
           symbol: request.symbol,
@@ -215,15 +227,19 @@ export class BitgetClient {
           posSide: request.positionSide.toLowerCase(),
         });
       }
+      operation = "placeOrder";
       const result = await this.client.callOperation<unknown>("placeOrder", buildPaperOrderParams(request, holdingMode, this.category));
       const response = record(result.data);
-      return this.readOrder(request, {
+      operation = "getOrderDetails";
+      return await this.readOrder(request, {
         providerOrderId: this.text(response.orderId),
         clientOrderId: this.text(response.clientOid, request.clientOrderId),
         submittedAt,
       });
     } catch (error) {
-      return this.readUnknownOrder(request, submittedAt, error);
+      const result = await this.readUnknownOrder(request, submittedAt, error);
+      const redact = (message: string | undefined) => message === undefined ? undefined : this.secrets.reduce((safe, secret) => safe.split(secret).join("REDACTED"), sanitizeProviderMessage(message));
+      return { ...result, providerOperation: operation, ...(result.providerMessage ? { providerMessage: redact(result.providerMessage)! } : {}), ...(result.providerReadbackMessage ? { providerReadbackMessage: redact(result.providerReadbackMessage)! } : {}) };
     }
   }
 

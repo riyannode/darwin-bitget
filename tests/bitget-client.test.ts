@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { BitgetApiError } from "@bitget-ai/bitget-agent-sdk";
-import { buildOpenOrdersReadParams, buildPaperOrderParams, buildUnresolvedExecution, extractProviderError, formatBitgetReadFailure, normalizeBitgetOrderStatus } from "../src/bitget/client.js";
+import { describe, expect, it, vi } from "vitest";
+import { BitgetApiError, BitgetRestClient } from "@bitget-ai/bitget-agent-sdk";
+import { BitgetClient, buildOpenOrdersReadParams, buildPaperOrderParams, buildUnresolvedExecution, extractProviderError, formatBitgetReadFailure, normalizeBitgetOrderStatus } from "../src/bitget/client.js";
+import { loadConfig } from "../src/config.js";
 import type { ExecutionRequest } from "../src/types.js";
 
 const request: ExecutionRequest = {
@@ -20,6 +21,17 @@ const request: ExecutionRequest = {
 };
 
 describe("Bitget read diagnostics", () => {
+  it("records the failed operation without retrying a financial write or leaking credentials", async () => {
+    const sdk = vi.spyOn(BitgetRestClient.prototype, "callOperation").mockRejectedValue({ code: "PROVIDER_ERROR", message: "fixture-passphrase" });
+    try {
+      const client = new BitgetClient(loadConfig({ TRADING_MODE: "PAPER", PAPER_ONLY: "true", AGENT_MODE: "AUTONOMOUS", BITGET_API_KEY: "fixture-key", BITGET_SECRET_KEY: "fixture-secret", BITGET_PASSPHRASE: "fixture-passphrase" }));
+      const result = await client.placePaperOrder(request);
+      expect(result.providerOperation).toBe("getAccountInfo");
+      expect(result.providerCode).toBe("PROVIDER_ERROR");
+      expect(JSON.stringify(result)).not.toContain("fixture-passphrase");
+      expect(sdk.mock.calls.map(([operation]) => operation)).toEqual(["getAccountInfo", "getOrderDetails"]);
+    } finally { sdk.mockRestore(); }
+  });
   it("normalizes provider order status", () => {
     expect(normalizeBitgetOrderStatus("filled")).toBe("filled");
     expect(normalizeBitgetOrderStatus("unknown-status")).toBe("unknown");

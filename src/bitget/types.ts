@@ -34,7 +34,7 @@ export function parseInstruments(value: unknown): Instrument[] {
     minOrderAmount: text(entry.minOrderAmount),
     pricePrecision: integer(entry.pricePrecision),
     quantityPrecision: integer(entry.quantityPrecision),
-    quantityStep: text(entry.sizeMultiplier, text(entry.quantityStep, text(entry.minOrderQty, "0"))),
+    quantityStep: text(entry.quantityMultiplier, text(entry.sizeMultiplier, text(entry.quantityStep, text(entry.minOrderQty, "0")))),
     leverageMin: text(entry.minLeverage, text(entry.leverageMin, "1")),
     leverageMax: text(entry.maxLeverage, text(entry.leverageMax, "1")),
   }));

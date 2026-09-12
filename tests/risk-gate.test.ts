@@ -17,6 +17,19 @@ function decision(action: Action, marginAllocationPct = "10", leverage = "2", re
 function context(next: Decision, availableMargin = account.availableMargin) { return { decision: next, instrument, account: { ...account, availableMargin }, evidenceObservedAt: account.observedAt, openOrderSymbols: [], supportedUniverse: ["BTCUSDT"], emergencyStop: false, dailyDrawdownBlocked: false, now: new Date(account.observedAt) }; }
 
 describe("futures risk gate", () => {
+  it("blocks public-only entries even when a position is already held", () => {
+    for (const symbol of ["SOXLUSDT", "SNXXUSDT"]) {
+      const next = context({ ...decision("OPEN_LONG"), symbol });
+      const result = evaluateRiskGate(config, { ...next, instrument: { ...instrument, symbol }, supportedUniverse: ["KORUUSDT", "NVDAUSDT"] });
+      expect(result.codes).toContain("SYMBOL_NOT_ALLOWED");
+    }
+    expect(evaluateRiskGate(config, { ...context(decision("OPEN_LONG")), supportedUniverse: [] }).codes).toContain("SYMBOL_NOT_ALLOWED");
+  });
+
+  it("retains existing position exits when executable discovery is empty", () => {
+    expect(evaluateRiskGate(config, { ...context(decision("CLOSE", "0", "1")), supportedUniverse: [] }).status).toBe("PASS");
+    expect(evaluateRiskGate(config, { ...context(decision("REDUCE", "0", "1", "25")), supportedUniverse: [] }).status).toBe("PASS");
+  });
   it("blocks margin allocation above owner limit and unavailable margin", () => {
     const result = evaluateRiskGate(config, context(decision("OPEN_LONG", "40", "2"), "50"));
     expect(result.status).toBe("BLOCK");

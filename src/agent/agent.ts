@@ -375,17 +375,20 @@ export class TraderAgent extends Agent<Env, AgentState> {
     this.recordEvent("CYCLE_STARTED", cycleId);
     try {
       const client = new BitgetClient(config);
-      const instruments = await client.getTradableInstruments();
-      if (instruments.length === 0) throw new Error("NO_TRADABLE_INSTRUMENTS");
+      const openPositionSymbols = await client.getOpenPositionSymbols();
+      const instruments = await client.getTradableInstruments().catch(() => {
+        this.recordEvent("DEMO_UNIVERSE_UNAVAILABLE", cycleId);
+        return [];
+      });
+      if (instruments.length === 0 && openPositionSymbols.length === 0) throw new Error("NO_TRADABLE_INSTRUMENTS");
       const supportedUniverse = instruments.map((instrument) => instrument.symbol);
       const allLessons = loadUsableLessons(this);
       const experiences = loadExperiences(this);
-      const openPositionSymbols = await client.getOpenPositionSymbols();
       const scan = await client.collectLightweightScan(instruments);
       const rankedScan = rankMarketCandidates(scan);
       this.recordEvent("MARKET_SCAN", cycleId, { symbols: String(scan.length), preRanked: String(rankedScan.length) });
       this.setState({ ...this.state, runtimeStatus: "ANALYZING", currentStage: "ANALYZING" });
-      const selectedSymbols = await selectCandidates(config, supportedUniverse, rankedScan);
+      const selectedSymbols = rankedScan.length ? await selectCandidates(config, supportedUniverse, rankedScan) : [];
       const candidateSymbols = [...new Set([...openPositionSymbols, ...selectedSymbols])];
       this.recordEvent("CANDIDATE_SELECTED", cycleId, { symbols: candidateSymbols.join(",") });
       const bundles = await client.collectEvidence(candidateSymbols);
@@ -403,7 +406,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
         this.setState({ ...this.state, runtimeStatus: "COOLDOWN", currentStage: "COOLDOWN" });
         this.recordEvent("COOLDOWN_STARTED", cycleId, { code: drawdown.code });
       }
-      const backtest = drawdown.blocked ? await runCooldownBacktest(config, { symbol: candidateSymbols[0] ?? supportedUniverse[0] ?? "", bars: await client.getHistoricalBars(candidateSymbols[0] ?? supportedUniverse[0] ?? ""), experiences, trigger: drawdown.code }) : undefined;
+      const backtest = drawdown.blocked ? await runCooldownBacktest(config, { symbol: candidateSymbols[0] ?? supportedUniverse[0] ?? "", bars: await client.getHistoricalBars(candidateSymbols[0] ?? supportedUniverse[0] ?? ""), experiences: experiences.filter((experience) => experience.outcomeStatus !== "EXECUTION_FAILURE"), trigger: drawdown.code }) : undefined;
       if (backtest) { saveBacktest(this, backtest); journal.backtest = backtest; this.recordEvent("BACKTEST_COMPLETED", cycleId); }
       const openExperiences = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
       const context = { bundles, supportedUniverse, experiences, openExperiences, lessons, openPositions, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE };

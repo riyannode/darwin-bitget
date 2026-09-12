@@ -48,6 +48,13 @@ function lesson(overrides: Partial<Lesson> = {}): Lesson {
 }
 
 describe("lesson memory", () => {
+  it("keeps infrastructure lessons for diagnostics without modifying stored lessons", () => {
+    const failure = lesson({ source: "EXECUTION_FAILURE", failureCode: "EXECUTION_UNKNOWN" });
+    const before = JSON.stringify(failure);
+    expect(retrieveLessons([failure], { symbol: "RAAPLUSDT", marketRegime: "UNKNOWN" })).toEqual([]);
+    expect(retrieveLessons([failure], { symbol: "RAAPLUSDT", marketRegime: "UNKNOWN", failureCode: "EXECUTION_UNKNOWN" })).toEqual([failure]);
+    expect(JSON.stringify(failure)).toBe(before);
+  });
   it("retrieves the relevant lesson without changing risk limits", () => {
     const result = retrieveLessons(
       [lesson(), lesson({ lessonId: "lesson-2", symbolScope: "RNVDAUSDT" })],

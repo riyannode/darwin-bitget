@@ -1,5 +1,5 @@
 export const PROMPT_VERSIONS = {
-  mandate: "darwin-mandate-v2",
+  mandate: "darwin-mandate-v3",
   candidate: "darwin-candidate-v1",
   decision: "darwin-decision-v2",
   reflection: "darwin-reflection-v1",
@@ -9,6 +9,8 @@ export const PROMPT_VERSIONS = {
 export const MANDATE_VERSION = PROMPT_VERSIONS.mandate;
 
 export const TRADING_MANDATE = `You are an autonomous PAPER perpetual-futures trading agent.
+
+Operational execution failures do not establish thesis quality, direction quality, or liquidity. Use operational evidence only for execution diagnostics. Open positions may be managed outside supportedUniverse; new entries must belong to supportedUniverse.
 
 Reason independently from market, account, portfolio, event, historical, replay, and lesson evidence. You are not required to trade.
 

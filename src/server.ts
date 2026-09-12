@@ -1,12 +1,22 @@
 import { routeAgentRequest } from "agents";
 import { TraderAgent } from "./agent/agent.js";
 import type { Env } from "./types.js";
+import { BitgetClient } from "./bitget/client.js";
+import { loadConfig } from "./config.js";
 
 export { TraderAgent };
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/api/universe" && request.method === "GET") {
+      try {
+        const instruments = await new BitgetClient(loadConfig(env)).getTradableInstruments();
+        return Response.json({ source: "DEMO_INTERSECTION", count: instruments.length, symbols: instruments.map((instrument) => instrument.symbol), commit: env.GIT_COMMIT_SHA }, { headers: { "Cache-Control": "no-store" } });
+      } catch {
+        return Response.json({ error: "DEMO_UNIVERSE_UNAVAILABLE" }, { status: 503 });
+      }
+    }
     if (url.pathname === "/api/snapshot" || url.pathname === "/api/control" || url.pathname === "/api/policy" || url.pathname === "/api/export/paper-log") {
       const id = env.TRADER_AGENT.idFromName("primary");
       const stub = env.TRADER_AGENT.get(id);

@@ -51,7 +51,7 @@ export const autonomousDecisionSetSchema = z.object({
 export type DecisionInput = z.infer<typeof decisionSchema>;
 
 const candidateSchema = z.object({
-  symbols: z.array(z.string().min(1)).min(3).max(5).refine((symbols) => new Set(symbols).size === symbols.length, "DUPLICATE_CANDIDATE"),
+  symbols: z.array(z.string().min(1)).min(1).max(5).refine((symbols) => new Set(symbols).size === symbols.length, "DUPLICATE_CANDIDATE"),
   rationale: z.array(z.string().min(1).max(240)).max(8),
 });
 
@@ -124,8 +124,10 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
     deepEvidenceSymbols: context.bundles.map((bundle) => bundle.instrument.symbol),
     deepEvidence,
     openExperiences: context.openExperiences.slice(-10),
-    experiences: context.experiences.slice(-10),
-    lessons: context.lessons,
+    experiences: context.experiences.filter((experience) => experience.outcomeStatus !== "EXECUTION_FAILURE").slice(-10),
+    operationalEvidence: context.experiences.filter((experience) => experience.outcomeStatus === "EXECUTION_FAILURE").slice(-10).map((experience) => ({ experienceId: experience.experienceId, symbol: experience.symbol, classification: "EXECUTION_FAILURE", strategyOutcome: "UNASSESSED" })),
+    lessons: context.lessons.filter((lesson) => lesson.source !== "EXECUTION_FAILURE"),
+    supportedUniverse: context.supportedUniverse.filter((symbol) => context.bundles.some((bundle) => bundle.instrument.symbol === symbol)),
     constraints: {
       actions: ["OPEN_LONG", "OPEN_SHORT", "HOLD", "REDUCE", "CLOSE"],
       paperOnly: true,
@@ -169,6 +171,7 @@ export function boundExitDecisions(exitDecisions: readonly Decision[], openPosit
 export async function decide(config: RuntimeConfig, context: DecisionContext, cycleId: string): Promise<AutonomousDecisionSet> {
   const generated = await generateQwenJson(config, autonomousDecisionSetSchema, `${context.mandate}\n${DECISION_TASK_PROMPT}\nReturn one primary action and optional exitDecisions. exitDecisions may only contain REDUCE or CLOSE for existing positions. Keep every rationale concise. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: 1200, timeoutMs: 60_000 });
   const createdAt = new Date().toISOString();
+  if ((generated.action === "OPEN_LONG" || generated.action === "OPEN_SHORT") && !context.supportedUniverse.includes(generated.symbol)) throw new Error("SYMBOL_NOT_ALLOWED");
   const exitKeys = new Set<string>();
   for (const exitDecision of generated.exitDecisions) {
     const key = `${exitDecision.symbol}:${exitDecision.positionSide}`;

@@ -327,6 +327,7 @@ export interface ExecutionResult {
   providerCode?: string;
   providerMessage?: string;
   providerReadbackCode?: string;
+  providerOperation?: string;
   providerReadbackMessage?: string;
   averageFillPrice?: string;
   fees?: string;

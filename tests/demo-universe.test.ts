@@ -1,0 +1,59 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { BitgetClient, executableIntersection } from "../src/bitget/client.js";
+import { parseInstruments } from "../src/bitget/types.js";
+import { loadConfig } from "../src/config.js";
+
+const config = loadConfig({ TRADING_MODE: "PAPER", PAPER_ONLY: "true", AGENT_MODE: "AUTONOMOUS" });
+const row = (symbol: string) => ({ symbol, category: "USDT-FUTURES", status: "online", symbolType: "stock", isRwa: "NO", minOrderQty: "0.01", minOrderAmount: "5", maxLeverage: "25", quantityMultiplier: "0.01" });
+const publicRows = ["SOXLUSDT", "SNXXUSDT", "KORUUSDT", "NVDAUSDT"].map(row);
+const demoRows = ["KORUUSDT", "NVDAUSDT"].map(row);
+
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+describe("Demo executable universe", () => {
+  it("excludes SOXL and SNXX and includes KORU and NVDA without requiring isRwa YES", () => {
+    expect(executableIntersection(parseInstruments(publicRows), parseInstruments(demoRows), "USDT-FUTURES").map(x => x.symbol)).toEqual(["KORUUSDT", "NVDAUSDT"]);
+  });
+
+  it("requires online stock metadata in both catalogs and uses Demo limits", () => {
+    const demo = parseInstruments([{ ...row("NVDAUSDT"), maxLeverage: "5" }, { ...row("KORUUSDT"), status: "offline" }]);
+    expect(executableIntersection(parseInstruments(publicRows), demo, "USDT-FUTURES")).toMatchObject([{ symbol: "NVDAUSDT", leverageMax: "5", quantityStep: "0.01" }]);
+  });
+
+  it("fetches full Demo catalog by GET without a symbol filter or financial operation", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({ code: "00000", data: demoRows }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new BitgetClient(config);
+    vi.spyOn(client, "getInstruments").mockResolvedValue(parseInstruments(publicRows));
+    const write = vi.spyOn(client, "placePaperOrder");
+    expect((await client.getTradableInstruments()).map(x => x.symbol)).toEqual(["KORUUSDT", "NVDAUSDT"]);
+    const [url, options] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toBe("https://api.bitget.com/api/v3/market/instruments?category=USDT-FUTURES");
+    expect(options.headers).toEqual({ paptrading: "1" });
+    expect(options.method ?? "GET").toBe("GET");
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it.each([Response.json({ code: "25100", data: null }), Response.json({ code: "00000", data: {} })])("fails closed on rejected or malformed Demo discovery", async (response) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+    const client = new BitgetClient(config);
+    const publicRead = vi.spyOn(client, "getInstruments").mockResolvedValue(parseInstruments(publicRows));
+    await expect(client.getTradableInstruments()).rejects.toThrow();
+    expect(publicRead).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on network failure", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("NETWORK_FAILURE")));
+    await expect(new BitgetClient(config).getTradableInstruments()).rejects.toThrow("NETWORK_FAILURE");
+  });
+
+  it("retains public evidence for a held symbol removed from Demo discovery", async () => {
+    const client = new BitgetClient(config);
+    vi.spyOn(client, "getInstruments").mockResolvedValue(parseInstruments(publicRows));
+    const evidence = vi.spyOn(client, "getMarketSnapshot").mockRejectedValue(new Error("REACHED_MARKET_READ"));
+    const { BitgetRestClient } = await import("@bitget-ai/bitget-agent-sdk");
+    vi.spyOn(BitgetRestClient.prototype, "callOperation").mockResolvedValue({ data: [], endpoint: "read", requestTime: "0", raw: { code: "00000" } });
+    await expect(client.collectEvidence(["SOXLUSDT"])).rejects.toThrow("REACHED_MARKET_READ");
+    expect(evidence).toHaveBeenCalledWith("SOXLUSDT");
+  });
+});

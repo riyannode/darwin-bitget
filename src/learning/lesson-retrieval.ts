@@ -28,6 +28,7 @@ export function retrieveLessons(
   limit = 5,
 ): Lesson[] {
   return lessons
+    .filter((lesson) => lesson.source !== "EXECUTION_FAILURE" || context.failureCode === lesson.failureCode)
     .map((lesson) => ({ lesson, value: score(lesson, context) }))
     .filter((entry) => entry.value >= 0)
     .sort((left, right) => right.value - left.value || right.lesson.updatedAt.localeCompare(left.lesson.updatedAt))

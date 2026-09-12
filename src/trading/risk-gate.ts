@@ -65,7 +65,9 @@ export function evaluateRiskGate(config: RuntimeConfig, context: RiskContext): R
 
   if (context.emergencyStop) addCode(codes, "EMERGENCY_STOP");
   if (!config.ownerPolicy.paperOnly) addCode(codes, "PAPER_ONLY");
-  if (!context.supportedUniverse.includes(decision.symbol)) addCode(codes, "SYMBOL_NOT_ALLOWED");
+  const managesPosition = (decision.action === "CLOSE" || decision.action === "REDUCE" || decision.action === "HOLD")
+    && account.positions.some((held) => held.symbol === decision.symbol && (decision.action === "HOLD" || held.positionSide === decision.positionSide));
+  if (!context.supportedUniverse.includes(decision.symbol) && !managesPosition) addCode(codes, "SYMBOL_NOT_ALLOWED");
   if (instrument.symbol !== decision.symbol || instrument.status.toLowerCase() !== "online") addCode(codes, "INSTRUMENT_UNAVAILABLE");
   if (!isFresh(context.evidenceObservedAt, config.evidenceMaxAgeSeconds, now)) addCode(codes, "STALE_EVIDENCE");
   if (context.dailyDrawdownBlocked) addCode(codes, "DAILY_DRAWDOWN");
