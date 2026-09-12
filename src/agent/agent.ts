@@ -287,6 +287,10 @@ export class TraderAgent extends Agent<Env, AgentState> {
         orderReference: journal.executionResult.providerOrderId ?? journal.executionResult.clientOrderId,
         executionStatus: journal.executionResult.status,
         reconciliationStatus: journal.reconciliationResult.status,
+        ...(journal.executionResult.providerCode ? { providerCode: journal.executionResult.providerCode } : {}),
+        ...(journal.executionResult.providerMessage ? { providerMessage: journal.executionResult.providerMessage } : {}),
+        ...(journal.executionResult.providerReadbackCode ? { providerReadbackCode: journal.executionResult.providerReadbackCode } : {}),
+        ...(journal.executionResult.providerReadbackMessage ? { providerReadbackMessage: journal.executionResult.providerReadbackMessage } : {}),
         timestamp: journal.executionResult.readBackAt,
       } : null,
       learning: {
@@ -498,7 +502,15 @@ export class TraderAgent extends Agent<Env, AgentState> {
     record.executionResult = executionResult;
     record.reconciliationResult = reconciliationResult;
     if (positionAfter) record.positionAfter = positionAfter;
-    this.recordEvent(reconciliationResult.status === "MATCHED" ? "EXECUTION_VERIFIED" : "EXECUTION_UNRESOLVED", cycleId, { decisionType, symbol: decision.symbol, codes: reconciliationResult.codes.join(",") });
+    this.recordEvent(reconciliationResult.status === "MATCHED" ? "EXECUTION_VERIFIED" : "EXECUTION_UNRESOLVED", cycleId, {
+      decisionType,
+      symbol: decision.symbol,
+      codes: reconciliationResult.codes.join(","),
+      ...(executionResult.providerCode ? { providerCode: executionResult.providerCode } : {}),
+      ...(executionResult.providerMessage ? { providerMessage: executionResult.providerMessage } : {}),
+      ...(executionResult.providerReadbackCode ? { providerReadbackCode: executionResult.providerReadbackCode } : {}),
+      ...(executionResult.providerReadbackMessage ? { providerReadbackMessage: executionResult.providerReadbackMessage } : {}),
+    });
     return record;
   }
 

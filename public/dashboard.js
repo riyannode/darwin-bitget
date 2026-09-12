@@ -120,7 +120,7 @@ function renderLatestTrade() {
   summary.className = trade ? "detail-grid" : "detail-grid empty";
   if (!trade) { summary.textContent = "No verified PAPER trade recorded yet."; return; }
   [detail("TIME", when(trade.timestamp)), detail("SYMBOL / SIDE", `${trade.symbol} / ${trade.positionSide ?? "—"}`), detail("ACTION", trade.action), detail("STATUS", trade.status)].forEach((item) => summary.append(item));
-  [detail("MARGIN", `${trade.marginAllocationPct}% / ${money(trade.marginAllocated)}`), detail("LEVERAGE", `${trade.leverage}x`), detail("POSITION NOTIONAL", money(trade.positionNotional)), detail("ENTRY", trade.entry), detail("EXIT", trade.exit), detail("REALIZED PNL", money(trade.realizedPnl)), detail("ORDER REFERENCE", trade.orderReference), detail("STRATEGY THESIS", trade.thesis, true)].forEach((item) => node.append(item));
+  [detail("MARGIN", `${trade.marginAllocationPct}% / ${money(trade.marginAllocated)}`), detail("LEVERAGE", `${trade.leverage}x`), detail("POSITION NOTIONAL", money(trade.positionNotional)), detail("ENTRY", trade.entry), detail("EXIT", trade.exit), detail("REALIZED PNL", money(trade.realizedPnl)), detail("ORDER REFERENCE", trade.orderReference), detail("STRATEGY THESIS", trade.thesis, true), detail("PROVIDER CODE", snapshot.executionEvidence?.providerCode), detail("PROVIDER MESSAGE", snapshot.executionEvidence?.providerMessage, true), detail("READBACK CODE", snapshot.executionEvidence?.providerReadbackCode), detail("READBACK MESSAGE", snapshot.executionEvidence?.providerReadbackMessage, true)].forEach((item) => node.append(item));
 }
 
 function renderActivity() {

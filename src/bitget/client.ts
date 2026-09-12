@@ -11,6 +11,64 @@ export function buildOpenOrdersReadParams(category: string): Record<string, stri
   return { category };
 }
 
+export interface ProviderErrorDetails {
+  code?: string;
+  message?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function textValue(value: unknown): string {
+  return typeof value === "string" || typeof value === "number" ? String(value) : "";
+}
+
+function sanitizeProviderMessage(value: string): string {
+  return value.replace(/(ACCESS-(?:KEY|SIGN|PASSPHRASE|TIMESTAMP)|apiKey|secretKey|passphrase)([=:])[^,\s]+/gi, "$1$2REDACTED").slice(0, 240);
+}
+
+export function extractProviderError(error: unknown): ProviderErrorDetails {
+  const record = isRecord(error) ? error : null;
+  const code = textValue(record?.code) || textValue(record?.type);
+  const message = sanitizeProviderMessage(error instanceof Error ? error.message : textValue(record?.message) || textValue(record?.msg));
+  return {
+    ...(code ? { code } : {}),
+    ...(message ? { message } : {}),
+  };
+}
+
+export function buildUnresolvedExecution(
+  request: ExecutionRequest,
+  submittedAt: string,
+  writeError: unknown,
+  readbackError?: unknown,
+): ExecutionResult {
+  const writeDetails = extractProviderError(writeError);
+  const readbackDetails = extractProviderError(readbackError);
+  return {
+    provider: "bitget",
+    clientOrderId: request.clientOrderId,
+    symbol: request.symbol,
+    action: request.action,
+    positionSide: request.positionSide,
+    providerSide: request.providerSide,
+    tradeSide: request.tradeSide,
+    marginAllocated: request.marginAllocated,
+    leverage: request.leverage,
+    positionNotional: request.positionNotional,
+    requestedQuantity: request.quantity,
+    executedQuantity: "0",
+    status: "unknown",
+    submittedAt,
+    readBackAt: new Date().toISOString(),
+    ...(writeDetails.code ? { providerCode: writeDetails.code } : {}),
+    providerMessage: writeDetails.message ?? "PROVIDER_WRITE_UNKNOWN",
+    ...(readbackDetails.code ? { providerReadbackCode: readbackDetails.code } : {}),
+    ...(readbackDetails.message ? { providerReadbackMessage: readbackDetails.message } : {}),
+  };
+}
+
 export class BitgetClient {
   private readonly client: BitgetRestClient;
   private readonly category: string;
@@ -164,25 +222,8 @@ export class BitgetClient {
         clientOrderId: this.text(response.clientOid, request.clientOrderId),
         submittedAt,
       });
-    } catch {
-      return {
-        provider: "bitget",
-        clientOrderId: request.clientOrderId,
-        symbol: request.symbol,
-        action: request.action,
-        positionSide: request.positionSide,
-        providerSide: request.providerSide,
-        tradeSide: request.tradeSide,
-        marginAllocated: request.marginAllocated,
-        leverage: request.leverage,
-        positionNotional: request.positionNotional,
-        requestedQuantity: request.quantity,
-        executedQuantity: "0",
-        status: "unknown",
-        submittedAt,
-        readBackAt: new Date().toISOString(),
-        providerMessage: error instanceof Error ? "PROVIDER_WRITE_UNKNOWN" : "PROVIDER_WRITE_UNKNOWN",
-      };
+    } catch (readbackError) {
+      return buildUnresolvedExecution(request, submittedAt, error, readbackError);
     }
   }
 

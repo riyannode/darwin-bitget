@@ -325,6 +325,8 @@ export interface ExecutionResult {
   readBackAt: string;
   providerCode?: string;
   providerMessage?: string;
+  providerReadbackCode?: string;
+  providerReadbackMessage?: string;
   averageFillPrice?: string;
   fees?: string;
   funding?: string;
@@ -447,6 +449,10 @@ export interface DashboardSnapshot {
     orderReference: string;
     executionStatus: ExecutionStatus;
     reconciliationStatus: ReconciliationResult["status"];
+    providerCode?: string;
+    providerMessage?: string;
+    providerReadbackCode?: string;
+    providerReadbackMessage?: string;
     timestamp: string;
   } | null;
   scheduler: {
