@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildDecisionPrompt, rankMarketCandidates } from "../src/agent/decision.js";
+import { autonomousDecisionSetSchema, buildDecisionPrompt, rankMarketCandidates } from "../src/agent/decision.js";
 import type { AccountSnapshot, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot } from "../src/types.js";
 
 function snapshot(symbol: string, change: string, volume: string): MarketSnapshot {
@@ -40,5 +40,14 @@ describe("market candidate pre-ranking", () => {
     expect(prompt).not.toContain('"openPositions":');
     expect(prompt).not.toContain("OTHERUSDT");
     expect(prompt).not.toContain('"evidence":');
+  });
+
+  it("allows multiple exits but no opening action inside exitDecisions", () => {
+    const longExit = { action: "REDUCE" as const, positionSide: "LONG" as const, symbol: "NVDAUSDT", marginAllocationPct: "0", leverage: "2", reductionPct: "50", confidence: 0.7, thesis: "thesis", strategyThesis: "strategy", supportingFactors: ["factor"], riskFactors: ["risk"], evidenceUsed: ["ticker"], lessonsUsed: [] };
+    const shortExit = { ...longExit, action: "CLOSE" as const, positionSide: "SHORT" as const, symbol: "SMCIUSDT", reductionPct: null };
+    const parsed = autonomousDecisionSetSchema.parse({ ...longExit, action: "HOLD", positionSide: null, symbol: "NVDAUSDT", marginAllocationPct: "0", reductionPct: null, exitDecisions: [longExit, shortExit] });
+
+    expect(parsed.exitDecisions).toHaveLength(2);
+    expect(() => autonomousDecisionSetSchema.parse({ ...longExit, action: "HOLD", positionSide: null, marginAllocationPct: "0", reductionPct: null, exitDecisions: [{ ...longExit, action: "OPEN_LONG" }] })).toThrow();
   });
 });

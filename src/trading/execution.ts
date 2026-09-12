@@ -70,7 +70,7 @@ export function buildExecutionRequest(decision: Decision, bundle: EvidenceBundle
     positionNotional,
     reductionPct,
     quantity,
-    clientOrderId: `paper-${cycleId.replaceAll("-", "").slice(0, 26)}`,
+    clientOrderId: `paper-${cycleId.replaceAll("-", "").slice(0, 16)}-${decision.decisionId.replaceAll("-", "").slice(0, 9)}`,
   };
 }
 

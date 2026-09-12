@@ -1,10 +1,10 @@
 import { Agent } from "agents";
-import type { DashboardSnapshot, Decision, Env, ExecutionResult, OwnerPolicy, PositionSnapshot, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
+import type { DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, Lesson, OwnerPolicy, PositionSnapshot, ReflectionResult, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
 import { decide, rankMarketCandidates, selectCandidates } from "./decision.js";
-import { scheduleTradingCycle } from "./scheduler.js";
+import { scheduleTradingCycle, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES } from "./scheduler.js";
 import { authorizeOwner } from "./owner-auth.js";
 import { retrieveLessons } from "../learning/lesson-retrieval.js";
 import { reflect, reflectWithQwen } from "../learning/reflection.js";
@@ -37,6 +37,7 @@ import { evaluateDrawdown } from "../trading/drawdown.js";
 import { loadOwnerPolicy, updateOwnerPolicy } from "../trading/policy.js";
 import { buildExecutionRequest, executePaperOrder } from "../trading/execution.js";
 import { reconcileExecution } from "../trading/reconcile.js";
+import { addDecimal, isDecimal } from "../trading/decimal.js";
 
 interface AgentState {
   emergencyStop: boolean;
@@ -50,12 +51,27 @@ interface AgentState {
   lastStatus: "IDLE" | "RUNNING" | "COMPLETED" | "FAILED";
   lastPolicyUpdateAt: string | null;
   cycleStartedAt: string | null;
+  temporaryScanIntervalExpiresAt: string | null;
+  temporaryScanIntervalCompleted: boolean;
 }
 
 const STALE_CYCLE_TIMEOUT_MS = 120_000;
 
 function failureCode(codes: string[]): string {
   return codes.join(",") || "";
+}
+
+function schedulerMetrics(events: readonly { type: string; metadata?: Record<string, string> }[]): DashboardSnapshot["scheduler"] {
+  const durations = events.flatMap((event) => event.type === "CYCLE_COMPLETED" && event.metadata?.durationMs ? [Number(event.metadata.durationMs)] : []).filter((value) => Number.isFinite(value));
+  return {
+    completedCycles: durations.length,
+    averageDurationMs: durations.length ? Math.round(durations.reduce((total, value) => total + value, 0) / durations.length) : 0,
+    maxDurationMs: durations.length ? Math.max(...durations) : 0,
+    inProgressCount: events.filter((event) => event.type === "CYCLE_IN_PROGRESS").length,
+    staleCount: events.filter((event) => event.type === "CYCLE_STALE").length,
+    failureCount: events.filter((event) => event.type === "CYCLE_FAILED" || event.type === "SCHEDULE_CALLBACK_FAILED").length,
+    timeoutCount: events.filter((event) => event.type === "CYCLE_TIMEOUT").length,
+  };
 }
 
 function tradeLifecycleStatus(experience: TradeExperience): TradeLifecycleStatus {
@@ -82,15 +98,18 @@ export class TraderAgent extends Agent<Env, AgentState> {
     lastStatus: "IDLE",
     lastPolicyUpdateAt: null,
     cycleStartedAt: null,
+    temporaryScanIntervalExpiresAt: null,
+    temporaryScanIntervalCompleted: false,
   };
 
   public override async onStart(): Promise<void> {
     ensureStorage(this);
+    this.ensureTemporaryScanTest();
     const policy = this.ensureActivePolicy();
     const config = loadConfig(this.env, policy);
     const activeCycle = this.state.lastStatus === "RUNNING";
     this.setState({ ...this.state, emergencyStop: policy.emergencyStop, model: config.qwenModel, runtimeStatus: activeCycle ? this.state.runtimeStatus : this.state.paused || policy.emergencyStop ? "PAUSED" : "ONLINE", currentStage: activeCycle ? this.state.currentStage : this.state.paused || policy.emergencyStop ? "PAUSED" : "ONLINE" });
-    if (!this.state.paused && !policy.emergencyStop) await scheduleTradingCycle(this, config.ownerPolicy.scanIntervalMinutes);
+    if (!this.state.paused && !policy.emergencyStop) await scheduleTradingCycle(this, this.activeScanIntervalMinutes(policy));
   }
 
   public override async onRequest(request: Request): Promise<Response> {
@@ -127,9 +146,15 @@ export class TraderAgent extends Agent<Env, AgentState> {
     this.recordEvent("SCHEDULE_CALLBACK", "CONTROL");
     if (this.state.paused || this.state.emergencyStop) return;
     try {
+      const policy = this.ensureActivePolicy();
+      const config = loadConfig(this.env, policy);
+      await this.ensureTradingSchedule(config);
       await this.runCycle();
     } catch (error) {
-      this.recordEvent("SCHEDULE_CALLBACK_FAILED", "CONTROL", { code: error instanceof Error ? error.message.split(":", 1)[0] ?? "SCHEDULE_CALLBACK_FAILED" : "SCHEDULE_CALLBACK_FAILED" });
+      const code = error instanceof Error ? error.message.split(":", 1)[0] ?? "SCHEDULE_CALLBACK_FAILED" : "SCHEDULE_CALLBACK_FAILED";
+      if (code === "CYCLE_IN_PROGRESS") this.recordEvent("CYCLE_IN_PROGRESS", this.state.lastCycleId ?? "UNKNOWN", { code });
+      if (code.includes("TIMEOUT")) this.recordEvent("CYCLE_TIMEOUT", this.state.lastCycleId ?? "UNKNOWN", { code });
+      this.recordEvent("SCHEDULE_CALLBACK_FAILED", "CONTROL", { code });
       return;
     }
   }
@@ -148,7 +173,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     }
     if (!effectivePaused) {
       const config = loadConfig(this.env, this.ensureActivePolicy());
-      await scheduleTradingCycle(this, config.ownerPolicy.scanIntervalMinutes);
+      await scheduleTradingCycle(this, this.activeScanIntervalMinutes(config.ownerPolicy));
     }
     return nextState;
   }
@@ -168,6 +193,25 @@ export class TraderAgent extends Agent<Env, AgentState> {
 
   public async getStatus(): Promise<AgentState> {
     return this.state;
+  }
+
+  private ensureTemporaryScanTest(): void {
+    const expiresAt = this.state.temporaryScanIntervalExpiresAt;
+    if (this.state.temporaryScanIntervalCompleted) return;
+    if (expiresAt) {
+      if (new Date(expiresAt).getTime() > Date.now()) return;
+      this.setState({ ...this.state, temporaryScanIntervalExpiresAt: null, temporaryScanIntervalCompleted: true });
+      this.recordEvent("TEMPORARY_SCAN_INTERVAL_EXPIRED", "CONTROL", { restoredIntervalMinutes: "15" });
+      return;
+    }
+    const nextExpiresAt = new Date(Date.now() + TEMPORARY_SCAN_INTERVAL_DURATION_MS).toISOString();
+    this.setState({ ...this.state, temporaryScanIntervalExpiresAt: nextExpiresAt, temporaryScanIntervalCompleted: false });
+    this.recordEvent("TEMPORARY_SCAN_INTERVAL_ACTIVATED", "CONTROL", { intervalMinutes: String(TEMPORARY_SCAN_INTERVAL_MINUTES), expiresAt: nextExpiresAt });
+  }
+
+  private activeScanIntervalMinutes(policy: OwnerPolicy): number {
+    this.ensureTemporaryScanTest();
+    return temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : policy.scanIntervalMinutes;
   }
 
   public async getDashboardSnapshot(): Promise<DashboardSnapshot> {
@@ -254,12 +298,15 @@ export class TraderAgent extends Agent<Env, AgentState> {
       },
       riskControls: {
         ...config.ownerPolicy,
+        scanIntervalMinutes: this.activeScanIntervalMinutes(config.ownerPolicy),
+        temporaryScanIntervalExpiresAt: this.state.temporaryScanIntervalExpiresAt,
         drawdownBlocked: Boolean(drawdown?.cooldownUntil && new Date(drawdown.cooldownUntil).getTime() > Date.now()),
         drawdownCode: drawdown?.cooldownUntil ? "DRAWDOWN_COOLDOWN" : "NONE",
         cooldownUntil: drawdown?.cooldownUntil ?? null,
       },
       activity: loadRecentEvents(this),
       lastPolicyUpdate: loadRecentEvents(this, 50).find((event) => event.type === "POLICY_UPDATED") ?? null,
+      scheduler: schedulerMetrics(loadRecentEvents(this, 200)),
     };
   }
 
@@ -267,11 +314,14 @@ export class TraderAgent extends Agent<Env, AgentState> {
     ensureStorage(this);
     if (this.state.paused) throw new Error("AGENT_PAUSED");
     if (this.state.emergencyStop) throw new Error("EMERGENCY_STOP");
-    if (this.state.lastStatus === "RUNNING" && !this.recoverStaleCycle()) throw new Error("CYCLE_IN_PROGRESS");
+    if (this.state.lastStatus === "RUNNING" && !this.recoverStaleCycle()) {
+      this.recordEvent("CYCLE_IN_PROGRESS", this.state.lastCycleId ?? "UNKNOWN", { code: "CYCLE_IN_PROGRESS" });
+      throw new Error("CYCLE_IN_PROGRESS");
+    }
     const startedAt = new Date().toISOString();
     const cycleId = crypto.randomUUID();
     const config = loadConfig(this.env, this.ensureActivePolicy());
-    const nextScanAt = new Date(Date.now() + config.ownerPolicy.scanIntervalMinutes * 60_000).toISOString();
+    const nextScanAt = new Date(Date.now() + this.activeScanIntervalMinutes(config.ownerPolicy) * 60_000).toISOString();
     this.setState({ ...this.state, lastCycleId: cycleId, lastScanAt: startedAt, nextScanAt, model: config.qwenModel, runtimeStatus: "SCANNING", currentStage: "SCANNING", lastStatus: "RUNNING", cycleStartedAt: startedAt });
     saveCycle(this, cycleId, "RUNNING", startedAt, null);
     const journal: TradingJournal = { cycleId, agentVersion: config.version ?? "0.2.0", promptVersion: MANDATE_VERSION, model: config.qwenModel, mode: config.agentMode, startedAt, retrievedLessons: [], createdLessons: [] };
@@ -310,110 +360,82 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (backtest) { saveBacktest(this, backtest); journal.backtest = backtest; this.recordEvent("BACKTEST_COMPLETED", cycleId); }
       const openExperiences = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
       const context = { bundles, supportedUniverse, experiences, openExperiences, lessons, openPositions, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE };
-      const decision = await decide(config, context, cycleId);
+      const decisionSet = await decide(config, context, cycleId);
+      const decision = decisionSet.decision;
+      const legacyExit = decision.action === "REDUCE" || decision.action === "CLOSE" ? [decision] : [];
+      const exitDecisions = [...legacyExit, ...decisionSet.exitDecisions.filter((exitDecision) => !legacyExit.some((legacy) => legacy.symbol === exitDecision.symbol && legacy.positionSide === exitDecision.positionSide))];
       const bundle = bundles.find((candidate) => candidate.instrument.symbol === decision.symbol) ?? bundles[0];
       if (!bundle) throw new Error("NO_EVIDENCE");
       this.setState({ ...this.state, runtimeStatus: "RISK_CHECK", currentStage: "RISK_CHECK" });
-      const riskGateResult = evaluateRiskGate(config, { decision, instrument: bundle.instrument, account: bundle.account, evidenceObservedAt: bundle.market.observedAt, openOrderSymbols: bundle.account.openOrderSymbols, supportedUniverse, emergencyStop: this.state.emergencyStop || config.ownerPolicy.emergencyStop, dailyDrawdownBlocked: drawdown.blocked });
       journal.marketContext = { scan, deep: bundles.map((candidate) => ({ market: candidate.market, regime: candidate.marketRegime })) };
       journal.portfolio = account;
       journal.evidence = bundles.flatMap((candidate) => candidate.evidence);
       journal.retrievedLessons = lessons.map((lesson) => lesson.lessonId);
       journal.decision = decision;
-      journal.riskGateResult = riskGateResult;
-      this.recordEvent("DECISION_CREATED", cycleId, { action: decision.action, symbol: decision.symbol });
-      this.recordEvent(riskGateResult.status === "PASS" ? "RISK_GATE_PASS" : "RISK_GATE_BLOCK", cycleId, { codes: riskGateResult.codes.join(",") });
-      let executionRequest;
-      let executionResult;
-      let reconciliationResult;
-      const positionBefore = findPosition(bundle.account.positions, decision.symbol, decision.positionSide);
-      if (riskGateResult.status === "PASS" && decision.action !== "HOLD") {
-        this.setState({ ...this.state, runtimeStatus: "EXECUTING", currentStage: "EXECUTING" });
-        executionRequest = buildExecutionRequest(decision, bundle, cycleId);
-        if (!recordIdempotency(this, executionRequest.clientOrderId, cycleId, decision.decisionId, startedAt)) throw new Error("DUPLICATE_ORDER");
-        this.recordEvent("PAPER_ORDER_SUBMITTED", cycleId, { symbol: decision.symbol, action: decision.action });
-        executionResult = await executePaperOrder(client, executionRequest);
-        this.setState({ ...this.state, runtimeStatus: "RECONCILING", currentStage: "RECONCILING" });
-        let positionAfter: PositionSnapshot | undefined;
-        try {
-          const afterBundle = (await client.collectEvidence([decision.symbol]))[0];
-          if (afterBundle) {
-            journal.portfolio = afterBundle.account;
-            positionAfter = findPosition(afterBundle.account.positions, decision.symbol, decision.positionSide);
-          }
-        } catch {
-          positionAfter = undefined;
+      journal.exitDecisions = exitDecisions;
+      const exitRecords: DecisionExecutionRecord[] = [];
+      let exitWriteBlocked = false;
+      for (const exitDecision of exitDecisions) {
+        if (exitWriteBlocked) break;
+        const exitBundle = (await client.collectEvidence([exitDecision.symbol]))[0];
+        if (!exitBundle) {
+          this.recordEvent("EXECUTION_UNRESOLVED", cycleId, { decisionType: "EXIT", symbol: exitDecision.symbol, codes: "EVIDENCE_READBACK_UNAVAILABLE" });
+          exitWriteBlocked = true;
+          break;
         }
-        reconciliationResult = reconcileExecution(executionRequest, executionResult, positionBefore, positionAfter);
-        if (executionRequest.tradeSide === "open" && executionResult.status === "filled" && !positionAfter) {
-          reconciliationResult = { ...reconciliationResult, status: "MISMATCH" as const, codes: [...reconciliationResult.codes, "POSITION_READBACK_MISSING"] };
+        const exitRecord = await this.executeDecision(client, config, exitDecision, exitBundle, cycleId, supportedUniverse, drawdown.blocked, startedAt, "EXIT");
+        exitRecords.push(exitRecord);
+        await this.persistDecisionOutcome(config, exitRecord, exitBundle, experiences, lessons, cycleId, startedAt, journal, false);
+        if (exitRecord.decision.decisionId === decision.decisionId) {
+          journal.riskGateResult = exitRecord.riskGateResult;
+          if (exitRecord.executionRequest) journal.executionRequest = exitRecord.executionRequest;
+          if (exitRecord.executionResult) journal.executionResult = exitRecord.executionResult;
+          if (exitRecord.reconciliationResult) journal.reconciliationResult = exitRecord.reconciliationResult;
+          if (exitRecord.positionBefore) journal.positionBefore = exitRecord.positionBefore;
+          if (exitRecord.positionAfter) journal.positionAfter = exitRecord.positionAfter;
+          if (exitRecord.accountAfter) journal.portfolio = exitRecord.accountAfter;
         }
-        if (positionBefore) journal.positionBefore = positionBefore;
-        if (positionAfter) journal.positionAfter = positionAfter;
-        journal.executionRequest = executionRequest;
-        journal.executionResult = executionResult;
-        journal.reconciliationResult = reconciliationResult;
-        this.recordEvent(reconciliationResult.status === "MATCHED" ? "EXECUTION_VERIFIED" : "EXECUTION_UNRESOLVED", cycleId);
+        if (exitRecord.reconciliationResult && exitRecord.reconciliationResult.status !== "MATCHED") exitWriteBlocked = true;
+      }
+      journal.exitExecutions = exitRecords;
+      const refreshedBundles = exitDecisions.length && !exitWriteBlocked ? await client.collectEvidence([...new Set([...candidateSymbols, decision.symbol])]) : bundles;
+      const refreshedBundle = refreshedBundles.find((candidate) => candidate.instrument.symbol === decision.symbol) ?? refreshedBundles[0];
+      if (!refreshedBundle) throw new Error("NO_EVIDENCE");
+      journal.portfolio = refreshedBundle.account;
+      if (!exitWriteBlocked && decision.action !== "REDUCE" && decision.action !== "CLOSE") {
+        const entryRecord = await this.executeDecision(client, config, decision, refreshedBundle, cycleId, supportedUniverse, drawdown.blocked, startedAt, "ENTRY");
+        journal.riskGateResult = entryRecord.riskGateResult;
+        if (entryRecord.executionRequest) journal.executionRequest = entryRecord.executionRequest;
+        if (entryRecord.executionResult) journal.executionResult = entryRecord.executionResult;
+        if (entryRecord.reconciliationResult) journal.reconciliationResult = entryRecord.reconciliationResult;
+        if (entryRecord.positionBefore) journal.positionBefore = entryRecord.positionBefore;
+        if (entryRecord.positionAfter) journal.positionAfter = entryRecord.positionAfter;
+        if (entryRecord.accountAfter) journal.portfolio = entryRecord.accountAfter;
+        await this.persistDecisionOutcome(config, entryRecord, refreshedBundle, experiences, lessons, cycleId, startedAt, journal, true);
+      } else if (exitWriteBlocked && (decision.action === "OPEN_LONG" || decision.action === "OPEN_SHORT")) {
+        this.recordEvent("ENTRY_SKIPPED", cycleId, { code: "EXIT_UNRESOLVED" });
+        journal.riskGateResult = { status: "BLOCK", codes: ["EXIT_UNRESOLVED"], checkedAt: new Date().toISOString() };
       }
       this.setState({ ...this.state, runtimeStatus: "REFLECTING", currentStage: "REFLECTING" });
-      const codes = [...riskGateResult.codes, ...(drawdown.code === "NONE" ? [] : [drawdown.code])];
-      const failure = failureCode(codes);
-      const verified = Boolean(executionResult && reconciliationResult?.status === "MATCHED" && executionResult.status === "filled");
-      const currentExperience = experiences.find((experience) => experience.outcomeStatus === "OPEN" && experience.symbol === decision.symbol && experience.positionSide === decision.positionSide);
-      const closed = decision.action === "CLOSE" && verified;
-      const reduced = decision.action === "REDUCE" && verified;
-      const opening = (decision.action === "OPEN_LONG" || decision.action === "OPEN_SHORT") && verified;
-      if (opening && executionResult) {
-        const openingExperience = reflect({ decision, outcome: "OPEN", failureCode: "", symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", experienceStatus: "OPEN", entryPrice: executionResult.averageFillPrice ?? bundle.market.lastPrice, evidenceAtEntry: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: decision.lessonsUsed, marginAllocated: executionResult.marginAllocated, positionNotional: executionResult.positionNotional, realizedPnlVerified: false });
-        journal.experienceId = openingExperience.experience.experienceId;
-        saveExperience(this, openingExperience.experience, startedAt);
-      } else if (closed && currentExperience && executionResult) {
-        const realizedPnl = executionResult.realizedPnl;
-        const resolvedPnl = realizedPnl ?? "UNAVAILABLE";
-        const realizedPnlVerified = Boolean(realizedPnl && /^-?\d+(?:\.\d+)?$/.test(realizedPnl));
-        const closeInput = { decision, outcome: realizedPnlVerified ? "CLOSED" : "CLOSED_PNL_UNVERIFIED", failureCode: realizedPnlVerified ? "" : "REALIZED_PNL_UNAVAILABLE", symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", experienceStatus: realizedPnlVerified ? outcomeFromPnl(resolvedPnl) : "EXECUTION_FAILURE" as const, entryPrice: currentExperience.entryPrice, exitPrice: executionResult.averageFillPrice ?? bundle.market.lastPrice, evidenceAtEntry: currentExperience.evidenceAtEntry, evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: [...new Set([...currentExperience.lessonsUsed, ...decision.lessonsUsed])], lessons: lessons.filter((lesson) => currentExperience.lessonsUsed.includes(lesson.lessonId) || decision.lessonsUsed.includes(lesson.lessonId)), marginAllocated: currentExperience.marginAllocated, positionNotional: currentExperience.positionNotional, realizedPnl: resolvedPnl, realizedPnlPct: executionResult.realizedPnlPct ?? "UNAVAILABLE", realizedPnlVerified, existingExperience: currentExperience };
-        const closedExperience = reflect({ ...closeInput, ...(executionResult.fees ? { fees: executionResult.fees } : {}), ...(executionResult.funding ? { funding: executionResult.funding } : {}) });
-        journal.experienceId = closedExperience.experience.experienceId;
-        saveExperience(this, closedExperience.experience, startedAt);
-        try {
-          const closeResult = await reflectWithQwen(config, { ...closeInput, ...(executionResult.fees ? { fees: executionResult.fees } : {}), ...(executionResult.funding ? { funding: executionResult.funding } : {}) });
-          journal.reflection = closeResult.reflection;
-          journal.createdLessons = [closeResult.lesson.lessonId];
-          saveExperience(this, closeResult.experience, startedAt);
-          saveLesson(this, closeResult.lesson);
-          recordLessonApplication(this, cycleId, closeResult.reflection.lessonEvaluations.filter((evaluation) => closeResult.experience.lessonsUsed.includes(evaluation.lessonId)), new Date().toISOString());
-          this.recordEvent("REFLECTION_COMPLETED", cycleId);
-          this.recordEvent("LESSON_CREATED", cycleId, { source: closeResult.lesson.source });
-        } catch (error) {
-          this.recordEvent("REFLECTION_FAILED", cycleId, { code: error instanceof Error ? error.message.split(":", 1)[0] ?? "REFLECTION_FAILED" : "REFLECTION_FAILED" });
-        }
-      } else if (reduced && currentExperience && executionResult) {
-        const reducedExperience: TradeExperience = { ...currentExperience, lastAction: "REDUCE", exitDecisionId: decision.decisionId, exitPrice: executionResult.averageFillPrice ?? bundle.market.lastPrice, exitThesis: decision.thesis, positionNotional: journal.positionAfter?.notional ?? currentExperience.positionNotional, marginAllocated: journal.positionAfter?.marginAllocated ?? currentExperience.marginAllocated, evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), ...(executionResult.realizedPnl ? { realizedPnl: executionResult.realizedPnl, realizedPnlVerified: true } : {}), ...(executionResult.realizedPnlPct ? { realizedPnlPct: executionResult.realizedPnlPct } : {}), ...(executionResult.fees ? { fees: executionResult.fees } : {}), ...(executionResult.funding ? { funding: executionResult.funding } : {}) };
-        journal.experienceId = reducedExperience.experienceId;
-        saveExperience(this, reducedExperience, startedAt);
-      } else if (riskGateResult.status === "BLOCK" || (executionResult && reconciliationResult?.status !== "MATCHED")) {
-        const failureResult = reflect({ decision, outcome: riskGateResult.status === "BLOCK" ? "RISK_BLOCKED" : "EXECUTION_FAILURE", failureCode: failure || "EXECUTION_FAILURE", symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", experienceStatus: riskGateResult.status === "BLOCK" ? "BLOCKED" : "EXECUTION_FAILURE", entryPrice: bundle.market.lastPrice, exitPrice: bundle.market.lastPrice, evidenceAtEntry: bundle.evidence.map((evidence) => evidence.type), evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: decision.lessonsUsed, marginAllocated: executionRequest?.marginAllocated ?? "0", positionNotional: executionRequest?.positionNotional ?? "0" });
-        journal.experienceId = failureResult.experience.experienceId;
-        journal.reflection = failureResult.reflection;
-        journal.createdLessons = [failureResult.lesson.lessonId];
-        saveExperience(this, failureResult.experience, startedAt);
-        saveLesson(this, failureResult.lesson);
-        this.recordEvent("REFLECTION_COMPLETED", cycleId);
-      }
       const backtestLesson = backtest ? createBacktestLesson(backtest) : undefined;
       journal.createdLessons = [...journal.createdLessons, ...(backtestLesson ? [backtestLesson.lessonId] : [])];
       if (backtestLesson) saveLesson(this, backtestLesson);
       if (backtestLesson) this.recordEvent("LESSON_CREATED", cycleId, { source: "BACKTEST_REPLAY" });
       journal.completedAt = new Date().toISOString();
+      journal.durationMs = Math.max(0, new Date(journal.completedAt).getTime() - new Date(startedAt).getTime());
+      this.recordEvent("CYCLE_COMPLETED", cycleId, { durationMs: String(journal.durationMs) });
       saveJournal(this, journal);
       saveCycle(this, cycleId, "COMPLETED", startedAt, journal.completedAt);
       this.setState({ ...this.state, runtimeStatus: drawdown.blocked ? "COOLDOWN" : "ONLINE", currentStage: drawdown.blocked ? "COOLDOWN" : "ONLINE", lastStatus: "COMPLETED", cycleStartedAt: null });
       return journal;
     } catch (error) {
       journal.completedAt = new Date().toISOString();
+      journal.durationMs = Math.max(0, new Date(journal.completedAt).getTime() - new Date(startedAt).getTime());
       saveJournal(this, journal);
       saveCycle(this, cycleId, "FAILED", startedAt, journal.completedAt);
-      this.recordEvent("CYCLE_FAILED", cycleId, { code: error instanceof Error ? error.message.split(":", 1)[0] ?? "CYCLE_FAILED" : "CYCLE_FAILED" });
+      const code = error instanceof Error ? error.message.split(":", 1)[0] ?? "CYCLE_FAILED" : "CYCLE_FAILED";
+      this.recordEvent("CYCLE_FAILED", cycleId, { code, durationMs: String(journal.durationMs) });
+      if (code.includes("TIMEOUT")) this.recordEvent("CYCLE_TIMEOUT", cycleId, { code });
       this.setState({ ...this.state, runtimeStatus: "ERROR", currentStage: "ERROR", lastStatus: "FAILED", cycleStartedAt: null });
       throw error;
     }
@@ -434,21 +456,173 @@ export class TraderAgent extends Agent<Env, AgentState> {
     return true;
   }
 
+  private async executeDecision(
+    client: BitgetClient,
+    config: RuntimeConfig,
+    decision: Decision,
+    bundle: EvidenceBundle,
+    cycleId: string,
+    supportedUniverse: readonly string[],
+    dailyDrawdownBlocked: boolean,
+    startedAt: string,
+    decisionType: "ENTRY" | "EXIT",
+  ): Promise<DecisionExecutionRecord> {
+    const riskGateResult = evaluateRiskGate(config, { decision, instrument: bundle.instrument, account: bundle.account, evidenceObservedAt: bundle.market.observedAt, openOrderSymbols: bundle.account.openOrderSymbols, supportedUniverse, emergencyStop: this.state.emergencyStop || config.ownerPolicy.emergencyStop, dailyDrawdownBlocked });
+    this.recordEvent("DECISION_CREATED", cycleId, { action: decision.action, symbol: decision.symbol, decisionType });
+    this.recordEvent(riskGateResult.status === "PASS" ? "RISK_GATE_PASS" : "RISK_GATE_BLOCK", cycleId, { codes: riskGateResult.codes.join(","), decisionType, symbol: decision.symbol });
+    const positionBefore = findPosition(bundle.account.positions, decision.symbol, decision.positionSide);
+    const record: DecisionExecutionRecord = { decision, riskGateResult, ...(positionBefore ? { positionBefore } : {}) };
+    if (riskGateResult.status === "BLOCK" || decision.action === "HOLD") return record;
+    this.setState({ ...this.state, runtimeStatus: "EXECUTING", currentStage: "EXECUTING" });
+    const executionRequest = buildExecutionRequest(decision, bundle, cycleId);
+    if (!recordIdempotency(this, executionRequest.clientOrderId, cycleId, decision.decisionId, startedAt)) throw new Error("DUPLICATE_ORDER");
+    this.recordEvent("PAPER_ORDER_SUBMITTED", cycleId, { symbol: decision.symbol, action: decision.action, decisionType });
+    const executionResult = await executePaperOrder(client, executionRequest);
+    this.setState({ ...this.state, runtimeStatus: "RECONCILING", currentStage: "RECONCILING" });
+    let positionAfter: PositionSnapshot | undefined;
+    let readbackFailure = false;
+    try {
+      const afterBundle = (await client.collectEvidence([decision.symbol]))[0];
+      if (afterBundle) {
+        record.accountAfter = afterBundle.account;
+        positionAfter = findPosition(afterBundle.account.positions, decision.symbol, decision.positionSide);
+      }
+      else readbackFailure = true;
+    } catch {
+      readbackFailure = true;
+    }
+    let reconciliationResult = reconcileExecution(executionRequest, executionResult, record.positionBefore, positionAfter);
+    if (readbackFailure) reconciliationResult = { ...reconciliationResult, status: "UNKNOWN", codes: [...reconciliationResult.codes, "POSITION_READBACK_UNAVAILABLE"] };
+    if (executionRequest.tradeSide === "open" && executionResult.status === "filled" && !positionAfter) reconciliationResult = { ...reconciliationResult, status: "MISMATCH", codes: [...reconciliationResult.codes, "POSITION_READBACK_MISSING"] };
+    record.executionRequest = executionRequest;
+    record.executionResult = executionResult;
+    record.reconciliationResult = reconciliationResult;
+    if (positionAfter) record.positionAfter = positionAfter;
+    this.recordEvent(reconciliationResult.status === "MATCHED" ? "EXECUTION_VERIFIED" : "EXECUTION_UNRESOLVED", cycleId, { decisionType, symbol: decision.symbol, codes: reconciliationResult.codes.join(",") });
+    return record;
+  }
+
+  private async persistDecisionOutcome(
+    config: RuntimeConfig,
+    record: DecisionExecutionRecord,
+    bundle: EvidenceBundle,
+    experiences: TradeExperience[],
+    lessons: Lesson[],
+    cycleId: string,
+    startedAt: string,
+    journal: TradingJournal,
+    allowFailureReflection: boolean,
+  ): Promise<{ reflection?: ReflectionResult; lesson?: Lesson }> {
+    const { decision, executionResult, reconciliationResult } = record;
+    const verified = Boolean(executionResult && reconciliationResult?.status === "MATCHED" && executionResult.status === "filled");
+    const currentExperience = experiences.find((experience) => experience.outcomeStatus === "OPEN" && experience.symbol === decision.symbol && experience.positionSide === decision.positionSide);
+    if (!currentExperience && allowFailureReflection && (record.riskGateResult.status === "BLOCK" || (executionResult && !verified))) {
+      const failure = failureCode(record.riskGateResult.codes.length ? record.riskGateResult.codes : ["EXECUTION_FAILURE"]);
+      const failureResult = reflect({ decision, outcome: record.riskGateResult.status === "BLOCK" ? "RISK_BLOCKED" : "EXECUTION_FAILURE", failureCode: failure, symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", experienceStatus: record.riskGateResult.status === "BLOCK" ? "BLOCKED" : "EXECUTION_FAILURE", entryPrice: bundle.market.lastPrice, exitPrice: bundle.market.lastPrice, evidenceAtEntry: bundle.evidence.map((evidence) => evidence.type), evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: decision.lessonsUsed, marginAllocated: record.executionRequest?.marginAllocated ?? "0", positionNotional: record.executionRequest?.positionNotional ?? "0" });
+      saveExperience(this, failureResult.experience, startedAt);
+      saveLesson(this, failureResult.lesson);
+      journal.experienceId = failureResult.experience.experienceId;
+      journal.experienceIds = [...(journal.experienceIds ?? []), failureResult.experience.experienceId];
+      journal.reflection = failureResult.reflection;
+      journal.createdLessons = [...journal.createdLessons, failureResult.lesson.lessonId];
+      this.recordEvent("REFLECTION_COMPLETED", cycleId, { symbol: decision.symbol, action: decision.action });
+      return {};
+    }
+    if (decision.action === "OPEN_LONG" || decision.action === "OPEN_SHORT") {
+      if (!verified || !executionResult) return {};
+      const openingExperience = reflect({ decision, outcome: "OPEN", failureCode: "", symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", experienceStatus: "OPEN", entryPrice: executionResult.averageFillPrice ?? bundle.market.lastPrice, evidenceAtEntry: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: decision.lessonsUsed, marginAllocated: executionResult.marginAllocated, positionNotional: executionResult.positionNotional, realizedPnlVerified: false });
+      experiences.unshift(openingExperience.experience);
+      saveExperience(this, openingExperience.experience, startedAt);
+      journal.experienceId = openingExperience.experience.experienceId;
+      journal.experienceIds = [...(journal.experienceIds ?? []), openingExperience.experience.experienceId];
+      return {};
+    }
+    if (!currentExperience || !executionResult) return {};
+    const realizedPnl = isDecimal(executionResult.realizedPnl) ? executionResult.realizedPnl : undefined;
+    const cumulativePnl = realizedPnl && isDecimal(currentExperience.realizedPnl) ? addDecimal(currentExperience.realizedPnl, realizedPnl) : currentExperience.realizedPnl;
+    const sharedInput = { decision, symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", entryPrice: currentExperience.entryPrice, exitPrice: executionResult.averageFillPrice ?? bundle.market.lastPrice, evidenceAtEntry: currentExperience.evidenceAtEntry, evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: [...new Set([...currentExperience.lessonsUsed, ...decision.lessonsUsed])], lessons: lessons.filter((lesson) => currentExperience.lessonsUsed.includes(lesson.lessonId) || decision.lessonsUsed.includes(lesson.lessonId)), marginAllocated: currentExperience.marginAllocated, positionNotional: record.positionAfter?.notional ?? currentExperience.positionNotional, realizedPnl: cumulativePnl, realizedPnlPct: executionResult.realizedPnlPct ?? currentExperience.realizedPnlPct, realizedPnlVerified: Boolean(realizedPnl), ...(executionResult.fees ? { fees: executionResult.fees } : {}), ...(executionResult.funding ? { funding: executionResult.funding } : {}) };
+    if (decision.action === "CLOSE" && verified) {
+      const closeInput = { ...sharedInput, outcome: realizedPnl ? "CLOSED" : "CLOSED_PNL_UNVERIFIED", failureCode: realizedPnl ? "" : "REALIZED_PNL_UNAVAILABLE", experienceStatus: realizedPnl ? outcomeFromPnl(cumulativePnl) : "EXECUTION_FAILURE" as const, existingExperience: currentExperience };
+      const local = reflect(closeInput);
+      const index = experiences.indexOf(currentExperience);
+      if (index >= 0) experiences[index] = local.experience;
+      saveExperience(this, local.experience, startedAt);
+      journal.experienceId = local.experience.experienceId;
+      journal.experienceIds = [...(journal.experienceIds ?? []), local.experience.experienceId];
+      try {
+        const result = await reflectWithQwen(config, closeInput);
+        saveExperience(this, result.experience, startedAt);
+        saveLesson(this, result.lesson);
+        recordLessonApplication(this, cycleId, result.reflection.lessonEvaluations.filter((evaluation) => result.experience.lessonsUsed.includes(evaluation.lessonId)), new Date().toISOString());
+        this.recordEvent("REFLECTION_COMPLETED", cycleId, { symbol: decision.symbol, action: decision.action });
+        this.recordEvent("LESSON_CREATED", cycleId, { source: result.lesson.source, symbol: decision.symbol });
+        journal.createdLessons = [...journal.createdLessons, result.lesson.lessonId];
+        journal.exitReflections = [...(journal.exitReflections ?? []), result.reflection];
+        journal.reflection = result.reflection;
+        return { reflection: result.reflection, lesson: result.lesson };
+      } catch (error) {
+        this.recordEvent("REFLECTION_FAILED", cycleId, { code: error instanceof Error ? error.message.split(":", 1)[0] ?? "REFLECTION_FAILED" : "REFLECTION_FAILED", symbol: decision.symbol });
+      }
+      return {};
+    }
+    if (decision.action === "REDUCE" && verified) {
+      const partialInput = { ...sharedInput, outcome: "PARTIAL_REDUCE", failureCode: "", experienceStatus: "OPEN" as const, existingExperience: currentExperience };
+      const local = reflect(partialInput);
+      const index = experiences.indexOf(currentExperience);
+      if (index >= 0) experiences[index] = local.experience;
+      saveExperience(this, local.experience, startedAt);
+      journal.experienceId = local.experience.experienceId;
+      journal.experienceIds = [...(journal.experienceIds ?? []), local.experience.experienceId];
+      if (realizedPnl) {
+        try {
+          const result = await reflectWithQwen(config, partialInput);
+          saveExperience(this, result.experience, startedAt);
+          saveLesson(this, result.lesson);
+          recordLessonApplication(this, cycleId, result.reflection.lessonEvaluations.filter((evaluation) => result.experience.lessonsUsed.includes(evaluation.lessonId)), new Date().toISOString());
+          this.recordEvent("REFLECTION_COMPLETED", cycleId, { symbol: decision.symbol, action: decision.action });
+          this.recordEvent("LESSON_CREATED", cycleId, { source: result.lesson.source, symbol: decision.symbol });
+          journal.createdLessons = [...journal.createdLessons, result.lesson.lessonId];
+          journal.exitReflections = [...(journal.exitReflections ?? []), result.reflection];
+          journal.reflection = result.reflection;
+          return { reflection: result.reflection, lesson: result.lesson };
+        } catch (error) {
+          this.recordEvent("REFLECTION_FAILED", cycleId, { code: error instanceof Error ? error.message.split(":", 1)[0] ?? "REFLECTION_FAILED" : "REFLECTION_FAILED", symbol: decision.symbol });
+        }
+      }
+      return {};
+    }
+    if (allowFailureReflection && (record.riskGateResult.status === "BLOCK" || (executionResult && !verified))) {
+      const failure = failureCode(record.riskGateResult.codes.length ? record.riskGateResult.codes : ["EXECUTION_FAILURE"]);
+      const failureResult = reflect({ decision, outcome: record.riskGateResult.status === "BLOCK" ? "RISK_BLOCKED" : "EXECUTION_FAILURE", failureCode: failure, symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", experienceStatus: record.riskGateResult.status === "BLOCK" ? "BLOCKED" : "EXECUTION_FAILURE", entryPrice: bundle.market.lastPrice, exitPrice: bundle.market.lastPrice, evidenceAtEntry: bundle.evidence.map((evidence) => evidence.type), evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: decision.lessonsUsed, marginAllocated: record.executionRequest?.marginAllocated ?? "0", positionNotional: record.executionRequest?.positionNotional ?? "0" });
+      saveExperience(this, failureResult.experience, startedAt);
+      saveLesson(this, failureResult.lesson);
+      journal.experienceId = failureResult.experience.experienceId;
+      journal.experienceIds = [...(journal.experienceIds ?? []), failureResult.experience.experienceId];
+      journal.reflection = failureResult.reflection;
+      journal.createdLessons = [...journal.createdLessons, failureResult.lesson.lessonId];
+      this.recordEvent("REFLECTION_COMPLETED", cycleId, { symbol: decision.symbol, action: decision.action });
+    }
+    return {};
+  }
+
   private recordEvent(type: string, cycleId: string, metadata?: Record<string, string>): void {
     saveEvent(this, { eventId: crypto.randomUUID(), type, cycleId, createdAt: new Date().toISOString(), ...(metadata ? { metadata } : {}) });
   }
 
   private async ensureTradingSchedule(config: ReturnType<typeof loadConfig>): Promise<void> {
     if (this.state.paused || this.state.emergencyStop || this.state.lastStatus === "RUNNING") return;
+    const intervalMinutes = this.activeScanIntervalMinutes(config.ownerPolicy);
     let schedules: Awaited<ReturnType<TraderAgent["listSchedules"]>> = [];
     try {
       schedules = await this.listSchedules();
       const cycleSchedules = schedules.filter((entry) => entry.callback === "runScheduledCycle");
-      if (cycleSchedules.length !== 1) {
-        await scheduleTradingCycle(this, config.ownerPolicy.scanIntervalMinutes);
+      const matchingSchedule = cycleSchedules.length === 1 && cycleSchedules[0]?.type === "interval" && cycleSchedules[0]?.intervalSeconds === intervalMinutes * 60;
+      if (!matchingSchedule) {
+        await scheduleTradingCycle(this, intervalMinutes);
+        this.recordEvent("SCHEDULE_RESCHEDULED", "CONTROL", { intervalMinutes: String(intervalMinutes) });
         const refreshedSchedules = await this.listSchedules();
         const refreshedCycle = refreshedSchedules.find((entry) => entry.callback === "runScheduledCycle");
-        const nextScanAt = refreshedCycle?.time && Number.isFinite(refreshedCycle.time) ? new Date(refreshedCycle.time * 1000).toISOString() : new Date(Date.now() + config.ownerPolicy.scanIntervalMinutes * 60_000).toISOString();
+        const nextScanAt = refreshedCycle?.time && Number.isFinite(refreshedCycle.time) ? new Date(refreshedCycle.time * 1000).toISOString() : new Date(Date.now() + intervalMinutes * 60_000).toISOString();
         this.setState({ ...this.state, nextScanAt });
       } else {
         const cycleSchedule = cycleSchedules[0];
@@ -503,8 +677,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const previous = this.ensureActivePolicy();
     const next = updateOwnerPolicy(previous, value);
     this.persistPolicy(previous, next);
-    if (previous.scanIntervalMinutes !== next.scanIntervalMinutes && !this.state.paused && !next.emergencyStop) await scheduleTradingCycle(this, next.scanIntervalMinutes);
-    this.setState({ ...this.state, emergencyStop: next.emergencyStop, nextScanAt: new Date(Date.now() + next.scanIntervalMinutes * 60_000).toISOString(), lastPolicyUpdateAt: new Date().toISOString() });
+    if (previous.scanIntervalMinutes !== next.scanIntervalMinutes && !this.state.paused && !next.emergencyStop) await scheduleTradingCycle(this, this.activeScanIntervalMinutes(next));
+    this.setState({ ...this.state, emergencyStop: next.emergencyStop, nextScanAt: new Date(Date.now() + this.activeScanIntervalMinutes(next) * 60_000).toISOString(), lastPolicyUpdateAt: new Date().toISOString() });
     return this.getDashboardSnapshot();
   }
 }

@@ -268,6 +268,22 @@ export interface Decision {
   createdAt: string;
 }
 
+export interface AutonomousDecisionSet {
+  decision: Decision;
+  exitDecisions: Decision[];
+}
+
+export interface DecisionExecutionRecord {
+  decision: Decision;
+  riskGateResult: RiskGateResult;
+  executionRequest?: ExecutionRequest;
+  executionResult?: ExecutionResult;
+  reconciliationResult?: ReconciliationResult;
+  positionBefore?: PositionSnapshot;
+  positionAfter?: PositionSnapshot;
+  accountAfter?: AccountSnapshot;
+}
+
 export interface RiskGateResult {
   status: RiskStatus;
   codes: string[];
@@ -368,6 +384,10 @@ export interface TradingJournal {
   evidence?: Evidence[];
   retrievedLessons: string[];
   decision?: Decision;
+  exitDecisions?: Decision[];
+  exitExecutions?: DecisionExecutionRecord[];
+  exitReflections?: ReflectionResult[];
+  experienceIds?: string[];
   riskGateResult?: RiskGateResult;
   executionRequest?: ExecutionRequest;
   executionResult?: ExecutionResult;
@@ -379,6 +399,7 @@ export interface TradingJournal {
   positionBefore?: PositionSnapshot;
   positionAfter?: PositionSnapshot;
   positionDiscrepancies?: string[];
+  durationMs?: number;
 }
 
 export interface ActivityEvent {
@@ -428,6 +449,15 @@ export interface DashboardSnapshot {
     reconciliationStatus: ReconciliationResult["status"];
     timestamp: string;
   } | null;
+  scheduler: {
+    completedCycles: number;
+    averageDurationMs: number;
+    maxDurationMs: number;
+    inProgressCount: number;
+    staleCount: number;
+    failureCount: number;
+    timeoutCount: number;
+  };
   learning: {
     reflection: ReflectionResult | null;
     lessons: Lesson[];
@@ -435,7 +465,7 @@ export interface DashboardSnapshot {
     backtest: BacktestReplay | null;
     recentExperiences: TradeExperience[];
   };
-  riskControls: OwnerPolicy & { drawdownBlocked: boolean; drawdownCode: string; cooldownUntil: string | null };
+  riskControls: OwnerPolicy & { drawdownBlocked: boolean; drawdownCode: string; cooldownUntil: string | null; temporaryScanIntervalExpiresAt: string | null };
   activity: ActivityEvent[];
   lastPolicyUpdate: ActivityEvent | null;
 }

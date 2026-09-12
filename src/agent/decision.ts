@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Decision, DecisionContext, MarketSnapshot, RuntimeConfig } from "../types.js";
+import type { AutonomousDecisionSet, Decision, DecisionContext, MarketSnapshot, RuntimeConfig } from "../types.js";
 import { CANDIDATE_TASK_PROMPT, DECISION_TASK_PROMPT, TRADING_MANDATE } from "./mandate.js";
 import { generateQwenJson } from "./qwen.js";
 
@@ -38,7 +38,15 @@ export const decisionSchema = z.object({
   createdAt: z.string().datetime(),
 }).superRefine(validateDecisionSemantics);
 
-const qwenDecisionSchema = z.object(decisionFields).superRefine(validateDecisionSemantics);
+const qwenExitDecisionSchema = z.object(decisionFields).superRefine((decision, context) => {
+  validateDecisionSemantics(decision, context);
+  if (decision.action !== "REDUCE" && decision.action !== "CLOSE") context.addIssue({ code: "custom", path: ["action"], message: "EXIT_ACTION_REQUIRED" });
+});
+
+export const autonomousDecisionSetSchema = z.object({
+  ...decisionFields,
+  exitDecisions: z.array(qwenExitDecisionSchema).max(25).default([]),
+}).superRefine(validateDecisionSemantics);
 
 export type DecisionInput = z.infer<typeof decisionSchema>;
 
@@ -125,6 +133,7 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
       openingRule: "OPEN_LONG uses LONG and OPEN_SHORT uses SHORT.",
       reductionRule: "REDUCE uses a percentage between 0 and 100.",
       closeRule: "CLOSE uses a position side and reductionPct null.",
+      exitRule: "exitDecisions may contain multiple REDUCE or CLOSE actions for existing positions. The primary action may contain at most one new opening action.",
     },
   });
 }
@@ -142,10 +151,19 @@ export async function selectCandidates(
   return candidates;
 }
 
-export async function decide(config: RuntimeConfig, context: DecisionContext, cycleId: string): Promise<Decision> {
-  const generated = await generateQwenJson(config, qwenDecisionSchema, `${context.mandate}\n${DECISION_TASK_PROMPT}\nReturn only the trading fields. Keep every rationale concise. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: 700, timeoutMs: 60_000 });
-  const decision = decisionSchema.parse({ ...generated, decisionId: crypto.randomUUID(), cycleId, createdAt: new Date().toISOString() });
+export async function decide(config: RuntimeConfig, context: DecisionContext, cycleId: string): Promise<AutonomousDecisionSet> {
+  const generated = await generateQwenJson(config, autonomousDecisionSetSchema, `${context.mandate}\n${DECISION_TASK_PROMPT}\nReturn one primary action and optional exitDecisions. exitDecisions may only contain REDUCE or CLOSE for existing positions. Keep every rationale concise. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: 1200, timeoutMs: 60_000 });
+  const createdAt = new Date().toISOString();
+  const decision = decisionSchema.parse({ ...generated, decisionId: crypto.randomUUID(), cycleId, createdAt });
+  const exitDecisions = generated.exitDecisions.map((exitDecision) => decisionSchema.parse({ ...exitDecision, decisionId: crypto.randomUUID(), cycleId, createdAt }));
+  const exitKeys = new Set<string>();
+  for (const exitDecision of exitDecisions) {
+    const key = `${exitDecision.symbol}:${exitDecision.positionSide}`;
+    if (exitKeys.has(key)) throw new Error("DUPLICATE_EXIT");
+    exitKeys.add(key);
+  }
   const knownLessons = new Set(context.lessons.map((lesson) => lesson.lessonId));
   if (decision.lessonsUsed.some((lessonId) => !knownLessons.has(lessonId))) throw new Error("LESSON_REFERENCE_INVALID");
-  return decision;
+  if (exitDecisions.some((exitDecision) => exitDecision.lessonsUsed.some((lessonId) => !knownLessons.has(lessonId)))) throw new Error("LESSON_REFERENCE_INVALID");
+  return { decision, exitDecisions };
 }
