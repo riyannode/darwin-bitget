@@ -44,14 +44,17 @@ h2 { font-size: 14px; letter-spacing: -.01em; }
 .summary-card { border: 1px solid var(--line); border-radius: 9px; background: var(--panel); padding: 14px; }
 .summary-card strong { display: block; margin-top: 7px; color: var(--accent); font-size: 22px; letter-spacing: -.04em; }
 .summary-card small { color: var(--muted); font-size: 10px; }
-.portfolio-rail { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 1px; padding: 0; overflow: hidden; margin-bottom: 14px; background: var(--line); }
+.portfolio-panel { margin-bottom: 14px; padding-bottom: 0; }
+.portfolio-rail { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 1px; padding: 0; overflow: hidden; margin: 0 -17px; background: var(--line); }
 .portfolio-rail > div { display: grid; gap: 4px; background: var(--panel); padding: 13px; }
 .portfolio-rail strong { font-size: 16px; }
 .positions-panel { margin-bottom: 14px; }
 .positions-list { display: grid; gap: 8px; }
-.position-row { display: grid; grid-template-columns: 1.3fr repeat(4, 1fr); gap: 12px; border-top: 1px solid var(--line); padding: 10px 0; }
+.position-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; border-top: 1px solid var(--line); padding: 10px 0; }
 .position-row:first-child { border-top: 0; }
 .position-row span { display: grid; gap: 2px; }
+.pnl-positive { color: var(--accent) !important; }
+.pnl-negative { color: var(--danger) !important; }
 @media (max-width: 700px) { .position-row { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .dashboard-grid { display: grid; gap: 14px; margin-bottom: 14px; }
 .top-grid { grid-template-columns: minmax(0, 1.8fr) minmax(250px, .8fr); }

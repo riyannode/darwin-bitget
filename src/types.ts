@@ -145,7 +145,9 @@ export interface PositionSnapshot {
   marginAllocated: string;
   leverage: string;
   entryPrice: string;
+  markPrice?: string;
   unrealizedPnl: string;
+  unrealizedPnlPct?: string;
   realizedPnl: string;
   openedAt?: string;
   liquidationPrice?: string;
@@ -436,6 +438,11 @@ export interface DashboardSnapshot {
     paperMode: true;
   };
   portfolio: AccountSnapshot | null;
+  portfolioFreshness: {
+    source: "PROVIDER_LIVE" | "JOURNAL_FALLBACK";
+    observedAt: string;
+    stale: boolean;
+  };
   performance: {
     totalPnl: string;
     winRate: string;

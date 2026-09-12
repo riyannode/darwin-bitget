@@ -1,7 +1,7 @@
 import { BitgetRestClient, loadConfig as loadBitgetConfig } from "@bitget-ai/bitget-agent-sdk";
-import type { EvidenceBundle, ExecutionResult, ExecutionRequest, Instrument, MarketSnapshot, RuntimeConfig } from "../types.js";
+import type { AccountSnapshot, EvidenceBundle, ExecutionResult, ExecutionRequest, Instrument, MarketSnapshot, RuntimeConfig } from "../types.js";
 import { classifyMarketRegime } from "../trading/market-regime.js";
-import { parseAccount, parseFillSummary, parseHistoricalBars, parseInstruments, parsePositionHistorySummary, parsePositionSymbols, parseTicker, record } from "./types.js";
+import { parseAccount, parseDashboardPortfolio, parseFillSummary, parseHistoricalBars, parseInstruments, parsePositionHistorySummary, parsePositionSymbols, parseTicker, record } from "./types.js";
 
 export function formatBitgetReadFailure(operation: string, symbol = "ACCOUNT"): string {
   return `BITGET_READ_FAILED_${operation}_${symbol}`;
@@ -150,6 +150,16 @@ export class BitgetClient {
   public async getOpenPositionSymbols(): Promise<string[]> {
     const result = await this.callRead<unknown>("getPositionInfo", { category: this.category });
     return parsePositionSymbols(result.data);
+  }
+
+  public async getDashboardPortfolio(): Promise<AccountSnapshot> {
+    const observedAt = new Date().toISOString();
+    const [accountResult, positionsResult, openOrdersResult] = await Promise.all([
+      this.callRead<unknown>("getAccountAssets", {}),
+      this.callRead<unknown>("getPositionInfo", { category: this.category }),
+      this.callRead<unknown>("getOpenOrders", buildOpenOrdersReadParams(this.category)),
+    ]);
+    return parseDashboardPortfolio(accountResult.data, positionsResult.data, openOrdersResult.data, observedAt);
   }
 
   public async collectLightweightScan(instruments: readonly Instrument[]): Promise<MarketSnapshot[]> {

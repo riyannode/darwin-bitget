@@ -121,6 +121,96 @@ export function parseAccount(value: unknown, instrument: Instrument, market: Mar
   };
 }
 
+export function parseDashboardPortfolio(accountValue: unknown, positionsValue: unknown, openOrdersValue: unknown, observedAt: string): AccountSnapshot {
+  const sourceRows = Array.isArray(accountValue) ? records(accountValue) : [];
+  const overview = Array.isArray(accountValue) ? {} : record(accountValue);
+  const accountRows = Array.isArray(overview.account) ? records(overview.account) : Array.isArray(overview.list) ? records(overview.list) : [];
+  const nestedAccount = overview.account && typeof overview.account === "object" && !Array.isArray(overview.account) ? record(overview.account) : undefined;
+  const account = accountRows[0] ?? nestedAccount ?? sourceRows[0] ?? overview;
+  const assetRows = Array.isArray(accountValue) ? sourceRows : Array.isArray(account.assets) ? records(account.assets) : Array.isArray(overview.assets) ? records(overview.assets) : [];
+  const positions = providerRows(positionsValue)
+    .map(parseDashboardPosition)
+    .filter((position) => hasPositionQuantity(position.quantity));
+  const orders = providerRows(openOrdersValue);
+  const accountEquity = firstDecimal(account, ["usdtEquity", "accountEquity", "totalEquity", "equity", "balance"]) || sumAssetValues(assetRows, ["usdValue", "equity", "balance"]);
+  if (!accountEquity || accountEquity === "0") throw new Error(`INVALID_PORTFOLIO_EQUITY_${Object.keys(account).sort().join("_") || "EMPTY"}`);
+  const availableMargin = firstDecimal(account, ["availableMargin", "availableBalance", "available", "effEquity"]) || sumAssetValues(assetRows, ["available", "equity", "balance"]);
+  const providerMarginUsage = firstDecimal(account, ["marginUsage", "marginUsed", "usedMargin", "totalMargin", "imr"]);
+  const positionMarginUsage = positions.map((position) => position.marginAllocated).filter(Boolean).reduce((total, margin) => addDecimal(total, margin), "0");
+  const marginUsage = providerMarginUsage || positionMarginUsage || (availableMargin ? subtractDecimal(accountEquity, availableMargin) : "");
+  const providerPositionValue = firstDecimal(account, ["positionValue"]);
+  const singlePosition = positions[0];
+  const normalizedPositions: PositionSnapshot[] = singlePosition && !singlePosition.notional && providerPositionValue
+    ? [{ ...singlePosition, notional: providerPositionValue }]
+    : positions;
+  const notionalValues = normalizedPositions.map((position) => position.notional).filter(Boolean);
+  const totalPositionNotional = notionalValues.reduce((total, notional) => addDecimal(total, notional), "0");
+  const pnlValues = normalizedPositions.map((position) => position.unrealizedPnl).filter(Boolean);
+  const unrealizedPnl = pnlValues.length ? pnlValues.reduce((total, pnl) => addDecimal(total, pnl), "0") : normalizedPositions.length ? "" : "0";
+  return {
+    balance: firstText(account, ["balance", "usdtBalance"], accountEquity),
+    availableBalance: availableMargin,
+    availableMargin,
+    marginUsage,
+    positionNotional: totalPositionNotional,
+    totalPositionNotional,
+    positionQuantity: normalizedPositions.reduce((total, position) => addDecimal(total, position.quantity), "0"),
+    portfolioEquity: accountEquity,
+    positions: normalizedPositions,
+    realizedPnl: firstText(account, ["realizedPnl", "realizedPL"]),
+    unrealizedPnl,
+    openOrders: orders.length,
+    openOrderSymbols: orders.map((entry) => text(entry.symbol)).filter(Boolean),
+    observedAt,
+  };
+}
+
+function providerRows(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) return records(value);
+  const payload = record(value);
+  if ("list" in payload) return Array.isArray(payload.list) ? records(payload.list) : [];
+  if ("data" in payload) return Array.isArray(payload.data) ? records(payload.data) : [];
+  return [payload];
+}
+
+function parseDashboardPosition(entry: Record<string, unknown>): PositionSnapshot {
+  const quantity = firstText(entry, ["total", "available", "quantity", "size"]);
+  const markPrice = firstText(entry, ["markPrice", "markPx", "marketPrice", "currentPrice", "lastPrice"]);
+  const position: PositionSnapshot = {
+    symbol: text(entry.symbol),
+    positionSide: parsePositionSide(firstText(entry, ["posSide", "positionSide", "holdSide"], "LONG")),
+    quantity,
+    notional: firstText(entry, ["notional", "positionNotional", "positionValue", "value"]),
+    marginAllocated: firstText(entry, ["marginSize", "margin", "marginAllocated", "isolatedMargin", "positionMargin", "positionBalance"]),
+    leverage: firstText(entry, ["leverage"], "1"),
+    entryPrice: firstText(entry, ["openPriceAvg", "avgPrice", "averageOpenPrice", "entryPrice"]),
+    unrealizedPnl: firstText(entry, ["unrealisedPnl", "unrealizedPnl", "unrealizedPL", "upl", "unrealizedProfit"]),
+    realizedPnl: firstText(entry, ["curRealisedPnl", "realizedPnl", "realizedPL", "achievedProfits"]),
+    ...(markPrice ? { markPrice } : {}),
+    ...(firstText(entry, ["unrealizedPnlPct", "unrealizedPnlPercent", "unrealizedPLRatio", "unrealizedPLR", "uplRatio", "profitRate"]) ? { unrealizedPnlPct: firstText(entry, ["unrealizedPnlPct", "unrealizedPnlPercent", "unrealizedPLRatio", "unrealizedPLR", "uplRatio", "profitRate"]) } : {}),
+    ...(firstText(entry, ["ctime", "cTime", "createdTime", "openTime"]) ? { openedAt: firstText(entry, ["ctime", "cTime", "createdTime", "openTime"]) } : {}),
+    ...(firstText(entry, ["liquidationPrice", "liqPrice"]) ? { liquidationPrice: firstText(entry, ["liquidationPrice", "liqPrice"]) } : {}),
+  };
+  return position;
+}
+
+function firstText(entry: Record<string, unknown>, keys: string[], fallback = ""): string {
+  for (const key of keys) {
+    const value = text(entry[key]);
+    if (value) return value;
+  }
+  return fallback;
+}
+
+function hasPositionQuantity(value: string): boolean {
+  if (!value) return false;
+  try {
+    return decimalParts(value).integer !== 0n;
+  } catch {
+    return value !== "0";
+  }
+}
+
 export function parsePositionSymbols(value: unknown): string[] {
   const container = Array.isArray(value) ? value : record(value).list;
   const rows = Array.isArray(container) ? records(container) : [];
