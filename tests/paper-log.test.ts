@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildPaperLogExport, paperLogToCsv, parsePaperLogPeriod } from "../src/storage/paper-log.js";
+import { buildPaperLogExport, calculatePeakDrawdown, paperLogToCsv, parsePaperLogPeriod } from "../src/storage/paper-log.js";
 import type { ActivityEvent, Decision, TradeExperience, TradingJournal } from "../src/types.js";
 
 function decision(cycleId: string, action: Decision["action"], decisionId: string, createdAt: string): Decision {
@@ -18,6 +18,18 @@ function experience(): TradeExperience {
 }
 
 describe("paper log export", () => {
+  it("calculates peak-to-trough drawdown after a new peak", () => {
+    expect(calculatePeakDrawdown(["10000", "10500", "10100"])).toEqual({ current: "-3.80952381", maximum: "-3.80952381" });
+  });
+
+  it("keeps the worst drawdown after a partial recovery", () => {
+    expect(calculatePeakDrawdown(["10000", "9000", "9500"])).toEqual({ current: "-5.00000000", maximum: "-10.00000000" });
+  });
+
+  it("reports zero drawdown for monotonic rising equity", () => {
+    expect(calculatePeakDrawdown(["10000", "10500", "11000"])).toEqual({ current: "0.00000000", maximum: "0.00000000" });
+  });
+
   it("exports full autonomous history, including HOLD, while excluding non-autonomous journals", () => {
     const journals = Array.from({ length: 30 }, (_, index) => journal(index, index === 0 ? "HOLD" : "OPEN_LONG"));
     const manual = { ...journal(31, "OPEN_LONG"), cycleId: "manual-test" , mode: "EVA_EVALUATION" as const };

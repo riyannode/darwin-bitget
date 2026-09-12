@@ -256,29 +256,23 @@ function exportExperience(experience: TradeExperience): PaperLogExperience {
   };
 }
 
-function percentChange(baseline: string, current: string): string | null {
-  const base = Number(baseline);
-  const value = Number(current);
-  if (!Number.isFinite(base) || base <= 0 || !Number.isFinite(value)) return null;
-  return (((value - base) / base) * 100).toFixed(8);
+export function calculatePeakDrawdown(equities: readonly string[]): { current: string | null; maximum: string | null } {
+  let runningPeak: number | null = null;
+  let currentDrawdown: number | null = null;
+  let maximumDrawdown = 0;
+  for (const equityText of equities) {
+    const equity = Number(equityText);
+    if (!Number.isFinite(equity) || equity < 0) continue;
+    runningPeak = runningPeak === null ? equity : Math.max(runningPeak, equity);
+    if (runningPeak <= 0) continue;
+    currentDrawdown = ((equity - runningPeak) / runningPeak) * 100;
+    maximumDrawdown = Math.min(maximumDrawdown, currentDrawdown);
+  }
+  return { current: currentDrawdown === null ? null : currentDrawdown.toFixed(8), maximum: runningPeak === null ? null : maximumDrawdown.toFixed(8) };
 }
 
 function summarizeDrawdown(journals: readonly TradingJournal[]): { current: string | null; maximum: string | null } {
-  const byDate = new Map<string, string>();
-  for (const journal of journals) {
-    const equity = journal.portfolio?.portfolioEquity;
-    if (!equity) continue;
-    const date = journal.startedAt.slice(0, 10);
-    if (!byDate.has(date)) byDate.set(date, equity);
-  }
-  const drawdowns = journals.flatMap((journal) => {
-    const equity = journal.portfolio?.portfolioEquity;
-    const baseline = equity ? byDate.get(journal.startedAt.slice(0, 10)) : undefined;
-    const value = equity && baseline ? percentChange(baseline, equity) : null;
-    return value ? [value] : [];
-  });
-  const numeric = drawdowns.map(Number).filter(Number.isFinite);
-  return { current: numeric.length ? drawdowns[drawdowns.length - 1] ?? null : null, maximum: numeric.length ? Math.min(...numeric).toFixed(8) : null };
+  return calculatePeakDrawdown(journals.flatMap((journal) => journal.portfolio?.portfolioEquity ? [journal.portfolio.portfolioEquity] : []));
 }
 
 export function buildPaperLogExport(input: {
