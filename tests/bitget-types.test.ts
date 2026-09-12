@@ -41,6 +41,22 @@ describe("Bitget provider readback", () => {
     expect(normalizeProviderProfitRate("-0.0006598963645957")).toBe("-0.06598963645957");
   });
 
+  it("keeps multiple live provider positions in the dashboard portfolio", () => {
+    const portfolio = parseDashboardPortfolio(
+      { usdtEquity: "50000", availableMargin: "47000" },
+      [
+        { symbol: "CRCLUSDT", posSide: "long", total: "2", avgPrice: "90", markPrice: "91", positionValue: "182", unrealisedPnl: "2" },
+        { symbol: "KORUUSDT", posSide: "short", total: "3", avgPrice: "40", markPrice: "39", positionValue: "117", unrealisedPnl: "3" },
+      ],
+      { list: [] },
+      "2026-09-12T17:00:00.000Z",
+    );
+
+    expect(portfolio.positions).toHaveLength(2);
+    expect(portfolio.positions.map((position) => `${position.symbol}:${position.positionSide}`)).toEqual(["CRCLUSDT:LONG", "KORUUSDT:SHORT"]);
+    expect(portfolio.unrealizedPnl).toBe("5");
+  });
+
   it("normalizes positive, zero, and missing provider ROI ratios", () => {
     expect(normalizeProviderProfitRate("0.012345")).toBe("1.2345");
     expect(normalizeProviderProfitRate("0")).toBe("0");

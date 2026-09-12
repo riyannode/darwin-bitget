@@ -7,6 +7,20 @@ export function formatBitgetReadFailure(operation: string, symbol = "ACCOUNT"): 
   return `BITGET_READ_FAILED_${operation}_${symbol}`;
 }
 
+export class BitgetReadError extends Error {
+  public readonly operation: string;
+  public readonly symbol: string;
+  public readonly details: ProviderErrorDetails;
+
+  public constructor(operation: string, symbol: string, cause: unknown) {
+    super(formatBitgetReadFailure(operation, symbol));
+    this.name = "BitgetReadError";
+    this.operation = operation;
+    this.symbol = symbol;
+    this.details = extractProviderError(cause);
+  }
+}
+
 export function buildOpenOrdersReadParams(category: string): Record<string, string> {
   return { category };
 }
@@ -157,9 +171,21 @@ export class BitgetClient {
     const [accountResult, positionsResult, openOrdersResult] = await Promise.all([
       this.callRead<unknown>("getAccountAssets", {}),
       this.callRead<unknown>("getPositionInfo", { category: this.category }),
-      this.callRead<unknown>("getOpenOrders", buildOpenOrdersReadParams(this.category)),
+      this.callRead<unknown>("getOpenOrders", buildOpenOrdersReadParams(this.category)).then((result) => ({ result })).catch((error: unknown) => ({ error })),
     ]);
-    return parseDashboardPortfolio(accountResult.data, positionsResult.data, openOrdersResult.data, observedAt);
+    const openOrdersFailure = "error" in openOrdersResult ? openOrdersResult.error : undefined;
+    const portfolio = parseDashboardPortfolio(accountResult.data, positionsResult.data, "error" in openOrdersResult ? { list: [] } : openOrdersResult.result.data, observedAt);
+    if (!(openOrdersFailure instanceof BitgetReadError)) return portfolio;
+    return {
+      ...portfolio,
+      openOrders: null,
+      openOrderSymbols: [],
+      openOrdersReadFailure: {
+        operation: openOrdersFailure.operation,
+        ...(openOrdersFailure.details.code ? { code: openOrdersFailure.details.code } : {}),
+        ...(openOrdersFailure.details.message ? { message: openOrdersFailure.details.message } : {}),
+      },
+    };
   }
 
   public async collectLightweightScan(instruments: readonly Instrument[]): Promise<MarketSnapshot[]> {
@@ -256,8 +282,8 @@ export class BitgetClient {
   private async callRead<T>(operation: string, params: Record<string, string>): Promise<{ data: T }> {
     try {
       return await this.client.callOperation<T>(operation, params);
-    } catch {
-      throw new Error(formatBitgetReadFailure(operation, params.symbol));
+    } catch (error) {
+      throw new BitgetReadError(operation, params.symbol ?? "ACCOUNT", error);
     }
   }
 

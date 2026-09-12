@@ -37,6 +37,23 @@ describe("Bitget read diagnostics", () => {
     } finally { sdk.mockRestore(); }
   });
 
+  it("keeps account and positions live when open-orders readback is temporarily unavailable", async () => {
+    const providerResult = (data: unknown) => ({ endpoint: "fixture", requestTime: "2026-09-12T00:00:00.000Z", data, raw: { code: "00000", data } });
+    const sdk = vi.spyOn(BitgetRestClient.prototype, "callOperation").mockImplementation(async (operation) => {
+      if (operation === "getAccountAssets") return providerResult({ usdtEquity: "50000", availableMargin: "47000", marginUsed: "3000", positionValue: "2996.3654" });
+      if (operation === "getPositionInfo") return providerResult([{ symbol: "CRCLUSDT", posSide: "long", total: "32.69", avgPrice: "91.7", markPrice: "91.82", leverage: "3", positionBalance: "998.78", unrealisedPnl: "-0.98", profitRate: "-0.0009", liqPrice: "44.2" }]);
+      if (operation === "getOpenOrders") throw { code: "40701", msg: "temporary open-orders unavailable" };
+      throw new Error(`UNEXPECTED_OPERATION_${operation}`);
+    });
+    try {
+      const portfolio = await new BitgetClient(loadConfig({ TRADING_MODE: "PAPER", PAPER_ONLY: "true", AGENT_MODE: "AUTONOMOUS", BITGET_API_KEY: "fixture-key", BITGET_SECRET_KEY: "fixture-secret", BITGET_PASSPHRASE: "fixture-passphrase" })).getDashboardPortfolio();
+      expect(portfolio.portfolioEquity).toBe("50000");
+      expect(portfolio.positions).toHaveLength(1);
+      expect(portfolio.openOrders).toBeNull();
+      expect(portfolio.openOrdersReadFailure).toEqual({ operation: "getOpenOrders", code: "40701", message: "temporary open-orders unavailable" });
+    } finally { sdk.mockRestore(); }
+  });
+
   it("records the failed operation without retrying a financial write or leaking credentials", async () => {
     const sdk = vi.spyOn(BitgetRestClient.prototype, "callOperation").mockRejectedValue({ code: "PROVIDER_ERROR", message: "fixture-passphrase" });
     try {

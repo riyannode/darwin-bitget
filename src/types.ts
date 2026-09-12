@@ -132,8 +132,13 @@ export interface AccountSnapshot {
   positions: PositionSnapshot[];
   realizedPnl: string;
   unrealizedPnl: string;
-  openOrders: number;
+  openOrders: number | null;
   openOrderSymbols: string[];
+  openOrdersReadFailure?: {
+    operation: string;
+    code?: string;
+    message?: string;
+  };
   observedAt: string;
 }
 
@@ -439,7 +444,7 @@ export interface DashboardSnapshot {
   };
   portfolio: AccountSnapshot | null;
   portfolioFreshness: {
-    source: "PROVIDER_LIVE" | "JOURNAL_FALLBACK";
+    source: "PROVIDER_LIVE" | "JOURNAL_FALLBACK" | "UNAVAILABLE";
     observedAt: string;
     stale: boolean;
     errorCode?: string;
@@ -448,10 +453,10 @@ export interface DashboardSnapshot {
     totalPnl: string;
     winRate: string;
     dailyDrawdown: string;
-    totalTrades: number;
-    wins: number;
-    losses: number;
-    breakeven: number;
+    totalTrades: number | null;
+    wins: number | null;
+    losses: number | null;
+    breakeven: number | null;
     dailyPnl: Record<string, { pnl: string; trades: number }>;
   };
   trades: TradeLogEntry[];

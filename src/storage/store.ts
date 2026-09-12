@@ -44,6 +44,13 @@ export interface StoredCycle {
   completedAt: string | null;
 }
 
+export const MAX_HISTORY_LIMIT = 100;
+
+export function clampHistoryLimit(limit: number, fallback = 25): number {
+  if (!Number.isInteger(limit) || limit < 1) return fallback;
+  return Math.min(limit, MAX_HISTORY_LIMIT);
+}
+
 export function saveCycle(
   executor: SqlExecutor,
   cycleId: string,
@@ -137,8 +144,8 @@ export function recordLessonApplication(executor: SqlExecutor, cycleId: string, 
   }
 }
 
-export function loadExperiences(executor: SqlExecutor): TradeExperience[] {
-  const rows = executor.sql<ExperienceRow>`SELECT payload FROM experiences ORDER BY created_at DESC LIMIT 100`;
+export function loadExperiences(executor: SqlExecutor, limit = MAX_HISTORY_LIMIT): TradeExperience[] {
+  const rows = executor.sql<ExperienceRow>`SELECT payload FROM experiences ORDER BY created_at DESC LIMIT ${clampHistoryLimit(limit, MAX_HISTORY_LIMIT)}`;
   return rows.flatMap((row) => {
     try {
       const value = JSON.parse(row.payload);
@@ -219,7 +226,7 @@ export function loadLatestJournal(executor: SqlExecutor): TradingJournal | null 
 }
 
 export function loadRecentJournals(executor: SqlExecutor, limit = 50): TradingJournal[] {
-  const rows = executor.sql<JournalRow>`SELECT payload FROM journals ORDER BY created_at DESC LIMIT ${limit}`;
+  const rows = executor.sql<JournalRow>`SELECT payload FROM journals ORDER BY created_at DESC LIMIT ${clampHistoryLimit(limit, 50)}`;
   return rows.flatMap((row) => {
     try {
       return [JSON.parse(row.payload) as TradingJournal];
@@ -276,7 +283,7 @@ export function saveEvent(executor: SqlExecutor, event: ActivityEvent): void {
 }
 
 export function loadRecentEvents(executor: SqlExecutor, limit = 25): ActivityEvent[] {
-  const rows = executor.sql<EventRow>`SELECT event_id, event_type, cycle_id, payload, created_at FROM events ORDER BY created_at DESC LIMIT ${limit}`;
+  const rows = executor.sql<EventRow>`SELECT event_id, event_type, cycle_id, payload, created_at FROM events ORDER BY created_at DESC LIMIT ${clampHistoryLimit(limit, 25)}`;
   return rows.flatMap((row) => {
     try {
       const event = JSON.parse(row.payload) as ActivityEvent;

@@ -24,6 +24,8 @@ export interface DemoSnapshot extends DashboardSnapshot {
     schedulerEnabled: false;
     qwenCalled: false;
     evaCalled: false;
+    preTradeAccount: AccountSnapshot;
+    postTradeAccount: AccountSnapshot;
   };
 }
 
@@ -162,8 +164,8 @@ function trade(): TradeLogEntry {
   };
 }
 
-function baseSnapshot(cycleId: string, proposed: Decision, riskGateResult: RiskGateResult, positions: AccountSnapshot["positions"], scenario: DemoScenario, title: string, evidenceLabel: DemoSnapshot["demo"]["evidenceLabel"], activities: string[]): DemoSnapshot {
-  const portfolio = account(positions);
+function baseSnapshot(cycleId: string, proposed: Decision, riskGateResult: RiskGateResult, preTradeAccount: AccountSnapshot, postTradeAccount: AccountSnapshot, scenario: DemoScenario, title: string, evidenceLabel: DemoSnapshot["demo"]["evidenceLabel"], activities: string[]): DemoSnapshot {
+  const portfolio = postTradeAccount;
   const isRecordedOpen = scenario === "verified-open";
   return {
     version: "judge-demo",
@@ -184,7 +186,7 @@ function baseSnapshot(cycleId: string, proposed: Decision, riskGateResult: RiskG
       totalPnl: "0",
       winRate: "0",
       dailyDrawdown: "0",
-      totalTrades: isRecordedOpen ? 1 : 0,
+      totalTrades: 0,
       wins: 0,
       losses: 0,
       breakeven: 0,
@@ -220,6 +222,8 @@ function baseSnapshot(cycleId: string, proposed: Decision, riskGateResult: RiskG
       schedulerEnabled: false,
       qwenCalled: false,
       evaCalled: false,
+      preTradeAccount,
+      postTradeAccount,
     },
   };
 }
@@ -227,18 +231,21 @@ function baseSnapshot(cycleId: string, proposed: Decision, riskGateResult: RiskG
 export function buildDemoSnapshot(scenario: DemoScenario): DemoSnapshot {
   const cycleId = `JUDGE-${scenario.toUpperCase().replace(/-/g, "-")}`;
   if (scenario === "verified-open") {
-    const currentAccount = account([position()]);
+    const preTradeAccount = account([]);
+    const postTradeAccount = account([position()]);
     const proposed = decision(cycleId, "OPEN_LONG", "LONG", "CRCLUSDT", "3", "Recorded CRCLUSDT OPEN_LONG evidence shows a bounded proposal followed by provider fill, readback, and matched reconciliation.");
-    return baseSnapshot(cycleId, proposed, riskResult(currentAccount, proposed), [position()], scenario, "Verified Open Replay", "RECORDED_PROVIDER_REPLAY", ["RECORDED_PROVIDER_FILL", "PROVIDER_READBACK", "RECONCILIATION_MATCHED"]);
+    return baseSnapshot(cycleId, proposed, riskResult(preTradeAccount, proposed), preTradeAccount, postTradeAccount, scenario, "Verified Open Replay", "RECORDED_PROVIDER_REPLAY", ["RECORDED_PROVIDER_FILL", "PROVIDER_READBACK", "RECONCILIATION_MATCHED"]);
   }
   if (scenario === "hold") {
-    const currentAccount = account([position()]);
+    const preTradeAccount = account([position()]);
+    const postTradeAccount = account([position()]);
     const proposed = decision(cycleId, "HOLD", "LONG", "CRCLUSDT", "3", "Fresh replay evidence does not justify changing the existing CRCLUSDT LONG position; no financial write is proposed.");
-    return baseSnapshot(cycleId, proposed, riskResult(currentAccount, proposed), [position()], scenario, "Hold Existing Position", "RECORDED_PROVIDER_REPLAY", ["POSITION_READBACK", "DECISION_CREATED", "NO_FINANCIAL_WRITE"]);
+    return baseSnapshot(cycleId, proposed, riskResult(preTradeAccount, proposed), preTradeAccount, postTradeAccount, scenario, "Hold Existing Position", "RECORDED_PROVIDER_REPLAY", ["POSITION_READBACK", "DECISION_CREATED", "NO_FINANCIAL_WRITE"]);
   }
-  const currentAccount = account([]);
+  const preTradeAccount = account([]);
+  const postTradeAccount = account([]);
   const proposed = decision(cycleId, "OPEN_LONG", "LONG", "CRCLUSDT", "6", "Synthetic proposal intentionally exceeds the owner leverage boundary to demonstrate deterministic rejection.");
-  return baseSnapshot(cycleId, proposed, riskResult(currentAccount, proposed), [], scenario, "Risk Reject", "DETERMINISTIC_RISK_REPLAY", ["DECISION_CREATED", "RISK_GATE_BLOCK", "NO_ORDER_SUBMISSION"]);
+  return baseSnapshot(cycleId, proposed, riskResult(preTradeAccount, proposed), preTradeAccount, postTradeAccount, scenario, "Risk Reject", "DETERMINISTIC_RISK_REPLAY", ["DECISION_CREATED", "RISK_GATE_BLOCK", "NO_ORDER_SUBMISSION"]);
 }
 
 export function normalizeScenario(value: string | null): DemoScenario {

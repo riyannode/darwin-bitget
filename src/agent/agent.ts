@@ -24,6 +24,7 @@ import {
   loadDailyDrawdownState,
   loadExperiences,
   loadActiveOwnerPolicy,
+  clampHistoryLimit,
   recordIdempotency,
   recordLessonApplication,
   recordLessonRetrieval,
@@ -45,7 +46,7 @@ import { reconcileExecution } from "../trading/reconcile.js";
 import { addDecimal, isDecimal } from "../trading/decimal.js";
 import { EvaClient } from "../eva/client.js";
 import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
-import { resolveDashboardPortfolio } from "./portfolio.js";
+
 
 interface AgentState {
   emergencyStop: boolean;
@@ -62,9 +63,12 @@ interface AgentState {
   temporaryScanIntervalExpiresAt: string | null;
   temporaryScanIntervalCompleted: boolean;
   temporaryScanIntervalDurationMs: number;
+  userStorageVersion: number;
 }
 
 const STALE_CYCLE_TIMEOUT_MS = 120_000;
+const USER_STORAGE_VERSION = 2;
+const SNAPSHOT_EVENT_LIMIT = 25;
 
 function failureCode(codes: string[]): string {
   return codes.join(",") || "";
@@ -90,6 +94,56 @@ function tradeLifecycleStatus(experience: TradeExperience): TradeLifecycleStatus
   return "EXECUTION_FAILURE";
 }
 
+function tradeLogEntries(experiences: readonly TradeExperience[], journals: readonly TradingJournal[]): DashboardSnapshot["trades"] {
+  return experiences.filter((experience) => experience.action !== "HOLD").map((experience) => {
+    const journal = journals.find((entry) => entry.experienceId === experience.experienceId || entry.decision?.decisionId === experience.exitDecisionId || entry.decision?.decisionId === experience.entryDecisionId);
+    const action = (experience.lastAction && experience.lastAction !== "HOLD" ? experience.lastAction : experience.action) as Exclude<TradeExperience["action"], "HOLD">;
+    return {
+      tradeId: experience.experienceId,
+      timestamp: experience.entryTime,
+      symbol: experience.symbol,
+      action,
+      marginAllocationPct: experience.marginAllocationPct,
+      marginAllocated: experience.marginAllocated,
+      leverage: experience.selectedLeverage,
+      positionNotional: experience.positionNotional,
+      entry: experience.entryPrice,
+      exit: experience.exitPrice,
+      realizedPnl: experience.realizedPnl,
+      status: tradeLifecycleStatus(experience),
+      thesis: experience.entryThesis,
+      orderReference: journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
+      positionSide: experience.positionSide,
+      openedAt: experience.entryTime,
+      ...(experience.exitTime ? { closedAt: experience.exitTime } : {}),
+    };
+  });
+}
+
+function executionEvidence(journal: TradingJournal | null): DashboardSnapshot["executionEvidence"] {
+  if (!journal?.executionResult || !journal.reconciliationResult) return null;
+  return {
+    provider: journal.executionResult.provider,
+    action: journal.executionResult.action,
+    symbol: journal.executionResult.symbol,
+    marginAllocated: journal.executionResult.marginAllocated,
+    leverage: journal.executionResult.leverage,
+    positionNotional: journal.executionResult.positionNotional,
+    orderReference: journal.executionResult.providerOrderId ?? journal.executionResult.clientOrderId,
+    executionStatus: journal.executionResult.status,
+    reconciliationStatus: journal.reconciliationResult.status,
+    ...(journal.executionResult.providerCode ? { providerCode: journal.executionResult.providerCode } : {}),
+    ...(journal.executionResult.providerMessage ? { providerMessage: journal.executionResult.providerMessage } : {}),
+    ...(journal.executionResult.providerReadbackCode ? { providerReadbackCode: journal.executionResult.providerReadbackCode } : {}),
+    ...(journal.executionResult.providerReadbackMessage ? { providerReadbackMessage: journal.executionResult.providerReadbackMessage } : {}),
+    timestamp: journal.executionResult.readBackAt,
+  };
+}
+
+function unavailablePerformance(): DashboardSnapshot["performance"] {
+  return { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, wins: null, losses: null, breakeven: null, dailyPnl: {} };
+}
+
 function json(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 }
@@ -110,10 +164,14 @@ export class TraderAgent extends Agent<Env, AgentState> {
     temporaryScanIntervalExpiresAt: null,
     temporaryScanIntervalCompleted: false,
     temporaryScanIntervalDurationMs: TEMPORARY_SCAN_INTERVAL_DURATION_MS,
+    userStorageVersion: 0,
   };
 
   public override async onStart(): Promise<void> {
-    ensureStorage(this);
+    if ((this.state.userStorageVersion ?? 0) < USER_STORAGE_VERSION) {
+      ensureStorage(this);
+      this.setState({ ...this.state, userStorageVersion: USER_STORAGE_VERSION });
+    }
     this.ensureTemporaryScanTest();
     const policy = this.ensureActivePolicy();
     const config = loadConfig(this.env, policy);
@@ -125,6 +183,10 @@ export class TraderAgent extends Agent<Env, AgentState> {
   public override async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/snapshot" && request.method === "GET") return json(await this.getDashboardSnapshot());
+    if (url.pathname === "/agent-journal" && request.method === "GET") return this.getAgentJournal(url);
+    if (url.pathname === "/trade-history" && request.method === "GET") return this.getTradeHistory(url);
+    if (url.pathname === "/learning" && request.method === "GET") return this.getLearning(url);
+    if (url.pathname === "/policy" && request.method === "GET") return this.getPolicyRead();
     if (url.pathname === "/export/paper-log" && request.method === "GET") return this.exportPaperLog(url);
     if ((url.pathname === "/control" || url.pathname === "/policy" || url.pathname === "/eva/connection-test") && request.method === "POST") {
       const auth = authorizeOwner(request, this.env);
@@ -228,7 +290,6 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const format = url.searchParams.get("format") ?? "json";
       if (format !== "json" && format !== "csv") return json({ error: "INVALID_EXPORT_FORMAT" }, 400);
       const period = parsePaperLogPeriod(url.searchParams.get("from"), url.searchParams.get("to"));
-      ensureStorage(this);
       const journals = loadAllAutonomousJournals(this, period.start ?? undefined, period.end ?? undefined);
       const exported = buildPaperLogExport({
         generatedAt: new Date().toISOString(),
@@ -275,51 +336,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   public async getDashboardSnapshot(): Promise<DashboardSnapshot> {
-    ensureStorage(this);
     const config = loadConfig(this.env, this.ensureActivePolicy());
-    await this.ensureTradingSchedule(config);
     const journal = loadLatestJournal(this);
-    const journals = loadRecentJournals(this);
-    const experiences = loadExperiences(this);
+    const events = loadRecentEvents(this, SNAPSHOT_EVENT_LIMIT);
     const drawdown = loadDailyDrawdownState(this);
-    const portfolio = await this.readDashboardPortfolio(config, journal?.portfolio ?? null);
-    const trades = experiences.filter((experience) => experience.action !== "HOLD").map((experience) => {
-      const journal = journals.find((entry) => entry.experienceId === experience.experienceId || entry.decision?.decisionId === experience.exitDecisionId || entry.decision?.decisionId === experience.entryDecisionId);
-      const action = experience.lastAction && experience.lastAction !== "HOLD" ? experience.lastAction : experience.action;
-      if (action === "HOLD") return null;
-      return {
-        tradeId: experience.experienceId,
-        timestamp: experience.entryTime,
-        symbol: experience.symbol,
-        action,
-        marginAllocationPct: experience.marginAllocationPct,
-        marginAllocated: experience.marginAllocated,
-        leverage: experience.selectedLeverage,
-        positionNotional: experience.positionNotional,
-        entry: experience.entryPrice,
-        exit: experience.exitPrice,
-        realizedPnl: experience.realizedPnl,
-        status: tradeLifecycleStatus(experience),
-        thesis: experience.entryThesis,
-        orderReference: journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
-        positionSide: experience.positionSide,
-        openedAt: experience.entryTime,
-        ...(experience.exitTime ? { closedAt: experience.exitTime } : {}),
-      };
-    }).filter((trade): trade is NonNullable<typeof trade> => trade !== null).slice(0, 25);
-    const closedExperiences = experiences.filter((experience) => experience.outcomeStatus === "PROFITABLE" || experience.outcomeStatus === "LOSING" || experience.outcomeStatus === "BREAK_EVEN");
-    const totalTrades = closedExperiences.length;
-    const wins = experiences.filter((experience) => experience.outcomeStatus === "PROFITABLE").length;
-    const losses = experiences.filter((experience) => experience.outcomeStatus === "LOSING").length;
-    const breakeven = experiences.filter((experience) => experience.outcomeStatus === "BREAK_EVEN").length;
-    const totalPnl = closedExperiences.reduce((total, experience) => total + Number(experience.realizedPnl || 0), 0).toFixed(8);
     const drawdownPct = drawdown ? calculateDrawdownPct(drawdown.baselineEquity, drawdown.lastEquity) : "0";
-    const dailyPnl = closedExperiences.reduce<Record<string, { pnl: string; trades: number }>>((summary, experience) => {
-      const day = (experience.exitTime || experience.entryTime).slice(0, 10);
-      const current = summary[day] ?? { pnl: "0", trades: 0 };
-      summary[day] = { pnl: (Number(current.pnl) + Number(experience.realizedPnl || 0)).toFixed(8), trades: current.trades + 1 };
-      return summary;
-    }, {});
     return {
       version: config.version ?? "0.2.0",
       commit: config.commit ?? "local",
@@ -333,63 +354,51 @@ export class TraderAgent extends Agent<Env, AgentState> {
         model: this.state.model || config.qwenModel,
         paperMode: true,
       },
-      portfolio: portfolio.value,
-      portfolioFreshness: portfolio.freshness,
-      performance: { totalPnl, winRate: totalTrades > 0 ? ((wins / totalTrades) * 100).toFixed(2) : "0", dailyDrawdown: drawdownPct, totalTrades, wins, losses, breakeven, dailyPnl },
-      trades,
+      portfolio: null,
+      portfolioFreshness: { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" },
+      performance: { ...unavailablePerformance(), dailyDrawdown: drawdownPct },
+      trades: [],
       latestDecision: journal?.decision ?? null,
-      decisions: journals.map((entry) => entry.decision).filter((decision): decision is Decision => Boolean(decision)).slice(0, 25),
-      executionEvidence: journal?.executionResult && journal.reconciliationResult ? {
-        provider: journal.executionResult.provider,
-        action: journal.executionResult.action,
-        symbol: journal.executionResult.symbol,
-        marginAllocated: journal.executionResult.marginAllocated,
-        leverage: journal.executionResult.leverage,
-        positionNotional: journal.executionResult.positionNotional,
-        orderReference: journal.executionResult.providerOrderId ?? journal.executionResult.clientOrderId,
-        executionStatus: journal.executionResult.status,
-        reconciliationStatus: journal.reconciliationResult.status,
-        ...(journal.executionResult.providerCode ? { providerCode: journal.executionResult.providerCode } : {}),
-        ...(journal.executionResult.providerMessage ? { providerMessage: journal.executionResult.providerMessage } : {}),
-        ...(journal.executionResult.providerReadbackCode ? { providerReadbackCode: journal.executionResult.providerReadbackCode } : {}),
-        ...(journal.executionResult.providerReadbackMessage ? { providerReadbackMessage: journal.executionResult.providerReadbackMessage } : {}),
-        timestamp: journal.executionResult.readBackAt,
-      } : null,
-      learning: {
-        reflection: journal?.reflection ?? null,
-        lessons: loadRecentLessons(this, 8),
-        lessonsUsed: journal?.decision?.lessonsUsed ?? [],
-        backtest: loadLatestBacktest(this),
-        recentExperiences: experiences.slice(0, 8),
-      },
-      riskControls: {
-        ...config.ownerPolicy,
-        scanIntervalMinutes: this.activeScanIntervalMinutes(config.ownerPolicy),
-        temporaryScanIntervalExpiresAt: this.state.temporaryScanIntervalExpiresAt,
-        drawdownBlocked: Boolean(drawdown?.cooldownUntil && new Date(drawdown.cooldownUntil).getTime() > Date.now()),
-        drawdownCode: drawdown?.cooldownUntil ? "DRAWDOWN_COOLDOWN" : "NONE",
-        cooldownUntil: drawdown?.cooldownUntil ?? null,
-      },
-      activity: loadRecentEvents(this),
-      lastPolicyUpdate: loadRecentEvents(this, 50).find((event) => event.type === "POLICY_UPDATED") ?? null,
-      scheduler: schedulerMetrics(loadRecentEvents(this, 200)),
+      decisions: journal?.decision ? [journal.decision] : [],
+      executionEvidence: executionEvidence(journal),
+      learning: { reflection: journal?.reflection ?? null, lessons: [], lessonsUsed: journal?.decision?.lessonsUsed ?? [], backtest: null, recentExperiences: [] },
+      riskControls: { ...config.ownerPolicy, scanIntervalMinutes: temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes, temporaryScanIntervalExpiresAt: this.state.temporaryScanIntervalExpiresAt, drawdownBlocked: Boolean(drawdown?.cooldownUntil && new Date(drawdown.cooldownUntil).getTime() > Date.now()), drawdownCode: drawdown?.cooldownUntil ? "DRAWDOWN_COOLDOWN" : "NONE", cooldownUntil: drawdown?.cooldownUntil ?? null },
+      activity: events,
+      lastPolicyUpdate: events.find((event) => event.type === "POLICY_UPDATED") ?? null,
+      // Snapshot scheduler metrics intentionally cover the same bounded recent event window.
+      scheduler: schedulerMetrics(events),
     };
   }
 
-  private async readDashboardPortfolio(config: RuntimeConfig, journalPortfolio: DashboardSnapshot["portfolio"]): Promise<{ value: DashboardSnapshot["portfolio"]; freshness: DashboardSnapshot["portfolioFreshness"] }> {
-    try {
-      const value = await new BitgetClient(config).getDashboardPortfolio();
-      return resolveDashboardPortfolio(value, journalPortfolio, new Date().toISOString());
-    } catch (error) {
-      const code = error instanceof Error && /^[A-Za-z0-9_-]{1,120}$/.test(error.message) ? error.message : "PROVIDER_READ_FAILED";
-      console.log(JSON.stringify({ event: "DASHBOARD_PORTFOLIO_READ_FAILED", code }));
-      const fallback = resolveDashboardPortfolio(null, journalPortfolio, new Date().toISOString());
-      return { value: fallback.value, freshness: { ...fallback.freshness, errorCode: code } };
-    }
+  private getAgentJournal(url: URL): Response {
+    const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
+    const journals = loadRecentJournals(this, limit);
+    return json({ journals, decisions: journals.flatMap((entry) => entry.decision ? [entry.decision] : []), limit });
+  }
+
+  private getTradeHistory(url: URL): Response {
+    const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
+    const experiences = loadExperiences(this, limit);
+    const journals = loadRecentJournals(this, limit);
+    const trades = tradeLogEntries(experiences, journals);
+    return json({ trades, limit });
+  }
+
+  private getLearning(url: URL): Response {
+    const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
+    const journal = loadLatestJournal(this);
+    return json({ learning: { reflection: journal?.reflection ?? null, lessons: loadRecentLessons(this, limit), lessonsUsed: journal?.decision?.lessonsUsed ?? [], backtest: loadLatestBacktest(this), recentExperiences: loadExperiences(this, limit) }, limit });
+  }
+
+  private getPolicyRead(): Response {
+    const config = loadConfig(this.env, this.ensureActivePolicy());
+    const drawdown = loadDailyDrawdownState(this);
+    const events = loadRecentEvents(this, SNAPSHOT_EVENT_LIMIT);
+    const riskControls: DashboardSnapshot["riskControls"] = { ...config.ownerPolicy, scanIntervalMinutes: temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes, temporaryScanIntervalExpiresAt: this.state.temporaryScanIntervalExpiresAt, drawdownBlocked: Boolean(drawdown?.cooldownUntil && new Date(drawdown.cooldownUntil).getTime() > Date.now()), drawdownCode: drawdown?.cooldownUntil ? "DRAWDOWN_COOLDOWN" : "NONE", cooldownUntil: drawdown?.cooldownUntil ?? null };
+    return json({ riskControls, lastPolicyUpdate: events.find((event) => event.type === "POLICY_UPDATED") ?? null });
   }
 
   private async runCycle(): Promise<TradingJournal> {
-    ensureStorage(this);
     if (this.state.paused) throw new Error("AGENT_PAUSED");
     if (this.state.emergencyStop) throw new Error("EMERGENCY_STOP");
     if (this.state.lastStatus === "RUNNING" && !this.recoverStaleCycle()) {

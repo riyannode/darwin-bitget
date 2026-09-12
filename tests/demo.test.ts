@@ -10,6 +10,9 @@ describe("zero-credential judge demo fixtures", () => {
     expect(snapshot.executionEvidence?.reconciliationStatus).toBe("MATCHED");
     expect(snapshot.portfolioFreshness.source).toBe("JOURNAL_FALLBACK");
     expect(snapshot.agent.status).toBe("PAUSED");
+    expect(snapshot.performance.totalTrades).toBe(0);
+    expect(snapshot.demo.preTradeAccount.positions).toHaveLength(0);
+    expect(snapshot.demo.postTradeAccount.positions).toHaveLength(1);
   });
 
   it("keeps HOLD a no-write replay", () => {

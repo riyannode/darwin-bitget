@@ -1,5 +1,6 @@
 {
   "framework": null,
+  "buildCommand": "true",
   "outputDirectory": "public",
   "rewrites": [
     {
