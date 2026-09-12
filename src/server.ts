@@ -17,10 +17,10 @@ export default {
         return Response.json({ error: "DEMO_UNIVERSE_UNAVAILABLE" }, { status: 503 });
       }
     }
-    if (url.pathname === "/api/snapshot" || url.pathname === "/api/control" || url.pathname === "/api/policy" || url.pathname === "/api/export/paper-log") {
+    if (url.pathname === "/api/snapshot" || url.pathname === "/api/control" || url.pathname === "/api/policy" || url.pathname === "/api/export/paper-log" || url.pathname === "/api/eva/connection-test") {
       const id = env.TRADER_AGENT.idFromName("primary");
       const stub = env.TRADER_AGENT.get(id);
-      const path = url.pathname === "/api/snapshot" ? "/snapshot" : url.pathname === "/api/policy" ? "/policy" : url.pathname === "/api/export/paper-log" ? "/export/paper-log" : "/control";
+      const path = url.pathname === "/api/snapshot" ? "/snapshot" : url.pathname === "/api/policy" ? "/policy" : url.pathname === "/api/export/paper-log" ? "/export/paper-log" : url.pathname === "/api/eva/connection-test" ? "/eva/connection-test" : "/control";
       const agentUrl = new URL(request.url);
       agentUrl.pathname = path;
       return stub.fetch(new Request(agentUrl, request));
