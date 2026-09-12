@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { autonomousDecisionSetSchema, buildDecisionPrompt, rankMarketCandidates } from "../src/agent/decision.js";
+import { autonomousDecisionSetSchema, buildDecisionPrompt, normalizeLessonReferences, rankMarketCandidates } from "../src/agent/decision.js";
 import type { AccountSnapshot, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot } from "../src/types.js";
 
 function snapshot(symbol: string, change: string, volume: string): MarketSnapshot {
@@ -49,5 +49,9 @@ describe("market candidate pre-ranking", () => {
 
     expect(parsed.exitDecisions).toHaveLength(2);
     expect(() => autonomousDecisionSetSchema.parse({ ...longExit, action: "HOLD", positionSide: null, marginAllocationPct: "0", reductionPct: null, exitDecisions: [{ ...longExit, action: "OPEN_LONG" }] })).toThrow();
+  });
+
+  it("keeps known lesson references and reports unknown references", () => {
+    expect(normalizeLessonReferences(["known", "unknown", "known"], new Set(["known"]))).toEqual({ accepted: ["known", "known"], ignored: ["unknown"] });
   });
 });

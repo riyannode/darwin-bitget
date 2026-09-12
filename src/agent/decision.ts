@@ -151,19 +151,29 @@ export async function selectCandidates(
   return candidates;
 }
 
+export function normalizeLessonReferences(ids: readonly string[], knownLessonIds: ReadonlySet<string>): { accepted: string[]; ignored: string[] } {
+  const accepted: string[] = [];
+  const ignored: string[] = [];
+  for (const id of ids) {
+    if (knownLessonIds.has(id)) accepted.push(id);
+    else ignored.push(id);
+  }
+  return { accepted, ignored };
+}
+
 export async function decide(config: RuntimeConfig, context: DecisionContext, cycleId: string): Promise<AutonomousDecisionSet> {
   const generated = await generateQwenJson(config, autonomousDecisionSetSchema, `${context.mandate}\n${DECISION_TASK_PROMPT}\nReturn one primary action and optional exitDecisions. exitDecisions may only contain REDUCE or CLOSE for existing positions. Keep every rationale concise. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: 1200, timeoutMs: 60_000 });
   const createdAt = new Date().toISOString();
-  const decision = decisionSchema.parse({ ...generated, decisionId: crypto.randomUUID(), cycleId, createdAt });
-  const exitDecisions = generated.exitDecisions.map((exitDecision) => decisionSchema.parse({ ...exitDecision, decisionId: crypto.randomUUID(), cycleId, createdAt }));
   const exitKeys = new Set<string>();
-  for (const exitDecision of exitDecisions) {
+  for (const exitDecision of generated.exitDecisions) {
     const key = `${exitDecision.symbol}:${exitDecision.positionSide}`;
     if (exitKeys.has(key)) throw new Error("DUPLICATE_EXIT");
     exitKeys.add(key);
   }
   const knownLessons = new Set(context.lessons.map((lesson) => lesson.lessonId));
-  if (decision.lessonsUsed.some((lessonId) => !knownLessons.has(lessonId))) throw new Error("LESSON_REFERENCE_INVALID");
-  if (exitDecisions.some((exitDecision) => exitDecision.lessonsUsed.some((lessonId) => !knownLessons.has(lessonId)))) throw new Error("LESSON_REFERENCE_INVALID");
-  return { decision, exitDecisions };
+  const primaryLessons = normalizeLessonReferences(generated.lessonsUsed, knownLessons);
+  const exitLessons = generated.exitDecisions.map((exitDecision) => normalizeLessonReferences(exitDecision.lessonsUsed, knownLessons));
+  const decision = decisionSchema.parse({ ...generated, lessonsUsed: primaryLessons.accepted, decisionId: crypto.randomUUID(), cycleId, createdAt });
+  const exitDecisions = generated.exitDecisions.map((exitDecision, index) => decisionSchema.parse({ ...exitDecision, lessonsUsed: exitLessons[index]?.accepted ?? [], decisionId: crypto.randomUUID(), cycleId, createdAt }));
+  return { decision, exitDecisions, ignoredLessonIds: [...new Set([...primaryLessons.ignored, ...exitLessons.flatMap((lessons) => lessons.ignored)])] };
 }

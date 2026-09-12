@@ -271,6 +271,7 @@ export interface Decision {
 export interface AutonomousDecisionSet {
   decision: Decision;
   exitDecisions: Decision[];
+  ignoredLessonIds: string[];
 }
 
 export interface DecisionExecutionRecord {

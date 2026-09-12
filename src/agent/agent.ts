@@ -173,7 +173,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
     }
     if (!effectivePaused) {
       const config = loadConfig(this.env, this.ensureActivePolicy());
-      await scheduleTradingCycle(this, this.activeScanIntervalMinutes(config.ownerPolicy));
+      const intervalMinutes = this.activeScanIntervalMinutes(config.ownerPolicy);
+      await scheduleTradingCycle(this, intervalMinutes);
+      this.setState({ ...this.state, nextScanAt: new Date(Date.now() + intervalMinutes * 60_000).toISOString() });
     }
     return nextState;
   }
@@ -366,6 +368,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const context = { bundles, supportedUniverse, experiences, openExperiences, lessons, openPositions, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE };
       const decisionSet = await decide(config, context, cycleId);
       const decision = decisionSet.decision;
+      if (decisionSet.ignoredLessonIds.length) this.recordEvent("LESSON_REFERENCE_IGNORED", cycleId, { count: String(decisionSet.ignoredLessonIds.length), ids: decisionSet.ignoredLessonIds.slice(0, 8).join(",") });
       const legacyExit = decision.action === "REDUCE" || decision.action === "CLOSE" ? [decision] : [];
       const exitDecisions = [...legacyExit, ...decisionSet.exitDecisions.filter((exitDecision) => !legacyExit.some((legacy) => legacy.symbol === exitDecision.symbol && legacy.positionSide === exitDecision.positionSide))];
       const bundle = bundles.find((candidate) => candidate.instrument.symbol === decision.symbol) ?? bundles[0];
