@@ -146,7 +146,7 @@ export function parseDashboardPortfolio(accountValue: unknown, positionsValue: u
   const notionalValues = normalizedPositions.map((position) => position.notional).filter(Boolean);
   const totalPositionNotional = notionalValues.reduce((total, notional) => addDecimal(total, notional), "0");
   const pnlValues = normalizedPositions.map((position) => position.unrealizedPnl).filter(Boolean);
-  const unrealizedPnl = pnlValues.length ? pnlValues.reduce((total, pnl) => addDecimal(total, pnl), "0") : normalizedPositions.length ? "" : "0";
+  const unrealizedPnl = pnlValues.length ? sumSignedDecimals(pnlValues) : normalizedPositions.length ? "" : "0";
   return {
     balance: firstText(account, ["balance", "usdtBalance"], accountEquity),
     availableBalance: availableMargin,

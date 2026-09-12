@@ -28,13 +28,13 @@ describe("Bitget provider readback", () => {
   it("preserves provider live position values for the dashboard", () => {
     const portfolio = parseDashboardPortfolio(
       { usdtEquity: "50000", availableMargin: "47000", marginUsed: "3000", positionValue: "2996.3654" },
-      [{ symbol: "CRCLUSDT", posSide: "long", total: "32.69", avgPrice: "91.7", markPrice: "91.82", leverage: "3", positionBalance: "998.78", unrealisedPnl: "3.9252", profitRate: "0.0039", liqPrice: "44.2" }],
+      [{ symbol: "CRCLUSDT", posSide: "long", total: "32.69", avgPrice: "91.7", markPrice: "91.82", leverage: "3", positionBalance: "998.78", unrealisedPnl: "-0.9807", profitRate: "-0.0009", liqPrice: "44.2" }],
       { list: [{ symbol: "CRCLUSDT", orderId: "open-1" }] },
       "2026-09-12T17:00:00.000Z",
     );
 
-    expect(portfolio).toMatchObject({ portfolioEquity: "50000", availableMargin: "47000", marginUsage: "3000", openOrders: 1, unrealizedPnl: "3.9252" });
-    expect(portfolio.positions[0]).toMatchObject({ symbol: "CRCLUSDT", positionSide: "LONG", quantity: "32.69", entryPrice: "91.7", markPrice: "91.82", marginAllocated: "998.78", leverage: "3", notional: "2996.3654", unrealizedPnl: "3.9252", unrealizedPnlPct: "0.0039", liquidationPrice: "44.2" });
+    expect(portfolio).toMatchObject({ portfolioEquity: "50000", availableMargin: "47000", marginUsage: "3000", openOrders: 1, unrealizedPnl: "-0.9807" });
+    expect(portfolio.positions[0]).toMatchObject({ symbol: "CRCLUSDT", positionSide: "LONG", quantity: "32.69", entryPrice: "91.7", markPrice: "91.82", marginAllocated: "998.78", leverage: "3", notional: "2996.3654", unrealizedPnl: "-0.9807", unrealizedPnlPct: "-0.0009", liquidationPrice: "44.2" });
   });
 
   it("fails closed when the account response has no equity field", () => {
