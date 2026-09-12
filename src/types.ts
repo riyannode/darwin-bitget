@@ -442,6 +442,7 @@ export interface DashboardSnapshot {
     source: "PROVIDER_LIVE" | "JOURNAL_FALLBACK";
     observedAt: string;
     stale: boolean;
+    errorCode?: string;
   };
   performance: {
     totalPnl: string;

@@ -381,9 +381,10 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const value = await new BitgetClient(config).getDashboardPortfolio();
       return resolveDashboardPortfolio(value, journalPortfolio, new Date().toISOString());
     } catch (error) {
-      const code = error instanceof Error && /^[A-Z0-9_-]{1,120}$/.test(error.message) ? error.message : "PROVIDER_READ_FAILED";
+      const code = error instanceof Error && /^[A-Za-z0-9_-]{1,120}$/.test(error.message) ? error.message : "PROVIDER_READ_FAILED";
       console.log(JSON.stringify({ event: "DASHBOARD_PORTFOLIO_READ_FAILED", code }));
-      return resolveDashboardPortfolio(null, journalPortfolio, new Date().toISOString());
+      const fallback = resolveDashboardPortfolio(null, journalPortfolio, new Date().toISOString());
+      return { value: fallback.value, freshness: { ...fallback.freshness, errorCode: code } };
     }
   }
 
