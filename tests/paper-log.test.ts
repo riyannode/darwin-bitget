@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildPaperLogExport, calculatePeakDrawdown, paperLogToCsv, parsePaperLogPeriod } from "../src/storage/paper-log.js";
-import type { ActivityEvent, Decision, TradeExperience, TradingJournal } from "../src/types.js";
+import type { ActivityEvent, Decision, ExecutionResult, TradeExperience, TradingJournal } from "../src/types.js";
 
 function decision(cycleId: string, action: Decision["action"], decisionId: string, createdAt: string): Decision {
   return { decisionId, cycleId, action, positionSide: action === "OPEN_LONG" || action === "CLOSE" ? "LONG" : null, symbol: "NVDAUSDT", marginAllocationPct: action === "HOLD" ? "0" : "1", leverage: "1", reductionPct: action === "CLOSE" ? null : null, confidence: 0.5, thesis: "bounded thesis", strategyThesis: "bounded strategy thesis", supportingFactors: ["volume"], riskFactors: ["volatility"], evidenceUsed: ["ticker"], lessonsUsed: [], createdAt };
@@ -15,6 +15,10 @@ function journal(index: number, action: Decision["action"]): TradingJournal {
 
 function experience(): TradeExperience {
   return { experienceId: "experience-1", symbol: "NVDAUSDT", positionSide: "LONG", action: "OPEN_LONG", entryDecisionId: "decision-1", entryPrice: "100", entryTime: "2026-09-12T00:01:00.000Z", exitDecisionId: "decision-2", exitPrice: "99", exitTime: "2026-09-12T00:02:00.000Z", selectedLeverage: "1", marginAllocationPct: "1", marginAllocated: "10", positionNotional: "10", realizedPnl: "-0.0456", realizedPnlPct: "-0.456", maximumFavorableExcursion: "0", maximumAdverseExcursion: "-0.0456", drawdownContribution: "-0.0456", liquidationDistance: "0", entryThesis: "entry", exitThesis: "exit", evidenceAtEntry: ["ticker"], evidenceAtExit: ["ticker"], lessonsUsed: [], marketContext: "RANGE_LOW_VOL", outcomeStatus: "LOSING", realizedPnlVerified: true };
+}
+
+function failedExecution(): ExecutionResult {
+  return { provider: "bitget", clientOrderId: "paper-test", symbol: "NVDAUSDT", action: "OPEN_LONG", positionSide: "LONG", providerSide: "buy", tradeSide: "open", marginAllocated: "10", leverage: "1", positionNotional: "10", requestedQuantity: "0.01", executedQuantity: "0", status: "unknown", submittedAt: "2026-09-12T00:01:00.000Z", readBackAt: "2026-09-12T00:01:01.000Z", providerOperation: "placeOrder", providerCode: "40010", providerMessage: "ORDER_REJECTED", providerReadbackCode: "ORDER_NOT_FOUND", providerReadbackMessage: "READBACK_EMPTY" };
 }
 
 describe("paper log export", () => {
@@ -53,6 +57,17 @@ describe("paper log export", () => {
     expect(csv).toContain("HOLD");
     expect(csv).not.toContain("apiKey");
     expect(csv).not.toContain("passphrase");
+  });
+
+  it("exports provider diagnostics in JSON and CSV", () => {
+    const base = journal(1, "OPEN_LONG");
+    const current = { ...base, executionRequest: { cycleId: base.cycleId, decisionId: "decision-1", symbol: "NVDAUSDT", action: "OPEN_LONG" as const, positionSide: "LONG" as const, providerSide: "buy" as const, tradeSide: "open" as const, marginAllocated: "10", leverage: "1", positionNotional: "10", reductionPct: null, quantity: "0.01", clientOrderId: "paper-test" }, executionResult: failedExecution() };
+    const exported = buildPaperLogExport({ generatedAt: "2026-09-12T00:03:00.000Z", period: { start: null, end: null }, environment: "test", model: "qwen3.8-max", version: "0.2.0", commit: "test", cycles: [{ cycleId: base.cycleId, status: "COMPLETED", startedAt: base.startedAt, completedAt: base.completedAt ?? null }], journals: [current], experiences: [], events: [] });
+    expect(exported.decisions[0]?.executionResult).toMatchObject({ providerOperation: "placeOrder", providerCode: "40010", providerMessage: "ORDER_REJECTED", providerReadbackCode: "ORDER_NOT_FOUND", providerReadbackMessage: "READBACK_EMPTY" });
+    const csv = paperLogToCsv(exported);
+    expect(csv).toContain("providerOperation");
+    expect(csv).toContain("placeOrder");
+    expect(csv).toContain("ORDER_REJECTED");
   });
 
   it("validates export periods deterministically", () => {

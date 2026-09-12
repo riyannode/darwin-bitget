@@ -99,8 +99,11 @@ export interface PaperLogExecutionResult {
   funding: string | null;
   realizedPnl: string | null;
   realizedPnlPct: string | null;
+  providerOperation: string | null;
   providerCode: string | null;
+  providerMessage: string | null;
   providerReadbackCode: string | null;
+  providerReadbackMessage: string | null;
   readBackAt: string;
 }
 
@@ -172,8 +175,11 @@ function executionResult(result: ExecutionResult | undefined): PaperLogExecution
     funding: result.funding ?? null,
     realizedPnl: result.realizedPnl ?? null,
     realizedPnlPct: result.realizedPnlPct ?? null,
+    providerOperation: result.providerOperation ?? null,
     providerCode: result.providerCode ?? null,
+    providerMessage: result.providerMessage ?? null,
     providerReadbackCode: result.providerReadbackCode ?? null,
+    providerReadbackMessage: result.providerReadbackMessage ?? null,
     readBackAt: result.readBackAt,
   };
 }
@@ -350,11 +356,11 @@ function csvValue(value: unknown): string {
 }
 
 export function paperLogToCsv(exported: PaperLogExport): string {
-  const header = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "decisionId", "decisionTimestamp", "action", "symbol", "positionSide", "marginAllocationPct", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "reflectionIds", "createdLessonIds"];
+  const header = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "decisionId", "decisionTimestamp", "action", "symbol", "positionSide", "marginAllocationPct", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "providerOperation", "providerCode", "providerMessage", "providerReadbackCode", "providerReadbackMessage", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "reflectionIds", "createdLessonIds"];
   const rows = exported.cycles.flatMap((cycle) => {
     const decisions = exported.decisions.filter((decision) => decision.cycleId === cycle.cycleId);
     if (!decisions.length) return [[cycle.cycleId, cycle.status, cycle.startedAt, cycle.completedAt, cycle.eventTypes, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]];
-    return decisions.map((decision) => [cycle.cycleId, cycle.status, cycle.startedAt, cycle.completedAt, cycle.eventTypes, decision.decisionId, decision.timestamp, decision.action, decision.symbol, decision.positionSide, decision.marginAllocationPct, decision.leverage, decision.reductionPct, decision.confidence, decision.strategyThesis, decision.supportingFactors, decision.riskFactors, decision.evidenceUsed, decision.lessonsUsed, decision.riskGate?.status, decision.riskGate?.codes, decision.executionRequest?.tradeSide, decision.executionRequest?.positionNotional, decision.executionRequest?.clientOrderId, decision.executionResult?.providerOrderId, decision.executionResult?.status, decision.executionResult?.requestedQuantity, decision.executionResult?.executedQuantity, decision.reconciliation?.status, decision.reconciliation?.codes, decision.providerVerified, decision.realizedPnl, decision.reflectionIds, decision.createdLessonIds]);
+    return decisions.map((decision) => [cycle.cycleId, cycle.status, cycle.startedAt, cycle.completedAt, cycle.eventTypes, decision.decisionId, decision.timestamp, decision.action, decision.symbol, decision.positionSide, decision.marginAllocationPct, decision.leverage, decision.reductionPct, decision.confidence, decision.strategyThesis, decision.supportingFactors, decision.riskFactors, decision.evidenceUsed, decision.lessonsUsed, decision.riskGate?.status, decision.riskGate?.codes, decision.executionRequest?.tradeSide, decision.executionRequest?.positionNotional, decision.executionRequest?.clientOrderId, decision.executionResult?.providerOrderId, decision.executionResult?.status, decision.executionResult?.requestedQuantity, decision.executionResult?.executedQuantity, decision.executionResult?.providerOperation, decision.executionResult?.providerCode, decision.executionResult?.providerMessage, decision.executionResult?.providerReadbackCode, decision.executionResult?.providerReadbackMessage, decision.reconciliation?.status, decision.reconciliation?.codes, decision.providerVerified, decision.realizedPnl, decision.reflectionIds, decision.createdLessonIds]);
   });
   return [header, ...rows].map((row) => row.map(csvValue).join(",")).join("\r\n") + "\r\n";
 }

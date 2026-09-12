@@ -720,7 +720,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (!localKeys.has(key)) {
         const code = `LOCAL_EXPERIENCE_MISSING:${key}`;
         discrepancies.push(code);
-        this.recordEvent("POSITION_STATE_DISCREPANCY", cycleId, { code, symbol: position.symbol, positionSide: position.positionSide, experienceId: "NONE" });
+        this.recordEvent("POSITION_STATE_DISCREPANCY", cycleId, { code, symbol: position.symbol, positionSide: position.positionSide, experienceId: "NONE", classification: "EXTERNAL_UNATTRIBUTED", origin: "PROVIDER_ONLY" });
       }
     }
     return discrepancies;
