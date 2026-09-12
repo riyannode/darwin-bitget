@@ -37,6 +37,12 @@ export function loadConfig(env: Omit<Env, "TRADER_AGENT">, activePolicy?: OwnerP
     ...(env.BITGET_PASSPHRASE?.trim() ? { bitgetPassphrase: env.BITGET_PASSPHRASE.trim() } : {}),
     ...(env.QWEN_API_KEY?.trim() ? { qwenApiKey: env.QWEN_API_KEY.trim() } : {}),
   };
+  const eva = {
+    ...(env.EVA_API_URL?.trim() ? { evaApiUrl: env.EVA_API_URL.trim() } : {}),
+    ...(env.EVA_GATEWAY_URL?.trim() ? { evaGatewayUrl: env.EVA_GATEWAY_URL.trim() } : {}),
+    ...(env.EVA_AGENT_ID?.trim() ? { evaAgentId: env.EVA_AGENT_ID.trim() } : {}),
+    ...(env.EVA_AGENT_API_KEY?.trim() ? { evaAgentApiKey: env.EVA_AGENT_API_KEY.trim() } : {}),
+  };
   return {
     tradingMode: "PAPER",
     agentMode,
@@ -50,5 +56,6 @@ export function loadConfig(env: Omit<Env, "TRADER_AGENT">, activePolicy?: OwnerP
     commit: required(env.GIT_COMMIT_SHA, "local"),
     environment: required(env.ENVIRONMENT, "production"),
     ...credentials,
+    ...eva,
   };
 }

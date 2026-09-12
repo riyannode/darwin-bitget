@@ -43,6 +43,8 @@ import { loadOwnerPolicy, updateOwnerPolicy } from "../trading/policy.js";
 import { buildExecutionRequest, executePaperOrder } from "../trading/execution.js";
 import { reconcileExecution } from "../trading/reconcile.js";
 import { addDecimal, isDecimal } from "../trading/decimal.js";
+import { EvaClient } from "../eva/client.js";
+import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
 
 interface AgentState {
   emergencyStop: boolean;
@@ -123,7 +125,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const url = new URL(request.url);
     if (url.pathname === "/snapshot" && request.method === "GET") return json(await this.getDashboardSnapshot());
     if (url.pathname === "/export/paper-log" && request.method === "GET") return this.exportPaperLog(url);
-    if ((url.pathname === "/control" || url.pathname === "/policy") && request.method === "POST") {
+    if ((url.pathname === "/control" || url.pathname === "/policy" || url.pathname === "/eva/connection-test") && request.method === "POST") {
       const auth = authorizeOwner(request, this.env);
       if (!auth.authorized) return json({ error: auth.code }, auth.status);
     }
@@ -147,7 +149,21 @@ export class TraderAgent extends Agent<Env, AgentState> {
         return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "INVALID_POLICY" : "INVALID_POLICY" }, 400);
       }
     }
+    if (url.pathname === "/eva/connection-test" && request.method === "POST") {
+      try {
+        return json(await this.runEvaConnectionTest());
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "EVA_CONNECTION_FAILED" : "EVA_CONNECTION_FAILED" }, 502);
+      }
+    }
     return new Response("NOT_FOUND", { status: 404 });
+  }
+
+  private async runEvaConnectionTest(): Promise<Record<string, unknown>> {
+    const config = loadConfig(this.env, this.ensureActivePolicy());
+    if (!config.evaAgentId || !config.evaAgentApiKey || !config.evaGatewayUrl) throw new Error("EVA_CREDENTIAL_MISSING");
+    const result = await new EvaClient({ ...(config.evaApiUrl ? { apiUrl: config.evaApiUrl } : {}), gatewayUrl: config.evaGatewayUrl, agentId: config.evaAgentId, agentApiKey: config.evaAgentApiKey, identity: { name: EVA_AGENT_NAME, version: config.version ?? "local", model: config.qwenModel } }).connectAndTest();
+    return { ...result, agentId: config.evaAgentId, protocol: EVA_PROTOCOL_VERSION, capabilities: [...EVA_CAPABILITIES], executionProviders: [...EVA_EXECUTION_PROVIDERS], endpoint: config.evaGatewayUrl };
   }
 
   public async runScheduledCycle(): Promise<void> {

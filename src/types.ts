@@ -44,6 +44,10 @@ export interface Env extends Cloudflare.Env {
   QWEN_API_KEY?: string;
   QWEN_BASE_URL?: string;
   QWEN_MODEL?: string;
+  EVA_API_URL?: string;
+  EVA_GATEWAY_URL?: string;
+  EVA_AGENT_ID?: string;
+  EVA_AGENT_API_KEY?: string;
 }
 
 export interface RuntimeConfig {
@@ -59,6 +63,10 @@ export interface RuntimeConfig {
   qwenApiKey?: string;
   qwenBaseUrl: string;
   qwenModel: string;
+  evaApiUrl?: string;
+  evaGatewayUrl?: string;
+  evaAgentId?: string;
+  evaAgentApiKey?: string;
   version?: string;
   commit?: string;
   environment?: string;
