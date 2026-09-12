@@ -610,7 +610,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   private async ensureTradingSchedule(config: ReturnType<typeof loadConfig>): Promise<void> {
-    if (this.state.paused || this.state.emergencyStop || this.state.lastStatus === "RUNNING") return;
+    if (this.state.paused || this.state.emergencyStop) return;
     const intervalMinutes = this.activeScanIntervalMinutes(config.ownerPolicy);
     let schedules: Awaited<ReturnType<TraderAgent["listSchedules"]>> = [];
     try {
