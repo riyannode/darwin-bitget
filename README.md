@@ -77,6 +77,10 @@ The live site reads the Worker snapshot, including `PROVIDER_LIVE` portfolio sta
 
 ## Deploy Your Own
 
+The public [live site](https://darwin-bitget.vercel.app/) remains the fastest
+judge path. A fork is a separate deployment with its own Worker, Durable
+Object state, Vercel project, and Bitget Demo credentials.
+
 ### A. Credential-free Judge Demo
 
 ```bash
@@ -85,11 +89,15 @@ cd darwin-bitget
 docker compose up --build
 ```
 
-This path needs no Bitget, Qwen, EVA, owner token, funded account, or live-trading account.
+This path needs no Bitget credentials, Qwen credentials, EVA credentials,
+owner token, funded account, or live-trading account. It is a deterministic
+local replay and never submits an order.
 
-### B. Self-hosted PAPER production
+### B. Forked/self-hosted PAPER production
 
-Requirements: Node.js/npm, Cloudflare account, Wrangler, Vercel account, Bitget Demo API credentials, and a Qwen API key.
+Requirements: Node.js/npm, a Cloudflare account, Wrangler, a Vercel account,
+Bitget Demo API credentials, and a Qwen API key. Fork the repository or clone
+your fork; do not use the original production Worker for a self-hosted UI.
 
 ```bash
 git clone https://github.com/riyannode/darwin-bitget.git
@@ -100,7 +108,8 @@ npm test
 npm run deploy:dry
 ```
 
-Backend-only Cloudflare secrets:
+Set these as backend-only Cloudflare Worker secrets; use placeholders only in
+local examples:
 
 ```text
 BITGET_API_KEY
@@ -110,11 +119,11 @@ QWEN_API_KEY
 OWNER_CONTROL_TOKEN
 ```
 
-Optional EVA secrets are documented in [docs/EVA_INTEGRATION.md](docs/EVA_INTEGRATION.md). Never put Bitget secret/passphrase, Qwen key, owner token, or EVA agent key in client code, browser storage, public Vercel environment, logs, exports, or GitHub.
+Optional EVA secrets are documented separately in [docs/EVA_INTEGRATION.md](docs/EVA_INTEGRATION.md). Never put `BITGET_SECRET_KEY`, `BITGET_PASSPHRASE`, `QWEN_API_KEY`, `OWNER_CONTROL_TOKEN`, or `EVA_AGENT_API_KEY` in client code, browser storage, public Vercel environment variables, logs, exports, or GitHub.
 
 Deploy the Worker with the repository's actual script: `npm run deploy`. Fork/import the repository into Vercel, point its `/api` rewrite to your own Worker, deploy, and verify the browser reaches your Worker rather than the original production Worker.
 
-The first deployment remains PAPER-only. Before START/RESUME verify Worker health, snapshot, Bitget Demo account, `portfolioFreshness.source=PROVIDER_LIVE`, `stale=false`, positions/open-orders readback, Qwen connectivity, and authenticated owner controls. Do not convert this guide into live-money trading instructions.
+The first deployment remains PAPER-only. Before `START` or `RESUME`, verify Worker health, snapshot reachability, Bitget Demo account access, `portfolioFreshness.source=PROVIDER_LIVE`, `stale=false`, positions/open-orders readback, Qwen connectivity, and authenticated owner controls. Do not start an autonomous cycle until those checks pass. DARWIN Bitget is configured for Bitget Demo PAPER trading; this guide is not live-money trading instruction.
 
 ## Documentation
 

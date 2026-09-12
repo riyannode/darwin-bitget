@@ -10,6 +10,24 @@ DARWIN Bitget is an autonomous PAPER futures agent for Bitget's 24/7 US-stock / 
 - Track: Agentic Trading
 - Mode: Bitget Demo PAPER only
 
+## Judge paths
+
+Present the paths in this order:
+
+1. [Live Production](https://darwin-bitget.vercel.app/) — actual autonomous
+   Bitget Demo PAPER runtime.
+2. **Zero-credential Docker Judge Demo** — run `docker compose up --build` for
+   a deterministic, credential-free replay.
+3. **Source / fork / self-host** — deploy a separate PAPER instance with the
+   developer's own Cloudflare, Vercel, Bitget Demo, and Qwen configuration.
+4. **Final PAPER Log** — `PENDING FINAL COMPETITION EXPORT` until collection is
+   complete.
+
+These contexts must not be conflated: the live site is production runtime,
+the Docker app is recorded replay, and a fork is the developer's own
+deployment. See [docs/DEPLOYMENT.md](DEPLOYMENT.md) for the two deployment
+paths and the required pre-resume checks.
+
 ## Problem
 
 Always-on perpetual markets produce more symbols, evidence, and position state than a fixed UI rule can safely summarize. An autonomous agent needs dynamic provider discovery, bounded model context, position-aware decisions, readback, reconciliation, and persistent learning without allowing model output to bypass owner controls.
