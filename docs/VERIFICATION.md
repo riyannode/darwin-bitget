@@ -1,35 +1,34 @@
 # Verification
 
-Verified state:
+## Verified implementation facts
 
-- strict TypeScript typecheck and scenario-based test suite pass locally;
-- Wrangler dry-run bundle, static assets, and Durable Object binding generation pass;
+- strict TypeScript and scenario-based tests cover the current Worker path;
+- Wrangler dry-run/build includes the Worker, Durable Object binding, and static assets;
 - authenticated Qwen calls work through the configured Bitget AI proxy with `qwen3.8-max`;
-- credentialed Bitget Demo/PAPER execution works through the official SDK path;
-- manual `NVDAUSDT` execution-path harness verified `OPEN_LONG` → provider readback → `CLOSE` → reconciliation `MATCHED`;
-- the manual lifecycle harness reported realized PnL `-0.0456`, final positions `0`, and final open orders `0`;
-- hedge-mode close sends `posSide` without `reduceOnly`;
-- one-way-mode close sends `reduceOnly`;
+- Bitget Demo/PAPER execution works through the official SDK path;
+- the manual `NVDAUSDT` execution-path harness verified `OPEN_LONG` → provider readback → `CLOSE` → reconciliation `MATCHED`, with realized PnL `-0.0456`, final positions `0`, and final open orders `0`;
+- hedge-mode close uses `posSide` without `reduceOnly`; one-way close uses `reduceOnly`;
 - provider parsing supports `orderStatus` and `cumExecQty`;
-- the frontend contains Dashboard, Agent Journal, Trade History, Learning, and Policy pages;
-- autonomous PAPER history is persisted in Durable Object SQLite and the submission export reads it without the dashboard's latest-25 display limit;
-- the export is read-only, includes HOLD cycles, and excludes the manual lifecycle harness because that harness does not write autonomous Worker journals;
-- policy/control mutations remain owner-authenticated and PAPER-only.
+- the frontend contains Dashboard, Agent Journal, Trade History, Open Position, Learning, and Policy pages;
+- Open Position is read-only, uses `PROVIDER_LIVE` on current readback, supports multiple positions, and refreshes through the 10-second snapshot polling;
+- signed provider PnL/rate parsing, deterministic reconciliation, runtime Git SHA injection, Demo-universe filtering, sequential exits, and ambiguous-write fail-closed behavior are covered by the implementation/tests.
 
-The manual `NVDAUSDT` lifecycle harness is execution-path verification only. It is not autonomous trading history and must not be presented as an autonomous Worker cycle in a submission log.
+The manual NVDA lifecycle is execution-path verification only. It is not autonomous Worker history and must not be presented as a competition log.
 
-The dashboard displays only bounded recent history for readability. The full autonomous log is available through:
+## Paper log evidence
+
+The dashboard shows bounded recent history. Full autonomous history is exported through:
 
 ```text
 GET /api/export/paper-log?format=json
 GET /api/export/paper-log?format=csv
 ```
 
-Both endpoints accept optional `from` and `to` ISO timestamps and never return credentials, auth headers, passphrases, or model chain-of-thought.
+The export is read-only, includes HOLD cycles, excludes manual harness records, and preserves sanitized provider diagnostics. It does not expose credentials, auth headers, passphrases, or model chain-of-thought. The final competition export is still `PENDING FINAL COMPETITION EXPORT`.
 
-Not verified:
+## Not claimed
 
-- EVA connectivity;
-- a two-week competition-period PAPER log, which requires continued autonomous runtime collection.
-
-The public Bitget instrument catalog is read-only evidence. It does not prove that a future credentialed Demo/PAPER order will be accepted.
+- No guaranteed profitability.
+- A Judge Demo replay is not a live provider session.
+- EVA evaluation is not part of the zero-credential demo.
+- Final competition-period metrics are not frozen.

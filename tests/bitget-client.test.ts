@@ -21,6 +21,22 @@ const request: ExecutionRequest = {
 };
 
 describe("Bitget read diagnostics", () => {
+  it("reads live dashboard portfolio without invoking financial writes", async () => {
+    const providerResult = (data: unknown) => ({ endpoint: "fixture", requestTime: "2026-09-12T00:00:00.000Z", data, raw: { code: "00000", data } });
+    const sdk = vi.spyOn(BitgetRestClient.prototype, "callOperation").mockImplementation(async (operation) => {
+      if (operation === "getAccountAssets") return providerResult({ usdtEquity: "50000", availableMargin: "47000", marginUsed: "3000", positionValue: "2996.3654" });
+      if (operation === "getPositionInfo") return providerResult([{ symbol: "CRCLUSDT", posSide: "long", total: "32.69", avgPrice: "91.7", markPrice: "91.82", leverage: "3", positionBalance: "998.78", unrealisedPnl: "3.9252", profitRate: "0.0039", liqPrice: "44.2" }]);
+      if (operation === "getOpenOrders") return providerResult({ list: [{ symbol: "CRCLUSDT", orderId: "open-1" }] });
+      throw new Error(`UNEXPECTED_OPERATION_${operation}`);
+    });
+    try {
+      const portfolio = await new BitgetClient(loadConfig({ TRADING_MODE: "PAPER", PAPER_ONLY: "true", AGENT_MODE: "AUTONOMOUS", BITGET_API_KEY: "fixture-key", BITGET_SECRET_KEY: "fixture-secret", BITGET_PASSPHRASE: "fixture-passphrase" })).getDashboardPortfolio();
+      expect(portfolio.positions[0]).toMatchObject({ symbol: "CRCLUSDT", markPrice: "91.82", unrealizedPnl: "3.9252", unrealizedPnlPct: "0.39" });
+      expect(portfolio.openOrders).toBe(1);
+      expect(sdk.mock.calls.map(([operation]) => operation)).toEqual(["getAccountAssets", "getPositionInfo", "getOpenOrders"]);
+    } finally { sdk.mockRestore(); }
+  });
+
   it("records the failed operation without retrying a financial write or leaking credentials", async () => {
     const sdk = vi.spyOn(BitgetRestClient.prototype, "callOperation").mockRejectedValue({ code: "PROVIDER_ERROR", message: "fixture-passphrase" });
     try {

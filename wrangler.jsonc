@@ -43,7 +43,6 @@
     "EVA_GATEWAY_URL": "wss://api.evalabs.my.id/v1/agent/connect",
     "EVA_AGENT_ID": "agt_MoFh0GlqzkobuQdg",
     "APP_VERSION": "0.2.0",
-    "GIT_COMMIT_SHA": "1a0b8c7",
     "ENVIRONMENT": "production",
   }
 }

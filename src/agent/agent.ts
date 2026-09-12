@@ -45,6 +45,7 @@ import { reconcileExecution } from "../trading/reconcile.js";
 import { addDecimal, isDecimal } from "../trading/decimal.js";
 import { EvaClient } from "../eva/client.js";
 import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
+import { resolveDashboardPortfolio } from "./portfolio.js";
 
 interface AgentState {
   emergencyStop: boolean;
@@ -281,6 +282,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const journals = loadRecentJournals(this);
     const experiences = loadExperiences(this);
     const drawdown = loadDailyDrawdownState(this);
+    const portfolio = await this.readDashboardPortfolio(config, journal?.portfolio ?? null);
     const trades = experiences.filter((experience) => experience.action !== "HOLD").map((experience) => {
       const journal = journals.find((entry) => entry.experienceId === experience.experienceId || entry.decision?.decisionId === experience.exitDecisionId || entry.decision?.decisionId === experience.entryDecisionId);
       const action = experience.lastAction && experience.lastAction !== "HOLD" ? experience.lastAction : experience.action;
@@ -331,7 +333,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
         model: this.state.model || config.qwenModel,
         paperMode: true,
       },
-      portfolio: journal?.portfolio ?? null,
+      portfolio: portfolio.value,
+      portfolioFreshness: portfolio.freshness,
       performance: { totalPnl, winRate: totalTrades > 0 ? ((wins / totalTrades) * 100).toFixed(2) : "0", dailyDrawdown: drawdownPct, totalTrades, wins, losses, breakeven, dailyPnl },
       trades,
       latestDecision: journal?.decision ?? null,
@@ -371,6 +374,18 @@ export class TraderAgent extends Agent<Env, AgentState> {
       lastPolicyUpdate: loadRecentEvents(this, 50).find((event) => event.type === "POLICY_UPDATED") ?? null,
       scheduler: schedulerMetrics(loadRecentEvents(this, 200)),
     };
+  }
+
+  private async readDashboardPortfolio(config: RuntimeConfig, journalPortfolio: DashboardSnapshot["portfolio"]): Promise<{ value: DashboardSnapshot["portfolio"]; freshness: DashboardSnapshot["portfolioFreshness"] }> {
+    try {
+      const value = await new BitgetClient(config).getDashboardPortfolio();
+      return resolveDashboardPortfolio(value, journalPortfolio, new Date().toISOString());
+    } catch (error) {
+      const code = error instanceof Error && /^[A-Za-z0-9_-]{1,120}$/.test(error.message) ? error.message : "PROVIDER_READ_FAILED";
+      console.log(JSON.stringify({ event: "DASHBOARD_PORTFOLIO_READ_FAILED", code }));
+      const fallback = resolveDashboardPortfolio(null, journalPortfolio, new Date().toISOString());
+      return { value: fallback.value, freshness: { ...fallback.freshness, errorCode: code } };
+    }
   }
 
   private async runCycle(): Promise<TradingJournal> {

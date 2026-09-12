@@ -1,28 +1,133 @@
-# Bitget Autonomous Trader
+# DARWIN Bitget
 
-Standalone Cloudflare Workers agent for autonomous PAPER perpetual-futures trading on the dynamically discovered Bitget contract catalog.
+DARWIN Bitget is an autonomous PAPER futures trading agent for Bitget's 24/7 US-stock / RWA perpetual market.
 
-The main path is:
+## Hackathon Submission
+
+- Event: Bitget AI Hackathon S2
+- Track: Agentic Trading
+- Live Production: [darwin-bitget.vercel.app](https://darwin-bitget.vercel.app/)
+- Source: [github.com/riyannode/darwin-bitget](https://github.com/riyannode/darwin-bitget)
+- Judge Demo: `docker compose up --build`, then [http://localhost:3000/demo](http://localhost:3000/demo)
+- Final PAPER Log: pending final competition export
+- Demo Video: pending
+- X submission: pending
+
+## Judge Paths
+
+1. [Live Production](https://darwin-bitget.vercel.app/) — actual autonomous Bitget Demo PAPER runtime.
+2. Zero-credential Docker Judge Demo — deterministic recorded replay with no provider or model calls.
+3. Source / fork / self-host — a separate PAPER instance with the developer's own backend credentials.
+4. Final PAPER Log — `PENDING FINAL COMPETITION EXPORT` while history is still being collected.
+
+## What DARWIN Does
+
+Each cycle discovers the current executable Bitget Demo stock-perpetual universe, performs a bounded market scan, asks Qwen to select candidates and form a futures decision, validates the proposed action with deterministic policy controls, and only then uses the Bitget Demo execution path. Provider readback and reconciliation decide whether a write is verified. Journals, experiences, reflections, and lessons persist in Durable Object SQLite.
 
 ```text
-dynamic universe → lightweight scan → Qwen shortlist → deep evidence
-→ Qwen decision → deterministic policy gate → Bitget PAPER
-→ readback → reconciliation → journal → reflection → lessons
+Demo executable universe → lightweight scan → Qwen shortlist → deep evidence
+→ Qwen decision → deterministic risk gate → Bitget Demo PAPER
+→ provider readback → reconciliation → journal → reflection / learning
 ```
 
-Qwen owns strategy selection, symbol selection, `OPEN_LONG` / `OPEN_SHORT` / `HOLD` / `REDUCE` / `CLOSE`, thesis, margin allocation, and leverage selection. `src/trading/policy.ts` and `src/trading/risk-gate.ts` own financial authority boundaries.
+Qwen owns strategy selection, symbol selection, `OPEN_LONG` / `OPEN_SHORT` / `HOLD` / `REDUCE` / `CLOSE`, thesis, margin allocation, and leverage selection. Deterministic code owns financial authority and safety boundaries. No profitability guarantee is claimed.
 
-The minimal frontend is a dark trading journal with Dashboard, Agent Journal, Trade History, Learning, and Policy pages. It is an observability surface and has no manual trading controls.
+## Why It Exists
 
-## Local validation
+Bitget's US-stock / RWA perpetual market runs continuously, but an autonomous agent still needs a reliable boundary between reasoning and financial authority. DARWIN shows that the model can make contextual decisions and learn from outcomes while the backend never lets model text grant itself more execution authority.
 
-```text
+## Architecture
+
+The Cloudflare Worker hosts the Durable Object agent and API boundary. It reads the dynamic Bitget Demo executable universe, uses public market data as evidence, calls Qwen, and persists the audit path. The Vercel frontend is an observation surface with no manual trading controls.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/LIVE.md](docs/LIVE.md), and [docs/DEMO.md](docs/DEMO.md).
+
+## Safety Boundary
+
+- `TRADING_MODE=PAPER` and `PAPER_ONLY=true` are required.
+- Owner policy limits margin allocation, leverage, drawdown, cooldown, and scheduler cadence.
+- Every financial action passes one deterministic risk gate.
+- Bitget readback and reconciliation are required before a write is treated as verified.
+- An ambiguous write stops remaining writes for that cycle; no blind retry is used.
+- External/provider text cannot change policy, auth, PAPER mode, tools, or schemas.
+
+## Judge Quick Start
+
+```bash
+docker compose up --build
+```
+
+Open [http://localhost:3000/demo](http://localhost:3000/demo). Scenarios:
+
+- `/demo?scenario=verified-open`
+- `/demo?scenario=hold`
+- `/demo?scenario=risk-reject`
+
+The UI says `JUDGE DEMO`, `RECORDED / DETERMINISTIC REPLAY`, and `NO LIVE ORDERS`. The demo never calls Bitget, Qwen, EVA, or a production Durable Object.
+
+```bash
+docker compose down -v --remove-orphans
+```
+
+The Judge Demo is not a live Bitget session. It exists to make the architecture reproducible without sharing credentials.
+
+## Live Production
+
+The live site reads the Worker snapshot, including `PROVIDER_LIVE` portfolio state and current provider unrealized PnL when readback succeeds. The detailed Open Position page is read-only. The dashboard is not a substitute for the full historical export.
+
+## Deploy Your Own
+
+### A. Credential-free Judge Demo
+
+```bash
+git clone https://github.com/riyannode/darwin-bitget.git
+cd darwin-bitget
+docker compose up --build
+```
+
+This path needs no Bitget, Qwen, EVA, owner token, funded account, or live-trading account.
+
+### B. Self-hosted PAPER production
+
+Requirements: Node.js/npm, Cloudflare account, Wrangler, Vercel account, Bitget Demo API credentials, and a Qwen API key.
+
+```bash
+git clone https://github.com/riyannode/darwin-bitget.git
+cd darwin-bitget
 npm install
 npm run typecheck
 npm test
 npm run deploy:dry
 ```
 
-`npm run test:paper` is a separate opt-in suite. Without explicit credentials and `PAPER_CONFIRM_ORDER=YES`, it reports `PAPER_INTEGRATION_NOT_RUN` and places no order.
+Backend-only Cloudflare secrets:
 
-No EVA repository or EVA source is modified by this project.
+```text
+BITGET_API_KEY
+BITGET_SECRET_KEY
+BITGET_PASSPHRASE
+QWEN_API_KEY
+OWNER_CONTROL_TOKEN
+```
+
+Optional EVA secrets are documented in [docs/EVA_INTEGRATION.md](docs/EVA_INTEGRATION.md). Never put Bitget secret/passphrase, Qwen key, owner token, or EVA agent key in client code, browser storage, public Vercel environment, logs, exports, or GitHub.
+
+Deploy the Worker with the repository's actual script: `npm run deploy`. Fork/import the repository into Vercel, point its `/api` rewrite to your own Worker, deploy, and verify the browser reaches your Worker rather than the original production Worker.
+
+The first deployment remains PAPER-only. Before START/RESUME verify Worker health, snapshot, Bitget Demo account, `portfolioFreshness.source=PROVIDER_LIVE`, `stale=false`, positions/open-orders readback, Qwen connectivity, and authenticated owner controls. Do not convert this guide into live-money trading instructions.
+
+## Documentation
+
+- [Submission](docs/SUBMISSION.md)
+- [Judge Demo](docs/DEMO.md)
+- [Deployment](docs/DEPLOYMENT.md)
+- [Live evidence](docs/LIVE.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Runbook](docs/RUNBOOK.md)
+- [Verification](docs/VERIFICATION.md)
+- [Trading universe](docs/TRADING_UNIVERSE.md)
+- [EVA integration](docs/EVA_INTEGRATION.md)
+
+## Final PAPER Log
+
+The final competition log is intentionally not committed yet. Reserve `submissions/paper-log-final.json` and `submissions/paper-log-final.csv`; generate them only after collection is complete. Final metrics use closed, provider-verified trades only. Open unrealized PnL and execution failures are not realized performance.

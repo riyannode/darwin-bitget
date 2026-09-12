@@ -1,21 +1,53 @@
 # Runbook
 
-## Local checks
+## Local source checks
 
-Run `npm install`, `npm run typecheck`, `npm test`, `npm run check`, `npm run build`, and `npm run deploy:dry`.
+```bash
+npm install
+npm run typecheck
+npm test
+npm run build
+npm run deploy:dry
+```
+
+## Credential-free Judge Demo
+
+```bash
+docker compose up --build
+```
+
+Open `http://localhost:3000/demo`. Use `?scenario=verified-open`, `?scenario=hold`, or `?scenario=risk-reject`. Cleanup:
+
+```bash
+docker compose down -v --remove-orphans
+```
+
+The demo requires no `.env`, credentials, or external network at runtime. It never submits orders.
 
 ## Worker configuration
 
-The Worker requires `TRADING_MODE=PAPER`, `PAPER_ONLY=true`, and `AGENT_MODE=AUTONOMOUS` or `EVA_EVALUATION`. Bitget and Qwen credentials belong in local secret configuration or Cloudflare secrets, never in source or fixtures.
+The Worker requires `TRADING_MODE=PAPER`, `PAPER_ONLY=true`, and `AGENT_MODE=AUTONOMOUS` or `EVA_EVALUATION`. Bitget and Qwen credentials belong in Cloudflare secrets, never in source, fixtures, `wrangler.jsonc`, Vercel public variables, or browser storage.
 
-For the Bitget AI hackathon Qwen subsidy key, use `QWEN_BASE_URL=https://hackathon.bitgetops.com/v1` with `QWEN_MODEL=qwen3.8-max`. Do not send that subsidy key to a DashScope regional endpoint.
+The owner policy defaults to 30% maximum single-position margin allocation, 5x maximum leverage, 10% daily drawdown, 60-minute cooldown, 15-minute scan cadence, and emergency stop disabled. Runtime policy/control mutations require `OWNER_CONTROL_TOKEN` and persist in the Durable Object.
 
-The owner policy defaults to 30% maximum single-position margin allocation, 5x maximum leverage, 10% daily drawdown, 60-minute cooldown, 15-minute scan cadence, and emergency stop disabled. The authenticated Policy page can update the bounded runtime values; the Durable Object persists them and reschedules the scan when its interval changes.
+## Safe first start
 
-Set `OWNER_CONTROL_TOKEN` as a Cloudflare Worker secret. Keep it out of GitHub, Vercel environment variables, browser bundles, and logs. The browser retains a token only in memory for authenticated control and policy requests.
+Before `START` or `RESUME` on a self-hosted Worker, verify:
+
+1. Worker health.
+2. Snapshot reachable.
+3. Bitget Demo account read succeeds.
+4. `portfolioFreshness.source=PROVIDER_LIVE` and `stale=false`.
+5. Positions and open orders readback succeeds.
+6. Qwen connectivity succeeds.
+7. Owner controls authenticate.
+
+Keep the first deployment PAPER-only. Do not force a trade while validating.
 
 ## Credentialed PAPER verification
 
-Set `PAPER_INTEGRATION=1`, `PAPER_TEST_LIFECYCLE=1`, provide all Bitget credentials, select a currently tradable `PAPER_TEST_SYMBOL`, set `PAPER_TEST_ACTION` to `OPEN_LONG` or `OPEN_SHORT`, set `PAPER_TEST_MARGIN_PCT` and `PAPER_TEST_LEVERAGE`, and set `PAPER_CONFIRM_ORDER=YES` before running `npm run test:paper`. The suite submits one bounded opening order and one closing order only after dynamic contract validation and deterministic risk approval. It verifies provider readback, position removal, and numeric realized PnL. It never retries an ambiguous write.
+The opt-in `npm run test:paper` suite requires explicit credentials and `PAPER_CONFIRM_ORDER=YES`. It submits only the configured bounded PAPER lifecycle after dynamic instrument and risk checks. No credential means `PAPER_INTEGRATION_NOT_RUN`; it is not a passing execution result. Never use the manual harness as autonomous competition history.
 
-No credentials means `PAPER_INTEGRATION_NOT_RUN`, not a passing integration result.
+## Operational safety
+
+An unresolved provider write remains unknown/unresolved and is not silently converted to a fill or failure. The cycle stops remaining financial writes after ambiguity. Provider diagnostics are sanitized before journaling and exporting.
