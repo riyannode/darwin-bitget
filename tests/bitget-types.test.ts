@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseAccount, parseDashboardPortfolio, parseFillSummary, parseInstruments, parsePositionHistorySummary } from "../src/bitget/types.js";
+import { normalizeProviderProfitRate, parseAccount, parseDashboardPortfolio, parseFillSummary, parseInstruments, parsePositionHistorySummary } from "../src/bitget/types.js";
 import type { Instrument, MarketSnapshot } from "../src/types.js";
 
 describe("Bitget provider readback", () => {
@@ -34,7 +34,17 @@ describe("Bitget provider readback", () => {
     );
 
     expect(portfolio).toMatchObject({ portfolioEquity: "50000", availableMargin: "47000", marginUsage: "3000", openOrders: 1, unrealizedPnl: "-0.9807" });
-    expect(portfolio.positions[0]).toMatchObject({ symbol: "CRCLUSDT", positionSide: "LONG", quantity: "32.69", entryPrice: "91.7", markPrice: "91.82", marginAllocated: "998.78", leverage: "3", notional: "2996.3654", unrealizedPnl: "-0.9807", unrealizedPnlPct: "-0.0009", liquidationPrice: "44.2" });
+    expect(portfolio.positions[0]).toMatchObject({ symbol: "CRCLUSDT", positionSide: "LONG", quantity: "32.69", entryPrice: "91.7", markPrice: "91.82", marginAllocated: "998.78", leverage: "3", notional: "2996.3654", unrealizedPnl: "-0.9807", unrealizedPnlPct: "-0.09", liquidationPrice: "44.2" });
+  });
+
+  it("normalizes negative provider ROI ratios to percentage points", () => {
+    expect(normalizeProviderProfitRate("-0.0006598963645957")).toBe("-0.06598963645957");
+  });
+
+  it("normalizes positive, zero, and missing provider ROI ratios", () => {
+    expect(normalizeProviderProfitRate("0.012345")).toBe("1.2345");
+    expect(normalizeProviderProfitRate("0")).toBe("0");
+    expect(normalizeProviderProfitRate(undefined)).toBeUndefined();
   });
 
   it("fails closed when the account response has no equity field", () => {

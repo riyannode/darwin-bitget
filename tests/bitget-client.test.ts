@@ -31,7 +31,7 @@ describe("Bitget read diagnostics", () => {
     });
     try {
       const portfolio = await new BitgetClient(loadConfig({ TRADING_MODE: "PAPER", PAPER_ONLY: "true", AGENT_MODE: "AUTONOMOUS", BITGET_API_KEY: "fixture-key", BITGET_SECRET_KEY: "fixture-secret", BITGET_PASSPHRASE: "fixture-passphrase" })).getDashboardPortfolio();
-      expect(portfolio.positions[0]).toMatchObject({ symbol: "CRCLUSDT", markPrice: "91.82", unrealizedPnl: "3.9252", unrealizedPnlPct: "0.0039" });
+      expect(portfolio.positions[0]).toMatchObject({ symbol: "CRCLUSDT", markPrice: "91.82", unrealizedPnl: "3.9252", unrealizedPnlPct: "0.39" });
       expect(portfolio.openOrders).toBe(1);
       expect(sdk.mock.calls.map(([operation]) => operation)).toEqual(["getAccountAssets", "getPositionInfo", "getOpenOrders"]);
     } finally { sdk.mockRestore(); }

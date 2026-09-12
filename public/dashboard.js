@@ -1,8 +1,10 @@
 const $ = (id) => document.getElementById(id);
 const text = (value, fallback = "—") => value === undefined || value === null || value === "" ? fallback : String(value);
 const money = (value) => value === undefined || value === null || value === "" ? "—" : `$${value}`;
+const signedMoney = (value) => { if (value === undefined || value === null || value === "") return "—"; const raw = String(value); return raw.startsWith("-") ? `-$${raw.slice(1)}` : raw.startsWith("+") ? `+$${raw.slice(1)}` : `$${raw}`; };
+const percent = (value) => { if (value === undefined || value === null || value === "") return "—"; const numeric = Number(value); return Number.isFinite(numeric) ? `${numeric.toFixed(4)}%` : "—"; };
 const pnlClass = (value) => { const numeric = Number(String(value).replace(/[$%]/g, "")); return numeric > 0 ? "pnl-positive" : numeric < 0 ? "pnl-negative" : ""; };
-const when = (value) => value ? new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
+const when = (value) => { if (!value) return "—"; const raw = String(value); const date = /^\d{11,}$/.test(raw) ? new Date(Number(raw)) : new Date(raw); return Number.isNaN(date.getTime()) ? raw : date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); };
 const list = (values) => Array.isArray(values) && values.length ? values.join(" · ") : "—";
 let snapshot = null;
 let tradeFilter = "ALL";
@@ -48,10 +50,48 @@ function renderCalendar() {
 function renderPortfolio() {
   const portfolio = snapshot.portfolio;
   const freshness = snapshot.portfolioFreshness; const freshnessNode = $("portfolio-freshness"); freshnessNode.textContent = freshness ? `${freshness.source}${freshness.stale ? " · STALE" : ""} · ${when(freshness.observedAt)}` : "—"; freshnessNode.style.color = freshness?.stale ? "var(--warning)" : "var(--accent)";
-  const node = $("portfolio"); node.replaceChildren(); [["ACCOUNT EQUITY", money(portfolio?.portfolioEquity)], ["AVAILABLE MARGIN", money(portfolio?.availableMargin)], ["MARGIN USED", money(portfolio?.marginUsage)], ["UNREALIZED PNL", money(portfolio?.unrealizedPnl)], ["REALIZED PNL", money(portfolio?.realizedPnl)], ["OPEN POSITIONS", portfolio?.positions?.length ?? 0]].forEach(([label, value]) => { const item = document.createElement("div"); const title = document.createElement("span"); title.className = "label"; title.textContent = label; const content = document.createElement("strong"); content.textContent = text(value); if (label.includes("PNL")) content.className = pnlClass(value); item.append(title, content); node.append(item); });
-  const positions = $("positions"); positions.replaceChildren(); positions.className = portfolio?.positions?.length ? "positions-list" : "positions-list empty";
-  if (!portfolio?.positions?.length) { positions.textContent = "No position readback yet."; return; }
-  portfolio.positions.forEach((position) => { const row = document.createElement("div"); row.className = "position-row"; [["SYMBOL / SIDE", `${position.symbol} / ${position.positionSide}`], ["ENTRY", money(position.entryPrice)], ["MARK", money(position.markPrice)], ["QTY", position.quantity], ["MARGIN", money(position.marginAllocated)], ["LEVERAGE", `${position.leverage}x`], ["NOTIONAL", money(position.notional)], ["UNREALIZED PNL", money(position.unrealizedPnl)], ["UNREALIZED PNL %", position.unrealizedPnlPct ? `${position.unrealizedPnlPct}%` : "—"]].forEach(([label, value]) => { const item = document.createElement("span"); const title = document.createElement("small"); title.className = "label"; title.textContent = label; const content = document.createElement("strong"); content.textContent = text(value); if (label.startsWith("UNREALIZED")) content.className = pnlClass(value); item.append(title, content); row.append(item); }); positions.append(row); });
+  const node = $("portfolio"); node.replaceChildren(); [["ACCOUNT EQUITY", money(portfolio?.portfolioEquity)], ["AVAILABLE MARGIN", money(portfolio?.availableMargin)], ["MARGIN USED", money(portfolio?.marginUsage)], ["UNREALIZED PNL", signedMoney(portfolio?.unrealizedPnl)], ["REALIZED PNL", signedMoney(portfolio?.realizedPnl)], ["OPEN POSITIONS", portfolio?.positions?.length ?? 0]].forEach(([label, value]) => { const item = document.createElement("div"); const title = document.createElement("span"); title.className = "label"; title.textContent = label; const content = document.createElement("strong"); content.textContent = text(value); if (label.includes("PNL")) content.className = pnlClass(value); item.append(title, content); node.append(item); });
+}
+
+function renderOpenPositions() {
+  const node = $("open-positions");
+  const freshness = snapshot.portfolioFreshness;
+  const freshnessNode = $("open-position-freshness");
+  freshnessNode.textContent = freshness ? `${freshness.source}${freshness.stale ? " · STALE" : ""} · ${when(freshness.observedAt)}` : "—";
+  freshnessNode.style.color = freshness?.stale || freshness?.source !== "PROVIDER_LIVE" ? "var(--warning)" : "var(--accent)";
+  const openKeys = new Set([...node.querySelectorAll("details[data-stable-key]")].filter((item) => item.open).map((item) => item.dataset.stableKey));
+  const positions = freshness?.source === "PROVIDER_LIVE" && !freshness.stale && Array.isArray(snapshot.portfolio?.positions) ? snapshot.portfolio.positions : [];
+  node.replaceChildren();
+  node.className = positions.length ? "position-cards" : "position-cards empty";
+  if (!positions.length) { node.textContent = "No open provider positions."; return; }
+  positions.forEach((position) => {
+    const key = `${position.symbol}:${position.positionSide}`;
+    const card = document.createElement("details");
+    card.className = "position-card";
+    card.dataset.stableKey = key;
+    card.open = openKeys.has(key);
+    const summary = document.createElement("summary");
+    summary.className = "position-summary";
+    const identity = document.createElement("strong");
+    identity.textContent = `${position.symbol} / ${position.positionSide}`;
+    const metrics = document.createElement("span");
+    metrics.className = "position-summary-metrics";
+    const pnl = document.createElement("span");
+    pnl.className = pnlClass(position.unrealizedPnl);
+    pnl.textContent = `Unrealized PnL: ${signedMoney(position.unrealizedPnl)}`;
+    const pnlPct = document.createElement("span");
+    pnlPct.className = pnlClass(position.unrealizedPnlPct);
+    pnlPct.textContent = percent(position.unrealizedPnlPct);
+    const mark = document.createElement("span");
+    mark.textContent = `Mark: ${money(position.markPrice)}`;
+    metrics.append(pnl, pnlPct, mark);
+    summary.append(identity, metrics);
+    const content = document.createElement("div");
+    content.className = "detail-grid position-details";
+    [["SYMBOL", position.symbol], ["SIDE", position.positionSide], ["ENTRY", money(position.entryPrice)], ["MARK", money(position.markPrice)], ["QTY", position.quantity], ["MARGIN", money(position.marginAllocated)], ["LEVERAGE", `${position.leverage}x`], ["NOTIONAL", money(position.notional)], ["UNREALIZED PNL", signedMoney(position.unrealizedPnl)], ["UNREALIZED PNL %", percent(position.unrealizedPnlPct)], ["LIQUIDATION PRICE", money(position.liquidationPrice)], ["OPENED AT", when(position.openedAt)]].forEach(([label, value]) => { const item = detail(label, value); if (label.startsWith("UNREALIZED")) item.querySelector(".value").className = `value ${pnlClass(value)}`; content.append(item); });
+    card.append(summary, content);
+    node.append(card);
+  });
 }
 
 function appendDecisionDetails(node, decision, positionNotional) {
@@ -83,12 +123,15 @@ function renderDecision() {
 function renderDecisionHistory() {
   const node = $("decision-history");
   const decisions = Array.isArray(snapshot.decisions) ? snapshot.decisions.slice(0, 25) : snapshot.latestDecision ? [snapshot.latestDecision] : [];
+  const openKeys = new Set([...node.querySelectorAll("details[data-stable-key]")].filter((item) => item.open).map((item) => item.dataset.stableKey));
   node.replaceChildren();
   node.className = decisions.length ? "decision-history" : "decision-history empty";
   if (!decisions.length) { node.textContent = "No decisions recorded yet."; return; }
   decisions.forEach((decision) => {
     const item = document.createElement("details");
     item.className = "history-item";
+    item.dataset.stableKey = decision.cycleId || decision.decisionId || "RUN_UNKNOWN";
+    item.open = openKeys.has(item.dataset.stableKey);
     const summary = document.createElement("summary");
     summary.append(detail("RUN ID", decision.cycleId || decision.decisionId || "RUN_UNKNOWN"), detail("TIMESTAMP", when(decision.createdAt)), detail("ACTION", decision.action), detail("SYMBOL", decision.symbol));
     const content = document.createElement("div");
@@ -150,9 +193,9 @@ function renderPolicy() {
   const version = document.createElement("span"); version.className = "subtle"; version.textContent = `Last update: ${when(snapshot.lastPolicyUpdate?.createdAt)} · ${snapshot.version} · ${snapshot.commit} · ${snapshot.environment}`; editor.append(version);
 }
 
-function render() { renderAgent(); renderPerformance(); renderCalendar(); renderPortfolio(); renderDecision(); renderDecisionHistory(); renderLearning(); renderRecentTrades(); renderLatestTrade(); renderActivity(); renderTradeTable(); renderLessons(); renderPolicy(); $("error").hidden = true; }
+function render() { renderAgent(); renderPerformance(); renderCalendar(); renderPortfolio(); renderOpenPositions(); renderDecision(); renderDecisionHistory(); renderLearning(); renderRecentTrades(); renderLatestTrade(); renderActivity(); renderTradeTable(); renderLessons(); renderPolicy(); $("error").hidden = true; }
 
-function selectPage(page) { document.querySelectorAll(".page").forEach((item) => { item.hidden = item.id !== `page-${page}`; }); document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.page === page)); const labels = { dashboard: "Dashboard", journal: "Agent Journal", "trade-history": "Trade History", "learning-page": "Learning", "policy-page": "Policy" }; $("page-title").textContent = labels[page] ?? "Dashboard"; }
+function selectPage(page) { document.querySelectorAll(".page").forEach((item) => { item.hidden = item.id !== `page-${page}`; }); document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.page === page)); const labels = { dashboard: "Dashboard", journal: "Agent Journal", "trade-history": "Trade History", "open-position": "Open Position", "learning-page": "Learning", "policy-page": "Policy" }; $("page-title").textContent = labels[page] ?? "Dashboard"; }
 
 async function refresh() { try { const response = await fetch("/api/snapshot", { cache: "no-store" }); if (!response.ok) throw new Error(`HTTP_${response.status}`); snapshot = await response.json(); render(); } catch (error) { const banner = $("error"); banner.textContent = error instanceof Error ? error.message : "SNAPSHOT_FAILED"; banner.hidden = false; } }
 function authHeaders() { return ownerToken ? { "authorization": `Bearer ${ownerToken}` } : {}; }

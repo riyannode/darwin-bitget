@@ -176,6 +176,7 @@ function providerRows(value: unknown): Record<string, unknown>[] {
 function parseDashboardPosition(entry: Record<string, unknown>): PositionSnapshot {
   const quantity = firstText(entry, ["total", "available", "quantity", "size"]);
   const markPrice = firstText(entry, ["markPrice", "markPx", "marketPrice", "currentPrice", "lastPrice"]);
+  const unrealizedPnlPct = parseProviderProfitRate(entry);
   const position: PositionSnapshot = {
     symbol: text(entry.symbol),
     positionSide: parsePositionSide(firstText(entry, ["posSide", "positionSide", "holdSide"], "LONG")),
@@ -187,11 +188,23 @@ function parseDashboardPosition(entry: Record<string, unknown>): PositionSnapsho
     unrealizedPnl: firstText(entry, ["unrealisedPnl", "unrealizedPnl", "unrealizedPL", "upl", "unrealizedProfit"]),
     realizedPnl: firstText(entry, ["curRealisedPnl", "realizedPnl", "realizedPL", "achievedProfits"]),
     ...(markPrice ? { markPrice } : {}),
-    ...(firstText(entry, ["unrealizedPnlPct", "unrealizedPnlPercent", "unrealizedPLRatio", "unrealizedPLR", "uplRatio", "profitRate"]) ? { unrealizedPnlPct: firstText(entry, ["unrealizedPnlPct", "unrealizedPnlPercent", "unrealizedPLRatio", "unrealizedPLR", "uplRatio", "profitRate"]) } : {}),
     ...(firstText(entry, ["ctime", "cTime", "createdTime", "openTime"]) ? { openedAt: firstText(entry, ["ctime", "cTime", "createdTime", "openTime"]) } : {}),
     ...(firstText(entry, ["liquidationPrice", "liqPrice"]) ? { liquidationPrice: firstText(entry, ["liquidationPrice", "liqPrice"]) } : {}),
   };
+  if (unrealizedPnlPct !== undefined) position.unrealizedPnlPct = unrealizedPnlPct;
   return position;
+}
+
+export function normalizeProviderProfitRate(value: string | undefined): string | undefined {
+  if (value === undefined || value === "") return undefined;
+  // Bitget UTA profitRate is decimal ROI; the dashboard stores percentage points.
+  return multiplySignedDecimal(value, "100");
+}
+
+function parseProviderProfitRate(entry: Record<string, unknown>): string | undefined {
+  const percentage = firstText(entry, ["unrealizedPnlPct", "unrealizedPnlPercent"]);
+  if (percentage) return percentage;
+  return normalizeProviderProfitRate(firstText(entry, ["unrealizedPLRatio", "unrealizedPLR", "uplRatio", "profitRate"]) || undefined);
 }
 
 function firstText(entry: Record<string, unknown>, keys: string[], fallback = ""): string {
@@ -300,6 +313,12 @@ function multiplyDecimal(left: string, right: string): string {
   const scale = leftParts.scale + rightParts.scale;
   const value = leftParts.integer * rightParts.integer;
   return decimalText(value, scale);
+}
+
+function multiplySignedDecimal(left: string, right: string): string {
+  const leftParts = signedDecimalParts(left);
+  const rightParts = signedDecimalParts(right);
+  return signedDecimalText(leftParts.integer * rightParts.integer, leftParts.scale + rightParts.scale);
 }
 
 function addDecimal(left: string, right: string): string {
