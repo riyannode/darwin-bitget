@@ -53,6 +53,7 @@ interface AgentState {
   cycleStartedAt: string | null;
   temporaryScanIntervalExpiresAt: string | null;
   temporaryScanIntervalCompleted: boolean;
+  temporaryScanIntervalDurationMs: number;
 }
 
 const STALE_CYCLE_TIMEOUT_MS = 120_000;
@@ -100,6 +101,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     cycleStartedAt: null,
     temporaryScanIntervalExpiresAt: null,
     temporaryScanIntervalCompleted: false,
+    temporaryScanIntervalDurationMs: TEMPORARY_SCAN_INTERVAL_DURATION_MS,
   };
 
   public override async onStart(): Promise<void> {
@@ -199,6 +201,12 @@ export class TraderAgent extends Agent<Env, AgentState> {
 
   private ensureTemporaryScanTest(): void {
     const expiresAt = this.state.temporaryScanIntervalExpiresAt;
+    if (this.state.temporaryScanIntervalDurationMs !== TEMPORARY_SCAN_INTERVAL_DURATION_MS) {
+      const nextExpiresAt = new Date(Date.now() + TEMPORARY_SCAN_INTERVAL_DURATION_MS).toISOString();
+      this.setState({ ...this.state, temporaryScanIntervalExpiresAt: nextExpiresAt, temporaryScanIntervalCompleted: false, temporaryScanIntervalDurationMs: TEMPORARY_SCAN_INTERVAL_DURATION_MS });
+      this.recordEvent("TEMPORARY_SCAN_INTERVAL_ACTIVATED", "CONTROL", { intervalMinutes: String(TEMPORARY_SCAN_INTERVAL_MINUTES), durationHours: "5", expiresAt: nextExpiresAt });
+      return;
+    }
     if (this.state.temporaryScanIntervalCompleted) return;
     if (expiresAt) {
       if (new Date(expiresAt).getTime() > Date.now()) return;
@@ -207,8 +215,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
       return;
     }
     const nextExpiresAt = new Date(Date.now() + TEMPORARY_SCAN_INTERVAL_DURATION_MS).toISOString();
-    this.setState({ ...this.state, temporaryScanIntervalExpiresAt: nextExpiresAt, temporaryScanIntervalCompleted: false });
-    this.recordEvent("TEMPORARY_SCAN_INTERVAL_ACTIVATED", "CONTROL", { intervalMinutes: String(TEMPORARY_SCAN_INTERVAL_MINUTES), expiresAt: nextExpiresAt });
+    this.setState({ ...this.state, temporaryScanIntervalExpiresAt: nextExpiresAt, temporaryScanIntervalCompleted: false, temporaryScanIntervalDurationMs: TEMPORARY_SCAN_INTERVAL_DURATION_MS });
+    this.recordEvent("TEMPORARY_SCAN_INTERVAL_ACTIVATED", "CONTROL", { intervalMinutes: String(TEMPORARY_SCAN_INTERVAL_MINUTES), durationHours: "5", expiresAt: nextExpiresAt });
   }
 
   private activeScanIntervalMinutes(policy: OwnerPolicy): number {

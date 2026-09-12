@@ -11,6 +11,8 @@ export function buildOpenOrdersReadParams(category: string): Record<string, stri
   return { category };
 }
 
+export type BitgetHoldingMode = "hedge_mode" | "one_way_mode";
+
 export interface ProviderErrorDetails {
   code?: string;
   message?: string;
@@ -26,6 +28,33 @@ function textValue(value: unknown): string {
 
 function sanitizeProviderMessage(value: string): string {
   return value.replace(/(ACCESS-(?:KEY|SIGN|PASSPHRASE|TIMESTAMP)|apiKey|secretKey|passphrase)([=:])[^,\s]+/gi, "$1$2REDACTED").slice(0, 240);
+}
+
+function parseHoldingMode(value: unknown): BitgetHoldingMode {
+  const response = record(value);
+  const mode = textValue(response.holdMode);
+  if (mode === "hedge_mode" || mode === "one_way_mode") return mode;
+  throw new Error("POSITION_MODE_UNKNOWN");
+}
+
+export function buildPaperOrderParams(request: ExecutionRequest, holdingMode: BitgetHoldingMode, category: string): Record<string, string> {
+  const params: Record<string, string> = {
+    category,
+    symbol: request.symbol,
+    side: request.providerSide,
+    orderType: "market",
+    qty: request.quantity,
+    clientOid: request.clientOrderId,
+  };
+  if (holdingMode === "hedge_mode") params.posSide = request.positionSide.toLowerCase();
+  if (holdingMode === "one_way_mode" && request.tradeSide === "close") params.reduceOnly = "yes";
+  return params;
+}
+
+export function normalizeBitgetOrderStatus(value: unknown): ExecutionResult["status"] {
+  const status = typeof value === "string" ? value.toLowerCase() : "";
+  if (["new", "partially_filled", "filled", "canceled", "cancelled", "rejected"].includes(status)) return status as ExecutionResult["status"];
+  return "unknown";
 }
 
 export function extractProviderError(error: unknown): ProviderErrorDetails {
@@ -176,6 +205,8 @@ export class BitgetClient {
   public async placePaperOrder(request: ExecutionRequest): Promise<ExecutionResult> {
     const submittedAt = new Date().toISOString();
     try {
+      const accountInfo = await this.client.callOperation<unknown>("getAccountInfo", {});
+      const holdingMode = parseHoldingMode(accountInfo.data);
       if (request.tradeSide === "open") {
         await this.client.callOperation<unknown>("setLeverage", {
           category: this.category,
@@ -184,16 +215,7 @@ export class BitgetClient {
           posSide: request.positionSide.toLowerCase(),
         });
       }
-      const result = await this.client.callOperation<unknown>("placeOrder", {
-        category: this.category,
-        symbol: request.symbol,
-        side: request.providerSide,
-        orderType: "market",
-        qty: request.quantity,
-        posSide: request.positionSide.toLowerCase(),
-        reduceOnly: request.tradeSide === "close" ? "yes" : "no",
-        clientOid: request.clientOrderId,
-      });
+      const result = await this.client.callOperation<unknown>("placeOrder", buildPaperOrderParams(request, holdingMode, this.category));
       const response = record(result.data);
       return this.readOrder(request, {
         providerOrderId: this.text(response.orderId),
@@ -243,8 +265,8 @@ export class BitgetClient {
       leverage: request.leverage,
       positionNotional: request.positionNotional,
       requestedQuantity: request.quantity,
-      executedQuantity: this.text(response.baseVolume ?? response.filledQty ?? response.fillQty, "0"),
-      status: this.normalizeStatus(response.status ?? response.state),
+      executedQuantity: this.text(response.cumExecQty ?? response.baseVolume ?? response.filledQty ?? response.fillQty, "0"),
+      status: normalizeBitgetOrderStatus(response.orderStatus ?? response.status ?? response.state),
       submittedAt: reference.submittedAt,
       readBackAt: new Date().toISOString(),
       ...(this.text(response.avgPrice, this.text(response.priceAvg, this.text(response.fillPrice))) ? { averageFillPrice: this.text(response.avgPrice, this.text(response.priceAvg, this.text(response.fillPrice))) } : {}),
@@ -289,12 +311,6 @@ export class BitgetClient {
     const providerCode = this.text(response.code);
     const providerMessage = this.text(response.msg);
     return { ...enriched, ...(providerCode ? { providerCode } : {}), ...(providerMessage ? { providerMessage } : {}), ...(readbackFailure && !enriched.realizedPnl ? { providerMessage: "REALIZED_PNL_READBACK_UNAVAILABLE" } : {}) };
-  }
-
-  private normalizeStatus(value: unknown): ExecutionResult["status"] {
-    const status = this.text(value).toLowerCase();
-    if (["new", "partially_filled", "filled", "canceled", "cancelled", "rejected"].includes(status)) return status as ExecutionResult["status"];
-    return "unknown";
   }
 
   private text(value: unknown, fallback = ""): string {

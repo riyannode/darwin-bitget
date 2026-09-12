@@ -30,11 +30,12 @@ describe("cycle scheduler", () => {
     expect(cancelled).toEqual(["old-cycle"]);
   });
 
-  it("keeps the temporary interval active for exactly two hours", () => {
+  it("keeps the temporary interval active for exactly five hours", () => {
     const activatedAt = Date.parse("2026-09-12T00:00:00.000Z");
     const expiresAt = new Date(activatedAt + TEMPORARY_SCAN_INTERVAL_DURATION_MS).toISOString();
 
     expect(TEMPORARY_SCAN_INTERVAL_MINUTES).toBe(3);
+    expect(TEMPORARY_SCAN_INTERVAL_DURATION_MS).toBe(5 * 60 * 60 * 1000);
     expect(temporaryScanIntervalActive(expiresAt, false, activatedAt + TEMPORARY_SCAN_INTERVAL_DURATION_MS - 1)).toBe(true);
     expect(temporaryScanIntervalActive(expiresAt, false, activatedAt + TEMPORARY_SCAN_INTERVAL_DURATION_MS)).toBe(false);
     expect(temporaryScanIntervalActive(expiresAt, true, activatedAt)).toBe(false);

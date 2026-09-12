@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { BitgetApiError } from "@bitget-ai/bitget-agent-sdk";
-import { buildOpenOrdersReadParams, buildUnresolvedExecution, extractProviderError, formatBitgetReadFailure } from "../src/bitget/client.js";
+import { buildOpenOrdersReadParams, buildPaperOrderParams, buildUnresolvedExecution, extractProviderError, formatBitgetReadFailure, normalizeBitgetOrderStatus } from "../src/bitget/client.js";
 import type { ExecutionRequest } from "../src/types.js";
 
 const request: ExecutionRequest = {
@@ -20,6 +20,21 @@ const request: ExecutionRequest = {
 };
 
 describe("Bitget read diagnostics", () => {
+  it("normalizes provider order status", () => {
+    expect(normalizeBitgetOrderStatus("filled")).toBe("filled");
+    expect(normalizeBitgetOrderStatus("unknown-status")).toBe("unknown");
+  });
+
+  it("uses hedge-mode position side without reduce-only on close", () => {
+    const closeRequest = { ...request, action: "CLOSE" as const, positionSide: "LONG" as const, providerSide: "sell" as const, tradeSide: "close" as const };
+    expect(buildPaperOrderParams(closeRequest, "hedge_mode", "USDT-FUTURES")).toEqual({ category: "USDT-FUTURES", symbol: "SOXLUSDT", side: "sell", orderType: "market", qty: "2.4", clientOid: "paper-cycle1-decision1", posSide: "long" });
+  });
+
+  it("uses reduce-only without position side in one-way mode", () => {
+    const closeRequest = { ...request, action: "CLOSE" as const, positionSide: "LONG" as const, providerSide: "sell" as const, tradeSide: "close" as const };
+    expect(buildPaperOrderParams(closeRequest, "one_way_mode", "USDT-FUTURES")).toEqual({ category: "USDT-FUTURES", symbol: "SOXLUSDT", side: "sell", orderType: "market", qty: "2.4", clientOid: "paper-cycle1-decision1", reduceOnly: "yes" });
+  });
+
   it("identifies the failed operation and symbol without provider payloads", () => {
     expect(formatBitgetReadFailure("getOpenOrders", "KORUUSDT")).toBe("BITGET_READ_FAILED_getOpenOrders_KORUUSDT");
     expect(formatBitgetReadFailure("getAccountAssets")).toBe("BITGET_READ_FAILED_getAccountAssets_ACCOUNT");
