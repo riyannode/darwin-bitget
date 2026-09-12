@@ -37,6 +37,13 @@ interface EventRow {
   created_at: string;
 }
 
+export interface StoredCycle {
+  cycleId: string;
+  status: string;
+  startedAt: string;
+  completedAt: string | null;
+}
+
 export function saveCycle(
   executor: SqlExecutor,
   cycleId: string,
@@ -142,6 +149,17 @@ export function loadExperiences(executor: SqlExecutor): TradeExperience[] {
   });
 }
 
+export function loadAllExperiences(executor: SqlExecutor): TradeExperience[] {
+  const rows = executor.sql<ExperienceRow>`SELECT payload FROM experiences ORDER BY created_at ASC, experience_id ASC`;
+  return rows.flatMap((row) => {
+    try {
+      return [parseExperience(JSON.parse(row.payload))];
+    } catch {
+      return [];
+    }
+  });
+}
+
 export function saveExperience(executor: SqlExecutor, experience: TradeExperience, createdAt: string): void {
   executor.sql`
     INSERT INTO experiences (experience_id, symbol, outcome_status, payload, created_at)
@@ -211,6 +229,35 @@ export function loadRecentJournals(executor: SqlExecutor, limit = 50): TradingJo
   });
 }
 
+export function loadAllAutonomousJournals(executor: SqlExecutor, from?: string, to?: string): TradingJournal[] {
+  const rows = from && to
+    ? executor.sql<JournalRow>`SELECT payload FROM journals WHERE created_at >= ${from} AND created_at <= ${to} ORDER BY created_at ASC, cycle_id ASC`
+    : from
+      ? executor.sql<JournalRow>`SELECT payload FROM journals WHERE created_at >= ${from} ORDER BY created_at ASC, cycle_id ASC`
+      : to
+        ? executor.sql<JournalRow>`SELECT payload FROM journals WHERE created_at <= ${to} ORDER BY created_at ASC, cycle_id ASC`
+        : executor.sql<JournalRow>`SELECT payload FROM journals ORDER BY created_at ASC, cycle_id ASC`;
+  return rows.flatMap((row) => {
+    try {
+      const journal = JSON.parse(row.payload) as TradingJournal;
+      return journal.mode === "AUTONOMOUS" ? [journal] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+export function loadAllStoredCycles(executor: SqlExecutor, from?: string, to?: string): StoredCycle[] {
+  const rows = from && to
+    ? executor.sql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at >= ${from} AND started_at <= ${to} ORDER BY started_at ASC, cycle_id ASC`
+    : from
+      ? executor.sql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at >= ${from} ORDER BY started_at ASC, cycle_id ASC`
+      : to
+        ? executor.sql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at <= ${to} ORDER BY started_at ASC, cycle_id ASC`
+        : executor.sql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>`SELECT cycle_id, status, started_at, completed_at FROM cycles ORDER BY started_at ASC, cycle_id ASC`;
+  return rows.map((row) => ({ cycleId: row.cycle_id, status: row.status, startedAt: row.started_at, completedAt: row.completed_at }));
+}
+
 export function loadLatestBacktest(executor: SqlExecutor): BacktestReplay | null {
   const rows = executor.sql<BacktestRow>`SELECT payload FROM backtests ORDER BY created_at DESC LIMIT 1`;
   if (rows.length === 0) return null;
@@ -230,6 +277,24 @@ export function saveEvent(executor: SqlExecutor, event: ActivityEvent): void {
 
 export function loadRecentEvents(executor: SqlExecutor, limit = 25): ActivityEvent[] {
   const rows = executor.sql<EventRow>`SELECT event_id, event_type, cycle_id, payload, created_at FROM events ORDER BY created_at DESC LIMIT ${limit}`;
+  return rows.flatMap((row) => {
+    try {
+      const event = JSON.parse(row.payload) as ActivityEvent;
+      return [{
+        eventId: event.eventId || row.event_id,
+        type: event.type || row.event_type,
+        cycleId: event.cycleId || row.cycle_id,
+        createdAt: event.createdAt || row.created_at,
+        ...(event.metadata ? { metadata: event.metadata } : {}),
+      }];
+    } catch {
+      return [];
+    }
+  });
+}
+
+export function loadAllEvents(executor: SqlExecutor): ActivityEvent[] {
+  const rows = executor.sql<EventRow>`SELECT event_id, event_type, cycle_id, payload, created_at FROM events ORDER BY created_at ASC, event_id ASC`;
   return rows.flatMap((row) => {
     try {
       const event = JSON.parse(row.payload) as ActivityEvent;

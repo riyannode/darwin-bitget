@@ -1,30 +1,35 @@
 # Verification
 
-Verified locally:
+Verified state:
 
-- strict TypeScript typecheck;
-- scenario-based futures risk, reconciliation, margin/leverage execution conversion, learning, and drawdown tests;
-- Wrangler dry-run bundle, static assets, and Durable Object binding generation;
-- credentialed PAPER lifecycle harness opt-in behavior without credentials.
-- deployed Worker and Vercel root/API probes returning HTTP 200;
-- deployed title `Darwin`, PAPER mode, version `0.2.0`, commit marker `03142a1`, and production environment readback;
-- unauthenticated policy mutation failing closed with `OWNER_AUTH_NOT_CONFIGURED`;
-- authenticated owner policy mutation changing the deployed scan interval from 15 to 5 minutes and restoring it to 15 minutes, with persisted `POLICY_UPDATED` audit fields and a rescheduled `nextScan`;
-- generated `OWNER_CONTROL_TOKEN` stored in the Windows user environment and uploaded as the Cloudflare Worker secret without exposing its value.
-- deployed Qwen configuration using the Bitget AI handbook proxy base URL and `qwen3.8-max`.
-- provider fill/history parsers for exact realized PnL, fees, funding, and weighted fill price fallback;
-- position-side parsing for provider short positions and lifecycle discrepancy events.
+- strict TypeScript typecheck and scenario-based test suite pass locally;
+- Wrangler dry-run bundle, static assets, and Durable Object binding generation pass;
+- authenticated Qwen calls work through the configured Bitget AI proxy with `qwen3.8-max`;
+- credentialed Bitget Demo/PAPER execution works through the official SDK path;
+- manual `NVDAUSDT` execution-path harness verified `OPEN_LONG` → provider readback → `CLOSE` → reconciliation `MATCHED`;
+- the manual lifecycle harness reported realized PnL `-0.0456`, final positions `0`, and final open orders `0`;
+- hedge-mode close sends `posSide` without `reduceOnly`;
+- one-way-mode close sends `reduceOnly`;
+- provider parsing supports `orderStatus` and `cumExecQty`;
+- the frontend contains Dashboard, Agent Journal, Trade History, Learning, and Policy pages;
+- autonomous PAPER history is persisted in Durable Object SQLite and the submission export reads it without the dashboard's latest-25 display limit;
+- the export is read-only, includes HOLD cycles, and excludes the manual lifecycle harness because that harness does not write autonomous Worker journals;
+- policy/control mutations remain owner-authenticated and PAPER-only.
 
-The dashboard is served from `public/` and uses the Durable Object snapshot/control endpoints. The visual implementation follows the supplied dark trading-journal reference with Dashboard, Trade Log, Learning, and read-only Policy pages.
+The manual `NVDAUSDT` lifecycle harness is execution-path verification only. It is not autonomous trading history and must not be presented as an autonomous Worker cycle in a submission log.
+
+The dashboard displays only bounded recent history for readability. The full autonomous log is available through:
+
+```text
+GET /api/export/paper-log?format=json
+GET /api/export/paper-log?format=csv
+```
+
+Both endpoints accept optional `from` and `to` ISO timestamps and never return credentials, auth headers, passphrases, or model chain-of-thought.
 
 Not verified:
 
-- authenticated Qwen calls;
-- authenticated Bitget Demo/PAPER order submission;
-- EVA connectivity.
+- EVA connectivity;
+- a two-week competition-period PAPER log, which requires continued autonomous runtime collection.
 
-The local PAPER lifecycle harness is armed for `NVDAUSDT`, but currently stops before any write with `BITGET_API_KEY_REQUIRED` because Bitget credentials are not present in the Windows user environment. The latest deployed autonomous cycle reaches `MARKET_SCAN` and then reports `Incorrect API key provided` from the Qwen proxy. No order was attempted by the harness.
-
-No credentials are embedded in the dashboard.
-
-The public Bitget instrument catalog is read-only evidence only. It does not prove that a credentialed Demo/PAPER order will be accepted.
+The public Bitget instrument catalog is read-only evidence. It does not prove that a future credentialed Demo/PAPER order will be accepted.

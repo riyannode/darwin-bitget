@@ -3,7 +3,7 @@ import type { DashboardSnapshot, Decision, DecisionExecutionRecord, Env, Evidenc
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
-import { decide, rankMarketCandidates, selectCandidates } from "./decision.js";
+import { boundExitDecisions, decide, rankMarketCandidates, selectCandidates } from "./decision.js";
 import { scheduleTradingCycle, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES } from "./scheduler.js";
 import { authorizeOwner } from "./owner-auth.js";
 import { retrieveLessons } from "../learning/lesson-retrieval.js";
@@ -13,6 +13,10 @@ import { ensureStorage } from "../storage/schema.js";
 import {
   loadLatestBacktest,
   loadLatestJournal,
+  loadAllAutonomousJournals,
+  loadAllEvents,
+  loadAllExperiences,
+  loadAllStoredCycles,
   loadRecentJournals,
   loadRecentEvents,
   loadRecentLessons,
@@ -32,6 +36,7 @@ import {
   saveJournal,
   saveLesson,
 } from "../storage/store.js";
+import { buildPaperLogExport, parsePaperLogPeriod, paperLogToCsv } from "../storage/paper-log.js";
 import { evaluateRiskGate } from "../trading/risk-gate.js";
 import { evaluateDrawdown } from "../trading/drawdown.js";
 import { loadOwnerPolicy, updateOwnerPolicy } from "../trading/policy.js";
@@ -117,6 +122,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   public override async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/snapshot" && request.method === "GET") return json(await this.getDashboardSnapshot());
+    if (url.pathname === "/export/paper-log" && request.method === "GET") return this.exportPaperLog(url);
     if ((url.pathname === "/control" || url.pathname === "/policy") && request.method === "POST") {
       const auth = authorizeOwner(request, this.env);
       if (!auth.authorized) return json({ error: auth.code }, auth.status);
@@ -197,6 +203,33 @@ export class TraderAgent extends Agent<Env, AgentState> {
 
   public async getStatus(): Promise<AgentState> {
     return this.state;
+  }
+
+  private exportPaperLog(url: URL): Response {
+    try {
+      if (this.env.TRADING_MODE !== "PAPER" || this.env.PAPER_ONLY !== "true") return json({ error: "PAPER_ONLY" }, 503);
+      const format = url.searchParams.get("format") ?? "json";
+      if (format !== "json" && format !== "csv") return json({ error: "INVALID_EXPORT_FORMAT" }, 400);
+      const period = parsePaperLogPeriod(url.searchParams.get("from"), url.searchParams.get("to"));
+      ensureStorage(this);
+      const journals = loadAllAutonomousJournals(this, period.start ?? undefined, period.end ?? undefined);
+      const exported = buildPaperLogExport({
+        generatedAt: new Date().toISOString(),
+        period,
+        environment: this.env.ENVIRONMENT?.trim() || "unknown",
+        model: this.state.model || this.env.QWEN_MODEL?.trim() || "unknown",
+        version: this.env.APP_VERSION?.trim() || "unknown",
+        commit: this.env.GIT_COMMIT_SHA?.trim() || "unknown",
+        cycles: loadAllStoredCycles(this, period.start ?? undefined, period.end ?? undefined),
+        journals,
+        experiences: loadAllExperiences(this),
+        events: loadAllEvents(this),
+      });
+      if (format === "csv") return new Response(paperLogToCsv(exported), { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": "attachment; filename=darwin-paper-log.csv", "cache-control": "no-store" } });
+      return new Response(JSON.stringify(exported), { headers: { "content-type": "application/json; charset=utf-8", "content-disposition": "attachment; filename=darwin-paper-log.json", "cache-control": "no-store" } });
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "PAPER_LOG_EXPORT_FAILED" : "PAPER_LOG_EXPORT_FAILED" }, 400);
+    }
   }
 
   private ensureTemporaryScanTest(): void {
@@ -378,7 +411,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const decision = decisionSet.decision;
       if (decisionSet.ignoredLessonIds.length) this.recordEvent("LESSON_REFERENCE_IGNORED", cycleId, { count: String(decisionSet.ignoredLessonIds.length), ids: decisionSet.ignoredLessonIds.slice(0, 8).join(",") });
       const legacyExit = decision.action === "REDUCE" || decision.action === "CLOSE" ? [decision] : [];
-      const exitDecisions = [...legacyExit, ...decisionSet.exitDecisions.filter((exitDecision) => !legacyExit.some((legacy) => legacy.symbol === exitDecision.symbol && legacy.positionSide === exitDecision.positionSide))];
+      const proposedExits = [...legacyExit, ...decisionSet.exitDecisions.filter((exitDecision) => !legacyExit.some((legacy) => legacy.symbol === exitDecision.symbol && legacy.positionSide === exitDecision.positionSide))];
+      const exitDecisions = boundExitDecisions(proposedExits, openPositions);
+      for (const exitDecision of proposedExits.filter((candidate) => !exitDecisions.some((accepted) => accepted.decisionId === candidate.decisionId))) {
+        this.recordEvent("EXIT_SKIPPED", cycleId, { code: "POSITION_NOT_OPEN", symbol: exitDecision.symbol, positionSide: exitDecision.positionSide ?? "UNKNOWN" });
+      }
       const bundle = bundles.find((candidate) => candidate.instrument.symbol === decision.symbol) ?? bundles[0];
       if (!bundle) throw new Error("NO_EVIDENCE");
       this.setState({ ...this.state, runtimeStatus: "RISK_CHECK", currentStage: "RISK_CHECK" });
@@ -388,6 +425,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
       journal.retrievedLessons = lessons.map((lesson) => lesson.lessonId);
       journal.decision = decision;
       journal.exitDecisions = exitDecisions;
+      if ((decision.action === "REDUCE" || decision.action === "CLOSE") && !exitDecisions.some((exitDecision) => exitDecision.decisionId === decision.decisionId)) {
+        journal.riskGateResult = { status: "BLOCK", codes: ["INSUFFICIENT_POSITION"], checkedAt: new Date().toISOString() };
+        this.recordEvent("DECISION_CREATED", cycleId, { action: decision.action, symbol: decision.symbol, decisionType: "EXIT" });
+        this.recordEvent("RISK_GATE_BLOCK", cycleId, { codes: "INSUFFICIENT_POSITION", decisionType: "EXIT", symbol: decision.symbol });
+      }
       const exitRecords: DecisionExecutionRecord[] = [];
       let exitWriteBlocked = false;
       for (const exitDecision of exitDecisions) {

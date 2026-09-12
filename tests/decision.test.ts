@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { autonomousDecisionSetSchema, buildDecisionPrompt, normalizeLessonReferences, rankMarketCandidates } from "../src/agent/decision.js";
-import type { AccountSnapshot, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot } from "../src/types.js";
+import { autonomousDecisionSetSchema, boundExitDecisions, buildDecisionPrompt, normalizeLessonReferences, rankMarketCandidates } from "../src/agent/decision.js";
+import type { AccountSnapshot, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot, PositionSnapshot } from "../src/types.js";
 
 function snapshot(symbol: string, change: string, volume: string): MarketSnapshot {
   return { symbol, lastPrice: "100", bidPrice: "99.9", askPrice: "100.1", priceChange24h: change, volume24h: volume, observedAt: "2026-09-12T00:00:00.000Z" };
@@ -51,7 +51,35 @@ describe("market candidate pre-ranking", () => {
     expect(() => autonomousDecisionSetSchema.parse({ ...longExit, action: "HOLD", positionSide: null, marginAllocationPct: "0", reductionPct: null, exitDecisions: [{ ...longExit, action: "OPEN_LONG" }] })).toThrow();
   });
 
+  it("does not cap the decision-set exit array", () => {
+    const exitDecisions = Array.from({ length: 30 }, (_, index) => ({
+      action: "CLOSE" as const,
+      positionSide: index % 2 === 0 ? "LONG" as const : "SHORT" as const,
+      symbol: `STOCK${index}USDT`,
+      marginAllocationPct: "0",
+      leverage: "1",
+      reductionPct: null,
+      confidence: 0.7,
+      thesis: "thesis",
+      strategyThesis: "strategy",
+      supportingFactors: ["factor"],
+      riskFactors: ["risk"],
+      evidenceUsed: ["ticker"],
+      lessonsUsed: [],
+    }));
+
+    expect(autonomousDecisionSetSchema.parse({ ...exitDecisions[0], action: "HOLD", positionSide: null, symbol: "STOCK0USDT", marginAllocationPct: "0", exitDecisions })).toMatchObject({ exitDecisions });
+  });
+
   it("keeps known lesson references and reports unknown references", () => {
     expect(normalizeLessonReferences(["known", "unknown", "known"], new Set(["known"]))).toEqual({ accepted: ["known", "known"], ignored: ["unknown"] });
+  });
+
+  it("bounds exits to currently open provider positions", () => {
+    const openPosition: PositionSnapshot = { symbol: "NVDAUSDT", positionSide: "LONG", quantity: "1", notional: "100", marginAllocated: "10", leverage: "1", entryPrice: "100", unrealizedPnl: "0", realizedPnl: "0" };
+    const openExit = { action: "CLOSE" as const, positionSide: "LONG" as const, symbol: "NVDAUSDT", decisionId: "open-exit", cycleId: "cycle-1", marginAllocationPct: "0", leverage: "1", reductionPct: null, confidence: 0.7, thesis: "thesis", strategyThesis: "strategy", supportingFactors: ["factor"], riskFactors: ["risk"], evidenceUsed: ["ticker"], lessonsUsed: [], createdAt: "2026-09-12T00:00:00.000Z" };
+    const closedExit = { ...openExit, decisionId: "closed-exit", symbol: "TSLAUSDT" };
+
+    expect(boundExitDecisions([openExit, closedExit], [openPosition]).map((entry) => entry.decisionId)).toEqual(["open-exit"]);
   });
 });

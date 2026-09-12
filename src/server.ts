@@ -7,10 +7,10 @@ export { TraderAgent };
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/api/snapshot" || url.pathname === "/api/control" || url.pathname === "/api/policy") {
+    if (url.pathname === "/api/snapshot" || url.pathname === "/api/control" || url.pathname === "/api/policy" || url.pathname === "/api/export/paper-log") {
       const id = env.TRADER_AGENT.idFromName("primary");
       const stub = env.TRADER_AGENT.get(id);
-      const path = url.pathname === "/api/snapshot" ? "/snapshot" : url.pathname === "/api/policy" ? "/policy" : "/control";
+      const path = url.pathname === "/api/snapshot" ? "/snapshot" : url.pathname === "/api/policy" ? "/policy" : url.pathname === "/api/export/paper-log" ? "/export/paper-log" : "/control";
       return stub.fetch(new Request(new URL(path, request.url), request));
     }
     if (env.ASSETS) {

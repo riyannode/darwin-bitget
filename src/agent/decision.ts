@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { AutonomousDecisionSet, Decision, DecisionContext, MarketSnapshot, RuntimeConfig } from "../types.js";
+import type { AutonomousDecisionSet, Decision, DecisionContext, MarketSnapshot, PositionSnapshot, RuntimeConfig } from "../types.js";
 import { CANDIDATE_TASK_PROMPT, DECISION_TASK_PROMPT, TRADING_MANDATE } from "./mandate.js";
 import { generateQwenJson } from "./qwen.js";
 
@@ -45,7 +45,7 @@ const qwenExitDecisionSchema = z.object(decisionFields).superRefine((decision, c
 
 export const autonomousDecisionSetSchema = z.object({
   ...decisionFields,
-  exitDecisions: z.array(qwenExitDecisionSchema).max(25).default([]),
+  exitDecisions: z.array(qwenExitDecisionSchema).default([]),
 }).superRefine(validateDecisionSemantics);
 
 export type DecisionInput = z.infer<typeof decisionSchema>;
@@ -159,6 +159,11 @@ export function normalizeLessonReferences(ids: readonly string[], knownLessonIds
     else ignored.push(id);
   }
   return { accepted, ignored };
+}
+
+export function boundExitDecisions(exitDecisions: readonly Decision[], openPositions: readonly PositionSnapshot[]): Decision[] {
+  const openPositionKeys = new Set(openPositions.filter((position) => Number(position.quantity) > 0).map((position) => `${position.symbol}:${position.positionSide}`));
+  return exitDecisions.filter((exitDecision) => openPositionKeys.has(`${exitDecision.symbol}:${exitDecision.positionSide}`));
 }
 
 export async function decide(config: RuntimeConfig, context: DecisionContext, cycleId: string): Promise<AutonomousDecisionSet> {
