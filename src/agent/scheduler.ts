@@ -1,6 +1,6 @@
 export const CYCLE_INTERVAL_SECONDS = 900;
-export const TEMPORARY_SCAN_INTERVAL_MINUTES = 3;
-export const TEMPORARY_SCAN_INTERVAL_DURATION_MS = 5 * 60 * 60 * 1000;
+export const TEMPORARY_SCAN_INTERVAL_MINUTES = 2;
+export const TEMPORARY_SCAN_INTERVAL_DURATION_MS = 2 * 60 * 60 * 1000;
 
 export function temporaryScanIntervalActive(expiresAt: string | null, completed: boolean, now = Date.now()): boolean {
   return !completed && Boolean(expiresAt) && new Date(expiresAt as string).getTime() > now;
