@@ -52,6 +52,18 @@ Demo executable universe → scan → Qwen shortlist → deep evidence
 → readback → reconciliation → journal → learning
 ```
 
+Private authenticated Bitget operations use the following transport:
+
+```text
+Cloudflare Worker → authenticated narrow gateway request → Cloudflare Tunnel
+→ stable-egress gateway → Bitget Demo PAPER API
+```
+
+Public market operations may remain direct. The Worker does not store
+`BITGET_API_KEY`, `BITGET_SECRET_KEY`, or `BITGET_PASSPHRASE`; those credentials
+remain in the stable-egress gateway. The Worker stores only backend-only gateway,
+Qwen, owner-control, and optional EVA secrets.
+
 Qwen owns strategy, thesis, symbol, direction, exits, margin allocation, and leverage. Deterministic code owns PAPER-only mode, hard owner bounds, provider metadata, balance/margin validation, idempotency, readback, reconciliation, and fail-closed ambiguity handling.
 
 ## Agent-quality evidence contract
@@ -73,7 +85,7 @@ Verified outcomes become experiences. Qwen reflection evaluates strategy, eviden
 
 ## Current production status
 
-The judge path is [https://darwin-bitget.vercel.app/](https://darwin-bitget.vercel.app/). It is a PAPER observability surface backed by a Cloudflare Worker/Durable Object and Bitget Demo UTA. Verify current provider state from the live snapshot; this document is not a frozen performance report.
+The judge path is [https://darwin-bitget.vercel.app/](https://darwin-bitget.vercel.app/). It is a PAPER observability surface backed by a Cloudflare Worker/Durable Object and Bitget Demo UTA. The browser reads provider-only `/api/live/portfolio` approximately every 10 seconds, `/api/snapshot` approximately every 60 seconds, and bounded history endpoints lazily when pages open. Verify current provider state from `/api/live/portfolio`; this document is not a frozen performance report.
 
 ## Judge material
 

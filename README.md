@@ -38,7 +38,7 @@ Bitget's US-stock / RWA perpetual market runs continuously, but an autonomous ag
 
 ## Architecture
 
-The Cloudflare Worker hosts the Durable Object agent and API boundary. It reads the dynamic Bitget Demo executable universe, uses public market data as evidence, calls Qwen, and persists the audit path. The Vercel frontend is an observation surface with no manual trading controls.
+The Cloudflare Worker hosts the Durable Object agent and API boundary. It reads the dynamic Bitget Demo executable universe, uses public market data as evidence, calls Qwen, and persists the audit path. The browser reads provider-only `/api/live/portfolio` approximately every 10 seconds, reads Durable Object runtime state from `/api/snapshot` approximately every 60 seconds, and loads bounded history endpoints lazily when pages open. Private authenticated Bitget operations use the stable-egress gateway; public market operations may remain direct. The Vercel frontend is an observation surface with no manual trading controls.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/LIVE.md](docs/LIVE.md), and [docs/DEMO.md](docs/DEMO.md).
 
@@ -73,7 +73,7 @@ The Judge Demo is not a live Bitget session. It exists to make the architecture 
 
 ## Live Production
 
-The live site reads the Worker snapshot, including `PROVIDER_LIVE` portfolio state and current provider unrealized PnL when readback succeeds. The detailed Open Position page is read-only. The dashboard is not a substitute for the full historical export.
+The live site reads provider-only `/api/live/portfolio` for current `PROVIDER_LIVE` portfolio state and current provider unrealized PnL. `/api/snapshot` is the slower Durable Object runtime-state read and is not the live portfolio polling path. If the account or position provider read fails, the UI shows provider state as unavailable and does not show journal portfolio fallback. The detailed Open Position page is read-only. The dashboard is not a substitute for the full historical export.
 
 ## Deploy Your Own
 
@@ -96,7 +96,8 @@ local replay and never submits an order.
 ### B. Forked/self-hosted PAPER production
 
 Requirements: Node.js/npm, a Cloudflare account, Wrangler, a Vercel account,
-Bitget Demo API credentials, and a Qwen API key. Fork the repository or clone
+a stable-egress gateway configured with Bitget Demo API credentials, and a Qwen
+API key. Fork the repository or clone
 your fork; do not use the original production Worker for a self-hosted UI.
 
 ```bash
@@ -108,8 +109,8 @@ npm test
 npm run deploy:dry
 ```
 
-Set these as backend-only Cloudflare Worker secrets; use placeholders only in
-local examples:
+Set only these as backend-only Cloudflare Worker secrets; use placeholders only
+in local examples. The Worker does not store or receive Bitget API credentials:
 
 ```text
 BITGET_GATEWAY_SERVICE_SECRET
@@ -117,11 +118,11 @@ QWEN_API_KEY
 OWNER_CONTROL_TOKEN
 ```
 
-Optional EVA secrets are documented separately in [docs/EVA_INTEGRATION.md](docs/EVA_INTEGRATION.md). Never put `BITGET_SECRET_KEY`, `BITGET_PASSPHRASE`, `QWEN_API_KEY`, `OWNER_CONTROL_TOKEN`, or `EVA_AGENT_API_KEY` in client code, browser storage, public Vercel environment variables, logs, exports, or GitHub.
+Optional EVA secrets are documented separately in [docs/EVA_INTEGRATION.md](docs/EVA_INTEGRATION.md). Never put `BITGET_API_KEY`, `BITGET_SECRET_KEY`, `BITGET_PASSPHRASE`, `QWEN_API_KEY`, `OWNER_CONTROL_TOKEN`, or `EVA_AGENT_API_KEY` in client code, browser storage, public Vercel environment variables, logs, exports, or GitHub. The stable gateway stores the Bitget credentials and remains PAPER-only.
 
 Deploy the Worker with the repository's actual script: `npm run deploy`. Fork/import the repository into Vercel, point its `/api` rewrite to your own Worker, deploy, and verify the browser reaches your Worker rather than the original production Worker.
 
-The first deployment remains PAPER-only. Before `START` or `RESUME`, verify Worker health, snapshot reachability, Bitget Demo account access, `portfolioFreshness.source=PROVIDER_LIVE`, `stale=false`, positions/open-orders readback, Qwen connectivity, and authenticated owner controls. Do not start an autonomous cycle until those checks pass. DARWIN Bitget is configured for Bitget Demo PAPER trading; this guide is not live-money trading instruction.
+The first deployment remains PAPER-only. Before `START` or `RESUME`, verify Worker health, `/api/snapshot` reachability, provider-only `/api/live/portfolio` account and position access, `source=PROVIDER_LIVE`, `stale=false`, positions/open-orders readback, Qwen connectivity, and authenticated owner controls. Do not start an autonomous cycle until those checks pass. DARWIN Bitget is configured for Bitget Demo PAPER trading; this guide is not live-money trading instruction.
 
 ## Documentation
 

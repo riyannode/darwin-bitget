@@ -12,6 +12,18 @@ Demo executable universe → lightweight market scan → Qwen shortlist
 → reflection / lesson evolution
 ```
 
+Private authenticated Bitget operations travel through the stable-egress path:
+
+```text
+Cloudflare Worker → authenticated narrow gateway request → Cloudflare Tunnel
+→ stable-egress gateway → Bitget Demo PAPER API
+```
+
+Public market operations may remain direct because they do not require private
+Bitget credentials. The Worker never stores `BITGET_API_KEY`,
+`BITGET_SECRET_KEY`, or `BITGET_PASSPHRASE`; it stores only the gateway service
+secret plus its backend-only Qwen, owner-control, and optional EVA secrets.
+
 PAPER scan eligibility comes from the Demo catalog. Public ticker/history endpoints may supply evidence, but a public-only symbol cannot become a new PAPER candidate. Existing provider positions remain eligible for management.
 
 ## Authority boundary
@@ -29,7 +41,18 @@ At most one new entry is considered per cycle. Multiple existing-position exits 
 
 ## Live dashboard path
 
-`/api/snapshot` performs a read-only provider portfolio readback for equity, margin, positions, and open orders. The dashboard refreshes it every 10 seconds. `PROVIDER_LIVE` with `stale=false` is current provider state; journal portfolio is explicit `JOURNAL_FALLBACK` only when readback fails. The Open Position page renders multiple provider positions and signed provider unrealized PnL/PnL percentage without modifying state.
+`/api/live/portfolio` is the provider-only live portfolio path for equity, margin,
+positions, and open orders. The browser refreshes it approximately every 10
+seconds. It does not use the Durable Object hot-path reads. If the account or
+position provider read fails, the UI shows provider state as unavailable and does
+not show journal portfolio fallback.
+
+`/api/snapshot` is the slower Durable Object runtime-state read, refreshed
+approximately every 60 seconds. It carries decision, scheduler, risk, and bounded
+activity state; it is not the live portfolio polling path. The browser loads the
+bounded journal, trade-history, learning, and policy endpoints lazily when their
+pages are opened. The Open Position page renders multiple provider positions and
+signed provider unrealized PnL/PnL percentage without modifying state.
 
 The deployment script injects the current Git commit into `GIT_COMMIT_SHA`, returned through `/api/snapshot.commit`.
 
