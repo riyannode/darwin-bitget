@@ -55,7 +55,7 @@ export class BitgetGatewayClient {
   public constructor(baseUrl: string, serviceSecret: string, fetchImpl: typeof fetch = fetch, timeoutMs = 15_000) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.serviceSecret = serviceSecret;
-    this.fetchImpl = fetchImpl;
+    this.fetchImpl = fetchImpl.bind(globalThis);
     this.timeoutMs = timeoutMs;
   }
 
