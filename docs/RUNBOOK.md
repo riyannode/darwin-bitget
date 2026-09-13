@@ -26,7 +26,7 @@ The demo requires no `.env`, credentials, or external network at runtime. It nev
 
 ## Worker configuration
 
-The Worker requires `TRADING_MODE=PAPER`, `PAPER_ONLY=true`, and `AGENT_MODE=AUTONOMOUS` or `EVA_EVALUATION`. Bitget and Qwen credentials belong in Cloudflare secrets, never in source, fixtures, `wrangler.jsonc`, Vercel public variables, or browser storage.
+The Worker requires `TRADING_MODE=PAPER`, `PAPER_ONLY=true`, and `AGENT_MODE=AUTONOMOUS` or `EVA_EVALUATION`. The Worker stores only backend-only gateway, Qwen, owner-control, and optional EVA secrets. Bitget API credentials belong only in the stable-egress gateway, never in Worker secrets, source, fixtures, `wrangler.jsonc`, Vercel public variables, or browser storage.
 
 The owner policy defaults to 30% maximum single-position margin allocation, 5x maximum leverage, 10% daily drawdown, 60-minute cooldown, 15-minute scan cadence, and emergency stop disabled. Runtime policy/control mutations require `OWNER_CONTROL_TOKEN` and persist in the Durable Object.
 
@@ -36,8 +36,8 @@ Before `START` or `RESUME` on a self-hosted Worker, verify:
 
 1. Worker health.
 2. Snapshot reachable.
-3. Bitget Demo account read succeeds.
-4. `portfolioFreshness.source=PROVIDER_LIVE` and `stale=false`.
+3. Provider-only `/api/live/portfolio` account read succeeds.
+4. `/api/live/portfolio` returns `source=PROVIDER_LIVE` and a non-stale result.
 5. Positions and open orders readback succeeds.
 6. Qwen connectivity succeeds.
 7. Owner controls authenticate.

@@ -115,7 +115,7 @@ function renderOpenPositions() {
 }
 
 function appendDecisionDetails(node, decision, positionNotional) {
-  [detail("MARGIN", `${decision.marginAllocationPct}%`), detail("LEVERAGE", `${decision.leverage}x`), detail("CONFIDENCE", decision.confidence), detail("POSITION NOTIONAL", money(positionNotional ?? (decision.action === "HOLD" ? "0" : undefined))), detail("STRATEGY THESIS", decision.strategyThesis, true), detail("SUPPORTING FACTORS", list(decision.supportingFactors), true), detail("RISK FACTORS", list(decision.riskFactors), true), detail("LESSONS USED", list(decision.lessonsUsed), true)].forEach((item) => node.append(item));
+  [detail("MARGIN", `${decision.marginAllocationPct}%`), detail("LEVERAGE", `${decision.leverage}x`), detail("CONFIDENCE", decision.confidence), detail("POSITION NOTIONAL", money(positionNotional ?? (decision.action === "HOLD" ? "0" : undefined))), detail("STRATEGY THESIS", decision.strategyThesis, true), detail("SUPPORTING FACTORS", list(decision.supportingFactors), true), detail("RISK FACTORS", list(decision.riskFactors), true), detail("EVIDENCE USED", list(decision.evidenceUsed), true), detail("LESSONS USED", list(decision.lessonsUsed), true)].forEach((item) => node.append(item));
 }
 
 function renderDecisionPanel(prefix, decision, positionNotional) {

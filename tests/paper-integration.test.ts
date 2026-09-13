@@ -16,11 +16,6 @@ function action(value: string | undefined): Exclude<Action, "HOLD"> {
   throw new Error("PAPER_TEST_ACTION_INVALID");
 }
 
-function positionSide(value: string | undefined): PositionSide {
-  if (value === "LONG" || value === "SHORT") return value;
-  throw new Error("PAPER_TEST_POSITION_SIDE_REQUIRED");
-}
-
 function decision(actionValue: Exclude<Action, "HOLD">, symbol: string, side: PositionSide, cycleId: string, margin: string, leverage: string, reductionPct: string | null, evidenceTypes: string[]): Decision {
   return {
     decisionId: `paper-test-${crypto.randomUUID()}`,

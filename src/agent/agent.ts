@@ -377,7 +377,6 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   private async getSchedulerDiagnostics(intervalMinutes: number, now = Date.now()): Promise<Pick<DashboardSnapshot["scheduler"], "nextScanAt" | "nextScanStale" | "configuredIntervalMinutes" | "matchingScheduleCount" | "schedulerHealthy" | "schedulerErrorCode">> {
-    const activeCycle = this.state.lastStatus === "RUNNING" || Boolean(this.state.cycleStartedAt);
     try {
       const result = await this.reconcileScheduler(intervalMinutes, { now });
       const schedulerHealthy = this.state.paused || this.state.emergencyStop

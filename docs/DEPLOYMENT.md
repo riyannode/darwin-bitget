@@ -4,10 +4,12 @@
 
 ```text
 Vercel static frontend → Cloudflare Worker + Durable Object
-                     → Bitget Demo UTA + Qwen hackathon endpoint
+                     → public market APIs / Qwen hackathon endpoint
+                     → authenticated narrow gateway → Cloudflare Tunnel
+                     → stable-egress gateway → Bitget Demo PAPER API
 ```
 
-The public site is [https://darwin-bitget.vercel.app/](https://darwin-bitget.vercel.app/). The repository's `vercel.json` rewrites `/api/*` to the production Worker. A self-hosted deployment must replace that destination with the developer's own Worker URL; never point a fork at the original Worker accidentally.
+The public site is [https://darwin-bitget.vercel.app/](https://darwin-bitget.vercel.app/). The repository's `vercel.json` rewrites `/api/*` to the production Worker. A self-hosted deployment must replace that destination with the developer's own Worker URL; never point a fork at the original Worker accidentally. Public market operations may remain direct; private authenticated Bitget operations use the gateway path shown above.
 
 ## Fork, clone, and self-host paths
 
@@ -57,8 +59,10 @@ npm run build
 npm run deploy:dry
 ```
 
-Set only the gateway service secret as a backend-only Cloudflare Worker secret.
-The Worker must not receive Bitget API credentials. Never place real values in
+Set only the gateway service secret, Qwen key, owner-control token, and any
+configured EVA secret as backend-only Cloudflare Worker secrets. The Worker must
+not store or receive `BITGET_API_KEY`, `BITGET_SECRET_KEY`, or `BITGET_PASSPHRASE`.
+Never place real values in
 the repository, browser, frontend bundle, public Vercel environment, logs, or
 paper-log exports:
 
@@ -77,7 +81,7 @@ Optional EVA configuration is separate and backend-only:
 `EVA_AGENT_API_KEY` is a Worker secret. The agent ID is runtime configuration,
 not a frontend credential.
 
-### Worker deployment
+### Bitget transport and Worker deployment
 
 The repository script reads current Git `HEAD` and injects the full commit as `GIT_COMMIT_SHA`:
 
@@ -102,13 +106,12 @@ the deployed rewrite does not still target the original production Worker.
 Before `START`/`RESUME`, verify:
 
 1. Worker health.
-2. `/api/snapshot` reachable.
-3. Bitget Demo account read succeeds.
-4. `portfolioFreshness.source=PROVIDER_LIVE`.
-5. `portfolioFreshness.stale=false`.
-6. Positions/open orders readback succeeds.
-7. Qwen connectivity succeeds.
-8. Authenticated owner controls work.
+2. `/api/snapshot` reachable for Durable Object runtime state.
+3. Provider-only `/api/live/portfolio` account and position read succeeds.
+4. `/api/live/portfolio` returns `source=PROVIDER_LIVE` and a non-stale readback.
+5. Positions/open orders readback succeeds.
+6. Qwen connectivity succeeds.
+7. Authenticated owner controls work.
 
 Only then start or resume autonomous scheduling. DARWIN Bitget is configured
 for Bitget Demo PAPER trading. Do not convert this fork/self-host guide into
@@ -116,4 +119,4 @@ live-money trading instructions.
 
 ## Deployment verification and final artifacts
 
-Compare Worker source SHA from deploy output with `/api/snapshot.commit`. Verify the Vercel source/deployment SHA separately. A healthy live readback shows `PROVIDER_LIVE` and `stale=false`. Do not commit `submissions/paper-log-final.json` or `.csv` until the collection period is complete; final metrics use closed provider-verified trades only.
+Compare Worker source SHA from deploy output with `/api/snapshot.commit`. Verify the Vercel source/deployment SHA separately. A healthy provider readback from `/api/live/portfolio` shows `PROVIDER_LIVE` and a non-stale result. Do not commit `submissions/paper-log-final.json` or `.csv` until the collection period is complete; final metrics use closed provider-verified trades only.
