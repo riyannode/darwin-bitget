@@ -89,9 +89,11 @@ describe("bounded Durable Object read paths", () => {
     const queries: string[] = [];
     const fake = {
       env: { TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_CATEGORY: "USDT-FUTURES" },
-      state: { runtimeStatus: "ONLINE", currentStage: "ONLINE", lastScanAt: null, nextScanAt: null, model: "qwen", temporaryScanIntervalExpiresAt: null },
+      state: { runtimeStatus: "ONLINE", currentStage: "ONLINE", lastScanAt: null, nextScanAt: null, model: "qwen", temporaryScanIntervalExpiresAt: null, temporaryScanIntervalCompleted: true, paused: true, emergencyStop: false, lastStatus: "IDLE", cycleStartedAt: null },
       ensureActivePolicy: () => policy,
       activeScanIntervalMinutes: () => 15,
+      listSchedules: async () => [],
+      getSchedulerDiagnostics: (TraderAgent.prototype as unknown as { getSchedulerDiagnostics: (intervalMinutes: number) => Promise<unknown> }).getSchedulerDiagnostics,
       sql(strings: TemplateStringsArray, ...values: unknown[]) {
         queries.push(strings.reduce((query, part, index) => query + part + (index < values.length ? "?" : ""), ""));
         return [];
@@ -100,6 +102,7 @@ describe("bounded Durable Object read paths", () => {
     const snapshot = await TraderAgent.prototype.getDashboardSnapshot.call(fake as never);
     expect(snapshot.portfolio).toBeNull();
     expect(snapshot.performance.totalTrades).toBeNull();
+    expect(snapshot.scheduler).toMatchObject({ nextScanAt: null, nextScanStale: true, configuredIntervalMinutes: 15, matchingScheduleCount: 0, schedulerHealthy: true });
     expect(queries.filter((query) => query.includes("FROM events")).length).toBe(1);
     expect(queries.some((query) => query.includes("FROM experiences"))).toBe(false);
     expect(queries.some((query) => query.includes("FROM lessons"))).toBe(false);

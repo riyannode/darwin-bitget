@@ -67,6 +67,7 @@ interface AgentState {
 }
 
 const STALE_CYCLE_TIMEOUT_MS = 120_000;
+const SCHEDULE_STALE_TOLERANCE_MS = 30_000;
 const USER_STORAGE_VERSION = 2;
 const SNAPSHOT_EVENT_LIMIT = 25;
 
@@ -84,6 +85,11 @@ function schedulerMetrics(events: readonly { type: string; metadata?: Record<str
     staleCount: events.filter((event) => event.type === "CYCLE_STALE").length,
     failureCount: events.filter((event) => event.type === "CYCLE_FAILED" || event.type === "SCHEDULE_CALLBACK_FAILED").length,
     timeoutCount: events.filter((event) => event.type === "CYCLE_TIMEOUT").length,
+    nextScanAt: null,
+    nextScanStale: false,
+    configuredIntervalMinutes: 0,
+    matchingScheduleCount: 0,
+    schedulerHealthy: false,
   };
 }
 
@@ -341,6 +347,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const events = loadRecentEvents(this, SNAPSHOT_EVENT_LIMIT);
     const drawdown = loadDailyDrawdownState(this);
     const drawdownPct = drawdown ? calculateDrawdownPct(drawdown.baselineEquity, drawdown.lastEquity) : "0";
+    const configuredIntervalMinutes = temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes;
+    const scheduler = await this.getSchedulerDiagnostics(configuredIntervalMinutes);
     return {
       version: config.version ?? "0.2.0",
       commit: config.commit ?? "local",
@@ -366,8 +374,57 @@ export class TraderAgent extends Agent<Env, AgentState> {
       activity: events,
       lastPolicyUpdate: events.find((event) => event.type === "POLICY_UPDATED") ?? null,
       // Snapshot scheduler metrics intentionally cover the same bounded recent event window.
-      scheduler: schedulerMetrics(events),
+      scheduler: { ...schedulerMetrics(events), ...scheduler },
     };
+  }
+
+  private async getSchedulerDiagnostics(intervalMinutes: number, now = Date.now()): Promise<Pick<DashboardSnapshot["scheduler"], "nextScanAt" | "nextScanStale" | "configuredIntervalMinutes" | "matchingScheduleCount" | "schedulerHealthy">> {
+    const intervalMs = intervalMinutes * 60_000;
+    const isStale = (nextScanAt: string | null): boolean => {
+      if (!nextScanAt) return true;
+      const nextScanMs = Date.parse(nextScanAt);
+      return !Number.isFinite(nextScanMs) || now > nextScanMs + intervalMs + SCHEDULE_STALE_TOLERANCE_MS;
+    };
+    const activeCycle = this.state.lastStatus === "RUNNING" || Boolean(this.state.cycleStartedAt);
+    let nextScanAt = this.state.nextScanAt;
+    let nextScanStale = isStale(nextScanAt);
+    let schedules: Awaited<ReturnType<TraderAgent["listSchedules"]>>;
+    try {
+      schedules = await this.listSchedules();
+    } catch {
+      return { nextScanAt, nextScanStale, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: 0, schedulerHealthy: false };
+    }
+
+    const cycleSchedules = () => schedules.filter((entry) => entry.callback === "runScheduledCycle");
+    const matchingSchedules = () => cycleSchedules().filter((entry) => entry.type === "interval" && entry.intervalSeconds === intervalMinutes * 60);
+    let currentCycleSchedules = cycleSchedules();
+    let currentMatchingSchedules = matchingSchedules();
+    const recoveryAllowed = !this.state.paused && !this.state.emergencyStop && !activeCycle && nextScanStale;
+    const scheduleMismatch = currentCycleSchedules.length !== 1 || currentMatchingSchedules.length !== 1;
+
+    if (recoveryAllowed && scheduleMismatch) {
+      try {
+        await scheduleTradingCycle(this, intervalMinutes);
+        schedules = await this.listSchedules();
+        currentCycleSchedules = cycleSchedules();
+        currentMatchingSchedules = matchingSchedules();
+        if (currentCycleSchedules.length === 1 && currentMatchingSchedules.length === 1) {
+          const repairedSchedule = currentMatchingSchedules[0];
+          nextScanAt = repairedSchedule?.time !== undefined && Number.isFinite(repairedSchedule.time)
+            ? new Date(repairedSchedule.time * 1000).toISOString()
+            : new Date(now + intervalMs).toISOString();
+          this.setState({ ...this.state, nextScanAt });
+          nextScanStale = isStale(nextScanAt);
+        }
+      } catch {
+        return { nextScanAt, nextScanStale, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: currentMatchingSchedules.length, schedulerHealthy: false };
+      }
+    }
+
+    const schedulerHealthy = this.state.paused || this.state.emergencyStop
+      ? currentCycleSchedules.length === 0
+      : currentCycleSchedules.length === 1 && currentMatchingSchedules.length === 1 && !nextScanStale;
+    return { nextScanAt, nextScanStale, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: currentMatchingSchedules.length, schedulerHealthy };
   }
 
   private getAgentJournal(url: URL): Response {

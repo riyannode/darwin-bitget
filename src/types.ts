@@ -486,6 +486,11 @@ export interface DashboardSnapshot {
     staleCount: number;
     failureCount: number;
     timeoutCount: number;
+    nextScanAt: string | null;
+    nextScanStale: boolean;
+    configuredIntervalMinutes: number;
+    matchingScheduleCount: number;
+    schedulerHealthy: boolean;
   };
   learning: {
     reflection: ReflectionResult | null;

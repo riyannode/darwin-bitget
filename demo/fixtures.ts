@@ -207,7 +207,7 @@ function baseSnapshot(cycleId: string, proposed: Decision, riskGateResult: RiskG
       reconciliationStatus: "MATCHED",
       timestamp: OBSERVED_AT,
     } : null,
-    scheduler: { completedCycles: 0, averageDurationMs: 0, maxDurationMs: 0, inProgressCount: 0, staleCount: 0, failureCount: 0, timeoutCount: 0 },
+    scheduler: { completedCycles: 0, averageDurationMs: 0, maxDurationMs: 0, inProgressCount: 0, staleCount: 0, failureCount: 0, timeoutCount: 0, nextScanAt: null, nextScanStale: false, configuredIntervalMinutes: 15, matchingScheduleCount: 0, schedulerHealthy: true },
     learning: { reflection: null, lessons: [], lessonsUsed: [], backtest: null, recentExperiences: [] },
     riskControls: { ...DEFAULT_OWNER_POLICY, drawdownBlocked: false, drawdownCode: "", cooldownUntil: null, temporaryScanIntervalExpiresAt: null },
     activity: activities.map((type) => event(type, cycleId)),
