@@ -93,6 +93,7 @@ describe("bounded Durable Object read paths", () => {
       ensureActivePolicy: () => policy,
       activeScanIntervalMinutes: () => 15,
       listSchedules: async () => [],
+      reconcileScheduler: (TraderAgent.prototype as unknown as { reconcileScheduler: (intervalMinutes: number, options?: { now?: number }) => Promise<unknown> }).reconcileScheduler,
       getSchedulerDiagnostics: (TraderAgent.prototype as unknown as { getSchedulerDiagnostics: (intervalMinutes: number) => Promise<unknown> }).getSchedulerDiagnostics,
       sql(strings: TemplateStringsArray, ...values: unknown[]) {
         queries.push(strings.reduce((query, part, index) => query + part + (index < values.length ? "?" : ""), ""));

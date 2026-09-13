@@ -4,7 +4,7 @@ import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
 import { boundExitDecisions, decide, rankMarketCandidates, selectCandidates } from "./decision.js";
-import { scheduleTradingCycle, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES } from "./scheduler.js";
+import { reconcileTradingSchedule, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES, type SchedulerReconciliationResult } from "./scheduler.js";
 import { authorizeOwner } from "./owner-auth.js";
 import { retrieveLessons } from "../learning/lesson-retrieval.js";
 import { reflect, reflectWithQwen } from "../learning/reflection.js";
@@ -67,7 +67,6 @@ interface AgentState {
 }
 
 const STALE_CYCLE_TIMEOUT_MS = 120_000;
-const SCHEDULE_STALE_TOLERANCE_MS = 30_000;
 const USER_STORAGE_VERSION = 2;
 const SNAPSHOT_EVENT_LIMIT = 25;
 
@@ -183,7 +182,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const config = loadConfig(this.env, policy);
     const activeCycle = this.state.lastStatus === "RUNNING";
     this.setState({ ...this.state, emergencyStop: policy.emergencyStop, model: config.qwenModel, runtimeStatus: activeCycle ? this.state.runtimeStatus : this.state.paused || policy.emergencyStop ? "PAUSED" : "ONLINE", currentStage: activeCycle ? this.state.currentStage : this.state.paused || policy.emergencyStop ? "PAUSED" : "ONLINE" });
-    if (!this.state.paused && !policy.emergencyStop) await scheduleTradingCycle(this, this.activeScanIntervalMinutes(policy));
+    if (!this.state.paused && !policy.emergencyStop) await this.reconcileScheduler(this.activeScanIntervalMinutes(policy), { ensureSchedule: true });
   }
 
   public override async onRequest(request: Request): Promise<Response> {
@@ -236,7 +235,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   public async runScheduledCycle(): Promise<void> {
-    this.recordEvent("SCHEDULE_CALLBACK", "CONTROL");
+    this.recordEventBestEffort("SCHEDULE_CALLBACK", "CONTROL");
     if (this.state.paused || this.state.emergencyStop) return;
     try {
       const policy = this.ensureActivePolicy();
@@ -245,9 +244,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
       await this.runCycle();
     } catch (error) {
       const code = error instanceof Error ? error.message.split(":", 1)[0] ?? "SCHEDULE_CALLBACK_FAILED" : "SCHEDULE_CALLBACK_FAILED";
-      if (code === "CYCLE_IN_PROGRESS") this.recordEvent("CYCLE_IN_PROGRESS", this.state.lastCycleId ?? "UNKNOWN", { code });
-      if (code.includes("TIMEOUT")) this.recordEvent("CYCLE_TIMEOUT", this.state.lastCycleId ?? "UNKNOWN", { code });
-      this.recordEvent("SCHEDULE_CALLBACK_FAILED", "CONTROL", { code });
+      if (code === "CYCLE_IN_PROGRESS") this.recordEventBestEffort("CYCLE_IN_PROGRESS", this.state.lastCycleId ?? "UNKNOWN", { code });
+      if (code.includes("TIMEOUT")) this.recordEventBestEffort("CYCLE_TIMEOUT", this.state.lastCycleId ?? "UNKNOWN", { code });
+      this.recordEventBestEffort("SCHEDULE_CALLBACK_FAILED", "CONTROL", { code });
       return;
     }
   }
@@ -267,8 +266,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (!effectivePaused) {
       const config = loadConfig(this.env, this.ensureActivePolicy());
       const intervalMinutes = this.activeScanIntervalMinutes(config.ownerPolicy);
-      await scheduleTradingCycle(this, intervalMinutes);
-      this.setState({ ...this.state, nextScanAt: new Date(Date.now() + intervalMinutes * 60_000).toISOString() });
+      await this.reconcileScheduler(intervalMinutes, { ensureSchedule: true });
     }
     return nextState;
   }
@@ -379,57 +377,28 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   private async getSchedulerDiagnostics(intervalMinutes: number, now = Date.now()): Promise<Pick<DashboardSnapshot["scheduler"], "nextScanAt" | "nextScanStale" | "configuredIntervalMinutes" | "matchingScheduleCount" | "schedulerHealthy" | "schedulerErrorCode">> {
-    const intervalMs = intervalMinutes * 60_000;
-    const isStale = (nextScanAt: string | null): boolean => {
-      if (!nextScanAt) return true;
-      const nextScanMs = Date.parse(nextScanAt);
-      return !Number.isFinite(nextScanMs) || now > nextScanMs + intervalMs + SCHEDULE_STALE_TOLERANCE_MS;
-    };
     const activeCycle = this.state.lastStatus === "RUNNING" || Boolean(this.state.cycleStartedAt);
-    let nextScanAt = this.state.nextScanAt;
-    let nextScanStale = isStale(nextScanAt);
-    let schedules: Awaited<ReturnType<TraderAgent["listSchedules"]>>;
     try {
-      schedules = await this.listSchedules();
-    } catch {
-      return { nextScanAt, nextScanStale, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: 0, schedulerHealthy: false, schedulerErrorCode: "SCHEDULE_LIST_FAILED" };
+      const result = await this.reconcileScheduler(intervalMinutes, { now });
+      const schedulerHealthy = this.state.paused || this.state.emergencyStop
+        ? result.cycleSchedules.length === 0
+        : result.cycleSchedules.length === 1 && result.matchingSchedules.length === 1 && !result.nextScanStale;
+      return { nextScanAt: result.nextScanAt, nextScanStale: result.nextScanStale, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: result.matchingSchedules.length, schedulerHealthy };
+    } catch (error) {
+      const errorCode = error instanceof Error && error.message.startsWith("SCHEDULE_LIST_FAILED") ? "SCHEDULE_LIST_FAILED" : "SCHEDULE_REPAIR_FAILED";
+      return { nextScanAt: this.state.nextScanAt, nextScanStale: true, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: 0, schedulerHealthy: false, schedulerErrorCode: errorCode };
     }
+  }
 
-    const cycleSchedules = () => schedules.filter((entry) => entry.callback === "runScheduledCycle");
-    const matchingSchedules = () => cycleSchedules().filter((entry) => entry.type === "interval" && entry.intervalSeconds === intervalMinutes * 60);
-    let currentCycleSchedules = cycleSchedules();
-    let currentMatchingSchedules = matchingSchedules();
-    const recoveryAllowed = !this.state.paused && !this.state.emergencyStop && !activeCycle && nextScanStale;
-    const scheduleMismatch = currentCycleSchedules.length !== 1 || currentMatchingSchedules.length !== 1;
-
-    const stillRecoveryAllowed = () => !this.state.paused && !this.state.emergencyStop && this.state.lastStatus !== "RUNNING" && !this.state.cycleStartedAt && isStale(this.state.nextScanAt);
-    if (recoveryAllowed && scheduleMismatch && stillRecoveryAllowed()) {
-      try {
-        await scheduleTradingCycle(this, intervalMinutes);
-        schedules = await this.listSchedules();
-        currentCycleSchedules = cycleSchedules();
-        currentMatchingSchedules = matchingSchedules();
-        if (!stillRecoveryAllowed()) {
-          for (const schedule of currentCycleSchedules) await this.cancelSchedule(schedule.id);
-          return { nextScanAt: this.state.nextScanAt, nextScanStale: isStale(this.state.nextScanAt), configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: 0, schedulerHealthy: this.state.paused || this.state.emergencyStop };
-        }
-        if (currentCycleSchedules.length === 1 && currentMatchingSchedules.length === 1) {
-          const repairedSchedule = currentMatchingSchedules[0];
-          nextScanAt = repairedSchedule?.time !== undefined && Number.isFinite(repairedSchedule.time)
-            ? new Date(repairedSchedule.time * 1000).toISOString()
-            : new Date(now + intervalMs).toISOString();
-          this.setState({ ...this.state, nextScanAt });
-          nextScanStale = isStale(nextScanAt);
-        }
-      } catch {
-        return { nextScanAt, nextScanStale, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: currentMatchingSchedules.length, schedulerHealthy: false, schedulerErrorCode: "SCHEDULE_REPAIR_FAILED" };
-      }
-    }
-
-    const schedulerHealthy = this.state.paused || this.state.emergencyStop
-      ? currentCycleSchedules.length === 0
-      : currentCycleSchedules.length === 1 && currentMatchingSchedules.length === 1 && !nextScanStale;
-    return { nextScanAt, nextScanStale, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: currentMatchingSchedules.length, schedulerHealthy };
+  private async reconcileScheduler(intervalMinutes: number, options: { ensureSchedule?: boolean; now?: number } = {}): Promise<SchedulerReconciliationResult> {
+    const result = await reconcileTradingSchedule(this, intervalMinutes, {
+      paused: this.state.paused,
+      emergencyStop: this.state.emergencyStop,
+      activeCycle: this.state.lastStatus === "RUNNING" || Boolean(this.state.cycleStartedAt),
+      nextScanAt: this.state.nextScanAt,
+    }, options);
+    if (result.matchingSchedules.length === 1 && result.nextScanAt !== this.state.nextScanAt) this.setState({ ...this.state, nextScanAt: result.nextScanAt });
+    return result;
   }
 
   private getAgentJournal(url: URL): Response {
@@ -779,29 +748,19 @@ export class TraderAgent extends Agent<Env, AgentState> {
     saveEvent(this, { eventId: crypto.randomUUID(), type, cycleId, createdAt: new Date().toISOString(), ...(metadata ? { metadata } : {}) });
   }
 
+  private recordEventBestEffort(type: string, cycleId: string, metadata?: Record<string, string>): void {
+    try {
+      this.recordEvent(type, cycleId, metadata);
+    } catch {
+      // Telemetry must not prevent the callback from reaching cycle handling.
+    }
+  }
+
   private async ensureTradingSchedule(config: ReturnType<typeof loadConfig>): Promise<void> {
     if (this.state.paused || this.state.emergencyStop) return;
     const intervalMinutes = this.activeScanIntervalMinutes(config.ownerPolicy);
-    let schedules: Awaited<ReturnType<TraderAgent["listSchedules"]>> = [];
-    try {
-      schedules = await this.listSchedules();
-      const cycleSchedules = schedules.filter((entry) => entry.callback === "runScheduledCycle");
-      const matchingSchedule = cycleSchedules.length === 1 && cycleSchedules[0]?.type === "interval" && cycleSchedules[0]?.intervalSeconds === intervalMinutes * 60;
-      if (!matchingSchedule) {
-        await scheduleTradingCycle(this, intervalMinutes);
-        this.recordEvent("SCHEDULE_RESCHEDULED", "CONTROL", { intervalMinutes: String(intervalMinutes) });
-        const refreshedSchedules = await this.listSchedules();
-        const refreshedCycle = refreshedSchedules.find((entry) => entry.callback === "runScheduledCycle");
-        const nextScanAt = refreshedCycle?.time && Number.isFinite(refreshedCycle.time) ? new Date(refreshedCycle.time * 1000).toISOString() : new Date(Date.now() + intervalMinutes * 60_000).toISOString();
-        this.setState({ ...this.state, nextScanAt });
-      } else {
-        const cycleSchedule = cycleSchedules[0];
-        const nextScanAt = cycleSchedule?.time && Number.isFinite(cycleSchedule.time) ? new Date(cycleSchedule.time * 1000).toISOString() : this.state.nextScanAt;
-        if (nextScanAt && nextScanAt !== this.state.nextScanAt) this.setState({ ...this.state, nextScanAt });
-      }
-    } catch (error) {
-      this.recordEvent("SCHEDULE_REPAIR_FAILED", "CONTROL", { code: error instanceof Error ? error.message.split(":", 1)[0] ?? "SCHEDULE_REPAIR_FAILED" : "SCHEDULE_REPAIR_FAILED", scheduleCount: String(schedules.length) });
-    }
+    const result = await this.reconcileScheduler(intervalMinutes, { ensureSchedule: true });
+    if (result.repaired) this.recordEventBestEffort("SCHEDULE_RESCHEDULED", "CONTROL", { intervalMinutes: String(intervalMinutes) });
   }
 
   private recordPositionDiscrepancies(experiences: readonly TradeExperience[], positions: readonly PositionSnapshot[], cycleId: string): string[] {
@@ -847,8 +806,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const previous = this.ensureActivePolicy();
     const next = updateOwnerPolicy(previous, value);
     this.persistPolicy(previous, next);
-    if (previous.scanIntervalMinutes !== next.scanIntervalMinutes && !this.state.paused && !next.emergencyStop) await scheduleTradingCycle(this, this.activeScanIntervalMinutes(next));
-    this.setState({ ...this.state, emergencyStop: next.emergencyStop, nextScanAt: new Date(Date.now() + this.activeScanIntervalMinutes(next) * 60_000).toISOString(), lastPolicyUpdateAt: new Date().toISOString() });
+    const intervalMinutes = this.activeScanIntervalMinutes(next);
+    this.setState({ ...this.state, emergencyStop: next.emergencyStop, nextScanAt: new Date(Date.now() + intervalMinutes * 60_000).toISOString(), lastPolicyUpdateAt: new Date().toISOString() });
+    if (previous.scanIntervalMinutes !== next.scanIntervalMinutes && !this.state.paused && !next.emergencyStop) await this.reconcileScheduler(intervalMinutes, { ensureSchedule: true });
     return this.getDashboardSnapshot();
   }
 }
