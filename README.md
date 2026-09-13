@@ -112,9 +112,7 @@ Set these as backend-only Cloudflare Worker secrets; use placeholders only in
 local examples:
 
 ```text
-BITGET_API_KEY
-BITGET_SECRET_KEY
-BITGET_PASSPHRASE
+BITGET_GATEWAY_SERVICE_SECRET
 QWEN_API_KEY
 OWNER_CONTROL_TOKEN
 ```

@@ -44,7 +44,7 @@ Requirements:
 - Node.js and npm;
 - a Cloudflare account and Wrangler;
 - a Vercel account;
-- Bitget Demo API credentials;
+- a stable-egress Bitget gateway on the operator's backend;
 - a Qwen API key.
 
 ```bash
@@ -57,17 +57,20 @@ npm run build
 npm run deploy:dry
 ```
 
-Set these as backend-only Cloudflare Worker secrets. Never place real values in
+Set only the gateway service secret as a backend-only Cloudflare Worker secret.
+The Worker must not receive Bitget API credentials. Never place real values in
 the repository, browser, frontend bundle, public Vercel environment, logs, or
 paper-log exports:
 
 ```text
-BITGET_API_KEY
-BITGET_SECRET_KEY
-BITGET_PASSPHRASE
-QWEN_API_KEY
+BITGET_GATEWAY_SERVICE_SECRET
 OWNER_CONTROL_TOKEN
+QWEN_API_KEY
 ```
+
+The stable gateway alone stores `BITGET_API_KEY`, `BITGET_SECRET_KEY`, and
+`BITGET_PASSPHRASE` in a restrictive environment file. It exposes only the
+narrow typed DARWIN actions and runs in Bitget Demo PAPER mode.
 
 Optional EVA configuration is separate and backend-only:
 `EVA_API_URL`, `EVA_GATEWAY_URL`, `EVA_AGENT_ID`, and `EVA_AGENT_API_KEY`.

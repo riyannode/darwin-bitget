@@ -37,10 +37,9 @@ export interface Env extends Cloudflare.Env {
   GIT_COMMIT_SHA?: string;
   ENVIRONMENT?: string;
   EVIDENCE_MAX_AGE_SECONDS?: string;
-  BITGET_API_KEY?: string;
-  BITGET_SECRET_KEY?: string;
-  BITGET_PASSPHRASE?: string;
   BITGET_API_BASE_URL?: string;
+  BITGET_GATEWAY_URL?: string;
+  BITGET_GATEWAY_SERVICE_SECRET?: string;
   QWEN_API_KEY?: string;
   QWEN_BASE_URL?: string;
   QWEN_MODEL?: string;
@@ -56,10 +55,9 @@ export interface RuntimeConfig {
   ownerPolicy: OwnerPolicy;
   evidenceMaxAgeSeconds: number;
   bitgetCategory: string;
-  bitgetApiKey?: string;
-  bitgetSecretKey?: string;
-  bitgetPassphrase?: string;
   bitgetApiBaseUrl: string;
+  bitgetGatewayUrl?: string;
+  bitgetGatewayServiceSecret?: string;
   qwenApiKey?: string;
   qwenBaseUrl: string;
   qwenModel: string;

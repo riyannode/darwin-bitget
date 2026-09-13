@@ -30,6 +30,7 @@
     "AGENT_MODE": "AUTONOMOUS",
     "PAPER_ONLY": "true",
     "BITGET_CATEGORY": "USDT-FUTURES",
+    "BITGET_GATEWAY_URL": "https://darwin-bitget-gateway.evalabs.my.id",
     "MAX_SINGLE_POSITION_MARGIN_PCT": "30",
     "MAX_LEVERAGE": "5",
     "MAX_DAILY_DRAWDOWN_PCT": "10",

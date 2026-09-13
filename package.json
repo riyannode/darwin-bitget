@@ -8,6 +8,7 @@
     "test:paper": "node --import tsx tests/paper-integration.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test",
+    "gateway:start": "node --import tsx gateway/src/server.ts",
     "build": "node scripts/deploy.mjs --dry-run",
     "deploy:dry": "node scripts/deploy.mjs --dry-run",
     "deploy": "node scripts/deploy.mjs"

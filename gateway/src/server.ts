@@ -1,0 +1,193 @@
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
+import { BitgetRestClient, loadConfig as loadBitgetConfig } from "@bitget-ai/bitget-agent-sdk";
+import { z } from "zod";
+import type { PrivateBitgetOperation } from "../../src/bitget/gateway-client.js";
+
+export interface GatewayProvider {
+  call(operation: PrivateBitgetOperation, args: Record<string, unknown>): Promise<{ endpoint: string; requestTime: string; data: unknown }>;
+}
+
+const emptyBody = z.object({}).strict();
+const categoryBody = z.object({ category: z.enum(["USDT-FUTURES"]) }).strict();
+const setLeverageBody = z.object({
+  category: z.enum(["USDT-FUTURES"]),
+  symbol: z.string().regex(/^[A-Z0-9]{3,30}$/),
+  leverage: z.string().regex(/^\d+(?:\.\d+)?$/),
+  posSide: z.enum(["long", "short"]),
+}).strict();
+const placeOrderBody = z.object({
+  category: z.enum(["USDT-FUTURES"]),
+  symbol: z.string().regex(/^[A-Z0-9]{3,30}$/),
+  side: z.enum(["buy", "sell"]),
+  orderType: z.literal("market"),
+  qty: z.string().regex(/^\d+(?:\.\d+)?$/),
+  clientOid: z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/),
+  posSide: z.enum(["long", "short"]).optional(),
+  reduceOnly: z.enum(["yes", "no"]).optional(),
+}).strict();
+const orderDetailsBody = z.object({
+  orderId: z.string().min(1).max(128).optional(),
+  clientOid: z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/).optional(),
+}).strict().refine((value) => Boolean(value.orderId || value.clientOid), "orderId or clientOid is required");
+const fillHistoryBody = z.object({
+  category: z.enum(["USDT-FUTURES"]),
+  orderId: z.string().min(1).max(128),
+  limit: z.string().regex(/^\d{1,3}$/),
+}).strict();
+const positionsHistoryBody = z.object({
+  category: z.enum(["USDT-FUTURES"]),
+  symbol: z.string().regex(/^[A-Z0-9]{3,30}$/),
+  limit: z.string().regex(/^\d{1,3}$/),
+}).strict();
+
+const ACTIONS: Record<string, { operation: PrivateBitgetOperation; schema: z.ZodType<Record<string, unknown>> }> = {
+  "account-assets": { operation: "getAccountAssets", schema: emptyBody },
+  "position-info": { operation: "getPositionInfo", schema: categoryBody },
+  "open-orders": { operation: "getOpenOrders", schema: categoryBody },
+  "account-info": { operation: "getAccountInfo", schema: emptyBody },
+  "set-leverage": { operation: "setLeverage", schema: setLeverageBody },
+  "place-order": { operation: "placeOrder", schema: placeOrderBody },
+  "order-details": { operation: "getOrderDetails", schema: orderDetailsBody },
+  "fill-history": { operation: "getFillHistory", schema: fillHistoryBody },
+  "positions-history": { operation: "getPositionsHistory", schema: positionsHistoryBody },
+};
+
+const MAX_BODY_BYTES = 32 * 1024;
+
+export class BitgetGatewayProvider implements GatewayProvider {
+  private readonly client: BitgetRestClient;
+
+  public constructor(env: {
+    BITGET_API_KEY?: string;
+    BITGET_SECRET_KEY?: string;
+    BITGET_PASSPHRASE?: string;
+    BITGET_API_BASE_URL?: string;
+  }) {
+    const apiKey = env.BITGET_API_KEY?.trim();
+    const secretKey = env.BITGET_SECRET_KEY?.trim();
+    const passphrase = env.BITGET_PASSPHRASE?.trim();
+    if (!apiKey || !secretKey || !passphrase) throw new Error("BITGET_GATEWAY_CREDENTIALS_REQUIRED");
+    this.client = new BitgetRestClient(loadBitgetConfig({
+      modules: "account,trade",
+      baseUrl: env.BITGET_API_BASE_URL?.trim() || "https://api.bitget.com",
+      apiKey,
+      secretKey,
+      passphrase,
+      paperTrading: true,
+      userAgent: "darwin-bitget-gateway/1.0",
+    }));
+  }
+
+  public async call(operation: PrivateBitgetOperation, args: Record<string, unknown>): Promise<{ endpoint: string; requestTime: string; data: unknown }> {
+    if (operation === "getAccountAssets" || operation === "getAccountInfo") return this.client.callOperation(operation, {});
+    return this.client.callOperation(operation, args);
+  }
+}
+
+export function createGatewayHandler(options: { serviceSecret: string; provider: GatewayProvider }): (request: Request) => Promise<Response> {
+  if (!options.serviceSecret) throw new Error("GATEWAY_SERVICE_SECRET_REQUIRED");
+  return async (request) => {
+    if (request.method === "GET" && new URL(request.url).pathname === "/healthz") return json({ ok: true, mode: "PAPER", demo: true });
+    if (request.method !== "POST") return json({ error: "NOT_FOUND" }, 404);
+
+    const path = new URL(request.url).pathname;
+    const match = path.match(/^\/v1\/bitget\/([a-z-]+)$/);
+    const actionName = match?.[1];
+    if (!actionName || !ACTIONS[actionName]) return json({ error: "NOT_FOUND" }, 404);
+    if (!constantTimeEqual(request.headers.get("authorization") ?? "", `Bearer ${options.serviceSecret}`)) return json({ error: "UNAUTHORIZED" }, 401);
+
+    const action = ACTIONS[actionName];
+    let body: unknown;
+    try {
+      const contentLength = Number(request.headers.get("content-length") ?? "0");
+      if (contentLength > MAX_BODY_BYTES) return json({ error: "BODY_TOO_LARGE" }, 413);
+      body = await request.json();
+    } catch {
+      return json({ error: "INVALID_JSON" }, 400);
+    }
+    const parsed = action.schema.safeParse(body);
+    if (!parsed.success) return json({ error: "INVALID_REQUEST" }, 400);
+
+    try {
+      const result = await options.provider.call(action.operation, parsed.data);
+      return json(result);
+    } catch (error) {
+      const provider = sanitizeProviderError(error, action.operation, typeof parsed.data.symbol === "string" ? parsed.data.symbol : "ACCOUNT");
+      return json({ error: `BITGET_GATEWAY_FAILED_${action.operation}`, provider }, 502);
+    }
+  };
+}
+
+export function startGatewayServer(options: { serviceSecret: string; provider: GatewayProvider; host: string; port: number }) {
+  const handler = createGatewayHandler(options);
+  const server = createServer(async (request, response) => {
+    try {
+      const body = await readBody(request);
+      const headers = new Headers();
+      for (const [key, value] of Object.entries(request.headers)) if (typeof value === "string") headers.set(key, value);
+      const url = `http://${request.headers.host ?? `${options.host}:${options.port}`}${request.url ?? "/"}`;
+      const init: RequestInit = { method: request.method ?? "GET", headers };
+      if (body.length) init.body = new TextDecoder().decode(body);
+      const webRequest = new Request(url, init);
+      const webResponse = await handler(webRequest);
+      response.statusCode = webResponse.status;
+      webResponse.headers.forEach((value, key) => response.setHeader(key, value));
+      response.end(Buffer.from(await webResponse.arrayBuffer()));
+    } catch {
+      response.statusCode = 500;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ error: "GATEWAY_INTERNAL_ERROR" }));
+    }
+  });
+  server.listen(options.port, options.host);
+  return server;
+}
+
+async function readBody(request: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > MAX_BODY_BYTES) throw new Error("BODY_TOO_LARGE");
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks);
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  if (leftBuffer.length !== rightBuffer.length) return false;
+  return timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function sanitizeProviderError(error: unknown, operation: PrivateBitgetOperation, symbol: string): { operation: string; symbol: string; code?: string; message?: string } {
+  const value = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const details = value.details && typeof value.details === "object" ? value.details as Record<string, unknown> : {};
+  const code = text(details.code ?? value.code);
+  const message = sanitizeMessage(text(details.message ?? value.message ?? error));
+  return { operation, symbol, ...(code ? { code } : {}), ...(message ? { message } : {}) };
+}
+
+function sanitizeMessage(value: string): string {
+  return value
+    .replace(/(ACCESS-(?:KEY|SIGN|PASSPHRASE|TIMESTAMP)|apiKey|secretKey|passphrase|authorization)([=:])[^,\s]+/gi, "$1$2REDACTED")
+    .slice(0, 240);
+}
+
+function text(value: unknown): string {
+  return typeof value === "string" || typeof value === "number" ? String(value) : "";
+}
+
+function json(value: unknown, status = 200): Response {
+  return Response.json(value, { status, headers: { "cache-control": "no-store" } });
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const serviceSecret = process.env.GATEWAY_SERVICE_SECRET?.trim();
+  if (!serviceSecret) throw new Error("GATEWAY_SERVICE_SECRET_REQUIRED");
+  const provider = new BitgetGatewayProvider(process.env);
+  startGatewayServer({ serviceSecret, provider, host: process.env.HOST?.trim() || "127.0.0.1", port: Number(process.env.PORT || 18080) });
+}

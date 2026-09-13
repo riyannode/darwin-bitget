@@ -48,11 +48,16 @@ describe("Demo executable universe", () => {
   });
 
   it("retains public evidence for a held symbol removed from Demo discovery", async () => {
-    const client = new BitgetClient(config);
+    const gateway = vi.fn(async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/account-assets")) return Response.json({ data: { usdtEquity: "50000" }, endpoint: "fixture", requestTime: "0" });
+      if (path.endsWith("/position-info") || path.endsWith("/open-orders")) return Response.json({ data: [], endpoint: "fixture", requestTime: "0" });
+      throw new Error(`UNEXPECTED_ROUTE_${path}`);
+    });
+    vi.stubGlobal("fetch", gateway);
+    const client = new BitgetClient(loadConfig({ TRADING_MODE: "PAPER", PAPER_ONLY: "true", AGENT_MODE: "AUTONOMOUS", BITGET_GATEWAY_URL: "https://gateway.test", BITGET_GATEWAY_SERVICE_SECRET: "gateway-secret" }));
     vi.spyOn(client, "getInstruments").mockResolvedValue(parseInstruments(publicRows));
     const evidence = vi.spyOn(client, "getMarketSnapshot").mockRejectedValue(new Error("REACHED_MARKET_READ"));
-    const { BitgetRestClient } = await import("@bitget-ai/bitget-agent-sdk");
-    vi.spyOn(BitgetRestClient.prototype, "callOperation").mockResolvedValue({ data: [], endpoint: "read", requestTime: "0", raw: { code: "00000" } });
     await expect(client.collectEvidence(["SOXLUSDT"])).rejects.toThrow("REACHED_MARKET_READ");
     expect(evidence).toHaveBeenCalledWith("SOXLUSDT");
   });
