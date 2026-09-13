@@ -16,7 +16,7 @@ PAPER scan eligibility comes from the Demo catalog. Public ticker/history endpoi
 
 ## Authority boundary
 
-Qwen chooses strategy thesis, symbol, `OPEN_LONG`, `OPEN_SHORT`, `HOLD`, `REDUCE`, or `CLOSE`, margin allocation, leverage, and contextual exits. The backend does not encode a trading strategy. `src/trading/policy.ts` and `src/trading/risk-gate.ts` own PAPER-only authority, owner limits, provider validity, idempotency, and position/exposure checks.
+Qwen chooses strategy thesis, symbol, `OPEN_LONG`, `OPEN_SHORT`, `HOLD`, `REDUCE`, or `CLOSE`, margin allocation, leverage, and contextual exits. The `darwin-mandate-v4` contract requires each decision to expose its rationale, supporting evidence, risks/invalidation, and evidence limitations. The backend does not encode a trading strategy. `src/trading/policy.ts` and `src/trading/risk-gate.ts` own PAPER-only authority, owner limits, provider validity, idempotency, and position/exposure checks.
 
 The only financial write path is:
 

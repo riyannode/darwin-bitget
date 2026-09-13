@@ -12,6 +12,7 @@
 - the frontend contains Dashboard, Agent Journal, Trade History, Open Position, Learning, and Policy pages;
 - Open Position is read-only, uses `PROVIDER_LIVE` on current readback, supports multiple positions, and refreshes through the 10-second snapshot polling;
 - signed provider PnL/rate parsing, deterministic reconciliation, runtime Git SHA injection, Demo-universe filtering, sequential exits, and ambiguous-write fail-closed behavior are covered by the implementation/tests.
+- `darwin-mandate-v4` requires evidence-backed decision rationale, supporting factors, risk/invalidation factors, and explicit evidence limitations; the dashboard renders `evidenceUsed` with the other explanation fields.
 
 The manual NVDA lifecycle is execution-path verification only. It is not autonomous Worker history and must not be presented as a competition log.
 

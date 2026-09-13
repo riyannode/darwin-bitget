@@ -54,6 +54,15 @@ Demo executable universe → scan → Qwen shortlist → deep evidence
 
 Qwen owns strategy, thesis, symbol, direction, exits, margin allocation, and leverage. Deterministic code owns PAPER-only mode, hard owner bounds, provider metadata, balance/margin validation, idempotency, readback, reconciliation, and fail-closed ambiguity handling.
 
+## Agent-quality evidence contract
+
+The current prompt contract is `darwin-mandate-v4`. Each decision must explain its
+decision rationale, supporting evidence, risk and invalidation conditions, evidence
+limitations, and lessons used. The dashboard exposes those fields directly so a
+judge can distinguish model reasoning from deterministic risk authority. The
+decision schema and risk gate remain unchanged; this is wording and presentation
+polish only.
+
 ## Bitget integration
 
 The Worker uses the official Bitget Agent SDK and Demo UTA context. PAPER eligibility is dynamically discovered from the Demo catalog; public-only symbols cannot become PAPER candidates. The dashboard uses a separate read-only provider portfolio readback for equity, margin, positions, open orders, and signed unrealized PnL.
