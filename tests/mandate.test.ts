@@ -6,6 +6,11 @@ describe("judge-facing mandate contract", () => {
   it("uses the v4 mandate and requires an evidence-backed explanation", () => {
     expect(PROMPT_VERSIONS.mandate).toBe("darwin-mandate-v4");
     expect(MANDATE_VERSION).toBe("darwin-mandate-v4");
+    expect(TRADING_MANDATE).not.toContain("You are not required to trade.");
+    expect(TRADING_MANDATE).toContain("Do not force a trade.");
+    expect(TRADING_MANDATE).toContain("HOLD is a valid autonomous decision when current evidence does not justify opening, reducing, or closing a position.");
+    expect(TRADING_MANDATE).toContain("New entries must be inside supportedUniverse");
+    expect(TRADING_MANDATE).toContain("existing positions may HOLD, REDUCE, or CLOSE outside supportedUniverse");
     expect(TRADING_MANDATE).toContain("decision rationale");
     expect(TRADING_MANDATE).toContain("supporting evidence");
     expect(TRADING_MANDATE).toContain("risk and invalidation");
