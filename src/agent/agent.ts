@@ -4,7 +4,7 @@ import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
 import { boundExitDecisions, decide, rankMarketCandidates, selectCandidates } from "./decision.js";
-import { scheduleTradingCycle, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES } from "./scheduler.js";
+import { reconcileTradingSchedule, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES, type SchedulerReconciliationResult } from "./scheduler.js";
 import { authorizeOwner } from "./owner-auth.js";
 import { retrieveLessons } from "../learning/lesson-retrieval.js";
 import { reflect, reflectWithQwen } from "../learning/reflection.js";
@@ -24,6 +24,7 @@ import {
   loadDailyDrawdownState,
   loadExperiences,
   loadActiveOwnerPolicy,
+  clampHistoryLimit,
   recordIdempotency,
   recordLessonApplication,
   recordLessonRetrieval,
@@ -46,6 +47,7 @@ import { addDecimal, isDecimal } from "../trading/decimal.js";
 import { EvaClient } from "../eva/client.js";
 import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
 
+
 interface AgentState {
   emergencyStop: boolean;
   paused: boolean;
@@ -61,9 +63,12 @@ interface AgentState {
   temporaryScanIntervalExpiresAt: string | null;
   temporaryScanIntervalCompleted: boolean;
   temporaryScanIntervalDurationMs: number;
+  userStorageVersion: number;
 }
 
 const STALE_CYCLE_TIMEOUT_MS = 120_000;
+const USER_STORAGE_VERSION = 2;
+const SNAPSHOT_EVENT_LIMIT = 25;
 
 function failureCode(codes: string[]): string {
   return codes.join(",") || "";
@@ -79,6 +84,11 @@ function schedulerMetrics(events: readonly { type: string; metadata?: Record<str
     staleCount: events.filter((event) => event.type === "CYCLE_STALE").length,
     failureCount: events.filter((event) => event.type === "CYCLE_FAILED" || event.type === "SCHEDULE_CALLBACK_FAILED").length,
     timeoutCount: events.filter((event) => event.type === "CYCLE_TIMEOUT").length,
+    nextScanAt: null,
+    nextScanStale: false,
+    configuredIntervalMinutes: 0,
+    matchingScheduleCount: 0,
+    schedulerHealthy: false,
   };
 }
 
@@ -87,6 +97,56 @@ function tradeLifecycleStatus(experience: TradeExperience): TradeLifecycleStatus
   if (experience.outcomeStatus === "PROFITABLE" || experience.outcomeStatus === "LOSING" || experience.outcomeStatus === "BREAK_EVEN") return "CLOSED";
   if (experience.outcomeStatus === "BLOCKED") return "BLOCKED";
   return "EXECUTION_FAILURE";
+}
+
+function tradeLogEntries(experiences: readonly TradeExperience[], journals: readonly TradingJournal[]): DashboardSnapshot["trades"] {
+  return experiences.filter((experience) => experience.action !== "HOLD").map((experience) => {
+    const journal = journals.find((entry) => entry.experienceId === experience.experienceId || entry.decision?.decisionId === experience.exitDecisionId || entry.decision?.decisionId === experience.entryDecisionId);
+    const action = (experience.lastAction && experience.lastAction !== "HOLD" ? experience.lastAction : experience.action) as Exclude<TradeExperience["action"], "HOLD">;
+    return {
+      tradeId: experience.experienceId,
+      timestamp: experience.entryTime,
+      symbol: experience.symbol,
+      action,
+      marginAllocationPct: experience.marginAllocationPct,
+      marginAllocated: experience.marginAllocated,
+      leverage: experience.selectedLeverage,
+      positionNotional: experience.positionNotional,
+      entry: experience.entryPrice,
+      exit: experience.exitPrice,
+      realizedPnl: experience.realizedPnl,
+      status: tradeLifecycleStatus(experience),
+      thesis: experience.entryThesis,
+      orderReference: journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
+      positionSide: experience.positionSide,
+      openedAt: experience.entryTime,
+      ...(experience.exitTime ? { closedAt: experience.exitTime } : {}),
+    };
+  });
+}
+
+function executionEvidence(journal: TradingJournal | null): DashboardSnapshot["executionEvidence"] {
+  if (!journal?.executionResult || !journal.reconciliationResult) return null;
+  return {
+    provider: journal.executionResult.provider,
+    action: journal.executionResult.action,
+    symbol: journal.executionResult.symbol,
+    marginAllocated: journal.executionResult.marginAllocated,
+    leverage: journal.executionResult.leverage,
+    positionNotional: journal.executionResult.positionNotional,
+    orderReference: journal.executionResult.providerOrderId ?? journal.executionResult.clientOrderId,
+    executionStatus: journal.executionResult.status,
+    reconciliationStatus: journal.reconciliationResult.status,
+    ...(journal.executionResult.providerCode ? { providerCode: journal.executionResult.providerCode } : {}),
+    ...(journal.executionResult.providerMessage ? { providerMessage: journal.executionResult.providerMessage } : {}),
+    ...(journal.executionResult.providerReadbackCode ? { providerReadbackCode: journal.executionResult.providerReadbackCode } : {}),
+    ...(journal.executionResult.providerReadbackMessage ? { providerReadbackMessage: journal.executionResult.providerReadbackMessage } : {}),
+    timestamp: journal.executionResult.readBackAt,
+  };
+}
+
+function unavailablePerformance(): DashboardSnapshot["performance"] {
+  return { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, wins: null, losses: null, breakeven: null, dailyPnl: {} };
 }
 
 function json(value: unknown, status = 200): Response {
@@ -109,21 +169,29 @@ export class TraderAgent extends Agent<Env, AgentState> {
     temporaryScanIntervalExpiresAt: null,
     temporaryScanIntervalCompleted: false,
     temporaryScanIntervalDurationMs: TEMPORARY_SCAN_INTERVAL_DURATION_MS,
+    userStorageVersion: 0,
   };
 
   public override async onStart(): Promise<void> {
-    ensureStorage(this);
+    if ((this.state.userStorageVersion ?? 0) < USER_STORAGE_VERSION) {
+      ensureStorage(this);
+      this.setState({ ...this.state, userStorageVersion: USER_STORAGE_VERSION });
+    }
     this.ensureTemporaryScanTest();
     const policy = this.ensureActivePolicy();
     const config = loadConfig(this.env, policy);
     const activeCycle = this.state.lastStatus === "RUNNING";
     this.setState({ ...this.state, emergencyStop: policy.emergencyStop, model: config.qwenModel, runtimeStatus: activeCycle ? this.state.runtimeStatus : this.state.paused || policy.emergencyStop ? "PAUSED" : "ONLINE", currentStage: activeCycle ? this.state.currentStage : this.state.paused || policy.emergencyStop ? "PAUSED" : "ONLINE" });
-    if (!this.state.paused && !policy.emergencyStop) await scheduleTradingCycle(this, this.activeScanIntervalMinutes(policy));
+    if (!this.state.paused && !policy.emergencyStop) await this.reconcileScheduler(this.activeScanIntervalMinutes(policy), { ensureSchedule: true });
   }
 
   public override async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/snapshot" && request.method === "GET") return json(await this.getDashboardSnapshot());
+    if (url.pathname === "/agent-journal" && request.method === "GET") return this.getAgentJournal(url);
+    if (url.pathname === "/trade-history" && request.method === "GET") return this.getTradeHistory(url);
+    if (url.pathname === "/learning" && request.method === "GET") return this.getLearning(url);
+    if (url.pathname === "/policy" && request.method === "GET") return this.getPolicyRead();
     if (url.pathname === "/export/paper-log" && request.method === "GET") return this.exportPaperLog(url);
     if ((url.pathname === "/control" || url.pathname === "/policy" || url.pathname === "/eva/connection-test") && request.method === "POST") {
       const auth = authorizeOwner(request, this.env);
@@ -167,7 +235,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   public async runScheduledCycle(): Promise<void> {
-    this.recordEvent("SCHEDULE_CALLBACK", "CONTROL");
+    this.recordEventBestEffort("SCHEDULE_CALLBACK", "CONTROL");
     if (this.state.paused || this.state.emergencyStop) return;
     try {
       const policy = this.ensureActivePolicy();
@@ -176,9 +244,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
       await this.runCycle();
     } catch (error) {
       const code = error instanceof Error ? error.message.split(":", 1)[0] ?? "SCHEDULE_CALLBACK_FAILED" : "SCHEDULE_CALLBACK_FAILED";
-      if (code === "CYCLE_IN_PROGRESS") this.recordEvent("CYCLE_IN_PROGRESS", this.state.lastCycleId ?? "UNKNOWN", { code });
-      if (code.includes("TIMEOUT")) this.recordEvent("CYCLE_TIMEOUT", this.state.lastCycleId ?? "UNKNOWN", { code });
-      this.recordEvent("SCHEDULE_CALLBACK_FAILED", "CONTROL", { code });
+      if (code === "CYCLE_IN_PROGRESS") this.recordEventBestEffort("CYCLE_IN_PROGRESS", this.state.lastCycleId ?? "UNKNOWN", { code });
+      if (code.includes("TIMEOUT")) this.recordEventBestEffort("CYCLE_TIMEOUT", this.state.lastCycleId ?? "UNKNOWN", { code });
+      this.recordEventBestEffort("SCHEDULE_CALLBACK_FAILED", "CONTROL", { code });
       return;
     }
   }
@@ -198,8 +266,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (!effectivePaused) {
       const config = loadConfig(this.env, this.ensureActivePolicy());
       const intervalMinutes = this.activeScanIntervalMinutes(config.ownerPolicy);
-      await scheduleTradingCycle(this, intervalMinutes);
-      this.setState({ ...this.state, nextScanAt: new Date(Date.now() + intervalMinutes * 60_000).toISOString() });
+      await this.reconcileScheduler(intervalMinutes, { ensureSchedule: true });
     }
     return nextState;
   }
@@ -227,7 +294,6 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const format = url.searchParams.get("format") ?? "json";
       if (format !== "json" && format !== "csv") return json({ error: "INVALID_EXPORT_FORMAT" }, 400);
       const period = parsePaperLogPeriod(url.searchParams.get("from"), url.searchParams.get("to"));
-      ensureStorage(this);
       const journals = loadAllAutonomousJournals(this, period.start ?? undefined, period.end ?? undefined);
       const exported = buildPaperLogExport({
         generatedAt: new Date().toISOString(),
@@ -274,50 +340,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   public async getDashboardSnapshot(): Promise<DashboardSnapshot> {
-    ensureStorage(this);
     const config = loadConfig(this.env, this.ensureActivePolicy());
-    await this.ensureTradingSchedule(config);
     const journal = loadLatestJournal(this);
-    const journals = loadRecentJournals(this);
-    const experiences = loadExperiences(this);
+    const events = loadRecentEvents(this, SNAPSHOT_EVENT_LIMIT);
     const drawdown = loadDailyDrawdownState(this);
-    const trades = experiences.filter((experience) => experience.action !== "HOLD").map((experience) => {
-      const journal = journals.find((entry) => entry.experienceId === experience.experienceId || entry.decision?.decisionId === experience.exitDecisionId || entry.decision?.decisionId === experience.entryDecisionId);
-      const action = experience.lastAction && experience.lastAction !== "HOLD" ? experience.lastAction : experience.action;
-      if (action === "HOLD") return null;
-      return {
-        tradeId: experience.experienceId,
-        timestamp: experience.entryTime,
-        symbol: experience.symbol,
-        action,
-        marginAllocationPct: experience.marginAllocationPct,
-        marginAllocated: experience.marginAllocated,
-        leverage: experience.selectedLeverage,
-        positionNotional: experience.positionNotional,
-        entry: experience.entryPrice,
-        exit: experience.exitPrice,
-        realizedPnl: experience.realizedPnl,
-        status: tradeLifecycleStatus(experience),
-        thesis: experience.entryThesis,
-        orderReference: journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
-        positionSide: experience.positionSide,
-        openedAt: experience.entryTime,
-        ...(experience.exitTime ? { closedAt: experience.exitTime } : {}),
-      };
-    }).filter((trade): trade is NonNullable<typeof trade> => trade !== null).slice(0, 25);
-    const closedExperiences = experiences.filter((experience) => experience.outcomeStatus === "PROFITABLE" || experience.outcomeStatus === "LOSING" || experience.outcomeStatus === "BREAK_EVEN");
-    const totalTrades = closedExperiences.length;
-    const wins = experiences.filter((experience) => experience.outcomeStatus === "PROFITABLE").length;
-    const losses = experiences.filter((experience) => experience.outcomeStatus === "LOSING").length;
-    const breakeven = experiences.filter((experience) => experience.outcomeStatus === "BREAK_EVEN").length;
-    const totalPnl = closedExperiences.reduce((total, experience) => total + Number(experience.realizedPnl || 0), 0).toFixed(8);
     const drawdownPct = drawdown ? calculateDrawdownPct(drawdown.baselineEquity, drawdown.lastEquity) : "0";
-    const dailyPnl = closedExperiences.reduce<Record<string, { pnl: string; trades: number }>>((summary, experience) => {
-      const day = (experience.exitTime || experience.entryTime).slice(0, 10);
-      const current = summary[day] ?? { pnl: "0", trades: 0 };
-      summary[day] = { pnl: (Number(current.pnl) + Number(experience.realizedPnl || 0)).toFixed(8), trades: current.trades + 1 };
-      return summary;
-    }, {});
+    const configuredIntervalMinutes = temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes;
+    const scheduler = await this.getSchedulerDiagnostics(configuredIntervalMinutes);
     return {
       version: config.version ?? "0.2.0",
       commit: config.commit ?? "local",
@@ -331,50 +360,76 @@ export class TraderAgent extends Agent<Env, AgentState> {
         model: this.state.model || config.qwenModel,
         paperMode: true,
       },
-      portfolio: journal?.portfolio ?? null,
-      performance: { totalPnl, winRate: totalTrades > 0 ? ((wins / totalTrades) * 100).toFixed(2) : "0", dailyDrawdown: drawdownPct, totalTrades, wins, losses, breakeven, dailyPnl },
-      trades,
+      portfolio: null,
+      portfolioFreshness: { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" },
+      performance: { ...unavailablePerformance(), dailyDrawdown: drawdownPct },
+      trades: [],
       latestDecision: journal?.decision ?? null,
-      decisions: journals.map((entry) => entry.decision).filter((decision): decision is Decision => Boolean(decision)).slice(0, 25),
-      executionEvidence: journal?.executionResult && journal.reconciliationResult ? {
-        provider: journal.executionResult.provider,
-        action: journal.executionResult.action,
-        symbol: journal.executionResult.symbol,
-        marginAllocated: journal.executionResult.marginAllocated,
-        leverage: journal.executionResult.leverage,
-        positionNotional: journal.executionResult.positionNotional,
-        orderReference: journal.executionResult.providerOrderId ?? journal.executionResult.clientOrderId,
-        executionStatus: journal.executionResult.status,
-        reconciliationStatus: journal.reconciliationResult.status,
-        ...(journal.executionResult.providerCode ? { providerCode: journal.executionResult.providerCode } : {}),
-        ...(journal.executionResult.providerMessage ? { providerMessage: journal.executionResult.providerMessage } : {}),
-        ...(journal.executionResult.providerReadbackCode ? { providerReadbackCode: journal.executionResult.providerReadbackCode } : {}),
-        ...(journal.executionResult.providerReadbackMessage ? { providerReadbackMessage: journal.executionResult.providerReadbackMessage } : {}),
-        timestamp: journal.executionResult.readBackAt,
-      } : null,
-      learning: {
-        reflection: journal?.reflection ?? null,
-        lessons: loadRecentLessons(this, 8),
-        lessonsUsed: journal?.decision?.lessonsUsed ?? [],
-        backtest: loadLatestBacktest(this),
-        recentExperiences: experiences.slice(0, 8),
-      },
-      riskControls: {
-        ...config.ownerPolicy,
-        scanIntervalMinutes: this.activeScanIntervalMinutes(config.ownerPolicy),
-        temporaryScanIntervalExpiresAt: this.state.temporaryScanIntervalExpiresAt,
-        drawdownBlocked: Boolean(drawdown?.cooldownUntil && new Date(drawdown.cooldownUntil).getTime() > Date.now()),
-        drawdownCode: drawdown?.cooldownUntil ? "DRAWDOWN_COOLDOWN" : "NONE",
-        cooldownUntil: drawdown?.cooldownUntil ?? null,
-      },
-      activity: loadRecentEvents(this),
-      lastPolicyUpdate: loadRecentEvents(this, 50).find((event) => event.type === "POLICY_UPDATED") ?? null,
-      scheduler: schedulerMetrics(loadRecentEvents(this, 200)),
+      decisions: journal?.decision ? [journal.decision] : [],
+      executionEvidence: executionEvidence(journal),
+      learning: { reflection: journal?.reflection ?? null, lessons: [], lessonsUsed: journal?.decision?.lessonsUsed ?? [], backtest: null, recentExperiences: [] },
+      riskControls: { ...config.ownerPolicy, scanIntervalMinutes: temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes, temporaryScanIntervalExpiresAt: this.state.temporaryScanIntervalExpiresAt, drawdownBlocked: Boolean(drawdown?.cooldownUntil && new Date(drawdown.cooldownUntil).getTime() > Date.now()), drawdownCode: drawdown?.cooldownUntil ? "DRAWDOWN_COOLDOWN" : "NONE", cooldownUntil: drawdown?.cooldownUntil ?? null },
+      activity: events,
+      lastPolicyUpdate: events.find((event) => event.type === "POLICY_UPDATED") ?? null,
+      // Snapshot scheduler metrics intentionally cover the same bounded recent event window.
+      scheduler: { ...schedulerMetrics(events), ...scheduler },
     };
   }
 
+  private async getSchedulerDiagnostics(intervalMinutes: number, now = Date.now()): Promise<Pick<DashboardSnapshot["scheduler"], "nextScanAt" | "nextScanStale" | "configuredIntervalMinutes" | "matchingScheduleCount" | "schedulerHealthy" | "schedulerErrorCode">> {
+    const activeCycle = this.state.lastStatus === "RUNNING" || Boolean(this.state.cycleStartedAt);
+    try {
+      const result = await this.reconcileScheduler(intervalMinutes, { now });
+      const schedulerHealthy = this.state.paused || this.state.emergencyStop
+        ? result.cycleSchedules.length === 0
+        : result.cycleSchedules.length === 1 && result.matchingSchedules.length === 1 && !result.nextScanStale;
+      return { nextScanAt: result.nextScanAt, nextScanStale: result.nextScanStale, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: result.matchingSchedules.length, schedulerHealthy };
+    } catch (error) {
+      const errorCode = error instanceof Error && error.message.startsWith("SCHEDULE_LIST_FAILED") ? "SCHEDULE_LIST_FAILED" : "SCHEDULE_REPAIR_FAILED";
+      return { nextScanAt: this.state.nextScanAt, nextScanStale: true, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: 0, schedulerHealthy: false, schedulerErrorCode: errorCode };
+    }
+  }
+
+  private async reconcileScheduler(intervalMinutes: number, options: { ensureSchedule?: boolean; now?: number } = {}): Promise<SchedulerReconciliationResult> {
+    const result = await reconcileTradingSchedule(this, intervalMinutes, {
+      paused: this.state.paused,
+      emergencyStop: this.state.emergencyStop,
+      activeCycle: this.state.lastStatus === "RUNNING" || Boolean(this.state.cycleStartedAt),
+      nextScanAt: this.state.nextScanAt,
+    }, options);
+    if (result.matchingSchedules.length === 1 && result.nextScanAt !== this.state.nextScanAt) this.setState({ ...this.state, nextScanAt: result.nextScanAt });
+    return result;
+  }
+
+  private getAgentJournal(url: URL): Response {
+    const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
+    const journals = loadRecentJournals(this, limit);
+    return json({ journals, decisions: journals.flatMap((entry) => entry.decision ? [entry.decision] : []), limit });
+  }
+
+  private getTradeHistory(url: URL): Response {
+    const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
+    const experiences = loadExperiences(this, limit);
+    const journals = loadRecentJournals(this, limit);
+    const trades = tradeLogEntries(experiences, journals);
+    return json({ trades, limit });
+  }
+
+  private getLearning(url: URL): Response {
+    const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
+    const journal = loadLatestJournal(this);
+    return json({ learning: { reflection: journal?.reflection ?? null, lessons: loadRecentLessons(this, limit), lessonsUsed: journal?.decision?.lessonsUsed ?? [], backtest: loadLatestBacktest(this), recentExperiences: loadExperiences(this, limit) }, limit });
+  }
+
+  private getPolicyRead(): Response {
+    const config = loadConfig(this.env, this.ensureActivePolicy());
+    const drawdown = loadDailyDrawdownState(this);
+    const events = loadRecentEvents(this, SNAPSHOT_EVENT_LIMIT);
+    const riskControls: DashboardSnapshot["riskControls"] = { ...config.ownerPolicy, scanIntervalMinutes: temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes, temporaryScanIntervalExpiresAt: this.state.temporaryScanIntervalExpiresAt, drawdownBlocked: Boolean(drawdown?.cooldownUntil && new Date(drawdown.cooldownUntil).getTime() > Date.now()), drawdownCode: drawdown?.cooldownUntil ? "DRAWDOWN_COOLDOWN" : "NONE", cooldownUntil: drawdown?.cooldownUntil ?? null };
+    return json({ riskControls, lastPolicyUpdate: events.find((event) => event.type === "POLICY_UPDATED") ?? null });
+  }
+
   private async runCycle(): Promise<TradingJournal> {
-    ensureStorage(this);
     if (this.state.paused) throw new Error("AGENT_PAUSED");
     if (this.state.emergencyStop) throw new Error("EMERGENCY_STOP");
     if (this.state.lastStatus === "RUNNING" && !this.recoverStaleCycle()) {
@@ -693,29 +748,19 @@ export class TraderAgent extends Agent<Env, AgentState> {
     saveEvent(this, { eventId: crypto.randomUUID(), type, cycleId, createdAt: new Date().toISOString(), ...(metadata ? { metadata } : {}) });
   }
 
+  private recordEventBestEffort(type: string, cycleId: string, metadata?: Record<string, string>): void {
+    try {
+      this.recordEvent(type, cycleId, metadata);
+    } catch {
+      // Telemetry must not prevent the callback from reaching cycle handling.
+    }
+  }
+
   private async ensureTradingSchedule(config: ReturnType<typeof loadConfig>): Promise<void> {
     if (this.state.paused || this.state.emergencyStop) return;
     const intervalMinutes = this.activeScanIntervalMinutes(config.ownerPolicy);
-    let schedules: Awaited<ReturnType<TraderAgent["listSchedules"]>> = [];
-    try {
-      schedules = await this.listSchedules();
-      const cycleSchedules = schedules.filter((entry) => entry.callback === "runScheduledCycle");
-      const matchingSchedule = cycleSchedules.length === 1 && cycleSchedules[0]?.type === "interval" && cycleSchedules[0]?.intervalSeconds === intervalMinutes * 60;
-      if (!matchingSchedule) {
-        await scheduleTradingCycle(this, intervalMinutes);
-        this.recordEvent("SCHEDULE_RESCHEDULED", "CONTROL", { intervalMinutes: String(intervalMinutes) });
-        const refreshedSchedules = await this.listSchedules();
-        const refreshedCycle = refreshedSchedules.find((entry) => entry.callback === "runScheduledCycle");
-        const nextScanAt = refreshedCycle?.time && Number.isFinite(refreshedCycle.time) ? new Date(refreshedCycle.time * 1000).toISOString() : new Date(Date.now() + intervalMinutes * 60_000).toISOString();
-        this.setState({ ...this.state, nextScanAt });
-      } else {
-        const cycleSchedule = cycleSchedules[0];
-        const nextScanAt = cycleSchedule?.time && Number.isFinite(cycleSchedule.time) ? new Date(cycleSchedule.time * 1000).toISOString() : this.state.nextScanAt;
-        if (nextScanAt && nextScanAt !== this.state.nextScanAt) this.setState({ ...this.state, nextScanAt });
-      }
-    } catch (error) {
-      this.recordEvent("SCHEDULE_REPAIR_FAILED", "CONTROL", { code: error instanceof Error ? error.message.split(":", 1)[0] ?? "SCHEDULE_REPAIR_FAILED" : "SCHEDULE_REPAIR_FAILED", scheduleCount: String(schedules.length) });
-    }
+    const result = await this.reconcileScheduler(intervalMinutes, { ensureSchedule: true });
+    if (result.repaired) this.recordEventBestEffort("SCHEDULE_RESCHEDULED", "CONTROL", { intervalMinutes: String(intervalMinutes) });
   }
 
   private recordPositionDiscrepancies(experiences: readonly TradeExperience[], positions: readonly PositionSnapshot[], cycleId: string): string[] {
@@ -761,8 +806,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const previous = this.ensureActivePolicy();
     const next = updateOwnerPolicy(previous, value);
     this.persistPolicy(previous, next);
-    if (previous.scanIntervalMinutes !== next.scanIntervalMinutes && !this.state.paused && !next.emergencyStop) await scheduleTradingCycle(this, this.activeScanIntervalMinutes(next));
-    this.setState({ ...this.state, emergencyStop: next.emergencyStop, nextScanAt: new Date(Date.now() + this.activeScanIntervalMinutes(next) * 60_000).toISOString(), lastPolicyUpdateAt: new Date().toISOString() });
+    const intervalMinutes = this.activeScanIntervalMinutes(next);
+    this.setState({ ...this.state, emergencyStop: next.emergencyStop, nextScanAt: new Date(Date.now() + intervalMinutes * 60_000).toISOString(), lastPolicyUpdateAt: new Date().toISOString() });
+    if (previous.scanIntervalMinutes !== next.scanIntervalMinutes && !this.state.paused && !next.emergencyStop) await this.reconcileScheduler(intervalMinutes, { ensureSchedule: true });
     return this.getDashboardSnapshot();
   }
 }

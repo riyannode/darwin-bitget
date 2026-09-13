@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { BitgetApiError, BitgetRestClient } from "@bitget-ai/bitget-agent-sdk";
+import { BitgetApiError } from "@bitget-ai/bitget-agent-sdk";
 import { BitgetClient, buildOpenOrdersReadParams, buildPaperOrderParams, buildUnresolvedExecution, extractProviderError, formatBitgetReadFailure, normalizeBitgetOrderStatus } from "../src/bitget/client.js";
 import { loadConfig } from "../src/config.js";
 import type { ExecutionRequest } from "../src/types.js";
@@ -20,17 +20,64 @@ const request: ExecutionRequest = {
   clientOrderId: "paper-cycle1-decision1",
 };
 
+function gatewayConfig() {
+  return loadConfig({ TRADING_MODE: "PAPER", PAPER_ONLY: "true", AGENT_MODE: "AUTONOMOUS", BITGET_GATEWAY_URL: "https://gateway.test", BITGET_GATEWAY_SERVICE_SECRET: "gateway-secret" });
+}
+
+function gatewayResponse(data: unknown): Response {
+  return Response.json({ endpoint: "fixture", requestTime: "2026-09-12T00:00:00.000Z", data });
+}
+
 describe("Bitget read diagnostics", () => {
-  it("records the failed operation without retrying a financial write or leaking credentials", async () => {
-    const sdk = vi.spyOn(BitgetRestClient.prototype, "callOperation").mockRejectedValue({ code: "PROVIDER_ERROR", message: "fixture-passphrase" });
+  it("reads live dashboard portfolio without invoking financial writes", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/account-assets")) return gatewayResponse({ usdtEquity: "50000", availableMargin: "47000", marginUsed: "3000", positionValue: "2996.3654" });
+      if (path.endsWith("/position-info")) return gatewayResponse([{ symbol: "CRCLUSDT", posSide: "long", total: "32.69", avgPrice: "91.7", markPrice: "91.82", leverage: "3", positionBalance: "998.78", unrealisedPnl: "3.9252", profitRate: "0.0039", liqPrice: "44.2" }]);
+      if (path.endsWith("/open-orders")) return gatewayResponse({ list: [{ symbol: "CRCLUSDT", orderId: "open-1" }] });
+      throw new Error(`UNEXPECTED_ROUTE_${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
     try {
-      const client = new BitgetClient(loadConfig({ TRADING_MODE: "PAPER", PAPER_ONLY: "true", AGENT_MODE: "AUTONOMOUS", BITGET_API_KEY: "fixture-key", BITGET_SECRET_KEY: "fixture-secret", BITGET_PASSPHRASE: "fixture-passphrase" }));
+      const portfolio = await new BitgetClient(gatewayConfig()).getDashboardPortfolio();
+      expect(portfolio.positions[0]).toMatchObject({ symbol: "CRCLUSDT", markPrice: "91.82", unrealizedPnl: "3.9252", unrealizedPnlPct: "0.39" });
+      expect(portfolio.openOrders).toBe(1);
+      expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual(["/v1/bitget/account-assets", "/v1/bitget/position-info", "/v1/bitget/open-orders"]);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it("keeps account and positions live when open-orders readback is temporarily unavailable", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/account-assets")) return gatewayResponse({ usdtEquity: "50000", availableMargin: "47000", marginUsed: "3000", positionValue: "2996.3654" });
+      if (path.endsWith("/position-info")) return gatewayResponse([{ symbol: "CRCLUSDT", posSide: "long", total: "32.69", avgPrice: "91.7", markPrice: "91.82", leverage: "3", positionBalance: "998.78", unrealisedPnl: "-0.98", profitRate: "-0.0009", liqPrice: "44.2" }]);
+      if (path.endsWith("/open-orders")) return Response.json({ error: "BITGET_GATEWAY_FAILED_getOpenOrders", provider: { operation: "getOpenOrders", code: "40701", message: "temporary open-orders unavailable", symbol: "ACCOUNT" } }, { status: 502 });
+      throw new Error(`UNEXPECTED_ROUTE_${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const portfolio = await new BitgetClient(gatewayConfig()).getDashboardPortfolio();
+      expect(portfolio.portfolioEquity).toBe("50000");
+      expect(portfolio.positions).toHaveLength(1);
+      expect(portfolio.openOrders).toBeNull();
+      expect(portfolio.openOrdersReadFailure).toEqual({ operation: "getOpenOrders", code: "40701", message: "temporary open-orders unavailable" });
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it("records the failed operation without retrying a financial write or leaking credentials", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      return Response.json({ error: "BITGET_GATEWAY_FAILED", provider: { operation: path.endsWith("/account-info") ? "getAccountInfo" : "getOrderDetails", code: "PROVIDER_ERROR", message: "authorization: Bearer gateway-secret", symbol: "ACCOUNT" } }, { status: 502 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const client = new BitgetClient(gatewayConfig());
       const result = await client.placePaperOrder(request);
       expect(result.providerOperation).toBe("getAccountInfo");
       expect(result.providerCode).toBe("PROVIDER_ERROR");
-      expect(JSON.stringify(result)).not.toContain("fixture-passphrase");
-      expect(sdk.mock.calls.map(([operation]) => operation)).toEqual(["getAccountInfo", "getOrderDetails"]);
-    } finally { sdk.mockRestore(); }
+      expect(JSON.stringify(result)).not.toContain("gateway-secret");
+      expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual(["/v1/bitget/account-info", "/v1/bitget/order-details"]);
+    } finally { vi.unstubAllGlobals(); }
   });
   it("normalizes provider order status", () => {
     expect(normalizeBitgetOrderStatus("filled")).toBe("filled");

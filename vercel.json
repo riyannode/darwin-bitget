@@ -1,7 +1,12 @@
 {
   "framework": null,
+  "buildCommand": "true",
   "outputDirectory": "public",
   "rewrites": [
+    {
+      "source": "/demo",
+      "destination": "/index.html"
+    },
     {
       "source": "/api/:path*",
       "destination": "https://darwin-bitget.hpelong377.workers.dev/api/:path*"

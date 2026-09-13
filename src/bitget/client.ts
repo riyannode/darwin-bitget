@@ -1,10 +1,25 @@
 import { BitgetRestClient, loadConfig as loadBitgetConfig } from "@bitget-ai/bitget-agent-sdk";
-import type { EvidenceBundle, ExecutionResult, ExecutionRequest, Instrument, MarketSnapshot, RuntimeConfig } from "../types.js";
+import type { AccountSnapshot, EvidenceBundle, ExecutionResult, ExecutionRequest, Instrument, MarketSnapshot, RuntimeConfig } from "../types.js";
 import { classifyMarketRegime } from "../trading/market-regime.js";
-import { parseAccount, parseFillSummary, parseHistoricalBars, parseInstruments, parsePositionHistorySummary, parsePositionSymbols, parseTicker, record } from "./types.js";
+import { parseAccount, parseDashboardPortfolio, parseFillSummary, parseHistoricalBars, parseInstruments, parsePositionHistorySummary, parsePositionSymbols, parseTicker, record } from "./types.js";
+import { BitgetGatewayClient, PRIVATE_BITGET_OPERATIONS, type PrivateBitgetOperation } from "./gateway-client.js";
 
 export function formatBitgetReadFailure(operation: string, symbol = "ACCOUNT"): string {
   return `BITGET_READ_FAILED_${operation}_${symbol}`;
+}
+
+export class BitgetReadError extends Error {
+  public readonly operation: string;
+  public readonly symbol: string;
+  public readonly details: ProviderErrorDetails;
+
+  public constructor(operation: string, symbol: string, cause: unknown) {
+    super(formatBitgetReadFailure(operation, symbol));
+    this.name = "BitgetReadError";
+    this.operation = operation;
+    this.symbol = symbol;
+    this.details = extractProviderError(cause);
+  }
 }
 
 export function buildOpenOrdersReadParams(category: string): Record<string, string> {
@@ -66,8 +81,9 @@ export function normalizeBitgetOrderStatus(value: unknown): ExecutionResult["sta
 
 export function extractProviderError(error: unknown): ProviderErrorDetails {
   const record = isRecord(error) ? error : null;
-  const code = textValue(record?.code) || textValue(record?.type);
-  const message = sanitizeProviderMessage(error instanceof Error ? error.message : textValue(record?.message) || textValue(record?.msg));
+  const details = isRecord(record?.details) ? record.details : null;
+  const code = textValue(details?.code) || textValue(record?.code) || textValue(record?.type);
+  const message = sanitizeProviderMessage(textValue(details?.message) || (error instanceof Error ? error.message : textValue(record?.message) || textValue(record?.msg)));
   return {
     ...(code ? { code } : {}),
     ...(message ? { message } : {}),
@@ -110,23 +126,17 @@ export class BitgetClient {
   private readonly category: string;
   private readonly baseUrl: string;
   private demoInstruments: Instrument[] = [];
-  private readonly secrets: string[];
+  private readonly gateway: BitgetGatewayClient | null;
 
   public constructor(config: RuntimeConfig) {
-    const credentials = {
-      ...(config.bitgetApiKey ? { apiKey: config.bitgetApiKey } : {}),
-      ...(config.bitgetSecretKey ? { secretKey: config.bitgetSecretKey } : {}),
-      ...(config.bitgetPassphrase ? { passphrase: config.bitgetPassphrase } : {}),
-    };
     this.category = config.bitgetCategory;
     this.baseUrl = config.bitgetApiBaseUrl;
-    this.secrets = [config.bitgetApiKey, config.bitgetSecretKey, config.bitgetPassphrase].filter((value): value is string => Boolean(value));
+    this.gateway = config.bitgetGatewayUrl && config.bitgetGatewayServiceSecret ? new BitgetGatewayClient(config.bitgetGatewayUrl, config.bitgetGatewayServiceSecret) : null;
     const bitgetConfig = loadBitgetConfig({
       modules: "account,trade,market",
       baseUrl: config.bitgetApiBaseUrl,
       paperTrading: true,
       userAgent: "bitget-autonomous-trader/0.1.0",
-      ...credentials,
     });
     this.client = new BitgetRestClient(bitgetConfig);
   }
@@ -150,6 +160,28 @@ export class BitgetClient {
   public async getOpenPositionSymbols(): Promise<string[]> {
     const result = await this.callRead<unknown>("getPositionInfo", { category: this.category });
     return parsePositionSymbols(result.data);
+  }
+
+  public async getDashboardPortfolio(): Promise<AccountSnapshot> {
+    const observedAt = new Date().toISOString();
+    const [accountResult, positionsResult, openOrdersResult] = await Promise.all([
+      this.callRead<unknown>("getAccountAssets", {}),
+      this.callRead<unknown>("getPositionInfo", { category: this.category }),
+      this.callRead<unknown>("getOpenOrders", buildOpenOrdersReadParams(this.category)).then((result) => ({ result })).catch((error: unknown) => ({ error })),
+    ]);
+    const openOrdersFailure = "error" in openOrdersResult ? openOrdersResult.error : undefined;
+    const portfolio = parseDashboardPortfolio(accountResult.data, positionsResult.data, "error" in openOrdersResult ? { list: [] } : openOrdersResult.result.data, observedAt);
+    if (!(openOrdersFailure instanceof BitgetReadError)) return portfolio;
+    return {
+      ...portfolio,
+      openOrders: null,
+      openOrderSymbols: [],
+      openOrdersReadFailure: {
+        operation: openOrdersFailure.operation,
+        ...(openOrdersFailure.details.code ? { code: openOrdersFailure.details.code } : {}),
+        ...(openOrdersFailure.details.message ? { message: openOrdersFailure.details.message } : {}),
+      },
+    };
   }
 
   public async collectLightweightScan(instruments: readonly Instrument[]): Promise<MarketSnapshot[]> {
@@ -216,11 +248,11 @@ export class BitgetClient {
     const submittedAt = new Date().toISOString();
     let operation = "getAccountInfo";
     try {
-      const accountInfo = await this.client.callOperation<unknown>("getAccountInfo", {});
+      const accountInfo = await this.callOperation<unknown>("getAccountInfo", {});
       const holdingMode = parseHoldingMode(accountInfo.data);
       if (request.tradeSide === "open") {
         operation = "setLeverage";
-        await this.client.callOperation<unknown>("setLeverage", {
+        await this.callOperation<unknown>("setLeverage", {
           category: this.category,
           symbol: request.symbol,
           leverage: request.leverage,
@@ -228,7 +260,7 @@ export class BitgetClient {
         });
       }
       operation = "placeOrder";
-      const result = await this.client.callOperation<unknown>("placeOrder", buildPaperOrderParams(request, holdingMode, this.category));
+      const result = await this.callOperation<unknown>("placeOrder", buildPaperOrderParams(request, holdingMode, this.category));
       const response = record(result.data);
       operation = "getOrderDetails";
       return await this.readOrder(request, {
@@ -238,22 +270,30 @@ export class BitgetClient {
       });
     } catch (error) {
       const result = await this.readUnknownOrder(request, submittedAt, error);
-      const redact = (message: string | undefined) => message === undefined ? undefined : this.secrets.reduce((safe, secret) => safe.split(secret).join("REDACTED"), sanitizeProviderMessage(message));
+      const redact = (message: string | undefined) => message === undefined ? undefined : sanitizeProviderMessage(message);
       return { ...result, providerOperation: operation, ...(result.providerMessage ? { providerMessage: redact(result.providerMessage)! } : {}), ...(result.providerReadbackMessage ? { providerReadbackMessage: redact(result.providerReadbackMessage)! } : {}) };
     }
   }
 
   private async callRead<T>(operation: string, params: Record<string, string>): Promise<{ data: T }> {
     try {
-      return await this.client.callOperation<T>(operation, params);
-    } catch {
-      throw new Error(formatBitgetReadFailure(operation, params.symbol));
+      return await this.callOperation<T>(operation, params);
+    } catch (error) {
+      throw new BitgetReadError(operation, params.symbol ?? "ACCOUNT", error);
     }
+  }
+
+  private async callOperation<T>(operation: string, params: Record<string, unknown>): Promise<{ data: T }> {
+    if ((PRIVATE_BITGET_OPERATIONS as readonly string[]).includes(operation)) {
+      if (!this.gateway) throw new Error("BITGET_GATEWAY_NOT_CONFIGURED");
+      return this.gateway.call<T>(operation as PrivateBitgetOperation, params);
+    }
+    return this.client.callOperation<T>(operation, params);
   }
 
   private async readUnknownOrder(request: ExecutionRequest, submittedAt: string, error: unknown): Promise<ExecutionResult> {
     try {
-      const result = await this.client.callOperation<unknown>("getOrderDetails", { clientOid: request.clientOrderId });
+      const result = await this.callOperation<unknown>("getOrderDetails", { clientOid: request.clientOrderId });
       const response = record(result.data);
       return this.readOrder(request, {
         providerOrderId: this.text(response.orderId),
@@ -266,7 +306,7 @@ export class BitgetClient {
   }
 
   private async readOrder(request: ExecutionRequest, reference: { providerOrderId: string; clientOrderId: string; submittedAt: string }): Promise<ExecutionResult> {
-    const result = await this.client.callOperation<unknown>("getOrderDetails", { orderId: reference.providerOrderId, clientOid: reference.clientOrderId });
+    const result = await this.callOperation<unknown>("getOrderDetails", { orderId: reference.providerOrderId, clientOid: reference.clientOrderId });
     const response = record(result.data);
     const baseExecution: ExecutionResult = {
       provider: "bitget",
@@ -296,7 +336,7 @@ export class BitgetClient {
     let readbackFailure = false;
     if (baseExecution.status === "filled" || baseExecution.status === "partially_filled") {
       try {
-        const fills = await this.client.callOperation<unknown>("getFillHistory", { category: this.category, orderId: reference.providerOrderId, limit: "100" });
+        const fills = await this.callOperation<unknown>("getFillHistory", { category: this.category, orderId: reference.providerOrderId, limit: "100" });
         const summary = parseFillSummary(fills.data);
         enriched = {
           ...enriched,
@@ -310,7 +350,7 @@ export class BitgetClient {
       }
       if (request.tradeSide === "close" && !enriched.realizedPnl) {
         try {
-          const history = await this.client.callOperation<unknown>("getPositionsHistory", { category: this.category, symbol: request.symbol, limit: "20" });
+          const history = await this.callOperation<unknown>("getPositionsHistory", { category: this.category, symbol: request.symbol, limit: "20" });
           const summary = parsePositionHistorySummary(history.data);
           enriched = {
             ...enriched,

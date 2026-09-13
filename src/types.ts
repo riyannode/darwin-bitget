@@ -37,10 +37,9 @@ export interface Env extends Cloudflare.Env {
   GIT_COMMIT_SHA?: string;
   ENVIRONMENT?: string;
   EVIDENCE_MAX_AGE_SECONDS?: string;
-  BITGET_API_KEY?: string;
-  BITGET_SECRET_KEY?: string;
-  BITGET_PASSPHRASE?: string;
   BITGET_API_BASE_URL?: string;
+  BITGET_GATEWAY_URL?: string;
+  BITGET_GATEWAY_SERVICE_SECRET?: string;
   QWEN_API_KEY?: string;
   QWEN_BASE_URL?: string;
   QWEN_MODEL?: string;
@@ -56,10 +55,9 @@ export interface RuntimeConfig {
   ownerPolicy: OwnerPolicy;
   evidenceMaxAgeSeconds: number;
   bitgetCategory: string;
-  bitgetApiKey?: string;
-  bitgetSecretKey?: string;
-  bitgetPassphrase?: string;
   bitgetApiBaseUrl: string;
+  bitgetGatewayUrl?: string;
+  bitgetGatewayServiceSecret?: string;
   qwenApiKey?: string;
   qwenBaseUrl: string;
   qwenModel: string;
@@ -132,8 +130,13 @@ export interface AccountSnapshot {
   positions: PositionSnapshot[];
   realizedPnl: string;
   unrealizedPnl: string;
-  openOrders: number;
+  openOrders: number | null;
   openOrderSymbols: string[];
+  openOrdersReadFailure?: {
+    operation: string;
+    code?: string;
+    message?: string;
+  };
   observedAt: string;
 }
 
@@ -145,7 +148,9 @@ export interface PositionSnapshot {
   marginAllocated: string;
   leverage: string;
   entryPrice: string;
+  markPrice?: string;
   unrealizedPnl: string;
+  unrealizedPnlPct?: string;
   realizedPnl: string;
   openedAt?: string;
   liquidationPrice?: string;
@@ -436,14 +441,20 @@ export interface DashboardSnapshot {
     paperMode: true;
   };
   portfolio: AccountSnapshot | null;
+  portfolioFreshness: {
+    source: "PROVIDER_LIVE" | "JOURNAL_FALLBACK" | "UNAVAILABLE";
+    observedAt: string;
+    stale: boolean;
+    errorCode?: string;
+  };
   performance: {
     totalPnl: string;
     winRate: string;
     dailyDrawdown: string;
-    totalTrades: number;
-    wins: number;
-    losses: number;
-    breakeven: number;
+    totalTrades: number | null;
+    wins: number | null;
+    losses: number | null;
+    breakeven: number | null;
     dailyPnl: Record<string, { pnl: string; trades: number }>;
   };
   trades: TradeLogEntry[];
@@ -473,6 +484,12 @@ export interface DashboardSnapshot {
     staleCount: number;
     failureCount: number;
     timeoutCount: number;
+    nextScanAt: string | null;
+    nextScanStale: boolean;
+    configuredIntervalMinutes: number;
+    matchingScheduleCount: number;
+    schedulerHealthy: boolean;
+    schedulerErrorCode?: string;
   };
   learning: {
     reflection: ReflectionResult | null;

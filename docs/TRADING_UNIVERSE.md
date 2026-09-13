@@ -1,9 +1,14 @@
 # Trading Universe
 
-The normal runtime does not use a manually curated symbol allowlist. The official Bitget instrument catalog is fetched at runtime and filtered deterministically for online tokenized-stock contracts in `BITGET_CATEGORY` (default `USDT-FUTURES`) where provider metadata reports `symbolType=stock` and `isRwa=YES`, with usable quantity, margin, and leverage metadata.
+PAPER scan eligibility comes from the official Bitget Demo `USDT-FUTURES` instrument catalog with `paptrading=1`. Darwin dynamically filters it to online stock/RWA perpetual instruments with valid quantity, margin, and leverage metadata. It never hardcodes the current symbol list or count.
 
-The resulting provider-valid universe is passed to Qwen. Qwen selects a bounded shortlist and later selects the final instrument. A symbol absent from the current provider catalog is rejected by the deterministic gate.
+Public ticker/history endpoints remain market-data sources. A symbol absent from the Demo executable catalog cannot enter candidate selection, deep evidence, a new OPEN decision, or execution. The effective pipeline is:
 
-Each cycle uses two market stages. Stage 1 calls the official SDK instrument catalog and one category-wide ticker request for lightweight candidate evidence. It does not create a trade decision. Qwen selects at most five candidates, while symbols with existing positions are always retained for position review.
+```text
+Demo instruments → online stock symbols → lightweight market scan
+→ Qwen shortlist → deep evidence → decision/risk/execution
+```
 
-Stage 2 collects per-candidate ticker data, 48 fifteen-minute historical bars, account assets, positions, and open orders. The resulting evidence bundle is passed to Qwen for the independent strategy thesis and futures action decision.
+The scan does not interpret indicators as trade rules. Qwen selects a bounded shortlist and receives deeper history, account/position state, orders, events when available, and retrieved lessons. Existing provider positions are retained for position-aware management even when discovery later changes.
+
+If Demo discovery fails, Darwin fails closed for new financial decisions rather than falling back to the public universe.

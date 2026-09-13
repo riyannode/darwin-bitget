@@ -1,5 +1,7 @@
 # EVA Integration
 
-EVA is an optional external adversarial evaluator. It may submit scenarios and bounded observable feedback through an isolated adapter boundary.
+EVA is an optional external adversarial evaluator. The Docker Judge Demo does not call EVA and requires no EVA credentials. No EVA evaluation is started by the canonical Docker command.
 
-EVA owns its own weakness memory. The trader owns its own lesson memory. Neither adapter may bypass `risk-gate.ts`, and this repository does not modify the EVA repository.
+When enabled in a deployed Worker, EVA credentials are backend-only runtime secrets. `EVA_AGENT_API_KEY` must never appear in source, `wrangler.jsonc`, real `.env.example` values, logs, exports, frontend code, or browser storage. EVA does not own Darwin's policy, execution, journal, or lesson state.
+
+EVA feedback is bounded observable evidence. It cannot bypass `risk-gate.ts`, grant PAPER authority, change owner policy, or invoke unrestricted financial execution. The trader owns its lessons; EVA owns its weakness memory.

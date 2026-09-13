@@ -1,7 +1,7 @@
 import { routeAgentRequest } from "agents";
 import { TraderAgent } from "./agent/agent.js";
 import type { Env } from "./types.js";
-import { BitgetClient } from "./bitget/client.js";
+import { BitgetClient, BitgetReadError } from "./bitget/client.js";
 import { loadConfig } from "./config.js";
 
 export { TraderAgent };
@@ -17,10 +17,20 @@ export default {
         return Response.json({ error: "DEMO_UNIVERSE_UNAVAILABLE" }, { status: 503 });
       }
     }
-    if (url.pathname === "/api/snapshot" || url.pathname === "/api/control" || url.pathname === "/api/policy" || url.pathname === "/api/export/paper-log" || url.pathname === "/api/eva/connection-test") {
+    if (url.pathname === "/api/live/portfolio" && request.method === "GET") {
+      try {
+        const portfolio = await new BitgetClient(loadConfig(env)).getDashboardPortfolio();
+        return Response.json({ source: "PROVIDER_LIVE", portfolio, observedAt: portfolio.observedAt, ...(portfolio.openOrdersReadFailure ? { degraded: true, errors: { openOrders: portfolio.openOrdersReadFailure } } : {}) }, { headers: { "Cache-Control": "no-store" } });
+      } catch (error) {
+        const code = error instanceof Error && /^[A-Za-z0-9_-]{1,120}$/.test(error.message) ? error.message : "PROVIDER_READ_FAILED";
+        const readFailure = error instanceof BitgetReadError ? { operation: error.operation, symbol: error.symbol, ...(error.details.code ? { code: error.details.code } : {}), ...(error.details.message ? { message: error.details.message } : {}) } : undefined;
+        return Response.json({ source: "PROVIDER_LIVE", error: code, ...(readFailure ? { provider: readFailure } : {}) }, { status: 503, headers: { "Cache-Control": "no-store" } });
+      }
+    }
+    if (url.pathname === "/api/snapshot" || url.pathname === "/api/agent-journal" || url.pathname === "/api/trade-history" || url.pathname === "/api/learning" || url.pathname === "/api/control" || url.pathname === "/api/policy" || url.pathname === "/api/export/paper-log" || url.pathname === "/api/eva/connection-test") {
       const id = env.TRADER_AGENT.idFromName("primary");
       const stub = env.TRADER_AGENT.get(id);
-      const path = url.pathname === "/api/snapshot" ? "/snapshot" : url.pathname === "/api/policy" ? "/policy" : url.pathname === "/api/export/paper-log" ? "/export/paper-log" : url.pathname === "/api/eva/connection-test" ? "/eva/connection-test" : "/control";
+      const path = url.pathname === "/api/snapshot" ? "/snapshot" : url.pathname === "/api/agent-journal" ? "/agent-journal" : url.pathname === "/api/trade-history" ? "/trade-history" : url.pathname === "/api/learning" ? "/learning" : url.pathname === "/api/policy" ? "/policy" : url.pathname === "/api/export/paper-log" ? "/export/paper-log" : url.pathname === "/api/eva/connection-test" ? "/eva/connection-test" : "/control";
       const agentUrl = new URL(request.url);
       agentUrl.pathname = path;
       return stub.fetch(new Request(agentUrl, request));

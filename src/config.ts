@@ -13,14 +13,6 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
-function validateCredentials(env: Omit<Env, "TRADER_AGENT">): void {
-  const values = [env.BITGET_API_KEY, env.BITGET_SECRET_KEY, env.BITGET_PASSPHRASE];
-  const present = values.filter((value) => Boolean(value?.trim())).length;
-  if (present !== 0 && present !== values.length) {
-    throw new Error("PARTIAL_BITGET_CREDENTIALS");
-  }
-}
-
 export function loadConfig(env: Omit<Env, "TRADER_AGENT">, activePolicy?: OwnerPolicy): RuntimeConfig {
   if (env.TRADING_MODE !== "PAPER" || env.PAPER_ONLY !== "true") {
     throw new Error("PAPER_ONLY");
@@ -28,15 +20,9 @@ export function loadConfig(env: Omit<Env, "TRADER_AGENT">, activePolicy?: OwnerP
   if (env.AGENT_MODE !== "AUTONOMOUS" && env.AGENT_MODE !== "EVA_EVALUATION") {
     throw new Error("INVALID_AGENT_MODE");
   }
-  validateCredentials(env);
   const ownerPolicy = activePolicy ?? loadOwnerPolicy(env);
   const agentMode = env.AGENT_MODE;
-  const credentials = {
-    ...(env.BITGET_API_KEY?.trim() ? { bitgetApiKey: env.BITGET_API_KEY.trim() } : {}),
-    ...(env.BITGET_SECRET_KEY?.trim() ? { bitgetSecretKey: env.BITGET_SECRET_KEY.trim() } : {}),
-    ...(env.BITGET_PASSPHRASE?.trim() ? { bitgetPassphrase: env.BITGET_PASSPHRASE.trim() } : {}),
-    ...(env.QWEN_API_KEY?.trim() ? { qwenApiKey: env.QWEN_API_KEY.trim() } : {}),
-  };
+  const qwen = env.QWEN_API_KEY?.trim() ? { qwenApiKey: env.QWEN_API_KEY.trim() } : {};
   const eva = {
     ...(env.EVA_API_URL?.trim() ? { evaApiUrl: env.EVA_API_URL.trim() } : {}),
     ...(env.EVA_GATEWAY_URL?.trim() ? { evaGatewayUrl: env.EVA_GATEWAY_URL.trim() } : {}),
@@ -50,12 +36,14 @@ export function loadConfig(env: Omit<Env, "TRADER_AGENT">, activePolicy?: OwnerP
     evidenceMaxAgeSeconds: positiveInteger(env.EVIDENCE_MAX_AGE_SECONDS, 90),
     bitgetCategory: required(env.BITGET_CATEGORY, "USDT-FUTURES").toUpperCase(),
     bitgetApiBaseUrl: required(env.BITGET_API_BASE_URL, "https://api.bitget.com"),
+    ...(env.BITGET_GATEWAY_URL?.trim() ? { bitgetGatewayUrl: env.BITGET_GATEWAY_URL.trim() } : {}),
+    ...(env.BITGET_GATEWAY_SERVICE_SECRET?.trim() ? { bitgetGatewayServiceSecret: env.BITGET_GATEWAY_SERVICE_SECRET.trim() } : {}),
     qwenBaseUrl: required(env.QWEN_BASE_URL, "https://hackathon.bitgetops.com/v1"),
     qwenModel: required(env.QWEN_MODEL, "qwen3.8-max"),
     version: required(env.APP_VERSION, "0.2.0"),
     commit: required(env.GIT_COMMIT_SHA, "local"),
     environment: required(env.ENVIRONMENT, "production"),
-    ...credentials,
+    ...qwen,
     ...eva,
   };
 }
