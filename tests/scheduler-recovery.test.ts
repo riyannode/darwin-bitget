@@ -153,4 +153,29 @@ describe("stale scheduler recovery", () => {
 
     expect(agent.executeDecision).not.toHaveBeenCalled();
   });
+
+  it("reports schedule inspection failure without mutating state", async () => {
+    const agent = fakeAgent([], []);
+    agent.listSchedules.mockRejectedValueOnce(new Error("SCHEDULER_UNAVAILABLE"));
+
+    const diagnostics = await getDiagnostics.call(agent, INTERVAL_MINUTES, NOW);
+
+    expect(agent.scheduleEvery).not.toHaveBeenCalled();
+    expect(agent.setState).not.toHaveBeenCalled();
+    expect(diagnostics).toMatchObject({ schedulerHealthy: false, schedulerErrorCode: "SCHEDULE_LIST_FAILED" });
+  });
+
+  it("disarms a schedule if pause arrives during recovery", async () => {
+    const agent = fakeAgent([], [schedule("repaired")]);
+    agent.scheduleEvery.mockImplementation(async () => {
+      agent.state = { ...agent.state, paused: true };
+      return "created-cycle";
+    });
+
+    await getDiagnostics.call(agent, INTERVAL_MINUTES, NOW);
+
+    expect(agent.scheduleEvery).toHaveBeenCalledOnce();
+    expect(agent.cancelSchedule).toHaveBeenCalledWith("repaired");
+    expect(agent.setState).not.toHaveBeenCalled();
+  });
 });

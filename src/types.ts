@@ -491,6 +491,7 @@ export interface DashboardSnapshot {
     configuredIntervalMinutes: number;
     matchingScheduleCount: number;
     schedulerHealthy: boolean;
+    schedulerErrorCode?: string;
   };
   learning: {
     reflection: ReflectionResult | null;

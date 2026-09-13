@@ -378,7 +378,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     };
   }
 
-  private async getSchedulerDiagnostics(intervalMinutes: number, now = Date.now()): Promise<Pick<DashboardSnapshot["scheduler"], "nextScanAt" | "nextScanStale" | "configuredIntervalMinutes" | "matchingScheduleCount" | "schedulerHealthy">> {
+  private async getSchedulerDiagnostics(intervalMinutes: number, now = Date.now()): Promise<Pick<DashboardSnapshot["scheduler"], "nextScanAt" | "nextScanStale" | "configuredIntervalMinutes" | "matchingScheduleCount" | "schedulerHealthy" | "schedulerErrorCode">> {
     const intervalMs = intervalMinutes * 60_000;
     const isStale = (nextScanAt: string | null): boolean => {
       if (!nextScanAt) return true;
@@ -392,7 +392,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     try {
       schedules = await this.listSchedules();
     } catch {
-      return { nextScanAt, nextScanStale, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: 0, schedulerHealthy: false };
+      return { nextScanAt, nextScanStale, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: 0, schedulerHealthy: false, schedulerErrorCode: "SCHEDULE_LIST_FAILED" };
     }
 
     const cycleSchedules = () => schedules.filter((entry) => entry.callback === "runScheduledCycle");
@@ -402,12 +402,17 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const recoveryAllowed = !this.state.paused && !this.state.emergencyStop && !activeCycle && nextScanStale;
     const scheduleMismatch = currentCycleSchedules.length !== 1 || currentMatchingSchedules.length !== 1;
 
-    if (recoveryAllowed && scheduleMismatch) {
+    const stillRecoveryAllowed = () => !this.state.paused && !this.state.emergencyStop && this.state.lastStatus !== "RUNNING" && !this.state.cycleStartedAt && isStale(this.state.nextScanAt);
+    if (recoveryAllowed && scheduleMismatch && stillRecoveryAllowed()) {
       try {
         await scheduleTradingCycle(this, intervalMinutes);
         schedules = await this.listSchedules();
         currentCycleSchedules = cycleSchedules();
         currentMatchingSchedules = matchingSchedules();
+        if (!stillRecoveryAllowed()) {
+          for (const schedule of currentCycleSchedules) await this.cancelSchedule(schedule.id);
+          return { nextScanAt: this.state.nextScanAt, nextScanStale: isStale(this.state.nextScanAt), configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: 0, schedulerHealthy: this.state.paused || this.state.emergencyStop };
+        }
         if (currentCycleSchedules.length === 1 && currentMatchingSchedules.length === 1) {
           const repairedSchedule = currentMatchingSchedules[0];
           nextScanAt = repairedSchedule?.time !== undefined && Number.isFinite(repairedSchedule.time)
@@ -417,7 +422,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
           nextScanStale = isStale(nextScanAt);
         }
       } catch {
-        return { nextScanAt, nextScanStale, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: currentMatchingSchedules.length, schedulerHealthy: false };
+        return { nextScanAt, nextScanStale, configuredIntervalMinutes: intervalMinutes, matchingScheduleCount: currentMatchingSchedules.length, schedulerHealthy: false, schedulerErrorCode: "SCHEDULE_REPAIR_FAILED" };
       }
     }
 
