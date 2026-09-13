@@ -72,7 +72,7 @@ export class BitgetGatewayClient {
     try {
       const response = await this.fetchImpl(`${this.baseUrl}${route}`, {
         method: "POST",
-        headers: { authorization: `Bearer ${this.serviceSecret}`, "content-type": "application/json" },
+        headers: { authorization: `Bearer ${this.serviceSecret}`, "content-type": "application/json", "user-agent": "darwin-bitget-worker-gateway/1.0" },
         body: JSON.stringify(args),
         signal: controller.signal,
       });

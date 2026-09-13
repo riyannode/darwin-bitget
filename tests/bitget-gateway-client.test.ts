@@ -7,6 +7,7 @@ describe("Worker Bitget gateway client", () => {
       expect(String(input)).toBe("https://gateway.test/v1/bitget/position-info");
       expect(init?.method).toBe("POST");
       expect(new Headers(init?.headers).get("authorization")).toBe("Bearer gateway-secret");
+      expect(new Headers(init?.headers).get("user-agent")).toBe("darwin-bitget-worker-gateway/1.0");
       expect(init?.body).toBe(JSON.stringify({ category: "USDT-FUTURES" }));
       return Response.json({ endpoint: "getPositionInfo", requestTime: "2026-09-13T00:00:00.000Z", data: [{ symbol: "SOXLUSDT" }] });
     });
