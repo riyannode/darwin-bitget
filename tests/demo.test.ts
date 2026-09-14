@@ -18,6 +18,10 @@ describe("zero-credential judge demo fixtures", () => {
   it("keeps HOLD a no-write replay", () => {
     const snapshot = buildDemoSnapshot("hold");
     expect(snapshot.latestDecision?.action).toBe("HOLD");
+    expect(snapshot.latestCyclePlan?.positionActions).toHaveLength(1);
+    expect(snapshot.latestCyclePlan?.positionActions[0]).toMatchObject({ symbol: "CRCLUSDT", action: "HOLD", positionSide: "LONG" });
+    expect(snapshot.latestCyclePlan?.entryActions[0]).toMatchObject({ symbol: "NVDAUSDT", action: "OPEN_LONG" });
+    expect(snapshot.latestDiscovery?.scannedUniverseCount).toBeGreaterThan(0);
     expect(snapshot.executionEvidence).toBeNull();
     expect(snapshot.demo.schedulerEnabled).toBe(false);
   });

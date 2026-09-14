@@ -3,7 +3,7 @@ import type { BacktestReplay, HistoricalBar, Lesson, RuntimeConfig, TradeExperie
 import { generateQwenJson } from "../agent/qwen.js";
 import { BACKTEST_TASK_PROMPT } from "../agent/mandate.js";
 
-const actionSchema = z.enum(["OPEN_LONG", "OPEN_SHORT", "HOLD", "REDUCE", "CLOSE"]);
+const actionSchema = z.enum(["OPEN_LONG", "OPEN_SHORT", "HOLD", "INCREASE", "REDUCE", "CLOSE", "REVERSE"]);
 
 function decimal(value: string): number {
   const parsed = Number(value);

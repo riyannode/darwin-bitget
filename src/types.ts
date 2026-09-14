@@ -1,4 +1,5 @@
-export type Action = "OPEN_LONG" | "OPEN_SHORT" | "HOLD" | "REDUCE" | "CLOSE";
+export type Action = "OPEN_LONG" | "OPEN_SHORT" | "HOLD" | "INCREASE" | "REDUCE" | "CLOSE" | "REVERSE";
+export type FinancialWriteAction = Exclude<Action, "HOLD" | "REVERSE">;
 export type PositionSide = "LONG" | "SHORT";
 export type AgentMode = "AUTONOMOUS" | "EVA_EVALUATION";
 export type TradingMode = "PAPER";
@@ -13,7 +14,7 @@ export type ExecutionStatus =
   | "not_found"
   | "unknown";
 export type LessonStatus = "CANDIDATE" | "ACTIVE" | "WEAKENED" | "CONTRADICTED" | "RETIRED";
-export type ExperienceOutcomeStatus = "PROFITABLE" | "LOSING" | "BREAK_EVEN" | "BLOCKED" | "EXECUTION_FAILURE" | "OPEN";
+export type ExperienceOutcomeStatus = "PROFITABLE" | "LOSING" | "BREAK_EVEN" | "CLOSED_UNCLASSIFIED" | "BLOCKED" | "EXECUTION_FAILURE" | "OPEN";
 export type AgentRuntimeStatus = "ONLINE" | "SCANNING" | "ANALYZING" | "DECIDING" | "RISK_CHECK" | "EXECUTING" | "RECONCILING" | "REFLECTING" | "BACKTESTING" | "COOLDOWN" | "PAUSED" | "ERROR";
 export type MarketRegime = "TRENDING_UP" | "TRENDING_DOWN" | "RANGE_LOW_VOL" | "RANGE_HIGH_VOL" | "VOLATILITY_EXPANSION" | "EVENT_DRIVEN" | "UNKNOWN";
 export type LessonAssessment = "HELPFUL" | "NEUTRAL" | "HARMFUL";
@@ -130,6 +131,8 @@ export interface AccountSnapshot {
   positions: PositionSnapshot[];
   realizedPnl: string;
   unrealizedPnl: string;
+  funding?: string;
+  fees?: string;
   openOrders: number | null;
   openOrderSymbols: string[];
   openOrdersReadFailure?: {
@@ -154,6 +157,8 @@ export interface PositionSnapshot {
   realizedPnl: string;
   openedAt?: string;
   liquidationPrice?: string;
+  funding?: string;
+  fees?: string;
 }
 
 export interface Evidence {
@@ -254,6 +259,8 @@ export interface BacktestReplay {
 export interface DecisionContext {
   bundles: EvidenceBundle[];
   supportedUniverse: string[];
+  openPositionSymbols: string[];
+  entryCandidateSymbols: string[];
   experiences: TradeExperience[];
   openExperiences: TradeExperience[];
   lessons: Lesson[];
@@ -269,8 +276,10 @@ export interface Decision {
   positionSide: PositionSide | null;
   symbol: string;
   marginAllocationPct: string;
+  additionalMarginPct?: string | null | undefined;
   leverage: string;
   reductionPct: string | null;
+  targetPositionSide?: PositionSide | null | undefined;
   confidence: number;
   thesis: string;
   strategyThesis: string;
@@ -281,14 +290,62 @@ export interface Decision {
   createdAt: string;
 }
 
+export type PositionManagementAction = "HOLD" | "INCREASE" | "REDUCE" | "CLOSE" | "REVERSE";
+export type EntryAction = "OPEN_LONG" | "OPEN_SHORT";
+
+export interface PositionManagementDecision extends Decision {
+  action: PositionManagementAction;
+  positionSide: PositionSide;
+}
+
+export interface EntryDecision extends Decision {
+  action: EntryAction;
+  positionSide: PositionSide;
+}
+
+export interface CycleDecisionPlan {
+  positionActions: PositionManagementDecision[];
+  entryActions: EntryDecision[];
+}
+
+export interface CycleDiscovery {
+  scannedUniverseCount: number;
+  selectedEntryCandidateSymbols: string[];
+  managedExistingPositionSymbols: string[];
+  financialWritesPerformed: number;
+}
+
+export interface NormalizedCycleDecisions {
+  cycleId: string;
+  plan: CycleDecisionPlan;
+  records: DecisionExecutionRecord[];
+  discovery?: CycleDiscovery;
+  status?: "RUNNING" | "COMPLETED" | "FAILED";
+  failureCode?: string;
+  failurePath?: string;
+  failureIssue?: string;
+  hasPersistedPlan?: boolean;
+  hasValidPlan?: boolean;
+}
+
+export interface LatestValidCyclePlan {
+  cycleId: string;
+  plan: CycleDecisionPlan;
+  discovery?: CycleDiscovery;
+  startedAt: string;
+  completedAt: string;
+}
+
 export interface AutonomousDecisionSet {
-  decision: Decision;
-  exitDecisions: Decision[];
+  plan: CycleDecisionPlan;
   ignoredLessonIds: string[];
 }
 
 export interface DecisionExecutionRecord {
   decision: Decision;
+  parentDecisionId?: string;
+  parentAction?: "REVERSE";
+  parentDecision?: Decision;
   riskGateResult: RiskGateResult;
   executionRequest?: ExecutionRequest;
   executionResult?: ExecutionResult;
@@ -308,7 +365,7 @@ export interface ExecutionRequest {
   cycleId: string;
   decisionId: string;
   symbol: string;
-  action: Exclude<Action, "HOLD">;
+  action: FinancialWriteAction;
   positionSide: PositionSide;
   providerSide: "buy" | "sell";
   tradeSide: "open" | "close";
@@ -325,7 +382,7 @@ export interface ExecutionResult {
   providerOrderId?: string;
   clientOrderId: string;
   symbol: string;
-  action: Exclude<Action, "HOLD">;
+  action: FinancialWriteAction;
   positionSide: PositionSide;
   providerSide: "buy" | "sell";
   tradeSide: "open" | "close";
@@ -400,6 +457,9 @@ export interface TradingJournal {
   portfolio?: AccountSnapshot;
   evidence?: Evidence[];
   retrievedLessons: string[];
+  cyclePlan?: CycleDecisionPlan;
+  executionRecords?: DecisionExecutionRecord[];
+  discovery?: CycleDiscovery;
   decision?: Decision;
   exitDecisions?: Decision[];
   exitExecutions?: DecisionExecutionRecord[];
@@ -452,14 +512,34 @@ export interface DashboardSnapshot {
     winRate: string;
     dailyDrawdown: string;
     totalTrades: number | null;
+    openTrades: number | null;
+    closedTrades: number | null;
     wins: number | null;
     losses: number | null;
     breakeven: number | null;
-    dailyPnl: Record<string, { pnl: string; trades: number }>;
+    verifiedRealizedPnl: string;
+    competitionBaselineEquity: string | null;
+    latestEquity: string | null;
+    performanceBaselineAt: string | null;
+    dailyPnl: Record<string, { pnl: string; trades: number; dailyReturnPct?: string }>;
   };
   trades: TradeLogEntry[];
   latestDecision: Decision | null;
   decisions: Decision[];
+  latestCyclePlan: CycleDecisionPlan | null;
+  latestCycleStatus: {
+    cycleId: string;
+    status: "RUNNING" | "COMPLETED" | "FAILED";
+    startedAt: string;
+    completedAt: string | null;
+    hasPersistedPlan: boolean;
+    hasValidPlan: boolean;
+    failureCode?: string;
+    failurePath?: string;
+    failureIssue?: string;
+  } | null;
+  cyclePlans: Array<NormalizedCycleDecisions & { startedAt: string; completedAt: string | null }>;
+  latestDiscovery: CycleDiscovery | null;
   executionEvidence: {
     provider: string;
     action: Exclude<Action, "HOLD">;
@@ -521,4 +601,37 @@ export interface TradeLogEntry {
   positionSide?: PositionSide | null;
   openedAt?: string;
   closedAt?: string;
+  entryReasoning?: PositionReasoning;
+  exitReasoning?: PositionReasoning;
+  managementEvents?: PositionReasoning[];
+}
+
+export interface PositionReasoning {
+  action: Action;
+  thesis: string;
+  strategyThesis: string;
+  supportingFactors: string[];
+  riskFactors: string[];
+  evidenceUsed: string[];
+  lessonsUsed: string[];
+  confidence: number;
+  cycleId: string;
+  decisionId: string;
+  createdAt: string;
+  entryPrice?: string;
+  entryTime?: string;
+  experienceId?: string;
+  additionalMarginPct?: string | null;
+  targetPositionSide?: PositionSide | null;
+}
+
+export interface PositionContext {
+  symbol: string;
+  positionSide: PositionSide;
+  experienceId?: string;
+  entryDecisionId?: string;
+  entryReasoning?: PositionReasoning;
+  latestManagement?: PositionReasoning;
+  managementEvents: PositionReasoning[];
+  updatedAt: string;
 }

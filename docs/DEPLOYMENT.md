@@ -117,6 +117,18 @@ Only then start or resume autonomous scheduling. DARWIN Bitget is configured
 for Bitget Demo PAPER trading. Do not convert this fork/self-host guide into
 live-money trading instructions.
 
+## Architecture-change rollout gate
+
+This cycle-plan change has intentional financial behavior impact. Before deploying an exact PR HEAD:
+
+1. verify the runtime is idle and no unresolved execution needs investigation;
+2. manually `PAUSE` and verify matching scheduler count becomes zero;
+3. preserve current provider positions; do not manually close CRCL or force an entry;
+4. deploy the exact PR HEAD and verify the Worker commit marker, `/api/snapshot`, `/api/live/portfolio`, gateway health, and scheduler configuration;
+5. manually `RESUME` only after the readbacks pass.
+
+Post-deploy acceptance observes at least two completed autonomous cycles. Each should show `MARKET_SCAN`, a non-zero scan count, separate entry shortlist and position-management evidence, total proposed actions at most five, healthy scheduler, and `PROVIDER_LIVE`. A trade is not required. If a write naturally occurs, require full provider readback and `MATCHED` reconciliation. A temporary fresh paper-log export checks historical compatibility and provider verification accounting; it is not automatically the final competition export.
+
 ## Deployment verification and final artifacts
 
-Compare Worker source SHA from deploy output with `/api/snapshot.commit`. Verify the Vercel source/deployment SHA separately. A healthy provider readback from `/api/live/portfolio` shows `PROVIDER_LIVE` and a non-stale result. Do not commit `submissions/paper-log-final.json` or `.csv` until the collection period is complete; final metrics use closed provider-verified trades only.
+Compare Worker source SHA from deploy output with `/api/snapshot.commit`. Verify the Vercel source/deployment SHA separately and ensure the frontend deployment corresponds to the same final PR HEAD. A healthy provider readback from `/api/live/portfolio` shows `PROVIDER_LIVE` and a non-stale result. Do not commit `submissions/paper-log-final.json` or `.csv` until the collection period is complete; final metrics use closed provider-verified trades only.

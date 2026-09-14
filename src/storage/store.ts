@@ -1,8 +1,9 @@
-import type { ActivityEvent, BacktestReplay, Lesson, LessonEvaluation, OwnerPolicy, TradeExperience, TradingJournal } from "../types.js";
+import type { ActivityEvent, BacktestReplay, CycleDecisionPlan, LatestValidCyclePlan, Lesson, LessonEvaluation, OwnerPolicy, PositionContext, PositionSide, TradeExperience, TradingJournal } from "../types.js";
 import { parseExperience } from "../learning/experiences.js";
 import { parseLesson } from "../learning/lessons.js";
 import { parseDailyDrawdownState, type DailyDrawdownState } from "../trading/drawdown.js";
 import { parseOwnerPolicy } from "../trading/policy.js";
+import { normalizeCycleDecisions, journalHasPersistedPlan } from "./journal-normalizer.js";
 import type { SqlExecutor } from "./schema.js";
 
 interface LessonRow {
@@ -21,7 +22,19 @@ interface RiskStateRow {
   payload: string;
 }
 
+interface PositionContextRow {
+  payload: string;
+}
+
 interface JournalRow {
+  payload: string;
+}
+
+interface CompletedCyclePlanRow {
+  cycle_id: string;
+  status: string;
+  started_at: string;
+  completed_at: string | null;
   payload: string;
 }
 
@@ -45,6 +58,11 @@ export interface StoredCycle {
 }
 
 export const MAX_HISTORY_LIMIT = 100;
+
+const PERFORMANCE_STATE_KEY = "performance_aggregate";
+const POSITION_CONTEXT_BOOTSTRAP_KEY = "position_context_bootstrap";
+const LATEST_VALID_CYCLE_PLAN_STATE_KEY = "latest_valid_cycle_plan";
+const MAX_TARGETED_DECISION_ID_LENGTH = 256;
 
 export function clampHistoryLimit(limit: number, fallback = 25): number {
   if (!Number.isInteger(limit) || limit < 1) return fallback;
@@ -156,6 +174,36 @@ export function loadExperiences(executor: SqlExecutor, limit = MAX_HISTORY_LIMIT
   });
 }
 
+export function loadOpenExperiences(executor: SqlExecutor, limit = MAX_HISTORY_LIMIT): TradeExperience[] {
+  const rows = executor.sql<ExperienceRow>`SELECT payload FROM experiences WHERE outcome_status = 'OPEN' ORDER BY created_at DESC, experience_id ASC LIMIT ${clampHistoryLimit(limit, MAX_HISTORY_LIMIT)}`;
+  return rows.flatMap((row) => {
+    try {
+      const experience = parseExperience(JSON.parse(row.payload));
+      return experience.outcomeStatus === "OPEN" ? [experience] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: readonly string[], limit = MAX_HISTORY_LIMIT): TradingJournal[] {
+  const journals = new Map<string, TradingJournal>();
+  for (const decisionId of [...new Set(decisionIds)].slice(0, limit)) {
+    if (typeof decisionId !== "string" || decisionId.length === 0 || decisionId.length > MAX_TARGETED_DECISION_ID_LENGTH || decisionId.trim().length === 0) continue;
+    const marker = `"decisionId":${JSON.stringify(decisionId)}`;
+    const rows = executor.sql<JournalRow>`SELECT payload FROM journals WHERE instr(payload, ${marker}) > 0 ORDER BY created_at DESC LIMIT 2`;
+    for (const row of rows) {
+      try {
+        const journal = JSON.parse(row.payload) as TradingJournal;
+        journals.set(journal.cycleId, journal);
+      } catch {
+        // Ignore malformed historical journal rows during bounded bootstrap.
+      }
+    }
+  }
+  return [...journals.values()];
+}
+
 export function loadAllExperiences(executor: SqlExecutor): TradeExperience[] {
   const rows = executor.sql<ExperienceRow>`SELECT payload FROM experiences ORDER BY created_at ASC, experience_id ASC`;
   return rows.flatMap((row) => {
@@ -172,6 +220,120 @@ export function saveExperience(executor: SqlExecutor, experience: TradeExperienc
     INSERT INTO experiences (experience_id, symbol, outcome_status, payload, created_at)
     VALUES (${experience.experienceId}, ${experience.symbol}, ${experience.outcomeStatus}, ${JSON.stringify(experience)}, ${createdAt})
     ON CONFLICT(experience_id) DO UPDATE SET payload = excluded.payload, outcome_status = excluded.outcome_status
+  `;
+}
+
+export function loadPerformanceAggregate<T>(executor: SqlExecutor): T | null {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${PERFORMANCE_STATE_KEY}`;
+  if (!rows[0]) return null;
+  try {
+    return JSON.parse(rows[0].payload) as T;
+  } catch {
+    return null;
+  }
+}
+
+export function savePerformanceAggregate(executor: SqlExecutor, aggregate: unknown, updatedAt: string): void {
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${PERFORMANCE_STATE_KEY}, ${JSON.stringify(aggregate)}, ${updatedAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+}
+
+function isCycleDecisionPlan(value: unknown): value is CycleDecisionPlan {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    && Array.isArray((value as { positionActions?: unknown }).positionActions)
+    && Array.isArray((value as { entryActions?: unknown }).entryActions);
+}
+
+function isLatestValidCyclePlan(value: unknown): value is LatestValidCyclePlan {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Partial<LatestValidCyclePlan>;
+  return typeof candidate.cycleId === "string"
+    && isCycleDecisionPlan(candidate.plan)
+    && typeof candidate.startedAt === "string"
+    && typeof candidate.completedAt === "string";
+}
+
+export function loadLatestValidCyclePlan(executor: SqlExecutor): LatestValidCyclePlan | null {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${LATEST_VALID_CYCLE_PLAN_STATE_KEY}`;
+  if (!rows[0]) return null;
+  try {
+    const value: unknown = JSON.parse(rows[0].payload);
+    return isLatestValidCyclePlan(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveLatestValidCyclePlan(executor: SqlExecutor, readModel: LatestValidCyclePlan): void {
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${LATEST_VALID_CYCLE_PLAN_STATE_KEY}, ${JSON.stringify(readModel)}, ${readModel.completedAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+}
+
+export function loadLatestCompletedCyclePlanFromHistory(executor: SqlExecutor): LatestValidCyclePlan | null {
+  const rows = executor.sql<CompletedCyclePlanRow>`
+    SELECT c.cycle_id, c.status, c.started_at, c.completed_at, j.payload
+    FROM cycles AS c
+    INNER JOIN journals AS j ON j.cycle_id = c.cycle_id
+    WHERE c.status = 'COMPLETED'
+    ORDER BY c.completed_at DESC, c.cycle_id DESC
+    LIMIT 50
+  `;
+  for (const row of rows) {
+    if (row.status !== "COMPLETED" || !row.completed_at) continue;
+    let journal: TradingJournal;
+    try {
+      journal = JSON.parse(row.payload) as TradingJournal;
+    } catch {
+      continue;
+    }
+    if (!journalHasPersistedPlan(journal)) continue;
+    const normalized = normalizeCycleDecisions(journal);
+    return { cycleId: journal.cycleId, plan: normalized.plan, ...(normalized.discovery ? { discovery: normalized.discovery } : {}), startedAt: row.started_at, completedAt: row.completed_at };
+  }
+  return null;
+}
+
+export function loadPositionContext(executor: SqlExecutor, symbol: string, positionSide: PositionSide): PositionContext | null {
+  const contextKey = `${symbol}:${positionSide}`;
+  const rows = executor.sql<PositionContextRow>`SELECT payload FROM position_context WHERE context_key = ${contextKey}`;
+  if (!rows[0]) return null;
+  try {
+    return JSON.parse(rows[0].payload) as PositionContext;
+  } catch {
+    return null;
+  }
+}
+
+export function savePositionContext(executor: SqlExecutor, context: PositionContext): void {
+  const contextKey = `${context.symbol}:${context.positionSide}`;
+  executor.sql`
+    INSERT INTO position_context (context_key, symbol, position_side, payload, updated_at)
+    VALUES (${contextKey}, ${context.symbol}, ${context.positionSide}, ${JSON.stringify(context)}, ${context.updatedAt})
+    ON CONFLICT(context_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+}
+
+export function loadPositionContextBootstrap(executor: SqlExecutor): { version: string } | null {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${POSITION_CONTEXT_BOOTSTRAP_KEY}`;
+  if (!rows[0]) return null;
+  try {
+    return JSON.parse(rows[0].payload) as { version: string };
+  } catch {
+    return null;
+  }
+}
+
+export function savePositionContextBootstrap(executor: SqlExecutor, version: string, updatedAt: string): void {
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${POSITION_CONTEXT_BOOTSTRAP_KEY}, ${JSON.stringify({ version })}, ${updatedAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
   `;
 }
 
@@ -262,6 +424,11 @@ export function loadAllStoredCycles(executor: SqlExecutor, from?: string, to?: s
       : to
         ? executor.sql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at <= ${to} ORDER BY started_at ASC, cycle_id ASC`
         : executor.sql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>`SELECT cycle_id, status, started_at, completed_at FROM cycles ORDER BY started_at ASC, cycle_id ASC`;
+  return rows.map((row) => ({ cycleId: row.cycle_id, status: row.status, startedAt: row.started_at, completedAt: row.completed_at }));
+}
+
+export function loadRecentStoredCycles(executor: SqlExecutor, limit = 25): StoredCycle[] {
+  const rows = executor.sql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>`SELECT cycle_id, status, started_at, completed_at FROM cycles ORDER BY started_at DESC, cycle_id DESC LIMIT ${clampHistoryLimit(limit, 25)}`;
   return rows.map((row) => ({ cycleId: row.cycle_id, status: row.status, startedAt: row.started_at, completedAt: row.completed_at }));
 }
 

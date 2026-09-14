@@ -14,6 +14,10 @@ let snapshot = {
   trades: [],
   latestDecision: null,
   decisions: [],
+  latestCyclePlan: null,
+  latestCycleStatus: null,
+  cyclePlans: [],
+  latestDiscovery: null,
   executionEvidence: null,
   scheduler: { completedCycles: 0, averageDurationMs: 0, maxDurationMs: 0, inProgressCount: 0, staleCount: 0, failureCount: 0, timeoutCount: 0 },
   learning: { reflection: null, lessons: [], lessonsUsed: [], backtest: null, recentExperiences: [] },
@@ -27,6 +31,10 @@ let loadedPages = new Set();
 let pageLoadedAt = new Map();
 let tradeFilter = "ALL";
 let ownerToken = "";
+let positionContexts = {};
+let positionContextsLoadedAt = 0;
+let selectedTradeId = null;
+let currentPage = "dashboard";
 const judgeDemo = window.location.pathname === "/demo";
 const initialDemoBanner = $("judge-demo-banner"); if (initialDemoBanner) initialDemoBanner.hidden = !judgeDemo;
 
@@ -36,6 +44,14 @@ function detail(label, value, wide = false) {
   const title = document.createElement("span"); title.className = "label"; title.textContent = label;
   const content = document.createElement("span"); content.className = "value"; content.textContent = text(value);
   node.append(title, content); return node;
+}
+
+function reasoningSection(title, reasoning, unavailableText) {
+  const section = document.createElement("section");
+  const heading = document.createElement("h3"); heading.textContent = title; section.append(heading);
+  if (!reasoning) { const empty = document.createElement("p"); empty.className = "subtle"; empty.textContent = unavailableText; section.append(empty); return section; }
+  [detail("THESIS", reasoning.thesis, true), detail("STRATEGY THESIS", reasoning.strategyThesis, true), detail("ENTRY PRICE", money(reasoning.entryPrice)), detail("ENTRY TIME", when(reasoning.entryTime)), detail("EXPERIENCE ID", reasoning.experienceId), detail("SUPPORTING FACTORS", list(reasoning.supportingFactors), true), detail("RISKS CONSIDERED", list(reasoning.riskFactors), true), detail("EVIDENCE USED", list(reasoning.evidenceUsed), true), detail("LESSONS USED", list(reasoning.lessonsUsed), true), detail("CONFIDENCE", reasoning.confidence), detail("DECISION / CYCLE", `${reasoning.decisionId} / ${reasoning.cycleId}`), detail("DECISION TIME", when(reasoning.createdAt))].forEach((item) => section.append(item));
+  return section;
 }
 
 function renderAgent() {
@@ -63,14 +79,14 @@ function renderPerformance() {
 function renderCalendar() {
   const node = $("calendar"); node.replaceChildren();
   ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].forEach((label) => { const item = document.createElement("span"); item.className = "day-label"; item.textContent = label; node.append(item); });
-  const now = new Date(); const year = now.getFullYear(); const month = now.getMonth(); const first = new Date(year, month, 1); const days = new Date(year, month + 1, 0).getDate(); const offset = (first.getDay() + 6) % 7; $("calendar-month").textContent = now.toLocaleString([], { month: "short", year: "numeric" });
-  for (let index = 0; index < 42; index += 1) { const day = index - offset + 1; const item = document.createElement("span"); if (day > 0 && day <= days) { const key = `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`; const value = snapshot.performance.dailyPnl[key]; item.textContent = value ? `${day}\n${value.pnl >= 0 ? "+" : ""}${value.pnl}` : String(day); item.style.whiteSpace = "pre-line"; if (value?.pnl > 0) item.className = "profit"; if (value?.pnl < 0) item.className = "loss"; } node.append(item); }
+  const now = new Date(); const year = now.getUTCFullYear(); const month = now.getUTCMonth(); const first = new Date(Date.UTC(year, month, 1)); const days = new Date(Date.UTC(year, month + 1, 0)).getUTCDate(); const offset = (first.getUTCDay() + 6) % 7; $("calendar-month").textContent = now.toLocaleString([], { month: "short", year: "numeric", timeZone: "UTC" });
+  for (let index = 0; index < 42; index += 1) { const day = index - offset + 1; const item = document.createElement("span"); if (day > 0 && day <= days) { const key = `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`; const value = snapshot.performance.dailyPnl[key]; item.textContent = value ? `${day}\n${value.pnl >= 0 ? "+" : ""}${value.pnl}\n${value.trades} trade${value.trades === 1 ? "" : "s"}` : String(day); item.style.whiteSpace = "pre-line"; if (value?.pnl > 0) item.className = "profit"; if (value?.pnl < 0) item.className = "loss"; if (value?.pnl === "0" || value?.pnl === 0) item.className = "zero"; } node.append(item); }
 }
 
 function renderPortfolio() {
   const portfolio = judgeDemo ? snapshot.portfolio : livePortfolio;
   const freshness = judgeDemo ? { source: "RECORDED_PROVIDER_REPLAY", observedAt: snapshot.portfolioFreshness.observedAt, stale: true } : liveFreshness; const freshnessNode = $("portfolio-freshness"); freshnessNode.textContent = freshness ? `${freshness.source}${freshness.stale ? " · STALE" : ""} · ${when(freshness.observedAt)}` : "—"; freshnessNode.style.color = freshness?.stale ? "var(--warning)" : "var(--accent)";
-  const node = $("portfolio"); node.replaceChildren(); [["ACCOUNT EQUITY", money(portfolio?.portfolioEquity)], ["AVAILABLE MARGIN", money(portfolio?.availableMargin)], ["MARGIN USED", money(portfolio?.marginUsage)], ["UNREALIZED PNL", signedMoney(portfolio?.unrealizedPnl)], ["REALIZED PNL", signedMoney(portfolio?.realizedPnl)], ["OPEN POSITIONS", portfolio?.positions?.length ?? 0]].forEach(([label, value]) => { const item = document.createElement("div"); const title = document.createElement("span"); title.className = "label"; title.textContent = label; const content = document.createElement("strong"); content.textContent = text(value); if (label.includes("PNL")) content.className = pnlClass(value); item.append(title, content); node.append(item); });
+  const node = $("portfolio"); node.replaceChildren(); [["ACCOUNT EQUITY", money(portfolio?.portfolioEquity)], ["AVAILABLE MARGIN", money(portfolio?.availableMargin)], ["MARGIN USED", money(portfolio?.marginUsage)], ["UNREALIZED PNL", signedMoney(portfolio?.unrealizedPnl)], ["REALIZED PNL", signedMoney(portfolio?.realizedPnl)], ["FUNDING", signedMoney(portfolio?.funding)], ["FEES", signedMoney(portfolio?.fees)], ["OPEN POSITIONS", portfolio?.positions?.length ?? 0]].forEach(([label, value]) => { const item = document.createElement("div"); const title = document.createElement("span"); title.className = "label"; title.textContent = label; const content = document.createElement("strong"); content.textContent = text(value); if (label.includes("PNL") || label === "FUNDING" || label === "FEES") content.className = pnlClass(value); item.append(title, content); node.append(item); });
 }
 
 function renderOpenPositions() {
@@ -108,14 +124,19 @@ function renderOpenPositions() {
     summary.append(identity, metrics);
     const content = document.createElement("div");
     content.className = "detail-grid position-details";
-    [["SYMBOL", position.symbol], ["SIDE", position.positionSide], ["ENTRY", money(position.entryPrice)], ["MARK", money(position.markPrice)], ["QTY", position.quantity], ["MARGIN", money(position.marginAllocated)], ["LEVERAGE", `${position.leverage}x`], ["NOTIONAL", money(position.notional)], ["UNREALIZED PNL", signedMoney(position.unrealizedPnl)], ["UNREALIZED PNL %", percent(position.unrealizedPnlPct)], ["LIQUIDATION PRICE", money(position.liquidationPrice)], ["OPENED AT", when(position.openedAt)]].forEach(([label, value]) => { const item = detail(label, value); if (label.startsWith("UNREALIZED")) item.querySelector(".value").className = `value ${pnlClass(value)}`; content.append(item); });
-    card.append(summary, content);
+    [["SYMBOL", position.symbol], ["SIDE", position.positionSide], ["ENTRY", money(position.entryPrice)], ["MARK", money(position.markPrice)], ["QTY", position.quantity], ["MARGIN", money(position.marginAllocated)], ["LEVERAGE", `${position.leverage}x`], ["NOTIONAL", money(position.notional)], ["UNREALIZED PNL", signedMoney(position.unrealizedPnl)], ["REALIZED PNL", signedMoney(position.realizedPnl)], ["FUNDING", signedMoney(position.funding)], ["FEES", signedMoney(position.fees)], ["UNREALIZED PNL %", percent(position.unrealizedPnlPct)], ["LIQUIDATION PRICE", money(position.liquidationPrice)], ["OPENED AT", when(position.openedAt)]].forEach(([label, value]) => { const item = detail(label, value); if (label.startsWith("UNREALIZED")) item.querySelector(".value").className = `value ${pnlClass(value)}`; content.append(item); });
+    const context = positionContexts[`${position.symbol}:${position.positionSide}`];
+    const reasoning = document.createElement("div"); reasoning.className = "position-reasoning";
+    reasoning.append(reasoningSection("WHY THIS POSITION WAS OPENED", context?.entryReasoning, "Provider position present; verified DARWIN entry context unavailable."), reasoningSection("CURRENT MANAGEMENT", context?.latestManagement, "No persisted DARWIN management decision available."));
+    card.append(summary, content, reasoning);
     node.append(card);
   });
 }
 
-function appendDecisionDetails(node, decision, positionNotional) {
-  [detail("MARGIN", `${decision.marginAllocationPct}%`), detail("LEVERAGE", `${decision.leverage}x`), detail("CONFIDENCE", decision.confidence), detail("POSITION NOTIONAL", money(positionNotional ?? (decision.action === "HOLD" ? "0" : undefined))), detail("STRATEGY THESIS", decision.strategyThesis, true), detail("SUPPORTING FACTORS", list(decision.supportingFactors), true), detail("RISK FACTORS", list(decision.riskFactors), true), detail("EVIDENCE USED", list(decision.evidenceUsed), true), detail("LESSONS USED", list(decision.lessonsUsed), true)].forEach((item) => node.append(item));
+function appendDecisionDetails(node, decision, positionNotional, executionRecord) {
+  const execution = executionRecord?.executionResult;
+  const after = executionRecord?.positionAfter;
+  [detail("MARGIN", `${decision.marginAllocationPct}%`), detail("ADDITIONAL MARGIN", decision.additionalMarginPct ? `${decision.additionalMarginPct}%` : "—"), detail("TARGET SIDE", decision.targetPositionSide ?? "—"), detail("LEVERAGE", `${execution?.leverage ?? decision.leverage}x`), detail("CONFIDENCE", decision.confidence), detail("POSITION NOTIONAL", money(positionNotional ?? after?.notional ?? (decision.action === "HOLD" ? "0" : undefined))), detail("RESULTING MARGIN", money(after?.marginAllocated)), detail("THESIS", decision.thesis, true), detail("STRATEGY THESIS", decision.strategyThesis, true), detail("SUPPORTING FACTORS", list(decision.supportingFactors), true), detail("RISK FACTORS", list(decision.riskFactors), true), detail("EVIDENCE USED", list(decision.evidenceUsed), true), detail("LESSONS USED", list(decision.lessonsUsed), true)].forEach((item) => node.append(item));
 }
 
 function renderDecisionPanel(prefix, decision, positionNotional) {
@@ -134,29 +155,87 @@ function renderDecisionPanel(prefix, decision, positionNotional) {
   appendDecisionDetails(node, decision, positionNotional);
 }
 
+function renderActionSection(title, actions, records = []) {
+  const section = document.createElement("section");
+  const heading = document.createElement("h3"); heading.textContent = title; section.append(heading);
+  if (!actions?.length) { const empty = document.createElement("p"); empty.className = "subtle"; empty.textContent = title === "NEW ENTRY ACTIONS" || title === "NEW ENTRIES" ? "No new entry justified this cycle." : "No position management actions recorded."; section.append(empty); return section; }
+  actions.forEach((action) => { const item = document.createElement("details"); item.className = "history-item"; const summary = document.createElement("summary"); summary.append(detail("SYMBOL / SIDE", `${action.symbol} / ${action.positionSide ?? "—"}`), detail("ACTION", action.action), detail("CONFIDENCE", action.confidence)); const content = document.createElement("div"); content.className = "detail-grid history-content"; const actionRecords = records.filter((record) => record.parentDecisionId === action.decisionId || record.decision?.decisionId === action.decisionId); appendDecisionDetails(content, action, undefined, actionRecords.find((record) => record.decision?.action === "INCREASE") ?? actionRecords[0]); if (action.action === "REVERSE") { const close = actionRecords.find((record) => record.decision?.action === "CLOSE"); const open = actionRecords.find((record) => record.decision?.action === "OPEN_LONG" || record.decision?.action === "OPEN_SHORT"); content.append(detail("PREVIOUS SIDE", action.positionSide), detail("TARGET SIDE", action.targetPositionSide), detail("CLOSE VERIFICATION", close?.reconciliationResult?.status ?? close?.riskGateResult?.status ?? "NOT RUN"), detail("OPPOSITE ENTRY RESULT", open?.reconciliationResult?.status ?? open?.riskGateResult?.status ?? "NOT RUN")); } item.append(summary, content); section.append(item); });
+  return section;
+}
+
+function renderCycleStatus(prefix) {
+  const node = $(prefix === "dashboard" ? "dashboard-cycle-status" : "journal-cycle-status");
+  if (!node) return;
+  node.replaceChildren();
+  const status = snapshot.latestCycleStatus;
+  if (!status) { node.className = "cycle-status empty"; node.textContent = "No cycle status recorded yet."; return; }
+  node.className = `cycle-status ${status.status.toLowerCase()}`;
+  const title = document.createElement("strong");
+  title.textContent = status.status === "FAILED" ? (status.hasPersistedPlan ? "CYCLE FAILED AFTER PLAN CREATION" : "CYCLE FAILED BEFORE DECISION") : status.status === "RUNNING" ? "ANALYZING / IN PROGRESS" : "CYCLE COMPLETED";
+  node.append(title, detail("STATUS", status.status), detail("CYCLE ID", status.cycleId), detail("STARTED", when(status.startedAt)));
+  if (status.failureCode) node.append(detail("FAILURE", status.failureCode));
+  if (status.failurePath) node.append(detail("PATH", status.failurePath));
+  if (status.failureIssue) node.append(detail("ISSUE", status.failureIssue));
+}
+
+function renderCyclePlan(prefix, plan, discovery) {
+  renderCycleStatus(prefix);
+  const node = $(prefix === "dashboard" ? "dashboard-cycle-plan" : "cycle-plan");
+
+  if (!node) return;
+  node.replaceChildren();
+  if (!plan) { node.className = "stack empty"; node.textContent = "No valid cycle plan recorded yet."; return; }
+  node.className = "cycle-plan stack";
+  node.append(renderActionSection("POSITION MANAGEMENT", plan.positionActions, plan.records ?? []), renderActionSection("NEW ENTRY ACTIONS", plan.entryActions, plan.records ?? []));
+  const discoveryNode = $(prefix === "dashboard" ? "dashboard-market-discovery" : "market-discovery");
+  if (discoveryNode) {
+    discoveryNode.replaceChildren();
+    discoveryNode.append(detail("UNIVERSE SCANNED", discovery?.scannedUniverseCount ?? "—"), detail("ENTRY CANDIDATES", list(discovery?.selectedEntryCandidateSymbols), true), detail("EXISTING POSITIONS MANAGED", list(discovery?.managedExistingPositionSymbols), true), detail("TOTAL PROPOSED ACTIONS", (plan.positionActions?.length ?? 0) + (plan.entryActions?.length ?? 0)), detail("FINANCIAL WRITES", discovery?.financialWritesPerformed ?? 0));
+  }
+}
+
 function renderDecision() {
-  const decision = snapshot.latestDecision;
-  renderDecisionPanel("", decision, snapshot.executionEvidence?.positionNotional);
-  renderDecisionPanel("dashboard", decision, snapshot.executionEvidence?.positionNotional);
+  const hasCyclePlan = Boolean(snapshot.latestCyclePlan);
+  document.querySelectorAll("[data-legacy-decision-panel]").forEach((panel) => { panel.hidden = hasCyclePlan; });
+  if (!hasCyclePlan) {
+    const decision = snapshot.latestDecision;
+    renderDecisionPanel("", decision, snapshot.executionEvidence?.positionNotional);
+    renderDecisionPanel("dashboard", decision, snapshot.executionEvidence?.positionNotional);
+  }
+  renderCyclePlan("dashboard", snapshot.latestCyclePlan, snapshot.latestDiscovery);
 }
 
 function renderDecisionHistory() {
   const node = $("decision-history");
-  const decisions = Array.isArray(snapshot.decisions) ? snapshot.decisions.slice(0, 25) : snapshot.latestDecision ? [snapshot.latestDecision] : [];
+  const cycles = Array.isArray(snapshot.cyclePlans) ? snapshot.cyclePlans.slice(0, 25) : [];
   const openKeys = new Set([...node.querySelectorAll("details[data-stable-key]")].filter((item) => item.open).map((item) => item.dataset.stableKey));
   node.replaceChildren();
-  node.className = decisions.length ? "decision-history" : "decision-history empty";
-  if (!decisions.length) { node.textContent = "No decisions recorded yet."; return; }
-  decisions.forEach((decision) => {
+  node.className = cycles.length ? "decision-history" : "decision-history empty";
+  if (!cycles.length) { node.textContent = "No decisions recorded yet."; return; }
+  cycles.forEach((cycle) => {
     const item = document.createElement("details");
     item.className = "history-item";
-    item.dataset.stableKey = decision.cycleId || decision.decisionId || "RUN_UNKNOWN";
+    item.dataset.stableKey = cycle.cycleId || "RUN_UNKNOWN";
     item.open = openKeys.has(item.dataset.stableKey);
     const summary = document.createElement("summary");
-    summary.append(detail("RUN ID", decision.cycleId || decision.decisionId || "RUN_UNKNOWN"), detail("TIMESTAMP", when(decision.createdAt)), detail("ACTION", decision.action), detail("SYMBOL", decision.symbol));
+    const status = cycle.status ?? "COMPLETED";
+    const actionCount = cycle.hasPersistedPlan ? cycle.plan.positionActions.length + cycle.plan.entryActions.length : "UNAVAILABLE";
+    summary.append(detail("CYCLE ID", cycle.cycleId || "RUN_UNKNOWN"), detail("TIMESTAMP", when(cycle.startedAt)), detail("STATUS", status), detail("ACTIONS", actionCount));
     const content = document.createElement("div");
     content.className = "detail-grid history-content";
-    appendDecisionDetails(content, decision);
+    if (status === "FAILED") {
+      content.append(detail("STATUS", cycle.hasPersistedPlan ? "CYCLE FAILED AFTER PLAN CREATION" : "CYCLE FAILED BEFORE DECISION"), detail("DECISION PLAN", cycle.hasPersistedPlan ? "Persisted plan retained as failed-cycle audit evidence." : "Decision plan not produced."));
+      if (cycle.failureCode) content.append(detail("FAILURE", cycle.failureCode));
+      if (cycle.failurePath) content.append(detail("PATH", cycle.failurePath));
+      if (cycle.failureIssue) content.append(detail("ISSUE", cycle.failureIssue));
+      if (cycle.hasPersistedPlan) content.append(renderActionSection("FAILED-CYCLE AUDIT EVIDENCE — POSITION MANAGEMENT", cycle.plan.positionActions, cycle.records ?? []), renderActionSection("FAILED-CYCLE AUDIT EVIDENCE — NEW ENTRIES", cycle.plan.entryActions, cycle.records ?? []));
+    } else if (status === "RUNNING") {
+      content.textContent = "ANALYZING / IN PROGRESS";
+    } else if (cycle.hasValidPlan) {
+      content.append(renderActionSection("POSITION MANAGEMENT", cycle.plan.positionActions, cycle.records ?? []), renderActionSection("NEW ENTRIES", cycle.plan.entryActions, cycle.records ?? []));
+    } else {
+      content.textContent = "No valid cycle plan recorded.";
+    }
     item.append(summary, content);
     node.append(item);
   });
@@ -175,7 +254,7 @@ function renderRecentTrades() {
 }
 
 function renderLatestTrade() {
-  const trade = snapshot.trades[0];
+  const trade = snapshot.trades.find((candidate) => candidate.tradeId === selectedTradeId) ?? snapshot.trades[0];
   const summary = $("latest-trade-summary");
   const node = $("latest-trade");
   summary.replaceChildren();
@@ -185,7 +264,16 @@ function renderLatestTrade() {
   summary.className = trade ? "detail-grid" : "detail-grid empty";
   if (!trade) { summary.textContent = "No verified PAPER trade recorded yet."; return; }
   [detail("TIME", when(trade.timestamp)), detail("SYMBOL / SIDE", `${trade.symbol} / ${trade.positionSide ?? "—"}`), detail("ACTION", trade.action), detail("STATUS", trade.status)].forEach((item) => summary.append(item));
-  [detail("MARGIN", `${trade.marginAllocationPct}% / ${money(trade.marginAllocated)}`), detail("LEVERAGE", `${trade.leverage}x`), detail("POSITION NOTIONAL", money(trade.positionNotional)), detail("ENTRY", trade.entry), detail("EXIT", trade.exit), detail("REALIZED PNL", money(trade.realizedPnl)), detail("ORDER REFERENCE", trade.orderReference), detail("STRATEGY THESIS", trade.thesis, true), detail("PROVIDER CODE", snapshot.executionEvidence?.providerCode), detail("PROVIDER MESSAGE", snapshot.executionEvidence?.providerMessage, true), detail("READBACK CODE", snapshot.executionEvidence?.providerReadbackCode), detail("READBACK MESSAGE", snapshot.executionEvidence?.providerReadbackMessage, true)].forEach((item) => node.append(item));
+  [detail("MARGIN", `${trade.marginAllocationPct}% / ${money(trade.marginAllocated)}`), detail("LEVERAGE", `${trade.leverage}x`), detail("POSITION NOTIONAL", money(trade.positionNotional)), detail("ENTRY", trade.entry), detail("EXIT", trade.exit), detail("REALIZED PNL", money(trade.realizedPnl)), detail("ORDER REFERENCE", trade.orderReference)].forEach((item) => node.append(item));
+  node.append(reasoningSection("WHY THIS TRADE WAS OPENED", trade.entryReasoning, "Verified opening exists; structured entry reasoning unavailable."));
+  if (trade.exitReasoning) node.append(reasoningSection("WHY THIS TRADE WAS CLOSED", trade.exitReasoning, "Structured close reasoning unavailable."));
+  if (trade.managementEvents?.length) {
+    const lifecycle = document.createElement("section");
+    const heading = document.createElement("h3"); heading.textContent = "POSITION LIFECYCLE"; lifecycle.append(heading);
+    trade.managementEvents.forEach((event) => lifecycle.append(reasoningSection(event.action, event, "Management reasoning unavailable.")));
+    node.append(lifecycle);
+  }
+  [detail("PROVIDER CODE", snapshot.executionEvidence?.providerCode), detail("PROVIDER MESSAGE", snapshot.executionEvidence?.providerMessage, true), detail("READBACK CODE", snapshot.executionEvidence?.providerReadbackCode), detail("READBACK MESSAGE", snapshot.executionEvidence?.providerReadbackMessage, true)].forEach((item) => node.append(item));
 }
 
 function renderActivity() {
@@ -196,7 +284,7 @@ function renderActivity() {
 
 function renderTradeTable() {
   const node = $("trade-table"); node.replaceChildren(); const trades = snapshot.trades.filter((trade) => tradeFilter === "ALL" || (tradeFilter === "OPEN" && (trade.status === "OPEN" || trade.status === "PARTIALLY_REDUCED")) || (tradeFilter === "CLOSED" && trade.status === "CLOSED") || (tradeFilter === "WIN" && Number(trade.realizedPnl) > 0) || (tradeFilter === "LOSS" && Number(trade.realizedPnl) < 0));
-  trades.forEach((trade) => { const row = document.createElement("tr"); [when(trade.timestamp), trade.symbol, trade.action, `${trade.marginAllocationPct}% / ${money(trade.marginAllocated)}`, `${trade.leverage}x`, money(trade.positionNotional), trade.entry, trade.exit, money(trade.realizedPnl), trade.status].forEach((value, index) => { const cell = document.createElement("td"); cell.textContent = text(value); if (index === 2) cell.className = "table-action"; row.append(cell); }); node.append(row); });
+  trades.forEach((trade) => { const row = document.createElement("tr"); row.tabIndex = 0; row.addEventListener("click", () => { selectedTradeId = trade.tradeId; renderLatestTrade(); }); [when(trade.timestamp), trade.symbol, trade.action, `${trade.marginAllocationPct}% / ${money(trade.marginAllocated)}`, `${trade.leverage}x`, money(trade.positionNotional), trade.entry, trade.exit, money(trade.realizedPnl), trade.status].forEach((value, index) => { const cell = document.createElement("td"); cell.textContent = text(value); if (index === 2) cell.className = "table-action"; row.append(cell); }); node.append(row); });
 }
 
 function renderLessons() {
@@ -215,7 +303,7 @@ function renderPolicy() {
   const version = document.createElement("span"); version.className = "subtle"; version.textContent = `Last update: ${when(snapshot.lastPolicyUpdate?.createdAt)} · ${snapshot.version} · ${snapshot.commit} · ${snapshot.environment}`; editor.append(version);
 }
 
-function render() { renderAgent(); renderPerformance(); renderCalendar(); renderPortfolio(); renderOpenPositions(); renderDecision(); renderDecisionHistory(); renderLearning(); renderRecentTrades(); renderLatestTrade(); renderActivity(); renderTradeTable(); renderLessons(); renderPolicy(); const banner = $("judge-demo-banner"); banner.hidden = !judgeDemo; if (judgeDemo) { document.querySelectorAll("[data-action]").forEach((button) => { button.hidden = true; button.disabled = true; }); document.querySelectorAll(".label").forEach((node) => { if (node.textContent === "LIVE READBACK") node.textContent = "RECORDED REPLAY"; }); banner.dataset.scenario = snapshot.demo?.title ?? "DETERMINISTIC REPLAY"; $("judge-demo-result").textContent = `RISK GATE ${snapshot.demoRiskGate?.status ?? "—"}${snapshot.demoRiskGate?.codes?.length ? ` · ${snapshot.demoRiskGate.codes.join(" / ")}` : ""}`; } }
+function render() { renderAgent(); renderPerformance(); renderCalendar(); renderPortfolio(); renderOpenPositions(); renderDecision(); renderCyclePlan("journal", snapshot.latestCyclePlan, snapshot.latestDiscovery); renderDecisionHistory(); renderLearning(); renderRecentTrades(); renderLatestTrade(); renderActivity(); renderTradeTable(); renderLessons(); renderPolicy(); const banner = $("judge-demo-banner"); banner.hidden = !judgeDemo; if (judgeDemo) { document.querySelectorAll("[data-action]").forEach((button) => { button.hidden = true; button.disabled = true; }); document.querySelectorAll(".label").forEach((node) => { if (node.textContent === "LIVE READBACK") node.textContent = "RECORDED REPLAY"; }); banner.dataset.scenario = snapshot.demo?.title ?? "DETERMINISTIC REPLAY"; $("judge-demo-result").textContent = `RISK GATE ${snapshot.demoRiskGate?.status ?? "—"}${snapshot.demoRiskGate?.codes?.length ? ` · ${snapshot.demoRiskGate.codes.join(" / ")}` : ""}`; } }
 
 async function requestJson(path) { const response = await fetch(path, { cache: "no-store" }); if (!response.ok) throw new Error(`HTTP_${response.status}`); return response.json(); }
 async function refreshSnapshot() {
@@ -226,6 +314,7 @@ async function refreshSnapshot() {
     const retained = {
       trades: loadedPages.has("trade-history") ? snapshot.trades : data.trades,
       decisions: loadedPages.has("journal") ? snapshot.decisions : data.decisions,
+      cyclePlans: loadedPages.has("journal") ? snapshot.cyclePlans : data.cyclePlans,
       learning: loadedPages.has("learning-page") ? snapshot.learning : data.learning,
       riskControls: loadedPages.has("policy-page") ? snapshot.riskControls : data.riskControls,
     };
@@ -254,14 +343,27 @@ async function refreshLivePortfolio() {
   snapshot.portfolio = livePortfolio;
   snapshot.portfolioFreshness = liveFreshness;
   renderPerformance(); renderPortfolio(); renderOpenPositions();
+  if (currentPage === "open-position") void loadPositionContexts();
+}
+async function loadPositionContexts() {
+  if (judgeDemo || Date.now() - positionContextsLoadedAt < 60000) return;
+  const positions = (livePortfolio || snapshot.portfolio)?.positions ?? [];
+  const entries = await Promise.all(positions.map(async (position) => {
+    const key = `${position.symbol}:${position.positionSide}`;
+    try { const data = await requestJson(`/api/position-context?symbol=${encodeURIComponent(position.symbol)}&positionSide=${encodeURIComponent(position.positionSide)}`); return [key, data.context] ; } catch { return [key, null]; }
+  }));
+  positionContexts = Object.fromEntries(entries);
+  positionContextsLoadedAt = Date.now();
+  renderOpenPositions();
 }
 async function loadPage(page) {
+  if (page === "open-position") { await loadPositionContexts(); return; }
   if (judgeDemo || (loadedPages.has(page) && Date.now() - (pageLoadedAt.get(page) ?? 0) < 60000)) return;
   const endpoints = { journal: "/api/agent-journal?limit=25", "trade-history": "/api/trade-history?limit=25", "learning-page": "/api/learning?limit=25", "policy-page": "/api/policy" };
   const endpoint = endpoints[page]; if (!endpoint) return;
   try {
     const data = await requestJson(endpoint);
-    if (page === "journal") { snapshot.decisions = data.decisions ?? []; snapshot.latestDecision = snapshot.decisions[0] ?? snapshot.latestDecision; }
+    if (page === "journal") { snapshot.decisions = data.decisions ?? []; snapshot.cyclePlans = data.cycles ?? data.cyclePlans ?? []; const validCycle = snapshot.cyclePlans.find((cycle) => cycle.status === "COMPLETED" && cycle.hasValidPlan); const persistedPlan = validCycle?.plan ?? data.latestValidCyclePlan?.plan ?? snapshot.latestCyclePlan; snapshot.latestCyclePlan = persistedPlan ?? null; snapshot.latestDiscovery = validCycle?.discovery ?? data.latestValidCyclePlan?.discovery ?? snapshot.latestDiscovery; if (!snapshot.latestCyclePlan) snapshot.latestDecision = null; }
     if (page === "trade-history") snapshot.trades = data.trades ?? [];
     if (page === "learning-page") snapshot.learning = data.learning ?? snapshot.learning;
     if (page === "policy-page") { snapshot.riskControls = data.riskControls ?? snapshot.riskControls; snapshot.lastPolicyUpdate = data.lastPolicyUpdate ?? null; }
@@ -270,8 +372,8 @@ async function loadPage(page) {
     const banner = $("error"); banner.textContent = `Page read failed: ${error instanceof Error ? error.message : "UNKNOWN"}`; banner.hidden = false;
   }
 }
-function invalidatePageData() { loadedPages.clear(); pageLoadedAt.clear(); }
-async function selectPage(page) { document.querySelectorAll(".page").forEach((item) => { item.hidden = item.id !== `page-${page}`; }); document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.page === page)); const labels = { dashboard: "Dashboard", journal: "Agent Journal", "trade-history": "Trade History", "open-position": "Open Position", "learning-page": "Learning", "policy-page": "Policy" }; $("page-title").textContent = labels[page] ?? "Dashboard"; await loadPage(page); }
+function invalidatePageData() { loadedPages.clear(); pageLoadedAt.clear(); positionContextsLoadedAt = 0; }
+async function selectPage(page) { currentPage = page; document.querySelectorAll(".page").forEach((item) => { item.hidden = item.id !== `page-${page}`; }); document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.page === page)); const labels = { dashboard: "Dashboard", journal: "Agent Journal", "trade-history": "Trade History", "open-position": "Open Position", "learning-page": "Learning", "policy-page": "Policy" }; $("page-title").textContent = labels[page] ?? "Dashboard"; await loadPage(page); }
 function authHeaders() { return ownerToken ? { "authorization": `Bearer ${ownerToken}` } : {}; }
 async function control(action) { if (action === "EMERGENCY_STOP" && !window.confirm("Enable the deterministic emergency stop?")) return; try { const response = await fetch("/api/control", { method: "POST", headers: { "content-type": "application/json", ...authHeaders() }, body: JSON.stringify({ action }) }); if (!response.ok) throw new Error(`HTTP_${response.status}`); invalidatePageData(); snapshot = { ...snapshot, ...(await response.json()), portfolio: livePortfolio, portfolioFreshness: liveFreshness }; render(); } catch (error) { const banner = $("error"); banner.textContent = error instanceof Error ? error.message : "CONTROL_FAILED"; banner.hidden = false; } }
 async function savePolicy() { const status = $("policy-status"); const values = Object.fromEntries([...document.querySelectorAll("[data-policy-field]")].map((input) => [input.dataset.policyField, input.value])); values.drawdownCooldownMinutes = Number(values.drawdownCooldownMinutes); values.scanIntervalMinutes = Number(values.scanIntervalMinutes); try { const response = await fetch("/api/policy", { method: "POST", headers: { "content-type": "application/json", ...authHeaders() }, body: JSON.stringify(values) }); if (!response.ok) throw new Error(`HTTP_${response.status}`); invalidatePageData(); snapshot = { ...snapshot, ...(await response.json()), portfolio: livePortfolio, portfolioFreshness: liveFreshness }; status.textContent = "POLICY_UPDATED"; render(); } catch (error) { status.textContent = error instanceof Error ? error.message : "POLICY_UPDATE_FAILED"; } }

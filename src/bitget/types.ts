@@ -89,7 +89,9 @@ export function parseAccount(value: unknown, instrument: Instrument, market: Mar
         leverage: text(entry.leverage, "1"),
         entryPrice: text(entry.openPriceAvg, text(entry.averageOpenPrice, "0")),
         unrealizedPnl: text(entry.unrealizedPnl, text(entry.unrealizedPL, text(entry.upl, "0"))),
-        realizedPnl: text(entry.realizedPnl, text(entry.achievedProfits, "0")),
+        realizedPnl: text(entry.realizedPnl, text(entry.realizedPL, text(entry.achievedProfits))),
+        ...(text(entry.funding, text(entry.fundingFee, text(entry.totalFunding))) ? { funding: text(entry.funding, text(entry.fundingFee, text(entry.totalFunding))) } : {}),
+        ...(text(entry.fees, text(entry.fee, text(entry.feeAmount))) ? { fees: text(entry.fees, text(entry.fee, text(entry.feeAmount))) } : {}),
         ...(text(entry.ctime, text(entry.openTime)) ? { openedAt: text(entry.ctime, text(entry.openTime)) } : {}),
         ...(text(entry.liquidationPrice) ? { liquidationPrice: text(entry.liquidationPrice) } : {}),
       };
@@ -103,6 +105,9 @@ export function parseAccount(value: unknown, instrument: Instrument, market: Mar
   const openOrderPayload = overview.openOrders;
   const openOrders = Array.isArray(openOrderPayload) ? records(openOrderPayload) : openOrderPayload && typeof openOrderPayload === "object" && !Array.isArray(openOrderPayload) && Array.isArray((openOrderPayload as Record<string, unknown>).list) ? records((openOrderPayload as Record<string, unknown>).list) : [];
   const instrumentPosition = positions.find((position) => position.symbol === instrument.symbol);
+  const accountRealizedPnl = firstSignedText(account, ["realizedPnl", "realizedPL"]);
+  const positionRealizedPnl = positions.map((position) => position.realizedPnl).filter(isSignedDecimal);
+  const realizedPnl = accountRealizedPnl || (positionRealizedPnl.length ? sumSignedDecimals(positionRealizedPnl) : "");
   return {
     balance: text(account.balance, equity),
     availableBalance: availableMargin,
@@ -113,8 +118,10 @@ export function parseAccount(value: unknown, instrument: Instrument, market: Mar
     positionQuantity: instrumentPosition?.quantity ?? "0",
     portfolioEquity: equity,
     positions,
-    realizedPnl: text(account.realizedPnl, "0"),
+    realizedPnl,
     unrealizedPnl: positions.reduce((total, position) => addDecimal(total, position.unrealizedPnl), "0"),
+    ...(firstSignedText(account, ["funding", "fundingFee", "totalFunding"]) ? { funding: firstSignedText(account, ["funding", "fundingFee", "totalFunding"]) } : {}),
+    ...(firstSignedText(account, ["fees", "fee", "feeAmount", "totalFee"]) ? { fees: firstSignedText(account, ["fees", "fee", "feeAmount", "totalFee"]) } : {}),
     openOrders: openOrders.length,
     openOrderSymbols: openOrders.map((entry) => text(entry.symbol)).filter(Boolean),
     observedAt,
@@ -157,8 +164,10 @@ export function parseDashboardPortfolio(accountValue: unknown, positionsValue: u
     positionQuantity: normalizedPositions.reduce((total, position) => addDecimal(total, position.quantity), "0"),
     portfolioEquity: accountEquity,
     positions: normalizedPositions,
-    realizedPnl: firstText(account, ["realizedPnl", "realizedPL"]),
+    realizedPnl: firstSignedText(account, ["realizedPnl", "realizedPL"]) || (normalizedPositions.map((position) => position.realizedPnl).filter(isSignedDecimal).length ? sumSignedDecimals(normalizedPositions.map((position) => position.realizedPnl).filter(isSignedDecimal)) : ""),
     unrealizedPnl,
+    ...(firstSignedText(account, ["funding", "fundingFee", "totalFunding"]) ? { funding: firstSignedText(account, ["funding", "fundingFee", "totalFunding"]) } : {}),
+    ...(firstSignedText(account, ["fees", "fee", "feeAmount", "totalFee"]) ? { fees: firstSignedText(account, ["fees", "fee", "feeAmount", "totalFee"]) } : {}),
     openOrders: orders.length,
     openOrderSymbols: orders.map((entry) => text(entry.symbol)).filter(Boolean),
     observedAt,
@@ -187,6 +196,8 @@ function parseDashboardPosition(entry: Record<string, unknown>): PositionSnapsho
     entryPrice: firstText(entry, ["openPriceAvg", "avgPrice", "averageOpenPrice", "entryPrice"]),
     unrealizedPnl: firstText(entry, ["unrealisedPnl", "unrealizedPnl", "unrealizedPL", "upl", "unrealizedProfit"]),
     realizedPnl: firstText(entry, ["curRealisedPnl", "realizedPnl", "realizedPL", "achievedProfits"]),
+    ...(firstText(entry, ["funding", "fundingFee", "totalFunding"]) ? { funding: firstText(entry, ["funding", "fundingFee", "totalFunding"]) } : {}),
+    ...(firstText(entry, ["fees", "fee", "feeAmount", "totalFee"]) ? { fees: firstText(entry, ["fees", "fee", "feeAmount", "totalFee"]) } : {}),
     ...(markPrice ? { markPrice } : {}),
     ...(firstText(entry, ["ctime", "cTime", "createdTime", "openTime"]) ? { openedAt: firstText(entry, ["ctime", "cTime", "createdTime", "openTime"]) } : {}),
     ...(firstText(entry, ["liquidationPrice", "liqPrice"]) ? { liquidationPrice: firstText(entry, ["liquidationPrice", "liqPrice"]) } : {}),
@@ -213,6 +224,18 @@ function firstText(entry: Record<string, unknown>, keys: string[], fallback = ""
     if (value) return value;
   }
   return fallback;
+}
+
+function firstSignedText(entry: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = text(entry[key]);
+    if (isSignedDecimal(value)) return value;
+  }
+  return "";
+}
+
+function isSignedDecimal(value: string): boolean {
+  return /^[-+]?\d+(?:\.\d+)?$/.test(value.trim());
 }
 
 function hasPositionQuantity(value: string): boolean {
@@ -364,7 +387,7 @@ function weightedAverage(prices: string[], quantities: string[]): string {
 }
 
 function signedDecimalParts(value: string): { integer: bigint; scale: number } {
-  const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(value.trim());
+  const match = /^([+-]?)(\d+)(?:\.(\d+))?$/.exec(value.trim());
   if (!match?.[2]) throw new Error("INVALID_DECIMAL");
   const magnitude = BigInt(`${match[2]}${match[3] ?? ""}`);
   return { integer: match[1] === "-" ? -magnitude : magnitude, scale: match[3]?.length ?? 0 };

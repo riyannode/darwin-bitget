@@ -250,7 +250,7 @@ export class BitgetClient {
     try {
       const accountInfo = await this.callOperation<unknown>("getAccountInfo", {});
       const holdingMode = parseHoldingMode(accountInfo.data);
-      if (request.tradeSide === "open") {
+      if (request.tradeSide === "open" && request.action !== "INCREASE") {
         operation = "setLeverage";
         await this.callOperation<unknown>("setLeverage", {
           category: this.category,

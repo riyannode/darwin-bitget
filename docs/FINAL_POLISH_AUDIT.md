@@ -1,13 +1,13 @@
 # Final Judging Polish Audit
 
-This audit is limited to judge-facing agent quality: decision explainability,
-agent architecture quality, risk-control clarity, and maintainability. Financial
-behavior, scheduler behavior, provider behavior, execution/reconciliation, and
-persisted schema are out of scope.
+This historical audit covered the pre-PR #4 judging polish pass. The current
+architecture change is documented in `docs/ARCHITECTURE.md`, `docs/VERIFICATION.md`,
+and `docs/SUBMISSION.md`. PR #4 intentionally changes financial behavior by
+separating position management from new-entry planning; it is not SAFE_CLEANUP.
 
 | Finding | Classification | Handling |
 | --- | --- | --- |
-| The mandate version and wording did not explicitly require a separated decision rationale, supporting evidence, risk/invalidation explanation, or evidence limitations. | `SAFE_CLEANUP` | Updated the wording to `darwin-mandate-v4`; no decision fields or risk rules changed. |
+| The pre-PR #3 mandate version and wording did not explicitly require a separated decision rationale, supporting evidence, risk/invalidation explanation, or evidence limitations. | `SAFE_CLEANUP` (historical) | The prior polish pass updated `darwin-mandate-v4`; PR #4 now intentionally supersedes it with `darwin-mandate-v5` and `darwin-decision-v3` for the CycleDecisionPlan contract. |
 | The judge-facing decision panels rendered thesis, factors, and lessons but omitted the persisted `evidenceUsed` field. | `SAFE_CLEANUP` | Rendered `EVIDENCE USED` beside the existing explanation fields. |
 | `getSchedulerDiagnostics` contained an unused `activeCycle` local. | `SAFE_CLEANUP` | Removed the dead local; scheduler behavior is unchanged. |
 | `gateway/src/server.ts` imported `ServerResponse` without using it. | `SAFE_CLEANUP` | Removed the unused type import. |
@@ -23,4 +23,6 @@ persisted schema are out of scope.
 | Judge replay/test logic is isolated under `demo/` and guarded by `JUDGE_DEMO`. | `NO_CHANGE_NEEDED` | The separate deterministic demo boundary is intentional and unchanged. |
 | Bitget adapter code repeats parsing/normalization for positions, profit rates, fills, and provider statuses. | `DEFER_AFTER_HACKATHON` | Provider behavior is excluded; no adapter refactor made. |
 
-Only the five `SAFE_CLEANUP` findings are implemented here.
+The historical five cleanup findings remain unchanged. PR #4 is a separate
+intentional architecture/financial-behavior change and must not be classified as
+SAFE_CLEANUP.

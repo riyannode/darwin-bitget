@@ -65,7 +65,7 @@ export function evaluateRiskGate(config: RuntimeConfig, context: RiskContext): R
 
   if (context.emergencyStop) addCode(codes, "EMERGENCY_STOP");
   if (!config.ownerPolicy.paperOnly) addCode(codes, "PAPER_ONLY");
-  const managesPosition = (decision.action === "CLOSE" || decision.action === "REDUCE" || decision.action === "HOLD")
+  const managesPosition = ["CLOSE", "REDUCE", "HOLD", "INCREASE", "REVERSE"].includes(decision.action)
     && account.positions.some((held) => held.symbol === decision.symbol && (decision.action === "HOLD" || held.positionSide === decision.positionSide));
   if (!context.supportedUniverse.includes(decision.symbol) && !managesPosition) addCode(codes, "SYMBOL_NOT_ALLOWED");
   if (instrument.symbol !== decision.symbol || instrument.status.toLowerCase() !== "online") addCode(codes, "INSTRUMENT_UNAVAILABLE");
@@ -76,6 +76,10 @@ export function evaluateRiskGate(config: RuntimeConfig, context: RiskContext): R
   if (context.openOrderSymbols.includes(decision.symbol)) addCode(codes, "DUPLICATE_ORDER");
   if (decision.action === "OPEN_LONG" || decision.action === "OPEN_SHORT") {
     validateOpeningDecision(config, context, codes);
+  } else if (decision.action === "INCREASE") {
+    validateIncreaseDecision(config, context, codes);
+  } else if (decision.action === "REVERSE") {
+    validateReverseDecision(config, context, codes);
   } else {
     validateClosingDecision(context, codes);
   }
@@ -108,6 +112,71 @@ function validateOpeningDecision(config: RuntimeConfig, context: RiskContext, co
     addCode(codes, "INVALID_LEVERAGE");
   }
   if (scaled(account.portfolioEquity) <= 0n) addCode(codes, "INVALID_PORTFOLIO_EQUITY");
+}
+
+function validateIncreaseDecision(config: RuntimeConfig, context: RiskContext, codes: string[]): void {
+  const { decision, instrument, account } = context;
+  if (!decision.positionSide) {
+    addCode(codes, "POSITION_SIDE_REQUIRED");
+    return;
+  }
+  const current = position(account, decision.symbol, decision.positionSide);
+  if (!current || compare(current.quantity, "0") <= 0) {
+    addCode(codes, "POSITION_NOT_OPEN");
+    return;
+  }
+  let additionalMargin = "0";
+  try {
+    if (!decision.additionalMarginPct || compare(decision.additionalMarginPct, "0") <= 0) addCode(codes, "INVALID_ADDITIONAL_MARGIN");
+    additionalMargin = percentageOf(account.portfolioEquity, decision.additionalMarginPct ?? "0");
+    const postActionMargin = add(current.marginAllocated, additionalMargin);
+    if (compare(postActionMargin, percentageOf(account.portfolioEquity, config.ownerPolicy.maxSinglePositionMarginPct)) > 0) addCode(codes, "MAX_SINGLE_POSITION_MARGIN_PCT");
+    if (compare(additionalMargin, account.availableMargin) > 0) addCode(codes, "INSUFFICIENT_MARGIN");
+  } catch {
+    addCode(codes, "INVALID_ADDITIONAL_MARGIN");
+  }
+  try {
+    if (compare(decision.leverage, current.leverage) !== 0) addCode(codes, "LEVERAGE_CHANGE_NOT_ALLOWED");
+    if (compare(decision.leverage, config.ownerPolicy.maxLeverage) > 0) addCode(codes, "MAX_LEVERAGE");
+    if (compare(current.leverage, config.ownerPolicy.maxLeverage) > 0) addCode(codes, "MAX_LEVERAGE");
+    if (compare(current.leverage, instrument.leverageMin) < 0 || compare(current.leverage, instrument.leverageMax) > 0) addCode(codes, "PROVIDER_LEVERAGE");
+    if (compare(multiply(additionalMargin, current.leverage), instrument.minOrderAmount) < 0) addCode(codes, "MIN_ORDER_AMOUNT");
+  } catch {
+    addCode(codes, "INVALID_LEVERAGE");
+  }
+  try {
+    if (scaled(account.portfolioEquity) <= 0n) addCode(codes, "INVALID_PORTFOLIO_EQUITY");
+  } catch {
+    addCode(codes, "INVALID_PORTFOLIO_EQUITY");
+  }
+}
+
+function validateReverseDecision(config: RuntimeConfig, context: RiskContext, codes: string[]): void {
+  const { decision, instrument, account } = context;
+  if (!decision.positionSide) {
+    addCode(codes, "POSITION_SIDE_REQUIRED");
+    return;
+  }
+  const current = position(account, decision.symbol, decision.positionSide);
+  if (!current || compare(current.quantity, "0") <= 0) addCode(codes, "POSITION_NOT_OPEN");
+  if (!decision.targetPositionSide) addCode(codes, "REVERSE_TARGET_SIDE_REQUIRED");
+  if (decision.targetPositionSide === decision.positionSide) addCode(codes, "REVERSE_TARGET_SIDE_NOT_OPPOSITE");
+  try {
+    if (compare(decision.marginAllocationPct, "0") <= 0) addCode(codes, "INVALID_MARGIN_ALLOCATION");
+    const margin = percentageOf(account.portfolioEquity, decision.marginAllocationPct);
+    if (compare(margin, account.availableMargin) > 0) addCode(codes, "INSUFFICIENT_MARGIN");
+    if (compare(margin, percentageOf(account.portfolioEquity, config.ownerPolicy.maxSinglePositionMarginPct)) > 0) addCode(codes, "MAX_SINGLE_POSITION_MARGIN_PCT");
+    if (compare(multiply(margin, decision.leverage), instrument.minOrderAmount) < 0) addCode(codes, "MIN_ORDER_AMOUNT");
+  } catch {
+    addCode(codes, "INVALID_MARGIN_ALLOCATION");
+  }
+  try {
+    if (compare(decision.leverage, "0") <= 0) addCode(codes, "INVALID_LEVERAGE");
+    if (compare(decision.leverage, config.ownerPolicy.maxLeverage) > 0) addCode(codes, "MAX_LEVERAGE");
+    if (compare(decision.leverage, instrument.leverageMin) < 0 || compare(decision.leverage, instrument.leverageMax) > 0) addCode(codes, "PROVIDER_LEVERAGE");
+  } catch {
+    addCode(codes, "INVALID_LEVERAGE");
+  }
 }
 
 function validateClosingDecision(context: RiskContext, codes: string[]): void {

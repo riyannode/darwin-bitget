@@ -1,17 +1,32 @@
 import { z } from "zod";
-import type { AutonomousDecisionSet, Decision, DecisionContext, MarketSnapshot, PositionSnapshot, RuntimeConfig } from "../types.js";
+import type {
+  AutonomousDecisionSet,
+  CycleDecisionPlan,
+  Decision,
+  DecisionContext,
+  EntryDecision,
+  MarketSnapshot,
+  PositionManagementDecision,
+  PositionSnapshot,
+  RuntimeConfig,
+} from "../types.js";
 import { CANDIDATE_TASK_PROMPT, DECISION_TASK_PROMPT, TRADING_MANDATE } from "./mandate.js";
 import { generateQwenJson } from "./qwen.js";
+
+export const MAX_TOTAL_ACTIONS_PER_CYCLE = 5;
+export const MAX_FINANCIAL_WRITES_PER_CYCLE = 5;
 
 const decimalString = z.string().regex(/^\d+(?:\.\d{1,8})?$/);
 
 const decisionFields = {
-  action: z.enum(["OPEN_LONG", "OPEN_SHORT", "HOLD", "REDUCE", "CLOSE"]),
+  action: z.enum(["OPEN_LONG", "OPEN_SHORT", "HOLD", "INCREASE", "REDUCE", "CLOSE", "REVERSE"]),
   positionSide: z.enum(["LONG", "SHORT"]).nullable(),
   symbol: z.string().min(1),
   marginAllocationPct: decimalString,
+  additionalMarginPct: decimalString.nullable().optional(),
   leverage: decimalString,
   reductionPct: decimalString.nullable(),
+  targetPositionSide: z.enum(["LONG", "SHORT"]).nullable().optional(),
   confidence: z.number().min(0).max(1),
   thesis: z.string().min(1).max(500),
   strategyThesis: z.string().min(1).max(500),
@@ -21,14 +36,21 @@ const decisionFields = {
   lessonsUsed: z.array(z.string().min(1)).max(5),
 };
 
-function validateDecisionSemantics(decision: z.infer<z.ZodObject<typeof decisionFields>>, context: z.RefinementCtx): void {
+type DecisionFields = z.infer<z.ZodObject<typeof decisionFields>>;
+
+function validateDecisionSemantics(decision: DecisionFields, context: z.RefinementCtx): void {
   const openingSide = decision.action === "OPEN_LONG" ? "LONG" : decision.action === "OPEN_SHORT" ? "SHORT" : null;
   if (openingSide && decision.positionSide !== openingSide) context.addIssue({ code: "custom", path: ["positionSide"], message: "INVALID_POSITION_SIDE" });
-  if ((decision.action === "REDUCE" || decision.action === "CLOSE") && !decision.positionSide) context.addIssue({ code: "custom", path: ["positionSide"], message: "POSITION_SIDE_REQUIRED" });
+  if (["INCREASE", "REDUCE", "CLOSE", "REVERSE"].includes(decision.action) && !decision.positionSide) context.addIssue({ code: "custom", path: ["positionSide"], message: "POSITION_SIDE_REQUIRED" });
   if (decision.action === "REDUCE" && (!decision.reductionPct || Number(decision.reductionPct) <= 0 || Number(decision.reductionPct) >= 100)) context.addIssue({ code: "custom", path: ["reductionPct"], message: "INVALID_REDUCTION_PCT" });
-  if (decision.action === "CLOSE" && decision.reductionPct !== null && decision.reductionPct !== "100") context.addIssue({ code: "custom", path: ["reductionPct"], message: "INVALID_REDUCTION_PCT" });
-  if ((decision.action === "HOLD" || decision.action === "REDUCE" || decision.action === "CLOSE") && decision.marginAllocationPct !== "0") context.addIssue({ code: "custom", path: ["marginAllocationPct"], message: "INVALID_MARGIN_ALLOCATION" });
-  if (decision.action === "HOLD" && decision.positionSide !== null) context.addIssue({ code: "custom", path: ["positionSide"], message: "INVALID_POSITION_SIDE" });
+  if (decision.action === "CLOSE" && decision.reductionPct !== null && Number(decision.reductionPct) !== 100) context.addIssue({ code: "custom", path: ["reductionPct"], message: "INVALID_REDUCTION_PCT" });
+  if ((decision.action === "HOLD" || decision.action === "REDUCE" || decision.action === "CLOSE" || decision.action === "INCREASE") && Number(decision.marginAllocationPct) !== 0) context.addIssue({ code: "custom", path: ["marginAllocationPct"], message: "INVALID_MARGIN_ALLOCATION" });
+  if (decision.action === "INCREASE" && (!decision.additionalMarginPct || Number(decision.additionalMarginPct) <= 0)) context.addIssue({ code: "custom", path: ["additionalMarginPct"], message: "INVALID_ADDITIONAL_MARGIN" });
+  if (decision.action !== "INCREASE" && decision.additionalMarginPct !== undefined && decision.additionalMarginPct !== null) context.addIssue({ code: "custom", path: ["additionalMarginPct"], message: "UNEXPECTED_ADDITIONAL_MARGIN" });
+  if (decision.action === "REVERSE" && (!decision.targetPositionSide || !decision.marginAllocationPct || Number(decision.marginAllocationPct) <= 0 || !decision.leverage || Number(decision.leverage) <= 0)) context.addIssue({ code: "custom", path: ["targetPositionSide"], message: "REVERSE_TARGET_SIDE_REQUIRED" });
+  if (decision.action !== "REVERSE" && decision.targetPositionSide !== undefined && decision.targetPositionSide !== null) context.addIssue({ code: "custom", path: ["targetPositionSide"], message: "UNEXPECTED_TARGET_POSITION_SIDE" });
+  if (decision.action === "REVERSE" && decision.targetPositionSide && decision.positionSide && decision.targetPositionSide === decision.positionSide) context.addIssue({ code: "custom", path: ["targetPositionSide"], message: "REVERSE_TARGET_SIDE_NOT_OPPOSITE" });
+  if (decision.action === "HOLD" && decision.positionSide !== null && !["LONG", "SHORT"].includes(decision.positionSide)) context.addIssue({ code: "custom", path: ["positionSide"], message: "INVALID_POSITION_SIDE" });
 }
 
 export const decisionSchema = z.object({
@@ -38,15 +60,23 @@ export const decisionSchema = z.object({
   createdAt: z.string().datetime(),
 }).superRefine(validateDecisionSemantics);
 
-const qwenExitDecisionSchema = z.object(decisionFields).superRefine((decision, context) => {
+const modelPositionActionSchema = z.object(decisionFields).superRefine((decision, context) => {
   validateDecisionSemantics(decision, context);
-  if (decision.action !== "REDUCE" && decision.action !== "CLOSE") context.addIssue({ code: "custom", path: ["action"], message: "EXIT_ACTION_REQUIRED" });
+  if (!decision.positionSide) context.addIssue({ code: "custom", path: ["positionSide"], message: "POSITION_SIDE_REQUIRED" });
+  if (!["HOLD", "INCREASE", "REDUCE", "CLOSE", "REVERSE"].includes(decision.action)) context.addIssue({ code: "custom", path: ["action"], message: "POSITION_MANAGEMENT_ACTION_REQUIRED" });
 });
 
-export const autonomousDecisionSetSchema = z.object({
-  ...decisionFields,
-  exitDecisions: z.array(qwenExitDecisionSchema).default([]),
-}).superRefine(validateDecisionSemantics);
+const modelEntryActionSchema = z.object(decisionFields).superRefine((decision, context) => {
+  validateDecisionSemantics(decision, context);
+  if (decision.action !== "OPEN_LONG" && decision.action !== "OPEN_SHORT") context.addIssue({ code: "custom", path: ["action"], message: "NEW_ENTRY_ACTION_REQUIRED" });
+});
+
+export const cycleDecisionPlanSchema = z.object({
+  positionActions: z.array(modelPositionActionSchema).max(MAX_TOTAL_ACTIONS_PER_CYCLE),
+  entryActions: z.array(modelEntryActionSchema).max(MAX_TOTAL_ACTIONS_PER_CYCLE),
+}).superRefine((plan, context) => {
+  if (plan.positionActions.length + plan.entryActions.length > MAX_TOTAL_ACTIONS_PER_CYCLE) context.addIssue({ code: "custom", path: [], message: "MAX_TOTAL_ACTIONS_PER_CYCLE" });
+});
 
 export type DecisionInput = z.infer<typeof decisionSchema>;
 
@@ -117,25 +147,32 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
     marketRegime: bundle.marketRegime ?? "UNKNOWN",
     historicalBars: bundle.historicalBars?.slice(-6) ?? [],
   }));
+  const bundleBySymbol = new Map(deepEvidence.map((bundle) => [bundle.symbol, bundle]));
   return JSON.stringify({
     cycleId,
     currentTimestamp: context.observedAt,
     portfolio,
+    supportedUniverse: context.supportedUniverse,
+    openPositionSymbols: context.openPositionSymbols,
+    entryCandidateSymbols: context.entryCandidateSymbols,
+    openPositionEvidence: context.openPositionSymbols.map((symbol) => bundleBySymbol.get(symbol)).filter(Boolean),
+    entryCandidateEvidence: context.entryCandidateSymbols.map((symbol) => bundleBySymbol.get(symbol)).filter(Boolean),
     deepEvidenceSymbols: context.bundles.map((bundle) => bundle.instrument.symbol),
     deepEvidence,
     openExperiences: context.openExperiences.slice(-10),
     experiences: context.experiences.filter((experience) => experience.outcomeStatus !== "EXECUTION_FAILURE").slice(-10),
     operationalEvidence: context.experiences.filter((experience) => experience.outcomeStatus === "EXECUTION_FAILURE").slice(-10).map((experience) => ({ experienceId: experience.experienceId, symbol: experience.symbol, classification: "EXECUTION_FAILURE", strategyOutcome: "UNASSESSED" })),
     lessons: context.lessons.filter((lesson) => lesson.source !== "EXECUTION_FAILURE"),
-    supportedUniverse: context.supportedUniverse.filter((symbol) => context.bundles.some((bundle) => bundle.instrument.symbol === symbol)),
     constraints: {
-      actions: ["OPEN_LONG", "OPEN_SHORT", "HOLD", "REDUCE", "CLOSE"],
+      positionActions: ["HOLD", "INCREASE", "REDUCE", "CLOSE", "REVERSE"],
+      entryActions: ["OPEN_LONG", "OPEN_SHORT"],
+      maxTotalActionsPerCycle: MAX_TOTAL_ACTIONS_PER_CYCLE,
+      maxFinancialWritesPerCycle: MAX_FINANCIAL_WRITES_PER_CYCLE,
       paperOnly: true,
       noChainOfThought: true,
-      openingRule: "OPEN_LONG uses LONG and OPEN_SHORT uses SHORT.",
-      reductionRule: "REDUCE uses a percentage between 0 and 100.",
-      closeRule: "CLOSE uses a position side and reductionPct null.",
-      exitRule: "exitDecisions may contain multiple REDUCE or CLOSE actions for existing positions. The primary action may contain at most one new opening action.",
+      managementRule: "Every open provider position appears exactly once in positionActions. HOLD preserves it, INCREASE adds additionalMarginPct without changing provider leverage, REDUCE and CLOSE reduce exposure, and REVERSE closes and verifies the current side before evaluating the opposite entry.",
+      entryRule: "entryActions are optional and must use current deep evidence for supportedUniverse candidates. An open symbol remains forbidden in entryActions; existing-symbol changes belong in positionActions.",
+      executionAuthority: "Deterministic TypeScript validates and orders financial writes; the model is not financial authority.",
     },
   });
 }
@@ -163,25 +200,90 @@ export function normalizeLessonReferences(ids: readonly string[], knownLessonIds
   return { accepted, ignored };
 }
 
+function positionKey(symbol: string, positionSide: string | null): string {
+  return `${symbol}:${positionSide ?? "NONE"}`;
+}
+
+export function financialWriteCount(action: Decision["action"]): number {
+  return action === "HOLD" ? 0 : action === "REVERSE" ? 2 : 1;
+}
+
+function liveOpenPositions(positions: readonly PositionSnapshot[]): PositionSnapshot[] {
+  return positions.filter((position) => Number(position.quantity) > 0);
+}
+
+export function assertOpenPositionCountWithinPlanLimit(openPositions: readonly PositionSnapshot[]): void {
+  if (liveOpenPositions(openPositions).length > MAX_TOTAL_ACTIONS_PER_CYCLE) throw new Error("OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT");
+}
+
+export function validateCycleDecisionPlan(plan: CycleDecisionPlan, context: DecisionContext): void {
+  const currentPositions = liveOpenPositions(context.openPositions);
+  assertOpenPositionCountWithinPlanLimit(currentPositions);
+  if (plan.positionActions.length + plan.entryActions.length > MAX_TOTAL_ACTIONS_PER_CYCLE) throw new Error("MAX_TOTAL_ACTIONS_PER_CYCLE");
+  const financialWrites = [...plan.positionActions, ...plan.entryActions].reduce((total, action) => total + financialWriteCount(action.action), 0);
+  if (financialWrites > MAX_FINANCIAL_WRITES_PER_CYCLE) throw new Error("MAX_FINANCIAL_WRITES_PER_CYCLE");
+  const currentKeys = new Set(currentPositions.map((position) => positionKey(position.symbol, position.positionSide)));
+  const currentSymbols = new Set(currentPositions.map((position) => position.symbol));
+  const managementKeys = new Set<string>();
+  for (const action of plan.positionActions) {
+    if (!action.positionSide) throw new Error("POSITION_SIDE_REQUIRED");
+    const key = positionKey(action.symbol, action.positionSide);
+    if (managementKeys.has(key)) throw new Error("DUPLICATE_MANAGEMENT_ACTION");
+    if (!currentKeys.has(key)) throw new Error("POSITION_NOT_OPEN");
+    if (!context.bundles.some((bundle) => bundle.instrument.symbol === action.symbol && bundle.account.positions.some((position) => positionKey(position.symbol, position.positionSide) === key && Number(position.quantity) > 0))) throw new Error("POSITION_EVIDENCE_REQUIRED");
+    if (action.action === "INCREASE" && (!action.additionalMarginPct || Number(action.additionalMarginPct) <= 0)) throw new Error("INVALID_ADDITIONAL_MARGIN");
+    if (action.action === "REVERSE") {
+      if (!action.targetPositionSide) throw new Error("REVERSE_TARGET_SIDE_REQUIRED");
+      if (action.targetPositionSide === action.positionSide) throw new Error("REVERSE_TARGET_SIDE_NOT_OPPOSITE");
+      if (Number(action.marginAllocationPct) <= 0) throw new Error("INVALID_MARGIN_ALLOCATION");
+    }
+    managementKeys.add(key);
+  }
+  if (managementKeys.size !== currentKeys.size || [...currentKeys].some((key) => !managementKeys.has(key))) throw new Error("MISSING_POSITION_MANAGEMENT");
+  const entrySymbols = new Set<string>();
+  const deepSymbols = new Set(context.entryCandidateSymbols.filter((symbol) => context.bundles.some((bundle) => bundle.instrument.symbol === symbol)));
+  for (const action of plan.entryActions) {
+    const expectedSide = action.action === "OPEN_LONG" ? "LONG" : "SHORT";
+    if (action.positionSide !== expectedSide) throw new Error("INVALID_POSITION_SIDE");
+    if (!context.supportedUniverse.includes(action.symbol)) throw new Error("SYMBOL_NOT_ALLOWED");
+    if (!deepSymbols.has(action.symbol)) throw new Error("ENTRY_EVIDENCE_REQUIRED");
+    if (currentSymbols.has(action.symbol)) throw new Error("ENTRY_SYMBOL_ALREADY_OPEN");
+    if (entrySymbols.has(action.symbol)) throw new Error("DUPLICATE_ENTRY_ACTION");
+    entrySymbols.add(action.symbol);
+  }
+}
+
+function materializeDecision(fields: DecisionFields, cycleId: string, createdAt: string): Decision {
+  return decisionSchema.parse({ ...fields, decisionId: crypto.randomUUID(), cycleId, createdAt });
+}
+
+export function orderCycleActions(plan: CycleDecisionPlan): Decision[] {
+  const rank = (action: Decision["action"]): number => action === "CLOSE" || action === "REVERSE" ? 0 : action === "REDUCE" ? 1 : action === "INCREASE" ? 2 : action === "OPEN_LONG" || action === "OPEN_SHORT" ? 3 : 4;
+  return [...plan.positionActions, ...plan.entryActions].sort((left, right) => rank(left.action) - rank(right.action)
+    || left.symbol.localeCompare(right.symbol)
+    || (left.positionSide ?? "").localeCompare(right.positionSide ?? "")
+    || left.decisionId.localeCompare(right.decisionId));
+}
+
 export function boundExitDecisions(exitDecisions: readonly Decision[], openPositions: readonly PositionSnapshot[]): Decision[] {
-  const openPositionKeys = new Set(openPositions.filter((position) => Number(position.quantity) > 0).map((position) => `${position.symbol}:${position.positionSide}`));
-  return exitDecisions.filter((exitDecision) => openPositionKeys.has(`${exitDecision.symbol}:${exitDecision.positionSide}`));
+  const openPositionKeys = new Set(liveOpenPositions(openPositions).map((position) => positionKey(position.symbol, position.positionSide)));
+  return exitDecisions.filter((exitDecision) => openPositionKeys.has(positionKey(exitDecision.symbol, exitDecision.positionSide)));
 }
 
 export async function decide(config: RuntimeConfig, context: DecisionContext, cycleId: string): Promise<AutonomousDecisionSet> {
-  const generated = await generateQwenJson(config, autonomousDecisionSetSchema, `${context.mandate}\n${DECISION_TASK_PROMPT}\nReturn one primary action and optional exitDecisions. exitDecisions may only contain REDUCE or CLOSE for existing positions. Keep every rationale concise. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: 1200, timeoutMs: 60_000 });
+  const generated = await generateQwenJson(config, cycleDecisionPlanSchema, `${context.mandate}\n${DECISION_TASK_PROMPT}\nReturn positionActions and entryActions only. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: 1800, timeoutMs: 60_000 });
   const createdAt = new Date().toISOString();
-  if ((generated.action === "OPEN_LONG" || generated.action === "OPEN_SHORT") && !context.supportedUniverse.includes(generated.symbol)) throw new Error("SYMBOL_NOT_ALLOWED");
-  const exitKeys = new Set<string>();
-  for (const exitDecision of generated.exitDecisions) {
-    const key = `${exitDecision.symbol}:${exitDecision.positionSide}`;
-    if (exitKeys.has(key)) throw new Error("DUPLICATE_EXIT");
-    exitKeys.add(key);
-  }
   const knownLessons = new Set(context.lessons.map((lesson) => lesson.lessonId));
-  const primaryLessons = normalizeLessonReferences(generated.lessonsUsed, knownLessons);
-  const exitLessons = generated.exitDecisions.map((exitDecision) => normalizeLessonReferences(exitDecision.lessonsUsed, knownLessons));
-  const decision = decisionSchema.parse({ ...generated, lessonsUsed: primaryLessons.accepted, decisionId: crypto.randomUUID(), cycleId, createdAt });
-  const exitDecisions = generated.exitDecisions.map((exitDecision, index) => decisionSchema.parse({ ...exitDecision, lessonsUsed: exitLessons[index]?.accepted ?? [], decisionId: crypto.randomUUID(), cycleId, createdAt }));
-  return { decision, exitDecisions, ignoredLessonIds: [...new Set([...primaryLessons.ignored, ...exitLessons.flatMap((lessons) => lessons.ignored)])] };
+  const ignoredLessonIds: string[] = [];
+  const materialize = (fields: DecisionFields): Decision => {
+    const lessons = normalizeLessonReferences(fields.lessonsUsed, knownLessons);
+    ignoredLessonIds.push(...lessons.ignored);
+    return materializeDecision({ ...fields, lessonsUsed: lessons.accepted }, cycleId, createdAt);
+  };
+  const plan: CycleDecisionPlan = {
+    positionActions: generated.positionActions.map((action) => materialize(action) as PositionManagementDecision),
+    entryActions: generated.entryActions.map((action) => materialize(action) as EntryDecision),
+  };
+  validateCycleDecisionPlan(plan, context);
+  return { plan, ignoredLessonIds: [...new Set(ignoredLessonIds)] };
 }

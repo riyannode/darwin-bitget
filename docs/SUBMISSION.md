@@ -2,7 +2,7 @@
 
 ## Positioning
 
-DARWIN Bitget is an autonomous PAPER futures agent for Bitget's 24/7 US-stock / RWA perpetual market. Qwen selects contextual trading behavior; deterministic code controls financial authority.
+DARWIN Bitget is an autonomous PAPER futures agent for Bitget's 24/7 US-stock / RWA perpetual market. DARWIN separates portfolio responsibility from opportunity discovery: every cycle re-evaluates each existing position while independently searching the current executable universe for new opportunities. Qwen proposes a bounded multi-action plan; deterministic code controls financial authority.
 
 ## Hackathon / Track
 
@@ -35,21 +35,27 @@ Always-on perpetual markets produce more symbols, evidence, and position state t
 ## What is implemented
 
 - dynamic Demo stock-perpetual discovery and public market evidence;
-- lightweight scan → Qwen shortlist → deep evidence → Qwen futures decision;
-- `OPEN_LONG`, `OPEN_SHORT`, `HOLD`, `REDUCE`, and `CLOSE`;
-- deterministic owner policy/risk gate and one new entry maximum per cycle;
-- multiple sequential exits with ambiguity stopping remaining writes;
+- lightweight scan → Qwen shortlist → separate management/entry deep evidence → Qwen `CycleDecisionPlan`;
+- `OPEN_LONG`, `OPEN_SHORT`, `HOLD`, `INCREASE`, `REDUCE`, `CLOSE`, and `REVERSE`;
+- deterministic owner policy/risk gate, `MAX_TOTAL_ACTIONS_PER_CYCLE=5`, and `MAX_FINANCIAL_WRITES_PER_CYCLE=5`;
+- sequential `CLOSE/REVERSE-close → REDUCE → INCREASE → OPEN → REVERSE-open` writes with provider refresh between matched writes and ambiguity stopping remaining writes;
 - Bitget Demo UTA execution, readback, reconciliation, journal, and sanitized diagnostics;
 - Durable Object SQLite experiences, reflections, lessons, and bounded replay;
 - read-only `PROVIDER_LIVE` portfolio dashboard with multi-position Open Position page;
+- compact persisted performance aggregate with one-time baseline, verified lifecycle counts, and bounded UTC daily summaries;
+- bounded persisted position-context reasoning for original entry and latest management decisions, including legacy CRCLUSDT bootstrap;
 - zero-credential deterministic Docker Judge Demo.
 
 ## Architecture and responsibility
 
 ```text
-Demo executable universe → scan → Qwen shortlist → deep evidence
-→ Qwen strategy/action → risk gate → Bitget Demo PAPER
-→ readback → reconciliation → journal → learning
+Demo executable universe → scan → bounded entry shortlist
+open provider positions → management evidence
+entry candidates → entry evidence
+→ Qwen CycleDecisionPlan { positionActions[], entryActions[] }
+→ deterministic validation → CLOSE → REDUCE → OPEN sequential planner
+→ risk gate → PAPER write → readback → reconciliation → refreshed portfolio
+→ journal → learning
 ```
 
 Private authenticated Bitget operations use the following transport:
@@ -64,16 +70,22 @@ Public market operations may remain direct. The Worker does not store
 remain in the stable-egress gateway. The Worker stores only backend-only gateway,
 Qwen, owner-control, and optional EVA secrets.
 
-Qwen owns strategy, thesis, symbol, direction, exits, margin allocation, and leverage. Deterministic code owns PAPER-only mode, hard owner bounds, provider metadata, balance/margin validation, idempotency, readback, reconciliation, and fail-closed ambiguity handling.
+The data boundary is explicit: provider-live `/api/live/portfolio` performs no Durable Object reads and reports current Bitget state; persisted `/api/snapshot` performance reports verified DARWIN aggregates; `/api/position-context` reports bounded structured decision evidence. These are not interchangeable and structured evidence is not hidden chain-of-thought.
+
+Qwen proposes strategy, thesis, symbol, direction, management intent, margin allocation, and leverage. Deterministic code owns PAPER-only mode, hard owner bounds, provider metadata, balance/margin validation, existing-side INCREASE semantics, reverse sequencing, idempotency, readback, reconciliation, and fail-closed ambiguity handling.
 
 ## Agent-quality evidence contract
 
-The current prompt contract is `darwin-mandate-v4`. Each decision must explain its
-decision rationale, supporting evidence, risk and invalidation conditions, evidence
-limitations, and lessons used. The dashboard exposes those fields directly so a
-judge can distinguish model reasoning from deterministic risk authority. The
-decision schema and risk gate remain unchanged; this is wording and presentation
-polish only.
+The current prompt contracts are `darwin-mandate-v6` and `darwin-decision-v4`. Each action must explain its decision rationale, supporting evidence, risk and invalidation conditions, evidence limitations, and lessons used. INCREASE carries additional margin and preserves provider leverage; REVERSE carries previous side, target side, and two-leg verification. The dashboard exposes those fields grouped by cycle so a judge can distinguish model reasoning from deterministic risk authority. This PR intentionally changes financial behavior architecture; it is not SAFE_CLEANUP.
+
+## Architectural differentiator for judging
+
+- **Decision explainability:** management and entry actions each retain evidence-attributed rationale, risk, confidence, and execution/reconciliation state.
+- **Agent architecture:** portfolio management cannot suppress unrelated opportunity discovery; an existing HOLD, INCREASE, REDUCE, CLOSE, or REVERSE and a new entry can coexist when deterministic rules allow it.
+- **Risk control:** deterministic five-action cap, current-position validation, refreshed portfolio risk checks, serialized writes, idempotency, and stop-on-ambiguity.
+- **Performance integrity:** total trades require verified autonomous opens, win rate uses verified closed outcomes only, total PnL is persisted equity delta from a one-time baseline, and daily summaries use trustworthy UTC equity observations only.
+- **Explainability:** Open Position preserves original verified entry reasoning separately from the latest HOLD/INCREASE/REDUCE/CLOSE/REVERSE management reasoning; Trade History exposes structured entry, exit, and lifecycle evidence.
+- **Operational integrity:** no forced trades, HOLD remains valid, unresolved writes are not verified trades, and the Docker replay is not production history. No better returns are promised.
 
 ## Bitget integration
 

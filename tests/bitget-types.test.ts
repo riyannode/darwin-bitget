@@ -37,6 +37,18 @@ describe("Bitget provider readback", () => {
     expect(portfolio.positions[0]).toMatchObject({ symbol: "CRCLUSDT", positionSide: "LONG", quantity: "32.69", entryPrice: "91.7", markPrice: "91.82", marginAllocated: "998.78", leverage: "3", notional: "2996.3654", unrealizedPnl: "-0.9807", unrealizedPnlPct: "-0.09", liquidationPrice: "44.2" });
   });
 
+  it("prefers account-level realized PnL over position-level values", () => {
+    const portfolio = parseDashboardPortfolio({ usdtEquity: "1000", realizedPnl: "7.5" }, [{ symbol: "CRCLUSDT", posSide: "long", total: "1", positionValue: "100", realizedPnl: "-2" }], { list: [] }, "2026-09-12T17:00:00.000Z");
+    expect(portfolio.realizedPnl).toBe("7.5");
+  });
+
+  it("falls back to signed position realized PnL without fabricating zero", () => {
+    const portfolio = parseDashboardPortfolio({ usdtEquity: "1000" }, [{ symbol: "CRCLUSDT", posSide: "long", total: "1", positionValue: "100", realizedPnl: "-2.0595" }, { symbol: "KORUUSDT", posSide: "short", total: "1", positionValue: "100", achievedProfits: "1.2500" }], { list: [] }, "2026-09-12T17:00:00.000Z");
+    expect(portfolio.realizedPnl).toBe("-0.8095");
+    const unavailable = parseDashboardPortfolio({ usdtEquity: "1000" }, [{ symbol: "CRCLUSDT", posSide: "long", total: "1", positionValue: "100" }], { list: [] }, "2026-09-12T17:00:00.000Z");
+    expect(unavailable.realizedPnl).toBe("");
+  });
+
   it("normalizes negative provider ROI ratios to percentage points", () => {
     expect(normalizeProviderProfitRate("-0.0006598963645957")).toBe("-0.06598963645957");
   });

@@ -1,6 +1,7 @@
 import { addDecimal, isDecimal } from "../trading/decimal.js";
 import type { ActivityEvent, Decision, DecisionExecutionRecord, ExecutionRequest, ExecutionResult, ReconciliationResult, TradeExperience, TradingJournal } from "../types.js";
 import type { StoredCycle } from "./store.js";
+import { cyclePlanDecisions, decisionCategory, effectiveExecutionRequest, effectiveExecutionResult, effectiveReconciliationResult, effectiveRiskGateResult, normalizeCycleDecisions } from "./journal-normalizer.js";
 
 export interface PaperLogPeriod {
   start: string | null;
@@ -46,18 +47,26 @@ export interface PaperLogCycle {
   durationMs: number | null;
   decisionIds: string[];
   eventTypes: string[];
+  scannedUniverseCount: number | null;
+  selectedEntryCandidates: string[];
+  managedExistingPositions: string[];
+  totalProposedActions: number;
+  financialWritesPerformed: number;
 }
 
 export interface PaperLogDecision {
   cycleId: string;
   decisionId: string;
   timestamp: string;
+  actionCategory: "POSITION_MANAGEMENT" | "NEW_ENTRY";
   action: Decision["action"];
   symbol: string;
   positionSide: Decision["positionSide"];
   marginAllocationPct: string;
+  additionalMarginPct: string | null;
   leverage: string;
   reductionPct: string | null;
+  targetPositionSide: Decision["targetPositionSide"];
   confidence: number;
   strategyThesis: string;
   supportingFactors: string[];
@@ -70,8 +79,25 @@ export interface PaperLogDecision {
   reconciliation: { status: string; codes: string[]; realizedPnl: string | null } | null;
   providerVerified: boolean;
   realizedPnl: string | null;
+  physicalWrites: PaperLogPhysicalWrite[];
   reflectionIds: string[];
   createdLessonIds: string[];
+}
+
+export interface PaperLogPhysicalWrite {
+  decisionId: string;
+  parentDecisionId: string | null;
+  action: string;
+  symbol: string;
+  positionSide: string;
+  tradeSide: string;
+  marginAllocated: string;
+  leverage: string;
+  positionNotional: string;
+  orderReference: string | null;
+  executionStatus: string | null;
+  reconciliationStatus: string | null;
+  providerVerified: boolean;
 }
 
 export interface PaperLogExecutionRequest {
@@ -189,49 +215,72 @@ function reconciliation(result: ReconciliationResult | undefined): PaperLogDecis
   return { status: result.status, codes: result.codes, realizedPnl: result.realizedPnl ?? null };
 }
 
-function isVerified(record: DecisionExecutionRecord | undefined): boolean {
-  return Boolean(record?.executionResult && record.executionResult.status === "filled" && record.reconciliationResult?.status === "MATCHED");
+function physicalWrite(record: DecisionExecutionRecord): PaperLogPhysicalWrite {
+  const execution = record.executionResult;
+  const reconciliationResult = record.reconciliationResult;
+  const verified = execution?.status === "filled" && reconciliationResult?.status === "MATCHED";
+  return {
+    decisionId: record.decision.decisionId,
+    parentDecisionId: record.parentDecisionId ?? null,
+    action: record.decision.action,
+    symbol: record.decision.symbol,
+    positionSide: record.decision.positionSide ?? "",
+    tradeSide: execution?.tradeSide ?? "",
+    marginAllocated: execution?.marginAllocated ?? "0",
+    leverage: execution?.leverage ?? record.decision.leverage,
+    positionNotional: execution?.positionNotional ?? "0",
+    orderReference: execution?.providerOrderId ?? execution?.clientOrderId ?? null,
+    executionStatus: execution?.status ?? null,
+    reconciliationStatus: reconciliationResult?.status ?? null,
+    providerVerified: verified,
+  };
 }
 
-function decisionRecord(journal: TradingJournal, decision: Decision, record: DecisionExecutionRecord | undefined): PaperLogDecision {
-  const verified = isVerified(record);
-  const realizedPnl = verified && record?.executionResult?.realizedPnl ? record.executionResult.realizedPnl : null;
+function decisionRecord(journal: TradingJournal, decision: Decision, record: DecisionExecutionRecord | undefined, physicalWrites: PaperLogPhysicalWrite[] = []): PaperLogDecision {
+  const effectiveExecution = effectiveExecutionResult(journal, decision, record);
+  const effectiveReconciliation = effectiveReconciliationResult(journal, decision, record);
+  const verified = effectiveExecution?.status === "filled" && effectiveReconciliation?.status === "MATCHED";
+  const realizedPnl = verified && effectiveExecution?.realizedPnl ? effectiveExecution.realizedPnl : null;
   const reflectionIds = [journal.reflection?.reflectionId ?? "", ...(journal.exitReflections ?? []).map((reflection) => reflection.reflectionId)].filter(Boolean);
   return {
     cycleId: journal.cycleId,
     decisionId: decision.decisionId,
     timestamp: decision.createdAt,
+    actionCategory: decisionCategory(journal, decision),
     action: decision.action,
     symbol: decision.symbol,
     positionSide: decision.positionSide,
     marginAllocationPct: decision.marginAllocationPct,
+    additionalMarginPct: decision.additionalMarginPct ?? null,
     leverage: decision.leverage,
     reductionPct: decision.reductionPct,
+    targetPositionSide: decision.targetPositionSide ?? null,
     confidence: decision.confidence,
     strategyThesis: decision.strategyThesis,
     supportingFactors: decision.supportingFactors,
     riskFactors: decision.riskFactors,
     evidenceUsed: decision.evidenceUsed,
     lessonsUsed: decision.lessonsUsed,
-    riskGate: record?.riskGateResult ? { status: record.riskGateResult.status, codes: record.riskGateResult.codes } : journal.riskGateResult ? { status: journal.riskGateResult.status, codes: journal.riskGateResult.codes } : null,
-    executionRequest: executionRequest(record?.executionRequest ?? (journal.decision?.decisionId === decision.decisionId ? journal.executionRequest : undefined)),
-    executionResult: executionResult(record?.executionResult ?? (journal.decision?.decisionId === decision.decisionId ? journal.executionResult : undefined)),
-    reconciliation: reconciliation(record?.reconciliationResult ?? (journal.decision?.decisionId === decision.decisionId ? journal.reconciliationResult : undefined)),
+    riskGate: (() => { const result = effectiveRiskGateResult(journal, decision, record); return result ? { status: result.status, codes: result.codes } : null; })(),
+    executionRequest: executionRequest(effectiveExecutionRequest(journal, decision, record)),
+    executionResult: executionResult(effectiveExecution),
+    reconciliation: reconciliation(effectiveReconciliation),
     providerVerified: verified,
     realizedPnl,
+    physicalWrites,
     reflectionIds,
     createdLessonIds: journal.createdLessons,
   };
 }
 
 function cycleDecisions(journal: TradingJournal): PaperLogDecision[] {
-  const records = journal.exitExecutions ?? [];
+  const records = normalizeCycleDecisions(journal).records;
   const seen = new Set<string>();
-  const decisions = [journal.decision, ...(journal.exitDecisions ?? [])].filter((decision): decision is Decision => Boolean(decision));
+  const decisions = cyclePlanDecisions(journal);
   return decisions.flatMap((decision) => {
     if (seen.has(decision.decisionId)) return [];
     seen.add(decision.decisionId);
-    return [decisionRecord(journal, decision, records.find((record) => record.decision.decisionId === decision.decisionId))];
+    return [decisionRecord(journal, decision, records.find((record) => record.decision.decisionId === decision.decisionId), records.filter((record) => record.parentDecisionId === decision.decisionId).map(physicalWrite))];
   });
 }
 
@@ -308,16 +357,22 @@ export function buildPaperLogExport(input: {
       durationMs: journal?.durationMs ?? null,
       decisionIds: journal ? cycleDecisions(journal).map((decision) => decision.decisionId) : [],
       eventTypes: cycleEvents.map((event) => event.type),
+      scannedUniverseCount: journal?.discovery?.scannedUniverseCount ?? null,
+      selectedEntryCandidates: journal?.discovery?.selectedEntryCandidateSymbols ?? [],
+      managedExistingPositions: journal?.discovery?.managedExistingPositionSymbols ?? [],
+      totalProposedActions: journal ? cycleDecisions(journal).length : 0,
+      financialWritesPerformed: journal?.discovery?.financialWritesPerformed ?? (journal ? normalizeCycleDecisions(journal).records.filter((record) => Boolean(record.executionResult)).length : 0),
     };
   });
   const decisions = journals.flatMap(cycleDecisions);
   const experienceIds = new Set(journals.flatMap((journal) => journal.experienceIds ?? []));
   const experiences = input.experiences.filter((experience) => experienceIds.has(experience.experienceId)).map(exportExperience);
-  const decisionCounts: Record<Decision["action"], number> = { HOLD: 0, OPEN_LONG: 0, OPEN_SHORT: 0, REDUCE: 0, CLOSE: 0 };
+  const decisionCounts: Record<Decision["action"], number> = { HOLD: 0, OPEN_LONG: 0, OPEN_SHORT: 0, INCREASE: 0, REDUCE: 0, CLOSE: 0, REVERSE: 0 };
   for (const decision of decisions) decisionCounts[decision.action] += 1;
-  const verifiedExecutions = decisions.filter((decision) => decision.providerVerified).length;
-  const unresolvedExecutions = decisions.filter((decision) => decision.executionResult && !decision.providerVerified).length;
-  const closed = experiences.filter((experience) => ["PROFITABLE", "LOSING", "BREAK_EVEN"].includes(experience.outcomeStatus));
+  const physicalWrites = decisions.flatMap((decision) => decision.physicalWrites);
+  const verifiedExecutions = decisions.filter((decision) => decision.action !== "REVERSE" && decision.providerVerified).length + physicalWrites.filter((write) => write.providerVerified).length;
+  const unresolvedExecutions = decisions.filter((decision) => decision.action !== "REVERSE" && decision.executionResult && !decision.providerVerified).length + physicalWrites.filter((write) => write.executionStatus !== null && !write.providerVerified).length;
+  const closed = experiences.filter((experience) => ["PROFITABLE", "LOSING", "BREAK_EVEN", "CLOSED_UNCLASSIFIED"].includes(experience.outcomeStatus));
   const realizedPnl = experiences.filter((experience) => experience.realizedPnlVerified && typeof experience.realizedPnl === "string" && isDecimal(experience.realizedPnl)).reduce((total, experience) => addDecimal(total, experience.realizedPnl ?? "0"), "0");
   const drawdown = summarizeDrawdown(journals);
   return {
@@ -356,11 +411,12 @@ function csvValue(value: unknown): string {
 }
 
 export function paperLogToCsv(exported: PaperLogExport): string {
-  const header = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "decisionId", "decisionTimestamp", "action", "symbol", "positionSide", "marginAllocationPct", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "providerOperation", "providerCode", "providerMessage", "providerReadbackCode", "providerReadbackMessage", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "reflectionIds", "createdLessonIds"];
+  const header = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "scannedUniverseCount", "selectedEntryCandidates", "managedExistingPositions", "totalProposedActions", "financialWritesPerformed", "decisionId", "decisionTimestamp", "actionCategory", "action", "symbol", "positionSide", "marginAllocationPct", "additionalMarginPct", "targetPositionSide", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "providerOperation", "providerCode", "providerMessage", "providerReadbackCode", "providerReadbackMessage", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "physicalWrites", "reflectionIds", "createdLessonIds"];
   const rows = exported.cycles.flatMap((cycle) => {
     const decisions = exported.decisions.filter((decision) => decision.cycleId === cycle.cycleId);
-    if (!decisions.length) return [[cycle.cycleId, cycle.status, cycle.startedAt, cycle.completedAt, cycle.eventTypes, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]];
-    return decisions.map((decision) => [cycle.cycleId, cycle.status, cycle.startedAt, cycle.completedAt, cycle.eventTypes, decision.decisionId, decision.timestamp, decision.action, decision.symbol, decision.positionSide, decision.marginAllocationPct, decision.leverage, decision.reductionPct, decision.confidence, decision.strategyThesis, decision.supportingFactors, decision.riskFactors, decision.evidenceUsed, decision.lessonsUsed, decision.riskGate?.status, decision.riskGate?.codes, decision.executionRequest?.tradeSide, decision.executionRequest?.positionNotional, decision.executionRequest?.clientOrderId, decision.executionResult?.providerOrderId, decision.executionResult?.status, decision.executionResult?.requestedQuantity, decision.executionResult?.executedQuantity, decision.executionResult?.providerOperation, decision.executionResult?.providerCode, decision.executionResult?.providerMessage, decision.executionResult?.providerReadbackCode, decision.executionResult?.providerReadbackMessage, decision.reconciliation?.status, decision.reconciliation?.codes, decision.providerVerified, decision.realizedPnl, decision.reflectionIds, decision.createdLessonIds]);
+    const cycleValues = [cycle.cycleId, cycle.status, cycle.startedAt, cycle.completedAt, cycle.eventTypes, cycle.scannedUniverseCount, cycle.selectedEntryCandidates, cycle.managedExistingPositions, cycle.totalProposedActions, cycle.financialWritesPerformed];
+    if (!decisions.length) return [[...cycleValues, ...Array(header.length - cycleValues.length).fill("")]];
+    return decisions.map((decision) => [...cycleValues, decision.decisionId, decision.timestamp, decision.actionCategory, decision.action, decision.symbol, decision.positionSide, decision.marginAllocationPct, decision.additionalMarginPct, decision.targetPositionSide, decision.leverage, decision.reductionPct, decision.confidence, decision.strategyThesis, decision.supportingFactors, decision.riskFactors, decision.evidenceUsed, decision.lessonsUsed, decision.riskGate?.status, decision.riskGate?.codes, decision.executionRequest?.tradeSide, decision.executionRequest?.positionNotional, decision.executionRequest?.clientOrderId, decision.executionResult?.providerOrderId, decision.executionResult?.status, decision.executionResult?.requestedQuantity, decision.executionResult?.executedQuantity, decision.executionResult?.providerOperation, decision.executionResult?.providerCode, decision.executionResult?.providerMessage, decision.executionResult?.providerReadbackCode, decision.executionResult?.providerReadbackMessage, decision.reconciliation?.status, decision.reconciliation?.codes, decision.providerVerified, decision.realizedPnl, decision.physicalWrites, decision.reflectionIds, decision.createdLessonIds]);
   });
   return [header, ...rows].map((row) => row.map(csvValue).join(",")).join("\r\n") + "\r\n";
 }

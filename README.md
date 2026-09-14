@@ -22,15 +22,31 @@ DARWIN Bitget is an autonomous PAPER futures trading agent for Bitget's 24/7 US-
 
 ## What DARWIN Does
 
-Each cycle discovers the current executable Bitget Demo stock-perpetual universe, performs a bounded market scan, asks Qwen to select candidates and form a futures decision, validates the proposed action with deterministic policy controls, and only then uses the Bitget Demo execution path. Provider readback and reconciliation decide whether a write is verified. Journals, experiences, reflections, and lessons persist in Durable Object SQLite.
+Each autonomous cycle independently manages every currently open PAPER position and evaluates unrelated new opportunities from the current executable Bitget Demo stock-perpetual universe. DARWIN can independently HOLD, scale into, reduce, close, or reverse an existing position while continuing to evaluate unrelated new entry opportunities. Qwen returns a bounded cycle plan; deterministic validation, risk controls, provider readback, and reconciliation own financial authority. Journals, experiences, reflections, lessons, the compact performance aggregate, and position-context reasoning persist in Durable Object SQLite. An existing HOLD does not consume the new-entry opportunity slot.
 
 ```text
-Demo executable universe → lightweight scan → Qwen shortlist → deep evidence
-→ Qwen decision → deterministic risk gate → Bitget Demo PAPER
-→ provider readback → reconciliation → journal → reflection / learning
+Executable Demo universe → lightweight scan → bounded entry shortlist
+                    ↘
+Open provider positions → management evidence
+                    ↘
+             Qwen CycleDecisionPlan
+             ├ positionActions[]
+             └ entryActions[]
+                    ↓
+       deterministic validation (max 5 semantic / 5 writes)
+                    ↓
+ CLOSE/REVERSE-close → REDUCE → INCREASE → OPEN → REVERSE-open
+                    ↓
+     risk check → PAPER write → readback
+                    ↓
+              reconciliation
+                    ↓
+        refreshed provider portfolio → next action
+                    ↓
+             journal / learning
 ```
 
-Qwen owns strategy selection, symbol selection, `OPEN_LONG` / `OPEN_SHORT` / `HOLD` / `REDUCE` / `CLOSE`, thesis, margin allocation, and leverage selection. Deterministic code owns financial authority and safety boundaries. No profitability guarantee is claimed.
+Qwen proposes strategy, rationale, and bounded actions. Deterministic TypeScript owns `MAX_TOTAL_ACTIONS_PER_CYCLE=5`, `MAX_FINANCIAL_WRITES_PER_CYCLE=5`, position/universe/evidence validation, risk gates, idempotency, execution order, sequential writes, provider refresh between writes, and stop-on-ambiguity behavior. `INCREASE` uses `additionalMarginPct` and the existing provider leverage. `REVERSE` is one semantic intent but two sequential physical writes: close/readback/reconciliation, then opposite entry risk evaluation and open. No profitability guarantee is claimed and five actions are not five required trades.
 
 ## Why It Exists
 
@@ -47,6 +63,9 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/LIVE.md](docs/LIVE.md), 
 - `TRADING_MODE=PAPER` and `PAPER_ONLY=true` are required.
 - Owner policy limits margin allocation, leverage, drawdown, cooldown, and scheduler cadence.
 - Every financial action passes one deterministic risk gate.
+- The plan is bounded to at most five total semantic actions and five physical financial writes per cycle; zero writes is valid.
+- If more than five provider positions are open, the cycle fails closed with `OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT` before model financial planning; positions are never silently omitted and the cap is not increased.
+- Financial writes are serialized in `CLOSE/REVERSE-close → REDUCE → INCREASE → OPEN → REVERSE-open` order, with provider portfolio refresh between matched writes. A reverse never submits the opposite side while the old provider position is visible or reconciliation is unresolved.
 - Bitget readback and reconciliation are required before a write is treated as verified.
 - An ambiguous write stops remaining writes for that cycle; no blind retry is used.
 - External/provider text cannot change policy, auth, PAPER mode, tools, or schemas.
@@ -73,7 +92,7 @@ The Judge Demo is not a live Bitget session. It exists to make the architecture 
 
 ## Live Production
 
-The live site reads provider-only `/api/live/portfolio` for current `PROVIDER_LIVE` portfolio state and current provider unrealized PnL. `/api/snapshot` is the slower Durable Object runtime-state read and is not the live portfolio polling path. If the account or position provider read fails, the UI shows provider state as unavailable and does not show journal portfolio fallback. The detailed Open Position page is read-only. The dashboard is not a substitute for the full historical export.
+The live site reads provider-only `/api/live/portfolio` for current `PROVIDER_LIVE` portfolio state, provider realized PnL, funding/fees when available, and current provider unrealized PnL. `/api/snapshot` is the slower Durable Object runtime/performance read and is not the live portfolio polling path. `/api/position-context` is a bounded persisted reasoning read keyed by symbol + side. The performance aggregate preserves provider-verified closures even when PnL enrichment is unavailable and keeps those outcomes out of win-rate classification. If the account or position provider read fails, the UI shows provider state as unavailable and does not show journal portfolio fallback. The detailed Open Position page is read-only. The dashboard is not a substitute for the full historical export.
 
 ## Deploy Your Own
 

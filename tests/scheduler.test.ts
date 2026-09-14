@@ -34,7 +34,7 @@ describe("cycle scheduler", () => {
     const activatedAt = Date.parse("2026-09-12T00:00:00.000Z");
     const expiresAt = new Date(activatedAt + TEMPORARY_SCAN_INTERVAL_DURATION_MS).toISOString();
 
-    expect(TEMPORARY_SCAN_INTERVAL_MINUTES).toBe(2);
+    expect(TEMPORARY_SCAN_INTERVAL_MINUTES).toBe(3);
     expect(TEMPORARY_SCAN_INTERVAL_DURATION_MS).toBe(2 * 60 * 60 * 1000);
     expect(temporaryScanIntervalActive(expiresAt, false, activatedAt + TEMPORARY_SCAN_INTERVAL_DURATION_MS - 1)).toBe(true);
     expect(temporaryScanIntervalActive(expiresAt, false, activatedAt + TEMPORARY_SCAN_INTERVAL_DURATION_MS)).toBe(false);

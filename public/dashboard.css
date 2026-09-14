@@ -72,6 +72,7 @@ h2 { font-size: 14px; letter-spacing: -.01em; }
 .calendar .day-label { min-height: 25px; text-align: center; background: var(--raised); }
 .calendar .profit { color: var(--accent); background: #10241f; }
 .calendar .loss { color: var(--danger); background: #241618; }
+.calendar .zero { color: var(--text); background: var(--raised); }
 .recent-trades { display: grid; gap: 3px; max-height: 300px; overflow: auto; }
 .recent-row { display: grid; grid-template-columns: 52px 1fr auto; gap: 9px; align-items: center; border-bottom: 1px solid var(--line); padding: 11px 3px; }
 .recent-row:last-child { border-bottom: 0; }
