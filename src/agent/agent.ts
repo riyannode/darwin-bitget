@@ -63,6 +63,10 @@ import { bootstrapPerformance, currentMonthDailyPnl, emptyPerformance, isPerform
 import { bootstrapPositionContexts, decisionReasoning, upsertPositionContext } from "./position-context.js";
 import { EvaClient } from "../eva/client.js";
 import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
+import { availableResearchCapabilities } from "../research/capabilities.js";
+import { ResearchExecutor } from "../research/executor.js";
+import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
+import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
 
 
 interface AgentState {
@@ -255,6 +259,9 @@ function latestValidCycleReadModel(readModel: LatestValidCyclePlan): NormalizedC
 }
 
 export class TraderAgent extends Agent<Env, AgentState> {
+  private readonly researchRouter = new ResearchRouter();
+  private readonly researchExecutor = new ResearchExecutor();
+
   override initialState: AgentState = {
     emergencyStop: false,
     paused: false,
@@ -700,7 +707,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const backtest = drawdown.blocked ? await runCooldownBacktest(config, { symbol: backtestSymbol, bars: await client.getHistoricalBars(backtestSymbol), experiences: experiences.filter((experience) => experience.outcomeStatus !== "EXECUTION_FAILURE"), trigger: drawdown.code }) : undefined;
       if (backtest) { saveBacktest(this, backtest); journal.backtest = backtest; this.recordEvent("BACKTEST_COMPLETED", cycleId); }
       const openExperiences = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
-      const context = { bundles, supportedUniverse, openPositionSymbols, entryCandidateSymbols: selectedEntryCandidateSymbols, experiences, openExperiences, lessons, openPositions, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE };
+      const executionCapacityHints = buildExecutionCapacityHints(bundles, config.ownerPolicy.maxLeverage);
+      const researchEvidence = await this.collectResearchEvidence(config, bundles, openPositionSymbols, selectedEntryCandidateSymbols);
+      const context = { bundles, supportedUniverse, openPositionSymbols, entryCandidateSymbols: selectedEntryCandidateSymbols, experiences, openExperiences, lessons, openPositions, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE, researchEvidence, executionCapacityHints };
       const decisionSet = await decide(config, context, cycleId);
       if (decisionSet.ignoredLessonIds.length) this.recordEvent("LESSON_REFERENCE_IGNORED", cycleId, { count: String(decisionSet.ignoredLessonIds.length), ids: decisionSet.ignoredLessonIds.slice(0, 8).join(",") });
       journal.marketContext = { scan, deep: bundles.map((candidate) => ({ market: candidate.market, regime: candidate.marketRegime })) };
@@ -751,6 +760,37 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if ((diagnostic.code ?? "").includes("TIMEOUT")) this.recordEvent("CYCLE_TIMEOUT", cycleId, diagnostic);
       this.setState({ ...this.state, runtimeStatus: "ERROR", currentStage: "ERROR", lastStatus: "FAILED", cycleStartedAt: null });
       throw error;
+    }
+  }
+
+  private async collectResearchEvidence(
+    config: RuntimeConfig,
+    bundles: readonly EvidenceBundle[],
+    openPositionSymbols: readonly string[],
+    entryCandidateSymbols: readonly string[],
+  ) {
+    if (!config.bitgetSignalEnabled) return [];
+    const availableResearchSkills = availableResearchCapabilities();
+    if (availableResearchSkills.length === 0) return [];
+    const routerInput: ResearchRouterInput = {
+      availableResearchSkills,
+      openPositionSymbols: [...openPositionSymbols],
+      entryCandidateSymbols: [...entryCandidateSymbols],
+      marketEvidence: bundles.map((bundle) => ({
+        symbol: bundle.instrument.symbol,
+        lastPrice: bundle.market.lastPrice,
+        priceChange24h: bundle.market.priceChange24h,
+        volume24h: bundle.market.volume24h,
+        marketRegime: bundle.marketRegime ?? "UNKNOWN",
+      })),
+      researchBudget: { maxResearchRequests: 3, maxMcpToolCalls: 4, concurrency: 2 },
+    };
+    try {
+      const plan = await this.researchRouter.plan(config, routerInput);
+      const validation = validateResearchPlan(plan, routerInput);
+      return await this.researchExecutor.execute(validation.accepted);
+    } catch {
+      return [];
     }
   }
 

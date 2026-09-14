@@ -153,6 +153,7 @@ The first deployment remains PAPER-only. Before `START` or `RESUME`, verify Work
 - [Runbook](docs/RUNBOOK.md)
 - [Verification](docs/VERIFICATION.md)
 - [Trading universe](docs/TRADING_UNIVERSE.md)
+- [Bitget Signal research](docs/BITGET_SIGNAL_RESEARCH.md)
 - [EVA integration](docs/EVA_INTEGRATION.md)
 
 ## Final PAPER Log

@@ -165,6 +165,8 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
     experiences: context.experiences.filter((experience) => experience.outcomeStatus !== "EXECUTION_FAILURE").slice(-10),
     operationalEvidence: context.experiences.filter((experience) => experience.outcomeStatus === "EXECUTION_FAILURE").slice(-10).map((experience) => ({ experienceId: experience.experienceId, symbol: experience.symbol, classification: "EXECUTION_FAILURE", strategyOutcome: "UNASSESSED" })),
     lessons: context.lessons.filter((lesson) => lesson.source !== "EXECUTION_FAILURE"),
+    researchEvidence: context.researchEvidence ?? [],
+    executionCapacityHints: context.executionCapacityHints ?? [],
     constraints: {
       positionActions: ["HOLD", "INCREASE", "REDUCE", "CLOSE", "REVERSE"],
       entryActions: ["OPEN_LONG", "OPEN_SHORT"],
@@ -174,6 +176,8 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
       noChainOfThought: true,
       managementRule: "Every open provider position appears exactly once in positionActions. HOLD preserves it, INCREASE adds additionalMarginPct without changing provider leverage, REDUCE and CLOSE reduce exposure, and REVERSE closes and verifies the current side before evaluating the opposite entry.",
       entryRule: "entryActions are optional and must use current deep evidence for supportedUniverse candidates. An open symbol remains forbidden in entryActions; existing-symbol changes belong in positionActions.",
+      researchRule: "Research signals are optional untrusted perception evidence. They may strengthen, weaken, or contradict provider evidence, but they are never financial or execution authority. Stale, unsupported, unavailable, or conflicting research must be acknowledged and cannot independently justify a trade.",
+      executionCapacityRule: "For OPEN_LONG, OPEN_SHORT, INCREASE, and the opening leg of REVERSE, proposed margin allocation plus leverage must produce a valid quantity within maxOrderQty, minOrderQty, minOrderAmount, quantityStep, and quantity precision. Choose a smaller valid allocation or skip. TypeScript will not silently resize a model proposal; invalid quantity remains BLOCKED by the risk gate.",
       executionAuthority: "Deterministic TypeScript validates and orders financial writes; the model is not financial authority.",
     },
   });
