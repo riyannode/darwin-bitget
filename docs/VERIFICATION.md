@@ -26,6 +26,11 @@ The repository is intended to verify the following through typecheck, unit tests
 - dashboard and Judge Demo render grouped cycle plans and discovery evidence;
 - new cycle-plan journals hide the legacy single-action headline; legacy journals retain the fallback Latest Decision view;
 - frontend has no provider credentials or manual financial controls.
+- `/api/live/portfolio` remains provider-only with zero Durable Object reads;
+- account-level realized PnL is preferred, signed position-level realized PnL is the fallback, and missing realized data remains unavailable;
+- the compact performance aggregate is read O(1) from Durable Object state and is updated incrementally rather than reconstructed during `/api/snapshot`;
+- the bounded position-context path joins exact symbol + side, preserves original verified entry evidence, and exposes latest management evidence without Qwen calls;
+- Open Position and Trade History distinguish provider-live facts from persisted DARWIN decision evidence.
 
 The prompt contracts are code-checked as `darwin-mandate-v6` and `darwin-decision-v4`. Reflection/backtest prompt versions remain unchanged.
 
@@ -42,7 +47,7 @@ GET /api/export/paper-log?format=json
 GET /api/export/paper-log?format=csv
 ```
 
-The export is read-only, includes HOLD cycles, exports every semantic action separately with its action category and cycle-level discovery fields, records REVERSE's close and opposite-entry physical writes separately under the parent intent, excludes manual harness and Docker records, and preserves sanitized provider diagnostics. It does not expose credentials, auth headers, passphrases, or model chain-of-thought. The final competition export is still `PENDING FINAL COMPETITION EXPORT`.
+The export is read-only, includes HOLD cycles, exports every semantic action separately with its action category and cycle-level discovery fields, records REVERSE's close and opposite-entry physical writes separately under the parent intent, excludes manual harness and Docker records, and preserves sanitized provider diagnostics. Performance aggregate state is separate from the export's bounded historical projection. It does not expose credentials, auth headers, passphrases, or model chain-of-thought. The final competition export is still `PENDING FINAL COMPETITION EXPORT`.
 
 ## Not claimed
 

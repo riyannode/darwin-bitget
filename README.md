@@ -22,7 +22,7 @@ DARWIN Bitget is an autonomous PAPER futures trading agent for Bitget's 24/7 US-
 
 ## What DARWIN Does
 
-Each autonomous cycle independently manages every currently open PAPER position and evaluates unrelated new opportunities from the current executable Bitget Demo stock-perpetual universe. DARWIN can independently HOLD, scale into, reduce, close, or reverse an existing position while continuing to evaluate unrelated new entry opportunities. Qwen returns a bounded cycle plan; deterministic validation, risk controls, provider readback, and reconciliation own financial authority. Journals, experiences, reflections, and lessons persist in Durable Object SQLite. An existing HOLD does not consume the new-entry opportunity slot.
+Each autonomous cycle independently manages every currently open PAPER position and evaluates unrelated new opportunities from the current executable Bitget Demo stock-perpetual universe. DARWIN can independently HOLD, scale into, reduce, close, or reverse an existing position while continuing to evaluate unrelated new entry opportunities. Qwen returns a bounded cycle plan; deterministic validation, risk controls, provider readback, and reconciliation own financial authority. Journals, experiences, reflections, lessons, the compact performance aggregate, and position-context reasoning persist in Durable Object SQLite. An existing HOLD does not consume the new-entry opportunity slot.
 
 ```text
 Executable Demo universe → lightweight scan → bounded entry shortlist
@@ -92,7 +92,7 @@ The Judge Demo is not a live Bitget session. It exists to make the architecture 
 
 ## Live Production
 
-The live site reads provider-only `/api/live/portfolio` for current `PROVIDER_LIVE` portfolio state and current provider unrealized PnL. `/api/snapshot` is the slower Durable Object runtime-state read and is not the live portfolio polling path. If the account or position provider read fails, the UI shows provider state as unavailable and does not show journal portfolio fallback. The detailed Open Position page is read-only. The dashboard is not a substitute for the full historical export.
+The live site reads provider-only `/api/live/portfolio` for current `PROVIDER_LIVE` portfolio state, provider realized PnL, funding/fees when available, and current provider unrealized PnL. `/api/snapshot` is the slower Durable Object runtime/performance read and is not the live portfolio polling path. `/api/position-context` is a bounded persisted reasoning read keyed by symbol + side. If the account or position provider read fails, the UI shows provider state as unavailable and does not show journal portfolio fallback. The detailed Open Position page is read-only. The dashboard is not a substitute for the full historical export.
 
 ## Deploy Your Own
 

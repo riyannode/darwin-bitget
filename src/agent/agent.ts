@@ -1,5 +1,5 @@
 import { Agent } from "agents";
-import type { CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, Lesson, OwnerPolicy, PositionSnapshot, ReflectionResult, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
+import type { CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, Lesson, OwnerPolicy, PositionContext, PositionSnapshot, ReflectionResult, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
@@ -21,6 +21,12 @@ import {
   loadRecentEvents,
   loadRecentLessons,
   loadUsableLessons,
+  loadPerformanceAggregate,
+  savePerformanceAggregate,
+  loadPositionContext,
+  savePositionContext,
+  loadPositionContextBootstrap,
+  savePositionContextBootstrap,
   loadDailyDrawdownState,
   loadExperiences,
   loadActiveOwnerPolicy,
@@ -46,6 +52,8 @@ import { buildExecutionRequest, executePaperOrder } from "../trading/execution.j
 import { executeCyclePlan } from "../trading/execution-planner.js";
 import { reconcileExecution } from "../trading/reconcile.js";
 import { addDecimal, isDecimal } from "../trading/decimal.js";
+import { bootstrapPerformance, currentMonthDailyPnl, emptyPerformance, isPerformanceAggregate, performanceTotalPnl, recordVerifiedClose, recordVerifiedOpen, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate } from "../trading/performance.js";
+import { bootstrapPositionContexts, decisionReasoning, upsertPositionContext } from "./position-context.js";
 import { EvaClient } from "../eva/client.js";
 import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
 
@@ -69,7 +77,7 @@ interface AgentState {
 }
 
 const STALE_CYCLE_TIMEOUT_MS = 120_000;
-const USER_STORAGE_VERSION = 2;
+const USER_STORAGE_VERSION = 3;
 const SNAPSHOT_EVENT_LIMIT = 25;
 
 function failureCode(codes: string[]): string {
@@ -101,11 +109,20 @@ function tradeLifecycleStatus(experience: TradeExperience): TradeLifecycleStatus
   return "EXECUTION_FAILURE";
 }
 
-function tradeLogEntries(experiences: readonly TradeExperience[], journals: readonly TradingJournal[]): DashboardSnapshot["trades"] {
+function tradeLogEntries(experiences: readonly TradeExperience[], journals: readonly TradingJournal[], contexts: ReadonlyMap<string, PositionContext> = new Map()): DashboardSnapshot["trades"] {
+  const decisions = journals.flatMap((journal) => cyclePlanDecisions(journal));
+  const verifiedOpenIds = verifiedLifecycleFacts(journals).verifiedOpenIds;
   return experiences.filter((experience) => experience.action !== "HOLD").map((experience) => {
+    const context = experience.positionSide ? contexts.get(`${experience.symbol}:${experience.positionSide}`) : undefined;
+    const entryDecision = decisions.find((candidate) => verifiedOpenIds.has(candidate.decisionId) && candidate.decisionId === experience.entryDecisionId && (candidate.action === "OPEN_LONG" || candidate.action === "OPEN_SHORT"));
+    const exitDecision = decisions.find((candidate) => candidate.decisionId === experience.exitDecisionId);
+    const lifecycleDecisions = decisions.filter((candidate) => candidate.symbol === experience.symbol && candidate.positionSide === experience.positionSide && candidate.action !== "OPEN_LONG" && candidate.action !== "OPEN_SHORT" && (!experience.exitTime || candidate.createdAt <= experience.exitTime) && candidate.createdAt >= experience.entryTime);
     const journal = journals.find((entry) => entry.experienceId === experience.experienceId || (entry.experienceIds ?? []).includes(experience.experienceId) || entry.decision?.decisionId === experience.exitDecisionId || entry.decision?.decisionId === experience.entryDecisionId);
     const record = journal ? normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === experience.exitDecisionId || candidate.decision.decisionId === experience.entryDecisionId) : undefined;
     const action = (experience.lastAction && experience.lastAction !== "HOLD" ? experience.lastAction : experience.action) as Exclude<TradeExperience["action"], "HOLD">;
+    const entryReasoning = context?.entryDecisionId === experience.entryDecisionId && verifiedOpenIds.has(experience.entryDecisionId) ? context.entryReasoning : entryDecision ? decisionReasoning(entryDecision) : undefined;
+    const exitReasoning = exitDecision ? decisionReasoning(exitDecision) : undefined;
+    const managementEvents = context?.entryDecisionId === experience.entryDecisionId && verifiedOpenIds.has(experience.entryDecisionId) ? context.managementEvents : lifecycleDecisions.map(decisionReasoning);
     return {
       tradeId: experience.experienceId,
       timestamp: experience.entryTime,
@@ -124,6 +141,9 @@ function tradeLogEntries(experiences: readonly TradeExperience[], journals: read
       positionSide: experience.positionSide,
       openedAt: experience.entryTime,
       ...(experience.exitTime ? { closedAt: experience.exitTime } : {}),
+      ...(entryReasoning ? { entryReasoning } : {}),
+      ...(exitReasoning ? { exitReasoning } : {}),
+      ...(managementEvents.length ? { managementEvents } : {}),
     };
   });
 }
@@ -152,7 +172,7 @@ function executionEvidence(journal: TradingJournal | null): DashboardSnapshot["e
 }
 
 function unavailablePerformance(): DashboardSnapshot["performance"] {
-  return { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, wins: null, losses: null, breakeven: null, dailyPnl: {} };
+  return { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, openTrades: null, closedTrades: null, wins: null, losses: null, breakeven: null, verifiedRealizedPnl: "", competitionBaselineEquity: null, latestEquity: null, performanceBaselineAt: null, dailyPnl: {} };
 }
 
 function json(value: unknown, status = 200): Response {
@@ -183,7 +203,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       ensureStorage(this);
       this.setState({ ...this.state, userStorageVersion: USER_STORAGE_VERSION });
     }
-    this.ensureTemporaryScanTest();
+    this.ensureReadModels();
     const policy = this.ensureActivePolicy();
     const config = loadConfig(this.env, policy);
     const activeCycle = this.state.lastStatus === "RUNNING";
@@ -194,6 +214,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   public override async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/snapshot" && request.method === "GET") return json(await this.getDashboardSnapshot());
+    if (url.pathname === "/position-context" && request.method === "GET") return this.getPositionContext(url);
     if (url.pathname === "/agent-journal" && request.method === "GET") return this.getAgentJournal(url);
     if (url.pathname === "/trade-history" && request.method === "GET") return this.getTradeHistory(url);
     if (url.pathname === "/learning" && request.method === "GET") return this.getLearning(url);
@@ -345,6 +366,57 @@ export class TraderAgent extends Agent<Env, AgentState> {
     return temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : policy.scanIntervalMinutes;
   }
 
+  private ensureReadModels(): void {
+    const initializedAt = new Date().toISOString();
+    const performance = loadPerformanceAggregate<PerformanceAggregate>(this);
+    if (!isPerformanceAggregate(performance)) {
+      const bootstrapJournals = loadRecentJournals(this, 100);
+      const bootstrapExperiences = loadExperiences(this, 100);
+      savePerformanceAggregate(this, bootstrapPerformance(bootstrapJournals, bootstrapExperiences, initializedAt), initializedAt);
+    }
+    if (!loadPositionContextBootstrap(this)) {
+      const bootstrapJournals = loadRecentJournals(this, 100);
+      const bootstrapExperiences = loadExperiences(this, 100);
+      for (const context of bootstrapPositionContexts(bootstrapJournals, bootstrapExperiences, initializedAt)) savePositionContext(this, context);
+      savePositionContextBootstrap(this, "position-context-v1", initializedAt);
+    }
+  }
+
+  private updatePerformanceReadModel(record: DecisionExecutionRecord, bundle: EvidenceBundle, verified: boolean): void {
+    if (!verified || !record.executionResult) return;
+    const observedAt = record.executionResult.readBackAt;
+    const equity = record.accountAfter?.portfolioEquity ?? bundle.account.portfolioEquity;
+    let performance = this.performanceWithEquity(equity, observedAt);
+    if (record.decision.action === "OPEN_LONG" || record.decision.action === "OPEN_SHORT") performance = recordVerifiedOpen(performance, equity, observedAt);
+    if (record.decision.action === "CLOSE" && isDecimal(record.executionResult.realizedPnl)) performance = recordVerifiedClose(performance, record.executionResult.realizedPnl, equity, observedAt);
+    savePerformanceAggregate(this, performance, observedAt);
+  }
+
+  private persistPerformanceEquity(equity: string, observedAt: string): void {
+    savePerformanceAggregate(this, this.performanceWithEquity(equity, observedAt), observedAt);
+  }
+
+  private performanceWithEquity(equity: string, observedAt: string): PerformanceAggregate {
+    let performance = loadPerformanceAggregate<PerformanceAggregate>(this);
+    if (!isPerformanceAggregate(performance)) performance = emptyPerformance(observedAt);
+    if (!performance.competitionBaselineEquity && isDecimal(equity) && Number(equity) > 0) performance = { ...performance, competitionBaselineEquity: equity, latestEquity: equity, performanceBaselineAt: observedAt };
+    return updateEquity(performance, equity, observedAt);
+  }
+
+  private updatePositionContext(record: DecisionExecutionRecord, experience?: TradeExperience): void {
+    const decision = record.parentDecision ?? record.decision;
+    const isEntry = record.decision.action === "OPEN_LONG" || record.decision.action === "OPEN_SHORT";
+    const isManagement = decision.action === "HOLD" || decision.action === "INCREASE" || decision.action === "REDUCE" || decision.action === "CLOSE" || decision.action === "REVERSE";
+    if (!isEntry && !isManagement) return;
+    const positionSide = decision.positionSide ?? record.decision.positionSide;
+    if (!positionSide) return;
+    const lookupSide = isEntry ? record.decision.positionSide : positionSide;
+    if (!lookupSide) return;
+    const current = loadPositionContext(this, decision.symbol, lookupSide);
+    const next = upsertPositionContext(current, record.decision, record.executionResult?.readBackAt ?? record.decision.createdAt, experience, record.parentDecision);
+    if (next) savePositionContext(this, next);
+  }
+
   public async getDashboardSnapshot(): Promise<DashboardSnapshot> {
     const config = loadConfig(this.env, this.ensureActivePolicy());
     const journal = loadLatestJournal(this);
@@ -356,6 +428,23 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const drawdownPct = drawdown ? calculateDrawdownPct(drawdown.baselineEquity, drawdown.lastEquity) : "0";
     const configuredIntervalMinutes = temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes;
     const scheduler = await this.getSchedulerDiagnostics(configuredIntervalMinutes);
+    const persistedPerformance = loadPerformanceAggregate<PerformanceAggregate>(this);
+    const performance = isPerformanceAggregate(persistedPerformance) ? {
+      totalPnl: performanceTotalPnl(persistedPerformance),
+      winRate: persistedPerformance.winRate,
+      dailyDrawdown: drawdownPct,
+      totalTrades: persistedPerformance.totalTrades,
+      openTrades: persistedPerformance.openTrades,
+      closedTrades: persistedPerformance.closedTrades,
+      wins: persistedPerformance.wins,
+      losses: persistedPerformance.losses,
+      breakeven: persistedPerformance.breakeven,
+      verifiedRealizedPnl: persistedPerformance.verifiedRealizedPnl,
+      competitionBaselineEquity: persistedPerformance.competitionBaselineEquity,
+      latestEquity: persistedPerformance.latestEquity,
+      performanceBaselineAt: persistedPerformance.performanceBaselineAt,
+      dailyPnl: currentMonthDailyPnl(persistedPerformance),
+    } : { ...unavailablePerformance(), dailyDrawdown: drawdownPct };
     return {
       version: config.version ?? "0.2.0",
       commit: config.commit ?? "local",
@@ -371,7 +460,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       },
       portfolio: null,
       portfolioFreshness: { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" },
-      performance: { ...unavailablePerformance(), dailyDrawdown: drawdownPct },
+      performance,
       trades: [],
       latestDecision: journal?.cyclePlan ? null : journal?.decision ?? null,
       decisions: recentJournals.flatMap((entry) => cyclePlanDecisions(entry)),
@@ -419,11 +508,24 @@ export class TraderAgent extends Agent<Env, AgentState> {
     return json({ journals, cycles, decisions: journals.flatMap((entry) => cyclePlanDecisions(entry)), limit });
   }
 
+  private getPositionContext(url: URL): Response {
+    const symbol = url.searchParams.get("symbol")?.trim() ?? "";
+    const positionSide = url.searchParams.get("positionSide");
+    if (!/^[A-Z0-9_-]{1,40}$/.test(symbol) || (positionSide !== "LONG" && positionSide !== "SHORT")) return json({ error: "INVALID_POSITION_CONTEXT_KEY" }, 400);
+    return json({ source: "DARWIN_PERSISTED", context: loadPositionContext(this, symbol, positionSide) });
+  }
+
   private getTradeHistory(url: URL): Response {
     const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
     const experiences = loadExperiences(this, limit);
     const journals = loadRecentJournals(this, limit);
-    const trades = tradeLogEntries(experiences, journals);
+    const contexts = new Map<string, PositionContext>();
+    for (const experience of experiences) {
+      if (!experience.positionSide) continue;
+      const context = loadPositionContext(this, experience.symbol, experience.positionSide);
+      if (context) contexts.set(`${experience.symbol}:${experience.positionSide}`, context);
+    }
+    const trades = tradeLogEntries(experiences, journals, contexts);
     return json({ trades, limit });
   }
 
@@ -527,6 +629,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       journal.executionRecords = execution.records;
       journal.discovery = { ...discovery, financialWritesPerformed: execution.records.filter((record) => Boolean(record.executionResult)).length };
       if (execution.finalPortfolio) journal.portfolio = execution.finalPortfolio;
+      this.persistPerformanceEquity(execution.finalPortfolio?.portfolioEquity ?? account.portfolioEquity, execution.finalPortfolio?.observedAt ?? account.observedAt);
       this.setState({ ...this.state, runtimeStatus: "REFLECTING", currentStage: "REFLECTING" });
       const backtestLesson = backtest ? createBacktestLesson(backtest) : undefined;
       journal.createdLessons = [...journal.createdLessons, ...(backtestLesson ? [backtestLesson.lessonId] : [])];
@@ -583,7 +686,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     this.recordEvent("DECISION_CREATED", cycleId, { action: decision.action, symbol: decision.symbol, decisionType });
     this.recordEvent(riskGateResult.status === "PASS" ? "RISK_GATE_PASS" : "RISK_GATE_BLOCK", cycleId, { codes: riskGateResult.codes.join(","), decisionType, symbol: decision.symbol });
     const positionBefore = findPosition(bundle.account.positions, decision.symbol, decision.positionSide);
-    const record: DecisionExecutionRecord = { decision, riskGateResult, ...(parentDecision ? { parentDecisionId: parentDecision.decisionId, parentAction: "REVERSE" as const } : {}), ...(positionBefore ? { positionBefore } : {}) };
+    const record: DecisionExecutionRecord = { decision, riskGateResult, ...(parentDecision ? { parentDecisionId: parentDecision.decisionId, parentAction: "REVERSE" as const, parentDecision } : {}), ...(positionBefore ? { positionBefore } : {}) };
     if (riskGateResult.status === "BLOCK" || decision.action === "HOLD") return record;
     this.setState({ ...this.state, runtimeStatus: "EXECUTING", currentStage: "EXECUTING" });
     const executionRequest = buildExecutionRequest(decision, bundle, cycleId);
@@ -635,6 +738,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
   ): Promise<{ reflection?: ReflectionResult; lesson?: Lesson }> {
     const { decision, executionResult, reconciliationResult } = record;
     const verified = Boolean(executionResult && reconciliationResult?.status === "MATCHED" && executionResult.status === "filled");
+    const managementDecision = record.parentDecision ?? decision;
+    const isEntryDecision = decision.action === "OPEN_LONG" || decision.action === "OPEN_SHORT";
+    const isManagementDecision = managementDecision.action === "HOLD" || managementDecision.action === "INCREASE" || managementDecision.action === "REDUCE" || managementDecision.action === "CLOSE" || managementDecision.action === "REVERSE";
+    if (isManagementDecision && (!isEntryDecision || verified)) this.updatePositionContext(record);
+    this.updatePerformanceReadModel(record, bundle, verified);
     const currentExperience = experiences.find((experience) => experience.outcomeStatus === "OPEN" && experience.symbol === decision.symbol && experience.positionSide === decision.positionSide);
     if (!currentExperience && allowFailureReflection && (record.riskGateResult.status === "BLOCK" || (executionResult && !verified))) {
       const failure = failureCode(record.riskGateResult.codes.length ? record.riskGateResult.codes : ["EXECUTION_FAILURE"]);
@@ -655,6 +763,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       saveExperience(this, openingExperience.experience, startedAt);
       journal.experienceId = openingExperience.experience.experienceId;
       journal.experienceIds = [...(journal.experienceIds ?? []), openingExperience.experience.experienceId];
+      this.updatePositionContext(record, openingExperience.experience);
       return {};
     }
     if (decision.action === "INCREASE" && verified && currentExperience && executionResult) {

@@ -50,6 +50,14 @@ Because every open provider position requires one management action, a live acco
 
 The new mandate/decision contracts are `darwin-mandate-v6` and `darwin-decision-v4`. Reflection and backtest prompt versions remain unchanged.
 
+## Data boundaries and read models
+
+`/api/live/portfolio` is provider-only and performs zero Durable Object reads. It answers what exists at Bitget now: equity, margin, positions, unrealized PnL, provider realized PnL, funding/fees when supplied, liquidation data, open orders, and provider observation time. `/api/snapshot` reads the compact `performance_aggregate` row plus existing bounded runtime/history windows; it does not scan all journals, experiences, or events to calculate performance. `/api/position-context?symbol=...&positionSide=...` reads one indexed `position_context` row for persisted DARWIN reasoning.
+
+The performance aggregate stores `totalTrades`, `openTrades`, `closedTrades`, wins/losses/breakeven, verified realized lifecycle PnL, the one-time `competitionBaselineEquity` and `performanceBaselineAt`, latest equity, total equity delta, and up to 62 UTC daily summaries. Daily summaries store opening/latest equity, daily PnL, daily return percentage, and verified opening-trade count. It is initialized once and updated incrementally from verified provider lifecycle facts. A one-time bounded bootstrap reads at most the configured recent 100 journals and experiences; it never runs on each snapshot.
+
+The position-context read model is keyed by `symbol:positionSide`. It preserves verified original entry reasoning from `TradeExperience` plus its original Decision and tracks bounded latest management events. It never uses failed, blocked, unresolved, synthetic, or opposite-side entries as live-position origin. Provider state answers what position exists; persisted structured evidence answers why DARWIN opened or manages it. This is not chain-of-thought.
+
 ## Authority boundary
 
 Qwen proposes rationale, evidence references, position management, and new entries. Qwen is not financial authority. Deterministic TypeScript owns plan validation, supported-universe and open-position checks, owner policy, risk gates, idempotency, execution ordering, provider readback, reconciliation, and write count.
@@ -64,7 +72,7 @@ Each action keeps its own decision ID, cycle ID, symbol, side, evidence, executi
 
 ## Live dashboard path
 
-`/api/live/portfolio` is the provider-only live portfolio path for equity, margin, positions, and open orders. The browser refreshes it approximately every 10 seconds. `/api/snapshot` is the slower Durable Object runtime-state read, refreshed approximately every 60 seconds. The dashboard shows a grouped Cycle Plan with Position Management and New Entry Actions plus compact Market Discovery evidence.
+`/api/live/portfolio` is the provider-only live portfolio path for equity, margin, positions, realized/unrealized PnL, funding/fees, and open orders. The browser refreshes it approximately every 10 seconds. `/api/snapshot` is the slower Durable Object runtime/performance read, refreshed approximately every 60 seconds. The browser loads `/api/position-context` lazily on the Open Position page with a 60-second bound. The dashboard shows a grouped Cycle Plan with Position Management and New Entry Actions plus compact Market Discovery evidence.
 
 ## Judge Demo boundary
 

@@ -131,6 +131,8 @@ export interface AccountSnapshot {
   positions: PositionSnapshot[];
   realizedPnl: string;
   unrealizedPnl: string;
+  funding?: string;
+  fees?: string;
   openOrders: number | null;
   openOrderSymbols: string[];
   openOrdersReadFailure?: {
@@ -155,6 +157,8 @@ export interface PositionSnapshot {
   realizedPnl: string;
   openedAt?: string;
   liquidationPrice?: string;
+  funding?: string;
+  fees?: string;
 }
 
 export interface Evidence {
@@ -327,6 +331,7 @@ export interface DecisionExecutionRecord {
   decision: Decision;
   parentDecisionId?: string;
   parentAction?: "REVERSE";
+  parentDecision?: Decision;
   riskGateResult: RiskGateResult;
   executionRequest?: ExecutionRequest;
   executionResult?: ExecutionResult;
@@ -493,10 +498,16 @@ export interface DashboardSnapshot {
     winRate: string;
     dailyDrawdown: string;
     totalTrades: number | null;
+    openTrades: number | null;
+    closedTrades: number | null;
     wins: number | null;
     losses: number | null;
     breakeven: number | null;
-    dailyPnl: Record<string, { pnl: string; trades: number }>;
+    verifiedRealizedPnl: string;
+    competitionBaselineEquity: string | null;
+    latestEquity: string | null;
+    performanceBaselineAt: string | null;
+    dailyPnl: Record<string, { pnl: string; trades: number; dailyReturnPct?: string }>;
   };
   trades: TradeLogEntry[];
   latestDecision: Decision | null;
@@ -565,4 +576,37 @@ export interface TradeLogEntry {
   positionSide?: PositionSide | null;
   openedAt?: string;
   closedAt?: string;
+  entryReasoning?: PositionReasoning;
+  exitReasoning?: PositionReasoning;
+  managementEvents?: PositionReasoning[];
+}
+
+export interface PositionReasoning {
+  action: Action;
+  thesis: string;
+  strategyThesis: string;
+  supportingFactors: string[];
+  riskFactors: string[];
+  evidenceUsed: string[];
+  lessonsUsed: string[];
+  confidence: number;
+  cycleId: string;
+  decisionId: string;
+  createdAt: string;
+  entryPrice?: string;
+  entryTime?: string;
+  experienceId?: string;
+  additionalMarginPct?: string | null;
+  targetPositionSide?: PositionSide | null;
+}
+
+export interface PositionContext {
+  symbol: string;
+  positionSide: PositionSide;
+  experienceId?: string;
+  entryDecisionId?: string;
+  entryReasoning?: PositionReasoning;
+  latestManagement?: PositionReasoning;
+  managementEvents: PositionReasoning[];
+  updatedAt: string;
 }

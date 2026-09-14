@@ -13,6 +13,8 @@ Every autonomous cycle still scans the full executable Demo stock-perpetual univ
 
 An open CRCLUSDT position no longer makes the whole cycle conceptually focus on CRCLUSDT. A valid cycle can show `HOLD CRCLUSDT LONG`, `INCREASE CRCLUSDT LONG`, `REDUCE CRCLUSDT LONG`, `CLOSE CRCLUSDT LONG`, or `REVERSE CRCLUSDT → SHORT` alongside an unrelated `OPEN_LONG NVDAUSDT` evaluation. No new entry is forced when evidence is insufficient.
 
+The live provider portfolio and persisted DARWIN evidence are deliberately separate. Provider-live values answer what exists now. The compact persisted performance aggregate answers verified trade counts, account-equity delta, and current-month daily performance. The bounded `/api/position-context` read answers why a live symbol + side was originally opened and why its latest management decision was chosen. Missing origin evidence is shown as unavailable, never invented.
+
 The dashboard Cycle Plan groups actions into `POSITION MANAGEMENT` and `NEW ENTRY ACTIONS`. The compact Market Discovery section shows universe scanned count, selected entry candidates, existing positions managed, total proposed actions, and financial writes performed. Decision History groups actions by cycle rather than presenting one primary decision.
 
 ## Implemented and verified in source
@@ -25,6 +27,7 @@ The dashboard Cycle Plan groups actions into `POSITION MANAGEMENT` and `NEW ENTR
 - `/api/live/portfolio` bypasses Durable Object hot-path reads. Private authenticated Bitget operations use the narrow gateway over Cloudflare Tunnel to the stable-egress gateway; public market operations may remain direct.
 - If an account or position provider read fails, the UI shows provider state as unavailable. It does not display journal portfolio fallback.
 - Financial writes are PAPER-only, bounded to five semantic actions and five physical writes per cycle, serialized `CLOSE/REVERSE-close → REDUCE → INCREASE → OPEN → REVERSE-open`, refreshed between matched writes, and stopped after ambiguity. INCREASE shows additional margin and existing leverage; REVERSE shows close verification separately from opposite-entry result.
+- Provider realized PnL prefers an account-level signed field and falls back to signed position-level aggregation only when account-level data is absent. Missing values remain unavailable. Funding and fees remain separate fields.
 
 ## Provider-live semantics
 

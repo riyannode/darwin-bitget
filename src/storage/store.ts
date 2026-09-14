@@ -1,4 +1,4 @@
-import type { ActivityEvent, BacktestReplay, Lesson, LessonEvaluation, OwnerPolicy, TradeExperience, TradingJournal } from "../types.js";
+import type { ActivityEvent, BacktestReplay, Lesson, LessonEvaluation, OwnerPolicy, PositionContext, PositionSide, TradeExperience, TradingJournal } from "../types.js";
 import { parseExperience } from "../learning/experiences.js";
 import { parseLesson } from "../learning/lessons.js";
 import { parseDailyDrawdownState, type DailyDrawdownState } from "../trading/drawdown.js";
@@ -18,6 +18,10 @@ interface ExperienceRow {
 }
 
 interface RiskStateRow {
+  payload: string;
+}
+
+interface PositionContextRow {
   payload: string;
 }
 
@@ -45,6 +49,9 @@ export interface StoredCycle {
 }
 
 export const MAX_HISTORY_LIMIT = 100;
+
+const PERFORMANCE_STATE_KEY = "performance_aggregate";
+const POSITION_CONTEXT_BOOTSTRAP_KEY = "position_context_bootstrap";
 
 export function clampHistoryLimit(limit: number, fallback = 25): number {
   if (!Number.isInteger(limit) || limit < 1) return fallback;
@@ -172,6 +179,62 @@ export function saveExperience(executor: SqlExecutor, experience: TradeExperienc
     INSERT INTO experiences (experience_id, symbol, outcome_status, payload, created_at)
     VALUES (${experience.experienceId}, ${experience.symbol}, ${experience.outcomeStatus}, ${JSON.stringify(experience)}, ${createdAt})
     ON CONFLICT(experience_id) DO UPDATE SET payload = excluded.payload, outcome_status = excluded.outcome_status
+  `;
+}
+
+export function loadPerformanceAggregate<T>(executor: SqlExecutor): T | null {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${PERFORMANCE_STATE_KEY}`;
+  if (!rows[0]) return null;
+  try {
+    return JSON.parse(rows[0].payload) as T;
+  } catch {
+    return null;
+  }
+}
+
+export function savePerformanceAggregate(executor: SqlExecutor, aggregate: unknown, updatedAt: string): void {
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${PERFORMANCE_STATE_KEY}, ${JSON.stringify(aggregate)}, ${updatedAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+}
+
+export function loadPositionContext(executor: SqlExecutor, symbol: string, positionSide: PositionSide): PositionContext | null {
+  const contextKey = `${symbol}:${positionSide}`;
+  const rows = executor.sql<PositionContextRow>`SELECT payload FROM position_context WHERE context_key = ${contextKey}`;
+  if (!rows[0]) return null;
+  try {
+    return JSON.parse(rows[0].payload) as PositionContext;
+  } catch {
+    return null;
+  }
+}
+
+export function savePositionContext(executor: SqlExecutor, context: PositionContext): void {
+  const contextKey = `${context.symbol}:${context.positionSide}`;
+  executor.sql`
+    INSERT INTO position_context (context_key, symbol, position_side, payload, updated_at)
+    VALUES (${contextKey}, ${context.symbol}, ${context.positionSide}, ${JSON.stringify(context)}, ${context.updatedAt})
+    ON CONFLICT(context_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+}
+
+export function loadPositionContextBootstrap(executor: SqlExecutor): { version: string } | null {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${POSITION_CONTEXT_BOOTSTRAP_KEY}`;
+  if (!rows[0]) return null;
+  try {
+    return JSON.parse(rows[0].payload) as { version: string };
+  } catch {
+    return null;
+  }
+}
+
+export function savePositionContextBootstrap(executor: SqlExecutor, version: string, updatedAt: string): void {
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${POSITION_CONTEXT_BOOTSTRAP_KEY}, ${JSON.stringify({ version })}, ${updatedAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
   `;
 }
 

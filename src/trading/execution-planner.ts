@@ -30,7 +30,7 @@ function reverseLeg(decision: Decision, action: "CLOSE" | "OPEN_LONG" | "OPEN_SH
 }
 
 function withParent(record: DecisionExecutionRecord, parent?: Decision): DecisionExecutionRecord {
-  return parent ? { ...record, parentDecisionId: parent.decisionId, parentAction: "REVERSE" } : record;
+  return parent ? { ...record, parentDecisionId: parent.decisionId, parentAction: "REVERSE", parentDecision: parent } : record;
 }
 
 function symbolStillOpen(account: AccountSnapshot, decision: Decision): boolean {
