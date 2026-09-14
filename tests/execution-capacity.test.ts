@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { buildExecutionCapacityHint, calculatedCapacityQuantity } from "../src/trading/execution-capacity.js";
-import type { EvidenceBundle } from "../src/types.js";
+import { buildExecutionRequest } from "../src/trading/execution.js";
+import { evaluateRiskGate } from "../src/trading/risk-gate.js";
+import { providerQuantityCodes } from "../src/trading/order-quantity.js";
+import type { Decision, EvidenceBundle, RuntimeConfig } from "../src/types.js";
 
 const bundle: Pick<EvidenceBundle, "market" | "account" | "instrument"> = {
   market: { symbol: "KORUUSDT", lastPrice: "19.026", bidPrice: "19.026", askPrice: "19.027", priceChange24h: "-0.15", volume24h: "4200000", observedAt: "2026-09-14T21:47:12.969Z" },
@@ -18,5 +21,20 @@ describe("execution capacity hints", () => {
   it("shows the old KORU proposal is oversized while a smaller valid allocation is expressible", () => {
     expect(calculatedCapacityQuantity(bundle, "1.5", "3")).toBe("118.42");
     expect(calculatedCapacityQuantity(bundle, "1.2", "3")).toBe("94.74");
+  });
+
+  it("keeps the invalid proposal blocked and does not enter the provider-write path", () => {
+    const decision: Decision = { decisionId: "koru-oversized", cycleId: "cycle-1", action: "OPEN_LONG", positionSide: "LONG", symbol: "KORUUSDT", marginAllocationPct: "1.5", leverage: "3", reductionPct: null, confidence: 0.7, thesis: "fixture", strategyThesis: "fixture", supportingFactors: ["fixture"], riskFactors: ["fixture"], evidenceUsed: ["TICKER", "INSTRUMENT"], lessonsUsed: [], createdAt: "2026-09-15T00:00:00.000Z" };
+    const evidenceBundle = { ...bundle, evidence: [] } satisfies EvidenceBundle;
+    const config: RuntimeConfig = { tradingMode: "PAPER", agentMode: "AUTONOMOUS", ownerPolicy: { paperOnly: true, maxSinglePositionMarginPct: "30", maxLeverage: "5", maxDailyDrawdownPct: "10", drawdownCooldownMinutes: 60, scanIntervalMinutes: 5, emergencyStop: false }, evidenceMaxAgeSeconds: 90, bitgetCategory: "USDT-FUTURES", bitgetApiBaseUrl: "https://api.bitget.com", qwenBaseUrl: "https://qwen.invalid", qwenModel: "qwen", bitgetSignalEnabled: false };
+    const risk = evaluateRiskGate(config, { decision, instrument: evidenceBundle.instrument, account: evidenceBundle.account, market: evidenceBundle.market, evidenceObservedAt: evidenceBundle.market.observedAt, openOrderSymbols: [], supportedUniverse: ["KORUUSDT"], emergencyStop: false, dailyDrawdownBlocked: false, now: new Date(evidenceBundle.market.observedAt) });
+    const request = buildExecutionRequest(decision, evidenceBundle, "cycle-1");
+    let providerWrites = 0;
+    if (risk.status === "PASS") providerWrites += 1;
+    expect(request.quantity).toBe("118.42");
+    expect(providerQuantityCodes(request.quantity, evidenceBundle.instrument, evidenceBundle.market.lastPrice)).toContain("MAX_ORDER_QTY");
+    expect(risk.status).toBe("BLOCK");
+    expect(risk.codes).toContain("MAX_ORDER_QTY");
+    expect(providerWrites).toBe(0);
   });
 });
