@@ -6,7 +6,7 @@ describe("judge-facing mandate contract", () => {
   it("uses the v6 mandate and requires independent management and entry reasoning", () => {
     expect(PROMPT_VERSIONS.mandate).toBe("darwin-mandate-v6");
     expect(MANDATE_VERSION).toBe("darwin-mandate-v6");
-    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v5");
+    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v6");
     expect(TRADING_MANDATE).not.toContain("You are not required to trade.");
     expect(TRADING_MANDATE).toContain("Do not force a trade.");
     expect(TRADING_MANDATE).toContain("HOLD is a valid autonomous decision when current evidence does not justify changing a position.");
@@ -32,6 +32,7 @@ describe("judge-facing mandate contract", () => {
     expect(DECISION_TASK_PROMPT).toContain("positionActions and entryActions");
     expect(DECISION_TASK_PROMPT).toContain("additionalMarginPct");
     expect(DECISION_TASK_PROMPT).toContain("targetPositionSide");
+    expect(DECISION_TASK_PROMPT).toContain('For OPEN_LONG entryActions, positionSide MUST be "LONG"; for OPEN_SHORT entryActions, positionSide MUST be "SHORT".');
   });
 
   it("renders evidence used beside the other decision explanations", () => {
