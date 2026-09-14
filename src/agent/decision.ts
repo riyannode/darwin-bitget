@@ -15,6 +15,8 @@ import { generateQwenJson } from "./qwen.js";
 
 export const MAX_TOTAL_ACTIONS_PER_CYCLE = 5;
 export const MAX_FINANCIAL_WRITES_PER_CYCLE = 5;
+export const CANDIDATE_MAX_OUTPUT_TOKENS = 700;
+export const DECISION_MAX_OUTPUT_TOKENS = 3200;
 
 const decimalString = z.string().regex(/^\d+(?:\.\d{1,8})?$/);
 
@@ -184,7 +186,7 @@ export async function selectCandidates(
 ): Promise<string[]> {
   const candidateScan = scan.map((snapshot) => [snapshot.symbol, snapshot.lastPrice, snapshot.priceChange24h, snapshot.volume24h]);
   const candidatePool = scan.map((snapshot) => snapshot.symbol);
-  const result = await generateQwenJson(config, candidateSchema, `${TRADING_MANDATE}\n${CANDIDATE_TASK_PROMPT}`, JSON.stringify({ candidatePool, scan: candidateScan }), { maxOutputTokens: 700, timeoutMs: 30_000 });
+  const result = await generateQwenJson(config, candidateSchema, `${TRADING_MANDATE}\n${CANDIDATE_TASK_PROMPT}`, JSON.stringify({ candidatePool, scan: candidateScan }), { maxOutputTokens: CANDIDATE_MAX_OUTPUT_TOKENS, timeoutMs: 30_000 });
   const candidates = result.symbols;
   if (candidates.some((symbol) => !supportedUniverse.includes(symbol) || !candidatePool.includes(symbol))) throw new Error("SYMBOL_NOT_ALLOWED");
   return candidates;
@@ -271,7 +273,7 @@ export function boundExitDecisions(exitDecisions: readonly Decision[], openPosit
 }
 
 export async function decide(config: RuntimeConfig, context: DecisionContext, cycleId: string): Promise<AutonomousDecisionSet> {
-  const generated = await generateQwenJson(config, cycleDecisionPlanSchema, `${context.mandate}\n${DECISION_TASK_PROMPT}\nReturn positionActions and entryActions only. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: 1800, timeoutMs: 60_000 });
+  const generated = await generateQwenJson(config, cycleDecisionPlanSchema, `${context.mandate}\n${DECISION_TASK_PROMPT}\nReturn positionActions and entryActions only. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: DECISION_MAX_OUTPUT_TOKENS, timeoutMs: 60_000 });
   const createdAt = new Date().toISOString();
   const knownLessons = new Set(context.lessons.map((lesson) => lesson.lessonId));
   const ignoredLessonIds: string[] = [];
