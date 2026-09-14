@@ -165,13 +165,15 @@ The cold research upper bound makes that observed no-write path approximately 25
 The latest production KORU evidence was read back before implementation:
 
 ```text
-cycleId: 2c38c143-f8fe-4c8b-98ee-aa8d48ec5357
-decisionId: df8afc49-deec-4c45-9cc3-ec8d432463a6
-action: OPEN_LONG
+cycleId: 1d1d8214-b5d5-402e-a293-76ad16f997ed
+decisionId: 98498f13-fb95-42a8-82cf-79693f77ebd3
+action: OPEN_SHORT
 symbol: KORUUSDT
 marginAllocationPct: 1.5
 leverage: 3
-calculated quantity: 118.42
+calculated quantity: 118.31
+market price: 19.033
+portfolio equity: 50043.28106382
 effective provider max quantity: 100
 risk status: BLOCK
 risk code: MAX_ORDER_QTY
