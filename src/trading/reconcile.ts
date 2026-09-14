@@ -14,8 +14,9 @@ export function reconcileExecution(
   if (execution.tradeSide !== request.tradeSide) codes.push("EXECUTION_MISMATCH");
   if (execution.clientOrderId !== request.clientOrderId) codes.push("EXECUTION_MISMATCH");
   if (execution.status === "unknown") codes.push("EXECUTION_UNKNOWN");
-  if (!["filled", "partially_filled"].includes(execution.status)) codes.push("EXECUTION_NOT_FILLED");
-  if (!execution.providerOrderId && execution.status !== "not_found") codes.push("MISSING_PROVIDER_REFERENCE");
+  if (execution.status === "rejected") codes.push("PROVIDER_REJECTED");
+  if (!["filled", "partially_filled"].includes(execution.status) && execution.status !== "rejected") codes.push("EXECUTION_NOT_FILLED");
+  if (!execution.providerOrderId && execution.status !== "not_found" && execution.status !== "rejected") codes.push("MISSING_PROVIDER_REFERENCE");
   if (request.tradeSide === "open" && positionAfter && Number(positionAfter.quantity) <= 0) codes.push("POSITION_OPEN_UNVERIFIED");
   if (request.tradeSide === "close" && request.action === "REDUCE" && positionBefore && !positionAfter) codes.push("POSITION_READBACK_MISSING");
   if (request.tradeSide === "close" && positionBefore && positionAfter && request.action === "CLOSE" && Number(positionAfter.quantity) > 0) codes.push("POSITION_NOT_CLOSED");

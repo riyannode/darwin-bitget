@@ -28,7 +28,7 @@ describe("prompt security boundary", () => {
 
   it("keeps deterministic limits authoritative over injected thesis text", () => {
     const decision: Decision = { decisionId: "decision-1", cycleId: "cycle-1", action: "OPEN_LONG", positionSide: "LONG", symbol: "NVDAUSDT", marginAllocationPct: "10", leverage: "99", reductionPct: null, confidence: 1, thesis: promptRegressionDataset[1], strategyThesis: promptRegressionDataset[2], supportingFactors: [], riskFactors: [], evidenceUsed: [], lessonsUsed: [], createdAt: "2026-09-12T00:00:00.000Z" };
-    const result = evaluateRiskGate(config, { decision, instrument, account, evidenceObservedAt: account.observedAt, openOrderSymbols: [], supportedUniverse: [instrument.symbol], emergencyStop: false, dailyDrawdownBlocked: false });
+    const result = evaluateRiskGate(config, { decision, instrument, account, market: { symbol: "NVDAUSDT", lastPrice: "100", bidPrice: "99.9", askPrice: "100.1", priceChange24h: "0", volume24h: "1000", observedAt: account.observedAt }, evidenceObservedAt: account.observedAt, openOrderSymbols: [], supportedUniverse: [instrument.symbol], emergencyStop: false, dailyDrawdownBlocked: false });
     expect(result.status).toBe("BLOCK");
     expect(result.codes).toContain("MAX_LEVERAGE");
   });

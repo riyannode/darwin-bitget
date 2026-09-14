@@ -135,6 +135,7 @@ function failureClassFromResponse(status: number, payload: unknown, rawBody: str
   const providerClass = provider && typeof provider.classification === "string" ? provider.classification : "";
   if (isGatewayFailureClass(payloadClass)) return payloadClass;
   if (isGatewayFailureClass(providerClass)) return providerClass;
+  if (status === 502) return "GATEWAY_HTTP_502";
   if (provider && (typeof provider.code === "string" || typeof provider.message === "string")) {
     return /order does not exist|not found/i.test(String(provider.message ?? "")) ? "PROVIDER_NOT_FOUND" : "PROVIDER_REJECTED";
   }

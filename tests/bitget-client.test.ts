@@ -127,6 +127,18 @@ describe("Bitget read diagnostics", () => {
     expect(execution.providerReadbackMessage).toBe("Order not found");
   });
 
+  it("represents a definitive provider rejection as rejected, never unknown or filled", () => {
+    const execution = buildUnresolvedExecution(
+      request,
+      "2026-09-12T00:00:00.000Z",
+      { classification: "PROVIDER_REJECTED", code: "400", message: "Exceeded the maximum quantity of contract orders: 100 KORU" },
+      { classification: "PROVIDER_NOT_FOUND", code: "400", message: "Order does not exist" },
+    );
+    expect(execution.status).toBe("rejected");
+    expect(execution.providerOrderId).toBeUndefined();
+    expect(execution.executedQuantity).toBe("0");
+  });
+
   it("redacts credential-shaped values from provider messages", () => {
     const details = extractProviderError(new Error("ACCESS-KEY=secret-value passphrase:another-secret"));
     expect(details.message).toBe("ACCESS-KEY=REDACTED passphrase:REDACTED");

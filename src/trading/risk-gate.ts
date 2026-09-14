@@ -1,4 +1,5 @@
-import type { AccountSnapshot, Decision, Instrument, RiskGateResult, RuntimeConfig } from "../types.js";
+import type { AccountSnapshot, Decision, Instrument, MarketSnapshot, RiskGateResult, RuntimeConfig } from "../types.js";
+import { calculateExecutionAmounts, providerQuantityCodes } from "./order-quantity.js";
 
 const SCALE = 8;
 const UNIT = 10n ** BigInt(SCALE);
@@ -46,10 +47,26 @@ function addCode(codes: string[], code: string): void {
   if (!codes.includes(code)) codes.push(code);
 }
 
+function addProviderQuantityCodes(decision: Decision, context: RiskContext, codes: string[]): void {
+  if (decision.action === "REVERSE") return;
+  try {
+    const amounts = calculateExecutionAmounts(decision, {
+      market: context.market,
+      account: context.account,
+      instrument: context.instrument,
+      evidence: [],
+    });
+    for (const code of providerQuantityCodes(amounts.quantity, context.instrument, context.market.lastPrice)) addCode(codes, code);
+  } catch {
+    addCode(codes, "INVALID_ORDER_QUANTITY");
+  }
+}
+
 export interface RiskContext {
   decision: Decision;
   instrument: Instrument;
   account: AccountSnapshot;
+  market: MarketSnapshot;
   evidenceObservedAt: string;
   openOrderSymbols: string[];
   supportedUniverse: readonly string[];
@@ -111,6 +128,7 @@ function validateOpeningDecision(config: RuntimeConfig, context: RiskContext, co
   } catch {
     addCode(codes, "INVALID_LEVERAGE");
   }
+  addProviderQuantityCodes(decision, context, codes);
   if (scaled(account.portfolioEquity) <= 0n) addCode(codes, "INVALID_PORTFOLIO_EQUITY");
 }
 
@@ -149,6 +167,7 @@ function validateIncreaseDecision(config: RuntimeConfig, context: RiskContext, c
   } catch {
     addCode(codes, "INVALID_PORTFOLIO_EQUITY");
   }
+  addProviderQuantityCodes(decision, context, codes);
 }
 
 function validateReverseDecision(config: RuntimeConfig, context: RiskContext, codes: string[]): void {
@@ -197,6 +216,7 @@ function validateClosingDecision(context: RiskContext, codes: string[]): void {
       if (compare(reducedNotional, instrument.minOrderAmount) < 0) addCode(codes, "MIN_ORDER_AMOUNT");
     }
   }
+  addProviderQuantityCodes(decision, context, codes);
 }
 
 export function marginAllocation(account: AccountSnapshot, marginAllocationPct: string): string {

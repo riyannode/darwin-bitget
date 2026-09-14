@@ -7,6 +7,7 @@ import type {
   DashboardSnapshot,
   Decision,
   Instrument,
+  MarketSnapshot,
   RiskGateResult,
   RuntimeConfig,
   TradeLogEntry,
@@ -65,6 +66,8 @@ const instrument: Instrument = {
   leverageMin: "1",
   leverageMax: "5",
 };
+
+const market: MarketSnapshot = { symbol: "CRCLUSDT", lastPrice: "91.7", bidPrice: "91.69", askPrice: "91.71", priceChange24h: "0", volume24h: "1000", observedAt: OBSERVED_AT };
 
 function event(type: string, cycleId: string): ActivityEvent {
   return { eventId: `${cycleId}-${type}`, type, cycleId, createdAt: OBSERVED_AT };
@@ -135,6 +138,7 @@ function riskResult(currentAccount: AccountSnapshot, proposed: Decision): RiskGa
     decision: proposed,
     instrument,
     account: currentAccount,
+    market,
     evidenceObservedAt: OBSERVED_AT,
     openOrderSymbols: [],
     supportedUniverse: SUPPORTED_UNIVERSE,

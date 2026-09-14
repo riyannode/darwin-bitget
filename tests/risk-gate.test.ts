@@ -13,7 +13,7 @@ function decision(action: Action, marginAllocationPct = "10", leverage = "2", re
   return { decisionId: "decision-1", cycleId: "cycle-1", action, positionSide, symbol: "BTCUSDT", marginAllocationPct, additionalMarginPct, leverage, reductionPct, targetPositionSide, confidence: 0.7, thesis: "evidence", strategyThesis: "contextual futures hypothesis", supportingFactors: ["factor"], riskFactors: ["risk"], evidenceUsed: ["TICKER"], lessonsUsed: [], createdAt: "2026-09-12T00:00:00.000Z" };
 }
 
-function context(next: Decision, availableMargin = account.availableMargin, accountOverride: AccountSnapshot = account) { return { decision: next, instrument, account: { ...accountOverride, availableMargin }, evidenceObservedAt: account.observedAt, openOrderSymbols: [], supportedUniverse: ["BTCUSDT"], emergencyStop: false, dailyDrawdownBlocked: false, now: new Date(account.observedAt) }; }
+function context(next: Decision, availableMargin = account.availableMargin, accountOverride: AccountSnapshot = account) { return { decision: next, instrument, account: { ...accountOverride, availableMargin }, market: { symbol: "BTCUSDT", lastPrice: "20000", bidPrice: "19999", askPrice: "20001", priceChange24h: "0", volume24h: "1000", observedAt: account.observedAt }, evidenceObservedAt: account.observedAt, openOrderSymbols: [], supportedUniverse: ["BTCUSDT"], emergencyStop: false, dailyDrawdownBlocked: false, now: new Date(account.observedAt) }; }
 
 describe("futures risk gate", () => {
   it("blocks public-only entries even when a position is already held", () => {
@@ -27,7 +27,7 @@ describe("futures risk gate", () => {
 
   it("retains existing position exits when executable discovery is empty", () => {
     expect(evaluateRiskGate(config, { ...context(decision("CLOSE", "0", "1")), supportedUniverse: [] }).status).toBe("PASS");
-    expect(evaluateRiskGate(config, { ...context(decision("REDUCE", "0", "1", "25")), supportedUniverse: [] }).status).toBe("PASS");
+    expect(evaluateRiskGate(config, { ...context(decision("REDUCE", "0", "1", "20")), supportedUniverse: [] }).status).toBe("PASS");
   });
   it("blocks margin allocation above owner limit and unavailable margin", () => {
     const result = evaluateRiskGate(config, context(decision("OPEN_LONG", "40", "2"), "50"));
@@ -41,7 +41,7 @@ describe("futures risk gate", () => {
   });
 
   it("allows a bounded reduction for the selected position side", () => {
-    const result = evaluateRiskGate(config, context(decision("REDUCE", "0", "1", "25")));
+    const result = evaluateRiskGate(config, context(decision("REDUCE", "0", "1", "20")));
     expect(result.status).toBe("PASS");
   });
 

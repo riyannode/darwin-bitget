@@ -21,7 +21,14 @@ describe("Worker Bitget gateway client", () => {
     const fetchImpl = vi.fn(async () => Response.json({ error: "BITGET_READ_FAILED_getAccountAssets_ACCOUNT", provider: { operation: "getAccountAssets", code: "403", message: "HTTP 403 from Bitget: Unknown error", symbol: "ACCOUNT" } }, { status: 502 }));
     const client = new BitgetGatewayClient("https://gateway.test", "gateway-secret", fetchImpl);
 
-    await expect(client.call("getAccountAssets", {})).rejects.toMatchObject({ operation: "getAccountAssets", details: { code: "403", message: "HTTP 403 from Bitget: Unknown error" } });
+    await expect(client.call("getAccountAssets", {})).rejects.toMatchObject({ operation: "getAccountAssets", details: { classification: "GATEWAY_HTTP_502", code: "403", message: "HTTP 403 from Bitget: Unknown error" } });
+  });
+
+  it("preserves a structured provider rejection through a non-502 gateway response", async () => {
+    const fetchImpl = vi.fn(async () => Response.json({ error: "BITGET_GATEWAY_FAILED_placeOrder", classification: "PROVIDER_REJECTED", provider: { operation: "placeOrder", code: "400", message: "Exceeded the maximum quantity of contract orders: 100 KORU", symbol: "KORUUSDT" } }, { status: 424 }));
+    const client = new BitgetGatewayClient("https://gateway.test", "gateway-secret", fetchImpl);
+
+    await expect(client.call("placeOrder", { category: "USDT-FUTURES", symbol: "KORUUSDT", side: "sell", orderType: "market", qty: "116.33", clientOid: "paper-koru" })).rejects.toMatchObject({ details: { classification: "PROVIDER_REJECTED", code: "400", message: "Exceeded the maximum quantity of contract orders: 100 KORU" } });
   });
 
   it("does not expose an arbitrary operation escape hatch", () => {
