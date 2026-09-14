@@ -107,6 +107,26 @@ function evidenceBytes(evidence: ResearchEvidence): number {
   return new TextEncoder().encode(JSON.stringify(evidence)).byteLength;
 }
 
+function technicalFacts(value: unknown, facts: string[]): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const add = (label: string, candidate: unknown): void => {
+    if (candidate === undefined || candidate === null || facts.length >= 5) return;
+    const candidateText = typeof candidate === "object" ? JSON.stringify(candidate) : String(candidate);
+    const text = boundedText(candidateText, 220);
+    if (text) facts.push(`${label}=${text}`);
+  };
+  add("technical.verdict", record.verdict);
+  const rsi = record.rsi && typeof record.rsi === "object" ? record.rsi as Record<string, unknown> : undefined;
+  if (rsi) add("technical.rsi", `value=${String(rsi.rsi ?? "")}, signal=${String(rsi.signal ?? "")}`);
+  const macd = record.macd && typeof record.macd === "object" ? record.macd as Record<string, unknown> : undefined;
+  if (macd) add("technical.macd", `histogram=${String(macd.histogram ?? "")}, cross=${String(macd.cross ?? "")}`);
+  add("technical.supportResistance", record.support_resistance);
+  add("technical.bullSignals", record.bull_signals);
+  add("technical.bearSignals", record.bear_signals);
+  return facts.length > 0;
+}
+
 export function normalizeResearchEvidence(skill: ResearchRequest["skill"], scope: string, raw: unknown, observedAt: string): ResearchEvidence {
   const base: ResearchEvidence = { skill, scope, observedAt, status: "AVAILABLE", facts: [], limitations: [] };
   const rawRecord = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : undefined;
@@ -122,7 +142,8 @@ export function normalizeResearchEvidence(skill: ResearchRequest["skill"], scope
     base.status = "UNAVAILABLE";
     base.limitations.push("MCP tool returned an error result.");
   } else if (base.status === "AVAILABLE") {
-    collectFacts(parsed, "research", base.facts, base.limitations);
+    if (skill === "technical-analysis" && !technicalFacts(parsed, base.facts)) collectFacts(parsed, "research", base.facts, base.limitations);
+    else if (skill !== "technical-analysis") collectFacts(parsed, "research", base.facts, base.limitations);
     if (base.limitations.length > 0 && base.facts.length === 0) base.status = "UNAVAILABLE";
     if (base.facts.length === 0 && base.status === "AVAILABLE") {
       base.status = "UNAVAILABLE";
@@ -198,6 +219,7 @@ export class ResearchExecutor {
   }
 
   private cacheEvidence(key: string, evidence: ResearchEvidence, cachedAt: number): void {
+    if (evidence.status !== "AVAILABLE" && evidence.status !== "STALE") return;
     this.pruneCache(cachedAt);
     this.cache.set(key, { cachedAt, evidence });
   }

@@ -98,22 +98,25 @@ describe("bounded research execution", () => {
     expect(executor.cacheSize()).toBe(3);
   });
 
-  it("turns MCP errors into unavailable evidence and refetches after cache expiry", async () => {
+  it("does not negative-cache transport failures", async () => {
     let calls = 0;
+    let recovered = false;
     const executor = new ResearchExecutor({
       connect: async () => ({
         callTool: async () => {
           calls += 1;
-          throw new Error("MCP_500");
+          if (!recovered) throw new Error("MCP_500");
+          return { content: [{ type: "text", text: JSON.stringify({ verdict: "recovered" }) }] };
         },
       }),
     });
     const first = await executor.execute([request()], new Date("2026-09-15T00:00:00.000Z"));
-    const cached = await executor.execute([request()], new Date("2026-09-15T00:05:00.000Z"));
-    const refetched = await executor.execute([request()], new Date("2026-09-15T00:11:00.000Z"));
+    recovered = true;
+    const recoveredResult = await executor.execute([request()], new Date("2026-09-15T00:00:01.000Z"));
+    const cachedAvailable = await executor.execute([request()], new Date("2026-09-15T00:05:00.000Z"));
     expect(first[0]?.status).toBe("UNAVAILABLE");
-    expect(cached[0]?.status).toBe("UNAVAILABLE");
-    expect(refetched[0]?.status).toBe("UNAVAILABLE");
+    expect(recoveredResult[0]?.status).toBe("AVAILABLE");
+    expect(cachedAvailable[0]?.status).toBe("AVAILABLE");
     expect(calls).toBe(2);
   });
 

@@ -127,13 +127,23 @@ Research is disabled unless `BITGET_SIGNAL_ENABLED=true`. A missing flag, router
 - Normalized evidence: at most five facts, three limitations, 6 KiB per item, 16 KiB per cycle using `TextEncoder` byte counts.
 - Raw MCP responses, full feeds, prompts, model output, and arbitrary JSON are not stored or passed to the main decision prompt.
 
-The validator accounts for each recipe's declared `callsPerRequest` cost, not just the number of requests. The cold MCP connection requires one standards-compliant initialization request. Because v1 has one MCP call per accepted request and accepts at most three requests, cold enrichment is at most:
+The validator accounts for each recipe's declared `callsPerRequest` cost, not just the number of requests. A real HTTP-counted probe using the production MCP client wrapper measured:
+
+| Phase | Cold one-symbol run | Cold three-symbol run |
+|---|---:|---:|
+| MCP connect/init HTTP requests | 3 | 3 |
+| HTTP requests per `technical_analysis` call | 1 | 1 each |
+| MCP close/cleanup HTTP requests | 0 | 0 |
+| Total MCP HTTP requests | 4 | 6 |
+
+The maximal admitted cold plan is therefore measured as:
 
 ```text
 1 research-router Qwen request
-+ 1 MCP initialize request
-+ 3 MCP tool requests
-= 5 new external requests
++ 3 MCP connect/init HTTP requests
++ 3 MCP tool HTTP requests
++ 0 MCP close/cleanup HTTP requests
+= 7 new external HTTP requests
 ```
 
 Warm cache hits add zero external research requests. `MAX_MCP_TOOL_CALLS_PER_CYCLE=4` remains a hard validator bound for future recipes; the current admitted recipe set is one tool call per request and the request cap is three.
@@ -151,7 +161,9 @@ For the latest production no-write cycle, the observed evidence set was five sym
 = 20 existing external requests before enrichment
 ```
 
-The cold research upper bound makes that observed no-write path approximately 25 external requests, leaving headroom under the 50-subrequest Worker limit. Existing sequential financial write/readback behavior is unchanged; this PR adds no requests to that path. Research concurrency is at most two waiting MCP calls.
+The measured cold research overhead makes that observed no-write path approximately 27 external requests, leaving headroom under the 50-subrequest Worker limit. Existing financial write/readback behavior is unchanged; this PR adds no requests to that path. Research concurrency is at most two waiting MCP calls.
+
+The measured normalized MSTR smoke result was `AVAILABLE` with bounded facts covering `NEUTRAL` verdict, RSI `58.83`/`neutral`, MACD histogram `-0.677657`/`death_cross`, support/resistance levels, and one bullish signal. Raw MCP output was not printed or persisted.
 
 ## Storage impact
 
