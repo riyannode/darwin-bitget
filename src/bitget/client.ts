@@ -116,6 +116,7 @@ export function buildUnresolvedExecution(
 ): ExecutionResult {
   const writeDetails = extractProviderError(writeError);
   const readbackDetails = extractProviderError(readbackError);
+  const definitivelyRejected = writeDetails.classification === "PROVIDER_REJECTED" && readbackDetails.classification === "PROVIDER_NOT_FOUND";
   return {
     provider: "bitget",
     clientOrderId: request.clientOrderId,
@@ -129,7 +130,7 @@ export function buildUnresolvedExecution(
     positionNotional: request.positionNotional,
     requestedQuantity: request.quantity,
     executedQuantity: "0",
-    status: "unknown",
+    status: definitivelyRejected ? "rejected" : "unknown",
     submittedAt,
     readBackAt: new Date().toISOString(),
     ...(writeDetails.classification ? { providerFailureClass: writeDetails.classification } : {}),

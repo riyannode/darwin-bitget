@@ -72,7 +72,7 @@ async function run(): Promise<void> {
   if (!bundle) throw new Error("NO_ACCOUNT_EVIDENCE");
   const openCycleId = crypto.randomUUID();
   const openDecision = decision(selectedAction, symbol, selectedSide, openCycleId, process.env.PAPER_TEST_MARGIN_PCT?.trim() || "5", process.env.PAPER_TEST_LEVERAGE?.trim() || "1", null, bundle.evidence.map((evidence) => evidence.type));
-  const openRisk = evaluateRiskGate(config, { decision: openDecision, instrument, account: bundle.account, evidenceObservedAt: bundle.market.observedAt, openOrderSymbols: bundle.account.openOrderSymbols, supportedUniverse: instruments.map((candidate) => candidate.symbol), emergencyStop: config.ownerPolicy.emergencyStop, dailyDrawdownBlocked: false });
+  const openRisk = evaluateRiskGate(config, { decision: openDecision, instrument, account: bundle.account, market: bundle.market, evidenceObservedAt: bundle.market.observedAt, openOrderSymbols: bundle.account.openOrderSymbols, supportedUniverse: instruments.map((candidate) => candidate.symbol), emergencyStop: config.ownerPolicy.emergencyStop, dailyDrawdownBlocked: false });
   if (openRisk.status !== "PASS") throw new Error(`PAPER_INTEGRATION_BLOCKED:${openRisk.codes.join(",")}`);
   const openRequest = buildExecutionRequest(openDecision, bundle, openCycleId);
   const openExecution = await executePaperOrder(client, openRequest);
@@ -82,7 +82,7 @@ async function run(): Promise<void> {
   if (openReconciliation.status !== "MATCHED" || openExecution.status !== "filled" || !openedPosition) throw new Error("PAPER_INTEGRATION_OPEN_UNVERIFIED");
   const closeCycleId = crypto.randomUUID();
   const closeDecision = decision("CLOSE", symbol, selectedSide, closeCycleId, "0", openedPosition.leverage, null, afterOpen?.evidence.map((evidence) => evidence.type) ?? []);
-  const closeRisk = evaluateRiskGate(config, { decision: closeDecision, instrument, account: afterOpen?.account ?? bundle.account, evidenceObservedAt: afterOpen?.market.observedAt ?? bundle.market.observedAt, openOrderSymbols: afterOpen?.account.openOrderSymbols ?? [], supportedUniverse: instruments.map((candidate) => candidate.symbol), emergencyStop: config.ownerPolicy.emergencyStop, dailyDrawdownBlocked: false });
+  const closeRisk = evaluateRiskGate(config, { decision: closeDecision, instrument, account: afterOpen?.account ?? bundle.account, market: afterOpen?.market ?? bundle.market, evidenceObservedAt: afterOpen?.market.observedAt ?? bundle.market.observedAt, openOrderSymbols: afterOpen?.account.openOrderSymbols ?? [], supportedUniverse: instruments.map((candidate) => candidate.symbol), emergencyStop: config.ownerPolicy.emergencyStop, dailyDrawdownBlocked: false });
   if (closeRisk.status !== "PASS") throw new Error(`PAPER_INTEGRATION_CLOSE_BLOCKED:${closeRisk.codes.join(",")}`);
   const closeRequest = buildExecutionRequest(closeDecision, afterOpen ?? bundle, closeCycleId);
   const closeExecution = await executePaperOrder(client, closeRequest);

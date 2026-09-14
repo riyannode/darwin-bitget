@@ -81,8 +81,26 @@ describe("Bitget gateway", () => {
     }));
     const body = await response.json() as { provider?: { code?: string; message?: string } };
 
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(424);
     expect(body.provider).toEqual({ operation: "getAccountAssets", symbol: "ACCOUNT", code: "403", message: "ACCESS-KEY=REDACTED" });
     expect(JSON.stringify(body)).not.toContain("secret-value");
+  });
+
+  it("returns definitive provider rejection as structured non-502 response", async () => {
+    const provider: GatewayProvider = {
+      call: vi.fn(async () => { throw Object.assign(new Error("Exceeded the maximum quantity of contract orders: 100 KORU"), { code: "400" }); }),
+    };
+    const handler = createGatewayHandler({ serviceSecret: "service-secret", provider });
+
+    const response = await handler(request("/v1/bitget/place-order", {
+      method: "POST",
+      headers: { authorization: "Bearer service-secret", "content-type": "application/json" },
+      body: JSON.stringify({ category: "USDT-FUTURES", symbol: "KORUUSDT", side: "sell", orderType: "market", qty: "116.33", clientOid: "paper-koru" }),
+    }));
+    const body = await response.json() as { classification?: string; provider?: { code?: string; message?: string } };
+
+    expect(response.status).toBe(424);
+    expect(body.classification).toBe("PROVIDER_REJECTED");
+    expect(body.provider).toMatchObject({ code: "400", message: "Exceeded the maximum quantity of contract orders: 100 KORU" });
   });
 });

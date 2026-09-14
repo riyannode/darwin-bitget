@@ -55,17 +55,19 @@ describe("Bitget provider readback", () => {
 
   it("keeps multiple live provider positions in the dashboard portfolio", () => {
     const portfolio = parseDashboardPortfolio(
-      { usdtEquity: "50000", availableMargin: "47000" },
+      { usdtEquity: "50000", availableMargin: "47000", positionValue: "299" },
       [
-        { symbol: "CRCLUSDT", posSide: "long", total: "2", avgPrice: "90", markPrice: "91", positionValue: "182", unrealisedPnl: "2" },
-        { symbol: "KORUUSDT", posSide: "short", total: "3", avgPrice: "40", markPrice: "39", positionValue: "117", unrealisedPnl: "3" },
+        { symbol: "CRCLUSDT", posSide: "long", total: "2", avgPrice: "90", markPrice: "91", unrealisedPnl: "2" },
+        { symbol: "COINUSDT", posSide: "long", total: "3", avgPrice: "40", markPrice: "39", unrealisedPnl: "3" },
       ],
       { list: [] },
       "2026-09-12T17:00:00.000Z",
     );
 
     expect(portfolio.positions).toHaveLength(2);
-    expect(portfolio.positions.map((position) => `${position.symbol}:${position.positionSide}`)).toEqual(["CRCLUSDT:LONG", "KORUUSDT:SHORT"]);
+    expect(portfolio.positions.map((position) => `${position.symbol}:${position.positionSide}`)).toEqual(["CRCLUSDT:LONG", "COINUSDT:LONG"]);
+    expect(portfolio.totalPositionNotional).toBe("299");
+    expect(portfolio.positionQuantity).toBe("5");
     expect(portfolio.unrealizedPnl).toBe("5");
   });
 

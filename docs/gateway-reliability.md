@@ -16,10 +16,22 @@ Supported classifications are:
 - `PROVIDER_REJECTED`
 - `PROVIDER_NOT_FOUND`
 
-The gateway returns provider-not-found responses with HTTP `424` and a structured
-JSON envelope. This avoids Cloudflare Tunnel replacing an origin HTTP `502` body
-with the generic `error code: 502` response. Other provider failures retain their
-existing HTTP behavior.
+The gateway returns definitive provider failures (`PROVIDER_NOT_FOUND` and
+`PROVIDER_REJECTED`) with HTTP `424` and a structured JSON envelope. This avoids
+Cloudflare Tunnel replacing an origin HTTP `502` body with the generic `error code:
+502` response. Genuine transport and gateway failures retain their `502`/timeout
+semantics.
+
+No financial write is constructed or submitted when the shared quantity calculation
+fails provider validation. The risk gate returns these deterministic codes:
+
+- `MIN_ORDER_QTY`
+- `MAX_ORDER_QTY`
+- `INVALID_ORDER_QUANTITY`
+- existing `MIN_ORDER_AMOUNT`
+
+The risk gate and execution request builder use the same integer-arithmetic quantity
+calculation. Quantities are never silently clamped to a provider maximum.
 
 ## Correlation logging
 

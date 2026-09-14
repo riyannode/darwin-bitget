@@ -138,6 +138,12 @@ export function parseDashboardPortfolio(accountValue: unknown, positionsValue: u
   const positions = providerRows(positionsValue)
     .map(parseDashboardPosition)
     .filter((position) => hasPositionQuantity(position.quantity));
+  const normalizedPositionsWithNotional = positions.length > 1
+    ? positions.map((position) => {
+      if (position.notional || !position.quantity || !position.markPrice) return position;
+      return { ...position, notional: multiplyDecimal(position.quantity, position.markPrice) };
+    })
+    : positions;
   const orders = providerRows(openOrdersValue);
   const accountEquity = firstDecimal(account, ["usdtEquity", "accountEquity", "totalEquity", "equity", "balance"]) || sumAssetValues(assetRows, ["usdValue", "equity", "balance"]);
   if (!accountEquity || accountEquity === "0") throw new Error(`INVALID_PORTFOLIO_EQUITY_${Object.keys(account).sort().join("_") || "EMPTY"}`);
@@ -146,10 +152,9 @@ export function parseDashboardPortfolio(accountValue: unknown, positionsValue: u
   const positionMarginUsage = positions.map((position) => position.marginAllocated).filter(Boolean).reduce((total, margin) => addDecimal(total, margin), "0");
   const marginUsage = providerMarginUsage || positionMarginUsage || (availableMargin ? subtractDecimal(accountEquity, availableMargin) : "");
   const providerPositionValue = firstDecimal(account, ["positionValue"]);
-  const singlePosition = positions[0];
-  const normalizedPositions: PositionSnapshot[] = singlePosition && !singlePosition.notional && providerPositionValue
-    ? [{ ...singlePosition, notional: providerPositionValue }]
-    : positions;
+  const normalizedPositions: PositionSnapshot[] = normalizedPositionsWithNotional.length === 1 && normalizedPositionsWithNotional[0] && !normalizedPositionsWithNotional[0].notional && providerPositionValue
+    ? [{ ...normalizedPositionsWithNotional[0], notional: providerPositionValue }]
+    : normalizedPositionsWithNotional;
   const notionalValues = normalizedPositions.map((position) => position.notional).filter(Boolean);
   const totalPositionNotional = notionalValues.reduce((total, notional) => addDecimal(total, notional), "0");
   const pnlValues = normalizedPositions.map((position) => position.unrealizedPnl).filter(Boolean);

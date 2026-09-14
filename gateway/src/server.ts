@@ -223,7 +223,7 @@ function classifyGatewayError(error: unknown, provider: { code?: string; message
 }
 
 function providerFailure(classification: GatewayFailureClass): boolean {
-  return classification === "PROVIDER_NOT_FOUND";
+  return classification === "PROVIDER_NOT_FOUND" || classification === "PROVIDER_REJECTED";
 }
 
 function sanitizeMessage(value: string): string {

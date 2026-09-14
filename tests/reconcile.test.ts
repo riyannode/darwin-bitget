@@ -15,4 +15,12 @@ describe("execution reconciliation", () => {
   });
   it("does not retry an ambiguous submission", () => { const result = reconcileExecution(request, execution({ status: "unknown" })); expect(result.status).toBe("UNKNOWN"); expect(result.codes).toContain("EXECUTION_UNKNOWN"); });
   it("detects provider/request mismatches", () => { const result = reconcileExecution(request, execution({ positionSide: "SHORT" })); expect(result.status).toBe("MISMATCH"); expect(result.codes).toContain("EXECUTION_MISMATCH"); });
+  it("keeps a definitive provider rejection out of verified execution", () => {
+    const rejected = execution({ executedQuantity: "0", status: "rejected", providerFailureClass: "PROVIDER_REJECTED", providerReadbackFailureClass: "PROVIDER_NOT_FOUND" });
+    delete rejected.providerOrderId;
+    const result = reconcileExecution(request, rejected);
+    expect(result.status).toBe("MISMATCH");
+    expect(result.codes).toContain("PROVIDER_REJECTED");
+    expect(result.codes).not.toContain("EXECUTION_UNKNOWN");
+  });
 });
