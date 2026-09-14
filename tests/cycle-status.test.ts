@@ -5,7 +5,7 @@ vi.mock("agents", () => ({ Agent: class {}, routeAgentRequest: vi.fn() }));
 import { z } from "zod";
 import { failureDiagnostic, TraderAgent } from "../src/agent/agent.js";
 import { cycleReadModel } from "../src/storage/journal-normalizer.js";
-import { loadLatestValidCyclePlan, saveCycle, saveJournal, saveLatestValidCyclePlan } from "../src/storage/store.js";
+import { loadLatestCompletedCyclePlanFromHistory, loadLatestValidCyclePlan, saveCycle, saveJournal, saveLatestValidCyclePlan } from "../src/storage/store.js";
 import type { SqlExecutor } from "../src/storage/schema.js";
 import type { CycleDecisionPlan, Decision, TradingJournal } from "../src/types.js";
 
@@ -144,6 +144,42 @@ describe("cycle status read model", () => {
     const snapshot = await TraderAgent.prototype.getDashboardSnapshot.call(fake as never);
     expect(snapshot.latestCyclePlan).toMatchObject({ positionActions: [{ action: "HOLD", symbol: "CRCLUSDT" }] });
     expect(snapshot.latestCycleStatus).toMatchObject({ cycleId: "cycle-failed-29", status: "FAILED", hasPersistedPlan: false, hasValidPlan: false });
+  });
+
+  it("backfills from a bounded completed-cycle join and ignores failed cycles", () => {
+    const queries: string[] = [];
+    const cyclePlanJournal = { ...baseJournal, cycleId: "cycle-plan", completedAt: "2026-09-14T12:10:00.000Z", cyclePlan: { positionActions: [hold], entryActions: [] } } as TradingJournal;
+    const legacyJournal = { ...baseJournal, cycleId: "cycle-legacy", completedAt: "2026-09-14T12:09:00.000Z", decision: hold } as TradingJournal;
+    const executor: SqlExecutor = {
+      sql<T>(strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) {
+        const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
+        queries.push(query);
+        if (!query.includes("JOIN journals")) throw new Error("UNBOUNDED_HISTORY_READ");
+        return [
+          { cycle_id: "cycle-failed", status: "FAILED", started_at: "2026-09-14T12:11:00.000Z", completed_at: "2026-09-14T12:11:30.000Z", payload: JSON.stringify({ ...baseJournal, cycleId: "cycle-failed", startedAt: "2026-09-14T12:11:00.000Z", completedAt: "2026-09-14T12:11:30.000Z", cyclePlan: { positionActions: [], entryActions: [] } }) },
+          { cycle_id: cyclePlanJournal.cycleId, status: "COMPLETED", started_at: cyclePlanJournal.startedAt, completed_at: cyclePlanJournal.completedAt, payload: JSON.stringify(cyclePlanJournal) },
+          { cycle_id: legacyJournal.cycleId, status: "COMPLETED", started_at: legacyJournal.startedAt, completed_at: legacyJournal.completedAt, payload: JSON.stringify(legacyJournal) },
+        ] as T[];
+      },
+    };
+    const result = loadLatestCompletedCyclePlanFromHistory(executor);
+    expect(result).toMatchObject({ cycleId: "cycle-plan", plan: { positionActions: [{ action: "HOLD" }] } });
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).toContain("c.status = 'COMPLETED'");
+    expect(queries[0]).toContain("ORDER BY c.completed_at DESC");
+    expect(queries[0]).toContain("LIMIT 50");
+  });
+
+  it("backfills a legacy decision plan from the same bounded lookup", () => {
+    const legacyJournal = { ...baseJournal, cycleId: "cycle-legacy", completedAt: "2026-09-14T12:09:00.000Z", decision: hold } as TradingJournal;
+    const executor: SqlExecutor = {
+      sql<T>(strings: TemplateStringsArray) {
+        const query = strings.join("");
+        if (!query.includes("JOIN journals")) throw new Error("UNBOUNDED_HISTORY_READ");
+        return [{ cycle_id: legacyJournal.cycleId, status: "COMPLETED", started_at: legacyJournal.startedAt, completed_at: legacyJournal.completedAt, payload: JSON.stringify(legacyJournal) }] as T[];
+      },
+    };
+    expect(loadLatestCompletedCyclePlanFromHistory(executor)).toMatchObject({ cycleId: "cycle-legacy", plan: { positionActions: [{ action: "HOLD" }] } });
   });
 });
 

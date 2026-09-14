@@ -30,6 +30,14 @@ interface JournalRow {
   payload: string;
 }
 
+interface CompletedCyclePlanRow {
+  cycle_id: string;
+  status: string;
+  started_at: string;
+  completed_at: string | null;
+  payload: string;
+}
+
 interface BacktestRow {
   payload: string;
 }
@@ -268,17 +276,25 @@ export function saveLatestValidCyclePlan(executor: SqlExecutor, readModel: Lates
 }
 
 export function loadLatestCompletedCyclePlanFromHistory(executor: SqlExecutor): LatestValidCyclePlan | null {
-  const statuses = new Map(loadAllStoredCycles(executor).map((cycle) => [cycle.cycleId, cycle]));
-  const journals = loadAllAutonomousJournals(executor);
-  for (let index = journals.length - 1; index >= 0; index -= 1) {
-    const journal = journals[index];
-    if (!journal || !journalHasPersistedPlan(journal)) continue;
-    const stored = statuses.get(journal.cycleId);
-    const status = stored?.status ?? (journal.completedAt ? "COMPLETED" : "RUNNING");
-    const completedAt = stored?.completedAt ?? journal.completedAt;
-    if (status !== "COMPLETED" || !completedAt) continue;
+  const rows = executor.sql<CompletedCyclePlanRow>`
+    SELECT c.cycle_id, c.status, c.started_at, c.completed_at, j.payload
+    FROM cycles AS c
+    INNER JOIN journals AS j ON j.cycle_id = c.cycle_id
+    WHERE c.status = 'COMPLETED'
+    ORDER BY c.completed_at DESC, c.cycle_id DESC
+    LIMIT 50
+  `;
+  for (const row of rows) {
+    if (row.status !== "COMPLETED" || !row.completed_at) continue;
+    let journal: TradingJournal;
+    try {
+      journal = JSON.parse(row.payload) as TradingJournal;
+    } catch {
+      continue;
+    }
+    if (!journalHasPersistedPlan(journal)) continue;
     const normalized = normalizeCycleDecisions(journal);
-    return { cycleId: journal.cycleId, plan: normalized.plan, ...(normalized.discovery ? { discovery: normalized.discovery } : {}), startedAt: stored?.startedAt ?? journal.startedAt, completedAt };
+    return { cycleId: journal.cycleId, plan: normalized.plan, ...(normalized.discovery ? { discovery: normalized.discovery } : {}), startedAt: row.started_at, completedAt: row.completed_at };
   }
   return null;
 }
