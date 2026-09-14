@@ -52,6 +52,7 @@ export const MAX_HISTORY_LIMIT = 100;
 
 const PERFORMANCE_STATE_KEY = "performance_aggregate";
 const POSITION_CONTEXT_BOOTSTRAP_KEY = "position_context_bootstrap";
+const MAX_TARGETED_DECISION_ID_LENGTH = 256;
 
 export function clampHistoryLimit(limit: number, fallback = 25): number {
   if (!Number.isInteger(limit) || limit < 1) return fallback;
@@ -178,8 +179,9 @@ export function loadOpenExperiences(executor: SqlExecutor, limit = MAX_HISTORY_L
 export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: readonly string[], limit = MAX_HISTORY_LIMIT): TradingJournal[] {
   const journals = new Map<string, TradingJournal>();
   for (const decisionId of [...new Set(decisionIds)].slice(0, limit)) {
-    const marker = `%"decisionId":"${decisionId}"%`;
-    const rows = executor.sql<JournalRow>`SELECT payload FROM journals WHERE payload LIKE ${marker} ORDER BY created_at DESC LIMIT 2`;
+    if (typeof decisionId !== "string" || decisionId.length === 0 || decisionId.length > MAX_TARGETED_DECISION_ID_LENGTH || decisionId.trim().length === 0) continue;
+    const marker = `"decisionId":${JSON.stringify(decisionId)}`;
+    const rows = executor.sql<JournalRow>`SELECT payload FROM journals WHERE instr(payload, ${marker}) > 0 ORDER BY created_at DESC LIMIT 2`;
     for (const row of rows) {
       try {
         const journal = JSON.parse(row.payload) as TradingJournal;

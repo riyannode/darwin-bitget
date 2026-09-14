@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { DatabaseSync } from "node:sqlite";
 import type { AccountSnapshot, Decision, ExecutionResult, TradeExperience, TradingJournal } from "../src/types.js";
 import type { SqlExecutor } from "../src/storage/schema.js";
 import { bootstrapPositionContexts } from "../src/agent/position-context.js";
@@ -20,7 +21,7 @@ describe("bounded legacy bootstrap lookup", () => {
     const sql = (strings: TemplateStringsArray, ...values: unknown[]): unknown[] => {
       const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
       if (query.includes("outcome_status = 'OPEN'")) return [{ payload: JSON.stringify(experience) }];
-      if (query.includes("payload LIKE")) return [{ payload: JSON.stringify(oldJournal) }];
+      if (query.includes("instr(payload")) return [{ payload: JSON.stringify(oldJournal) }];
       if (query.includes("FROM journals")) return newer;
       if (query.includes("FROM experiences")) return [];
       return [];
@@ -36,5 +37,26 @@ describe("bounded legacy bootstrap lookup", () => {
     expect(performance.openTrades).toBe(1);
     expect(contexts).toHaveLength(1);
     expect(contexts[0]).toMatchObject({ symbol: "CRCLUSDT", positionSide: "LONG", entryDecisionId: "old-crcl-open", entryReasoning: { thesis: "original CRCL entry" } });
+  });
+
+  it("executes literal instr matching in SQLite and skips malformed or pathological IDs", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("CREATE TABLE journals (cycle_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)");
+    const payload = (decisionId: string, cycleId: string): string => JSON.stringify({ ...oldJournal, cycleId, decision: { ...opening, decisionId } });
+    const rows: Array<[string, string]> = [
+      ["normal-uuid", payload("123e4567-e89b-12d3-a456-426614174000", "normal")],
+      ["short", payload("legacy-short", "short")],
+      ["wildcards", payload("legacy%_wildcard", "wildcards")],
+      ["quotes", payload("legacy\"quoted", "quotes")],
+      ["malformed", "{\"decisionId\":\"legacy-short\""],
+    ];
+    const insert = db.prepare("INSERT INTO journals (cycle_id, payload, created_at) VALUES (?, ?, ?)");
+    for (const [cycleId, journal] of rows) insert.run(cycleId, journal, "2026-09-14T10:00:00.000Z");
+    const queries: string[] = [];
+    const executor = { sql<T>(strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[] { const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), ""); queries.push(query); const sqliteValues = values.map((value) => typeof value === "boolean" ? (value ? 1 : 0) : value) as (string | number | null)[]; if (query.trimStart().startsWith("SELECT")) return db.prepare(query).all(...sqliteValues) as T[]; db.exec(query); return []; } };
+    const found = loadJournalsForDecisionIds(executor, ["123e4567-e89b-12d3-a456-426614174000", "legacy-short", "legacy%_wildcard", "legacy\"quoted", "x".repeat(257)]);
+    expect(found.map((journal) => journal.cycleId).sort()).toEqual(["normal", "quotes", "short", "wildcards"]);
+    expect(queries.every((query) => !/\b(LIKE|GLOB)\b/i.test(query))).toBe(true);
+    expect(queries.every((query) => query.includes("instr(payload, ?)") && query.includes("ORDER BY created_at DESC LIMIT 2"))).toBe(true);
   });
 });
