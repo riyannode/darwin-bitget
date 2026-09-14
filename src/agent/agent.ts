@@ -79,7 +79,7 @@ interface AgentState {
 }
 
 const STALE_CYCLE_TIMEOUT_MS = 120_000;
-const USER_STORAGE_VERSION = 3;
+const USER_STORAGE_VERSION = 4;
 const SNAPSHOT_EVENT_LIMIT = 25;
 
 function failureCode(codes: string[]): string {
@@ -203,7 +203,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   public override async onStart(): Promise<void> {
     if ((this.state.userStorageVersion ?? 0) < USER_STORAGE_VERSION) {
       ensureStorage(this);
-      this.setState({ ...this.state, userStorageVersion: USER_STORAGE_VERSION });
+      this.setState({ ...this.state, userStorageVersion: USER_STORAGE_VERSION, temporaryScanIntervalExpiresAt: null, temporaryScanIntervalCompleted: false, temporaryScanIntervalDurationMs: 0 });
     }
     this.ensureReadModels();
     const policy = this.ensureActivePolicy();
