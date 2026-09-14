@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { assertOpenPositionCountWithinPlanLimit, cycleDecisionPlanSchema, buildDecisionPrompt, MAX_FINANCIAL_WRITES_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
 import type { AccountSnapshot, CycleDecisionPlan, Decision, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot, PositionSnapshot } from "../src/types.js";
+import { DECISION_TASK_PROMPT, PROMPT_VERSIONS } from "../src/agent/mandate.js";
 
 function snapshot(symbol: string, change = "1", volume = "100"): MarketSnapshot {
   return { symbol, lastPrice: "100", bidPrice: "99.9", askPrice: "100.1", priceChange24h: change, volume24h: volume, observedAt: "2026-09-12T00:00:00.000Z" };
@@ -50,6 +51,20 @@ describe("cycle decision plan contract", () => {
     const value = plan([decision("HOLD", "CRCLUSDT", "LONG")]);
     expect(() => validateCycleDecisionPlan(value, context([existing], []))).not.toThrow();
     expect(value.positionActions[0]).toMatchObject({ action: "HOLD", symbol: "CRCLUSDT", positionSide: "LONG" });
+  });
+
+  it("accepts numeric zero representations for management margins and numeric 100 for CLOSE", () => {
+    for (const marginAllocationPct of ["0", "0.0", "0.00"]) {
+      expect(() => cycleDecisionPlanSchema.parse({ positionActions: [decision("HOLD", "CRCLUSDT", "LONG", "hold-schema", { marginAllocationPct })], entryActions: [] })).not.toThrow();
+    }
+    expect(() => cycleDecisionPlanSchema.parse({ positionActions: [decision("INCREASE", "CRCLUSDT", "LONG", "increase-schema", { marginAllocationPct: "0.0", additionalMarginPct: "5" })], entryActions: [] })).not.toThrow();
+    expect(() => cycleDecisionPlanSchema.parse({ positionActions: [decision("REDUCE", "CRCLUSDT", "LONG", "reduce-schema", { marginAllocationPct: "0.00", reductionPct: "50" })], entryActions: [] })).not.toThrow();
+    expect(() => cycleDecisionPlanSchema.parse({ positionActions: [decision("CLOSE", "CRCLUSDT", "LONG", "close-schema", { marginAllocationPct: "0.0", reductionPct: "100.0" })], entryActions: [] })).not.toThrow();
+  });
+
+  it("rejects positive management margins and non-total CLOSE reductions", () => {
+    expect(() => cycleDecisionPlanSchema.parse({ positionActions: [decision("HOLD", "CRCLUSDT", "LONG", "hold-positive", { marginAllocationPct: "5" })], entryActions: [] })).toThrow("INVALID_MARGIN_ALLOCATION");
+    expect(() => cycleDecisionPlanSchema.parse({ positionActions: [decision("CLOSE", "CRCLUSDT", "LONG", "close-partial", { marginAllocationPct: "0.0", reductionPct: "90" })], entryActions: [] })).toThrow("INVALID_REDUCTION_PCT");
   });
 
   it("allows CRCL HOLD and NVDA OPEN_LONG in the same cycle", () => {
@@ -156,5 +171,12 @@ describe("cycle decision plan contract", () => {
     expect(prompt).toContain('"supportedUniverse"');
     expect(prompt).toContain('"maxTotalActionsPerCycle":5');
     expect(prompt).toContain('"maxFinancialWritesPerCycle":5');
+    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v5");
+    expect(DECISION_TASK_PROMPT).toContain('HOLD: positionSide = actual provider side, marginAllocationPct = "0"');
+    expect(DECISION_TASK_PROMPT).toContain('INCREASE: positionSide = actual provider side, marginAllocationPct = "0"');
+    expect(DECISION_TASK_PROMPT).toContain('REDUCE: positionSide = actual provider side, marginAllocationPct = "0"');
+    expect(DECISION_TASK_PROMPT).toContain('CLOSE: positionSide = actual provider side, marginAllocationPct = "0"');
+    expect(DECISION_TASK_PROMPT).toContain('REVERSE: positionSide = current provider side, targetPositionSide is opposite');
+    expect(DECISION_TASK_PROMPT).toContain('For OPEN_LONG / OPEN_SHORT entryActions, marginAllocationPct is positive');
   });
 });
