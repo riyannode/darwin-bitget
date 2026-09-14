@@ -14,16 +14,19 @@ import { CANDIDATE_TASK_PROMPT, DECISION_TASK_PROMPT, TRADING_MANDATE } from "./
 import { generateQwenJson } from "./qwen.js";
 
 export const MAX_TOTAL_ACTIONS_PER_CYCLE = 5;
+export const MAX_FINANCIAL_WRITES_PER_CYCLE = 5;
 
 const decimalString = z.string().regex(/^\d+(?:\.\d{1,8})?$/);
 
 const decisionFields = {
-  action: z.enum(["OPEN_LONG", "OPEN_SHORT", "HOLD", "REDUCE", "CLOSE"]),
+  action: z.enum(["OPEN_LONG", "OPEN_SHORT", "HOLD", "INCREASE", "REDUCE", "CLOSE", "REVERSE"]),
   positionSide: z.enum(["LONG", "SHORT"]).nullable(),
   symbol: z.string().min(1),
   marginAllocationPct: decimalString,
+  additionalMarginPct: decimalString.nullable().optional(),
   leverage: decimalString,
   reductionPct: decimalString.nullable(),
+  targetPositionSide: z.enum(["LONG", "SHORT"]).nullable().optional(),
   confidence: z.number().min(0).max(1),
   thesis: z.string().min(1).max(500),
   strategyThesis: z.string().min(1).max(500),
@@ -38,10 +41,15 @@ type DecisionFields = z.infer<z.ZodObject<typeof decisionFields>>;
 function validateDecisionSemantics(decision: DecisionFields, context: z.RefinementCtx): void {
   const openingSide = decision.action === "OPEN_LONG" ? "LONG" : decision.action === "OPEN_SHORT" ? "SHORT" : null;
   if (openingSide && decision.positionSide !== openingSide) context.addIssue({ code: "custom", path: ["positionSide"], message: "INVALID_POSITION_SIDE" });
-  if ((decision.action === "REDUCE" || decision.action === "CLOSE") && !decision.positionSide) context.addIssue({ code: "custom", path: ["positionSide"], message: "POSITION_SIDE_REQUIRED" });
+  if (["INCREASE", "REDUCE", "CLOSE", "REVERSE"].includes(decision.action) && !decision.positionSide) context.addIssue({ code: "custom", path: ["positionSide"], message: "POSITION_SIDE_REQUIRED" });
   if (decision.action === "REDUCE" && (!decision.reductionPct || Number(decision.reductionPct) <= 0 || Number(decision.reductionPct) >= 100)) context.addIssue({ code: "custom", path: ["reductionPct"], message: "INVALID_REDUCTION_PCT" });
   if (decision.action === "CLOSE" && decision.reductionPct !== null && decision.reductionPct !== "100") context.addIssue({ code: "custom", path: ["reductionPct"], message: "INVALID_REDUCTION_PCT" });
-  if ((decision.action === "HOLD" || decision.action === "REDUCE" || decision.action === "CLOSE") && decision.marginAllocationPct !== "0") context.addIssue({ code: "custom", path: ["marginAllocationPct"], message: "INVALID_MARGIN_ALLOCATION" });
+  if ((decision.action === "HOLD" || decision.action === "REDUCE" || decision.action === "CLOSE" || decision.action === "INCREASE") && decision.marginAllocationPct !== "0") context.addIssue({ code: "custom", path: ["marginAllocationPct"], message: "INVALID_MARGIN_ALLOCATION" });
+  if (decision.action === "INCREASE" && (!decision.additionalMarginPct || Number(decision.additionalMarginPct) <= 0)) context.addIssue({ code: "custom", path: ["additionalMarginPct"], message: "INVALID_ADDITIONAL_MARGIN" });
+  if (decision.action !== "INCREASE" && decision.additionalMarginPct !== undefined && decision.additionalMarginPct !== null) context.addIssue({ code: "custom", path: ["additionalMarginPct"], message: "UNEXPECTED_ADDITIONAL_MARGIN" });
+  if (decision.action === "REVERSE" && (!decision.targetPositionSide || !decision.marginAllocationPct || Number(decision.marginAllocationPct) <= 0 || !decision.leverage || Number(decision.leverage) <= 0)) context.addIssue({ code: "custom", path: ["targetPositionSide"], message: "REVERSE_TARGET_SIDE_REQUIRED" });
+  if (decision.action !== "REVERSE" && decision.targetPositionSide !== undefined && decision.targetPositionSide !== null) context.addIssue({ code: "custom", path: ["targetPositionSide"], message: "UNEXPECTED_TARGET_POSITION_SIDE" });
+  if (decision.action === "REVERSE" && decision.targetPositionSide && decision.positionSide && decision.targetPositionSide === decision.positionSide) context.addIssue({ code: "custom", path: ["targetPositionSide"], message: "REVERSE_TARGET_SIDE_NOT_OPPOSITE" });
   if (decision.action === "HOLD" && decision.positionSide !== null && !["LONG", "SHORT"].includes(decision.positionSide)) context.addIssue({ code: "custom", path: ["positionSide"], message: "INVALID_POSITION_SIDE" });
 }
 
@@ -55,7 +63,7 @@ export const decisionSchema = z.object({
 const modelPositionActionSchema = z.object(decisionFields).superRefine((decision, context) => {
   validateDecisionSemantics(decision, context);
   if (!decision.positionSide) context.addIssue({ code: "custom", path: ["positionSide"], message: "POSITION_SIDE_REQUIRED" });
-  if (!["HOLD", "REDUCE", "CLOSE"].includes(decision.action)) context.addIssue({ code: "custom", path: ["action"], message: "POSITION_MANAGEMENT_ACTION_REQUIRED" });
+  if (!["HOLD", "INCREASE", "REDUCE", "CLOSE", "REVERSE"].includes(decision.action)) context.addIssue({ code: "custom", path: ["action"], message: "POSITION_MANAGEMENT_ACTION_REQUIRED" });
 });
 
 const modelEntryActionSchema = z.object(decisionFields).superRefine((decision, context) => {
@@ -156,13 +164,14 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
     operationalEvidence: context.experiences.filter((experience) => experience.outcomeStatus === "EXECUTION_FAILURE").slice(-10).map((experience) => ({ experienceId: experience.experienceId, symbol: experience.symbol, classification: "EXECUTION_FAILURE", strategyOutcome: "UNASSESSED" })),
     lessons: context.lessons.filter((lesson) => lesson.source !== "EXECUTION_FAILURE"),
     constraints: {
-      positionActions: ["HOLD", "REDUCE", "CLOSE"],
+      positionActions: ["HOLD", "INCREASE", "REDUCE", "CLOSE", "REVERSE"],
       entryActions: ["OPEN_LONG", "OPEN_SHORT"],
       maxTotalActionsPerCycle: MAX_TOTAL_ACTIONS_PER_CYCLE,
+      maxFinancialWritesPerCycle: MAX_FINANCIAL_WRITES_PER_CYCLE,
       paperOnly: true,
       noChainOfThought: true,
-      managementRule: "Every open provider position appears exactly once in positionActions. HOLD requires its current position side and does not write.",
-      entryRule: "entryActions are optional and must use current deep evidence for supportedUniverse candidates.",
+      managementRule: "Every open provider position appears exactly once in positionActions. HOLD preserves it, INCREASE adds additionalMarginPct without changing provider leverage, REDUCE and CLOSE reduce exposure, and REVERSE closes and verifies the current side before evaluating the opposite entry.",
+      entryRule: "entryActions are optional and must use current deep evidence for supportedUniverse candidates. An open symbol remains forbidden in entryActions; existing-symbol changes belong in positionActions.",
       executionAuthority: "Deterministic TypeScript validates and orders financial writes; the model is not financial authority.",
     },
   });
@@ -195,6 +204,10 @@ function positionKey(symbol: string, positionSide: string | null): string {
   return `${symbol}:${positionSide ?? "NONE"}`;
 }
 
+export function financialWriteCount(action: Decision["action"]): number {
+  return action === "HOLD" ? 0 : action === "REVERSE" ? 2 : 1;
+}
+
 function liveOpenPositions(positions: readonly PositionSnapshot[]): PositionSnapshot[] {
   return positions.filter((position) => Number(position.quantity) > 0);
 }
@@ -207,6 +220,8 @@ export function validateCycleDecisionPlan(plan: CycleDecisionPlan, context: Deci
   const currentPositions = liveOpenPositions(context.openPositions);
   assertOpenPositionCountWithinPlanLimit(currentPositions);
   if (plan.positionActions.length + plan.entryActions.length > MAX_TOTAL_ACTIONS_PER_CYCLE) throw new Error("MAX_TOTAL_ACTIONS_PER_CYCLE");
+  const financialWrites = [...plan.positionActions, ...plan.entryActions].reduce((total, action) => total + financialWriteCount(action.action), 0);
+  if (financialWrites > MAX_FINANCIAL_WRITES_PER_CYCLE) throw new Error("MAX_FINANCIAL_WRITES_PER_CYCLE");
   const currentKeys = new Set(currentPositions.map((position) => positionKey(position.symbol, position.positionSide)));
   const currentSymbols = new Set(currentPositions.map((position) => position.symbol));
   const managementKeys = new Set<string>();
@@ -215,6 +230,13 @@ export function validateCycleDecisionPlan(plan: CycleDecisionPlan, context: Deci
     const key = positionKey(action.symbol, action.positionSide);
     if (managementKeys.has(key)) throw new Error("DUPLICATE_MANAGEMENT_ACTION");
     if (!currentKeys.has(key)) throw new Error("POSITION_NOT_OPEN");
+    if (!context.bundles.some((bundle) => bundle.instrument.symbol === action.symbol && bundle.account.positions.some((position) => positionKey(position.symbol, position.positionSide) === key && Number(position.quantity) > 0))) throw new Error("POSITION_EVIDENCE_REQUIRED");
+    if (action.action === "INCREASE" && (!action.additionalMarginPct || Number(action.additionalMarginPct) <= 0)) throw new Error("INVALID_ADDITIONAL_MARGIN");
+    if (action.action === "REVERSE") {
+      if (!action.targetPositionSide) throw new Error("REVERSE_TARGET_SIDE_REQUIRED");
+      if (action.targetPositionSide === action.positionSide) throw new Error("REVERSE_TARGET_SIDE_NOT_OPPOSITE");
+      if (Number(action.marginAllocationPct) <= 0) throw new Error("INVALID_MARGIN_ALLOCATION");
+    }
     managementKeys.add(key);
   }
   if (managementKeys.size !== currentKeys.size || [...currentKeys].some((key) => !managementKeys.has(key))) throw new Error("MISSING_POSITION_MANAGEMENT");
@@ -236,7 +258,7 @@ function materializeDecision(fields: DecisionFields, cycleId: string, createdAt:
 }
 
 export function orderCycleActions(plan: CycleDecisionPlan): Decision[] {
-  const rank = (action: Decision["action"]): number => action === "CLOSE" ? 0 : action === "REDUCE" ? 1 : action === "OPEN_LONG" || action === "OPEN_SHORT" ? 2 : 3;
+  const rank = (action: Decision["action"]): number => action === "CLOSE" || action === "REVERSE" ? 0 : action === "REDUCE" ? 1 : action === "INCREASE" ? 2 : action === "OPEN_LONG" || action === "OPEN_SHORT" ? 3 : 4;
   return [...plan.positionActions, ...plan.entryActions].sort((left, right) => rank(left.action) - rank(right.action)
     || left.symbol.localeCompare(right.symbol)
     || (left.positionSide ?? "").localeCompare(right.positionSide ?? "")

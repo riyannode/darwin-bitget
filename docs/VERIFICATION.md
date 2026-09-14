@@ -8,12 +8,15 @@ The repository is intended to verify the following through typecheck, unit tests
 
 - `CycleDecisionPlan` separates `positionActions[]` and `entryActions[]`;
 - every open provider position must receive exactly one management action;
-- management actions may target existing positions outside `supportedUniverse`;
+- management actions may target existing positions outside `supportedUniverse` and include `HOLD`, `INCREASE`, `REDUCE`, `CLOSE`, and `REVERSE`;
 - new entries require supported-universe membership and current deep evidence;
-- `MAX_TOTAL_ACTIONS_PER_CYCLE=5` rejects over-cap intent without truncation;
+- `MAX_TOTAL_ACTIONS_PER_CYCLE=5` rejects over-cap semantic intent without truncation;
+- `MAX_FINANCIAL_WRITES_PER_CYCLE=5` rejects reverse-expanded plans that would exceed the physical-write cap;
 - `OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT` rejects live open-position counts above five before model financial planning and records a visible rejection without writes;
 - entry actions targeting any already-open symbol are rejected with `ENTRY_SYMBOL_ALREADY_OPEN` (no pyramiding, hedge, or reversal through entryActions);
-- `CLOSE → REDUCE → OPEN` ordering is deterministic and financial writes are sequential;
+- `CLOSE/REVERSE-close → REDUCE → INCREASE → OPEN → REVERSE-open` ordering is deterministic and financial writes are sequential;
+- INCREASE uses additional margin, preserves the provider leverage, and gates post-action margin;
+- REVERSE requires an opposite target side and never submits the opposite entry before matched close, provider refresh, and old-position absence;
 - provider evidence and portfolio state refresh between matched writes;
 - ambiguous/unresolved writes stop remaining writes without blind retry;
 - idempotency remains per action;
@@ -24,7 +27,7 @@ The repository is intended to verify the following through typecheck, unit tests
 - new cycle-plan journals hide the legacy single-action headline; legacy journals retain the fallback Latest Decision view;
 - frontend has no provider credentials or manual financial controls.
 
-The prompt contracts are code-checked as `darwin-mandate-v5` and `darwin-decision-v3`. Reflection/backtest prompt versions remain unchanged.
+The prompt contracts are code-checked as `darwin-mandate-v6` and `darwin-decision-v4`. Reflection/backtest prompt versions remain unchanged.
 
 ### PRODUCTION VERIFIED
 
@@ -39,7 +42,7 @@ GET /api/export/paper-log?format=json
 GET /api/export/paper-log?format=csv
 ```
 
-The export is read-only, includes HOLD cycles, exports every action separately with its action category and cycle-level discovery fields, excludes manual harness and Docker records, and preserves sanitized provider diagnostics. It does not expose credentials, auth headers, passphrases, or model chain-of-thought. The final competition export is still `PENDING FINAL COMPETITION EXPORT`.
+The export is read-only, includes HOLD cycles, exports every semantic action separately with its action category and cycle-level discovery fields, records REVERSE's close and opposite-entry physical writes separately under the parent intent, excludes manual harness and Docker records, and preserves sanitized provider diagnostics. It does not expose credentials, auth headers, passphrases, or model chain-of-thought. The final competition export is still `PENDING FINAL COMPETITION EXPORT`.
 
 ## Not claimed
 

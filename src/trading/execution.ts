@@ -39,19 +39,24 @@ function percentage(value: string, percentageValue: string): string {
 }
 
 function providerSide(decision: Decision): "buy" | "sell" {
-  if (decision.action === "OPEN_LONG") return "buy";
-  if (decision.action === "OPEN_SHORT") return "sell";
+  if (decision.action === "OPEN_LONG" || (decision.action === "INCREASE" && decision.positionSide === "LONG")) return "buy";
+  if (decision.action === "OPEN_SHORT" || (decision.action === "INCREASE" && decision.positionSide === "SHORT")) return "sell";
   return decision.positionSide === "LONG" ? "sell" : "buy";
 }
 
 export function buildExecutionRequest(decision: Decision, bundle: EvidenceBundle, cycleId: string): ExecutionRequest {
   if (decision.action === "HOLD") throw new Error("HOLD_NOT_EXECUTABLE");
+  if (decision.action === "REVERSE") throw new Error("REVERSE_NOT_EXPANDED");
   const current = findPosition(bundle, decision);
-  const opening = decision.action === "OPEN_LONG" || decision.action === "OPEN_SHORT";
-  const marginAllocated = opening
-    ? marginAllocation(bundle.account, decision.marginAllocationPct)
-    : current?.marginAllocated ?? "0";
-  const leverage = opening ? decision.leverage : current?.leverage ?? "1";
+  if (decision.action === "INCREASE" && !current) throw new Error("POSITION_NOT_OPEN");
+  if (decision.action === "INCREASE" && (!decision.additionalMarginPct || Number(decision.additionalMarginPct) <= 0)) throw new Error("INVALID_ADDITIONAL_MARGIN");
+  const opening = decision.action === "OPEN_LONG" || decision.action === "OPEN_SHORT" || decision.action === "INCREASE";
+  const marginAllocated = decision.action === "INCREASE"
+    ? marginAllocation(bundle.account, decision.additionalMarginPct ?? "0")
+    : opening
+      ? marginAllocation(bundle.account, decision.marginAllocationPct)
+      : current?.marginAllocated ?? "0";
+  const leverage = decision.action === "INCREASE" ? current?.leverage ?? "1" : opening ? decision.leverage : current?.leverage ?? "1";
   const fullNotional = opening ? leveragedNotional(marginAllocated, leverage) : current?.notional ?? "0";
   const fullQuantity = opening ? divideDecimal(fullNotional, bundle.market.lastPrice, bundle.instrument.quantityPrecision) : current?.quantity ?? "0";
   const reductionPct = decision.action === "REDUCE" ? decision.reductionPct : decision.action === "CLOSE" ? "100" : null;

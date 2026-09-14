@@ -40,7 +40,7 @@ The image requires `JUDGE_DEMO=true` and starts a local fixture server. If it is
 ## Scenarios
 
 - `/demo?scenario=verified-open` — recorded CRCLUSDT `OPEN_LONG` evidence with risk `PASS`, provider `filled`, readback, and reconciliation `MATCHED`. The local demo did not send the order.
-- `/demo?scenario=hold` — recorded CRCLUSDT LONG management `HOLD` plus independent NVDAUSDT `OPEN_LONG` entry evaluation. It is deterministic replay evidence: no provider session, no order submission, and no financial write.
+- `/demo?scenario=hold` — recorded CRCLUSDT LONG management `HOLD` plus independent NVDAUSDT `OPEN_LONG` entry evaluation. The production contract also supports `INCREASE`, `REDUCE`, `CLOSE`, and `REVERSE` management intents; this fixture remains a no-write replay.
 - `/demo?scenario=risk-reject` — a deterministic proposal exceeding the real owner leverage boundary. The pure production risk gate returns `BLOCK`/`MAX_LEVERAGE`; no order is submitted.
 
 The demo also exposes `/api/demo/scenarios`, `/api/snapshot`, and clearly labeled replay downloads. Replay exports are not the final competition PAPER log.

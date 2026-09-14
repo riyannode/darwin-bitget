@@ -1,4 +1,5 @@
-export type Action = "OPEN_LONG" | "OPEN_SHORT" | "HOLD" | "REDUCE" | "CLOSE";
+export type Action = "OPEN_LONG" | "OPEN_SHORT" | "HOLD" | "INCREASE" | "REDUCE" | "CLOSE" | "REVERSE";
+export type FinancialWriteAction = Exclude<Action, "HOLD" | "REVERSE">;
 export type PositionSide = "LONG" | "SHORT";
 export type AgentMode = "AUTONOMOUS" | "EVA_EVALUATION";
 export type TradingMode = "PAPER";
@@ -271,8 +272,10 @@ export interface Decision {
   positionSide: PositionSide | null;
   symbol: string;
   marginAllocationPct: string;
+  additionalMarginPct?: string | null | undefined;
   leverage: string;
   reductionPct: string | null;
+  targetPositionSide?: PositionSide | null | undefined;
   confidence: number;
   thesis: string;
   strategyThesis: string;
@@ -283,7 +286,7 @@ export interface Decision {
   createdAt: string;
 }
 
-export type PositionManagementAction = "HOLD" | "REDUCE" | "CLOSE";
+export type PositionManagementAction = "HOLD" | "INCREASE" | "REDUCE" | "CLOSE" | "REVERSE";
 export type EntryAction = "OPEN_LONG" | "OPEN_SHORT";
 
 export interface PositionManagementDecision extends Decision {
@@ -322,6 +325,8 @@ export interface AutonomousDecisionSet {
 
 export interface DecisionExecutionRecord {
   decision: Decision;
+  parentDecisionId?: string;
+  parentAction?: "REVERSE";
   riskGateResult: RiskGateResult;
   executionRequest?: ExecutionRequest;
   executionResult?: ExecutionResult;
@@ -341,7 +346,7 @@ export interface ExecutionRequest {
   cycleId: string;
   decisionId: string;
   symbol: string;
-  action: Exclude<Action, "HOLD">;
+  action: FinancialWriteAction;
   positionSide: PositionSide;
   providerSide: "buy" | "sell";
   tradeSide: "open" | "close";
@@ -358,7 +363,7 @@ export interface ExecutionResult {
   providerOrderId?: string;
   clientOrderId: string;
   symbol: string;
-  action: Exclude<Action, "HOLD">;
+  action: FinancialWriteAction;
   positionSide: PositionSide;
   providerSide: "buy" | "sell";
   tradeSide: "open" | "close";

@@ -9,7 +9,7 @@ const lessonSchema = z.object({
   marketRegime: z.string().min(1),
   trigger: z.string().min(1),
   failureCode: z.string(),
-  actionTaken: z.enum(["OPEN_LONG", "OPEN_SHORT", "HOLD", "REDUCE", "CLOSE"]),
+  actionTaken: z.enum(["OPEN_LONG", "OPEN_SHORT", "HOLD", "INCREASE", "REDUCE", "CLOSE", "REVERSE"]),
   observedOutcome: z.string().min(1),
   lesson: z.string().min(1),
   applicableConditions: z.array(z.string()),

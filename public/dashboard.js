@@ -117,8 +117,10 @@ function renderOpenPositions() {
   });
 }
 
-function appendDecisionDetails(node, decision, positionNotional) {
-  [detail("MARGIN", `${decision.marginAllocationPct}%`), detail("LEVERAGE", `${decision.leverage}x`), detail("CONFIDENCE", decision.confidence), detail("POSITION NOTIONAL", money(positionNotional ?? (decision.action === "HOLD" ? "0" : undefined))), detail("STRATEGY THESIS", decision.strategyThesis, true), detail("SUPPORTING FACTORS", list(decision.supportingFactors), true), detail("RISK FACTORS", list(decision.riskFactors), true), detail("EVIDENCE USED", list(decision.evidenceUsed), true), detail("LESSONS USED", list(decision.lessonsUsed), true)].forEach((item) => node.append(item));
+function appendDecisionDetails(node, decision, positionNotional, executionRecord) {
+  const execution = executionRecord?.executionResult;
+  const after = executionRecord?.positionAfter;
+  [detail("MARGIN", `${decision.marginAllocationPct}%`), detail("ADDITIONAL MARGIN", decision.additionalMarginPct ? `${decision.additionalMarginPct}%` : "—"), detail("TARGET SIDE", decision.targetPositionSide ?? "—"), detail("LEVERAGE", `${execution?.leverage ?? decision.leverage}x`), detail("CONFIDENCE", decision.confidence), detail("POSITION NOTIONAL", money(positionNotional ?? after?.notional ?? (decision.action === "HOLD" ? "0" : undefined))), detail("RESULTING MARGIN", money(after?.marginAllocated)), detail("STRATEGY THESIS", decision.strategyThesis, true), detail("SUPPORTING FACTORS", list(decision.supportingFactors), true), detail("RISK FACTORS", list(decision.riskFactors), true), detail("EVIDENCE USED", list(decision.evidenceUsed), true), detail("LESSONS USED", list(decision.lessonsUsed), true)].forEach((item) => node.append(item));
 }
 
 function renderDecisionPanel(prefix, decision, positionNotional) {
@@ -137,11 +139,11 @@ function renderDecisionPanel(prefix, decision, positionNotional) {
   appendDecisionDetails(node, decision, positionNotional);
 }
 
-function renderActionSection(title, actions) {
+function renderActionSection(title, actions, records = []) {
   const section = document.createElement("section");
   const heading = document.createElement("h3"); heading.textContent = title; section.append(heading);
   if (!actions?.length) { const empty = document.createElement("p"); empty.className = "subtle"; empty.textContent = title === "NEW ENTRY ACTIONS" || title === "NEW ENTRIES" ? "No new entry justified this cycle." : "No position management actions recorded."; section.append(empty); return section; }
-  actions.forEach((action) => { const item = document.createElement("details"); item.className = "history-item"; const summary = document.createElement("summary"); summary.append(detail("SYMBOL / SIDE", `${action.symbol} / ${action.positionSide ?? "—"}`), detail("ACTION", action.action), detail("CONFIDENCE", action.confidence)); const content = document.createElement("div"); content.className = "detail-grid history-content"; appendDecisionDetails(content, action); item.append(summary, content); section.append(item); });
+  actions.forEach((action) => { const item = document.createElement("details"); item.className = "history-item"; const summary = document.createElement("summary"); summary.append(detail("SYMBOL / SIDE", `${action.symbol} / ${action.positionSide ?? "—"}`), detail("ACTION", action.action), detail("CONFIDENCE", action.confidence)); const content = document.createElement("div"); content.className = "detail-grid history-content"; const actionRecords = records.filter((record) => record.parentDecisionId === action.decisionId || record.decision?.decisionId === action.decisionId); appendDecisionDetails(content, action, undefined, actionRecords.find((record) => record.decision?.action === "INCREASE") ?? actionRecords[0]); if (action.action === "REVERSE") { const close = actionRecords.find((record) => record.decision?.action === "CLOSE"); const open = actionRecords.find((record) => record.decision?.action === "OPEN_LONG" || record.decision?.action === "OPEN_SHORT"); content.append(detail("PREVIOUS SIDE", action.positionSide), detail("TARGET SIDE", action.targetPositionSide), detail("CLOSE VERIFICATION", close?.reconciliationResult?.status ?? close?.riskGateResult?.status ?? "NOT RUN"), detail("OPPOSITE ENTRY RESULT", open?.reconciliationResult?.status ?? open?.riskGateResult?.status ?? "NOT RUN")); } item.append(summary, content); section.append(item); });
   return section;
 }
 
@@ -151,7 +153,7 @@ function renderCyclePlan(prefix, plan, discovery) {
   node.replaceChildren();
   if (!plan) { node.className = "stack empty"; node.textContent = "No cycle plan recorded yet."; return; }
   node.className = "cycle-plan stack";
-  node.append(renderActionSection("POSITION MANAGEMENT", plan.positionActions), renderActionSection("NEW ENTRY ACTIONS", plan.entryActions));
+  node.append(renderActionSection("POSITION MANAGEMENT", plan.positionActions, plan.records ?? []), renderActionSection("NEW ENTRY ACTIONS", plan.entryActions, plan.records ?? []));
   const discoveryNode = $(prefix === "dashboard" ? "dashboard-market-discovery" : "market-discovery");
   if (discoveryNode) {
     discoveryNode.replaceChildren();
@@ -186,7 +188,7 @@ function renderDecisionHistory() {
     summary.append(detail("CYCLE ID", cycle.cycleId || "RUN_UNKNOWN"), detail("TIMESTAMP", when(cycle.startedAt)), detail("ACTIONS", cycle.plan.positionActions.length + cycle.plan.entryActions.length));
     const content = document.createElement("div");
     content.className = "detail-grid history-content";
-    content.append(renderActionSection("POSITION MANAGEMENT", cycle.plan.positionActions), renderActionSection("NEW ENTRIES", cycle.plan.entryActions));
+    content.append(renderActionSection("POSITION MANAGEMENT", cycle.plan.positionActions, cycle.records ?? []), renderActionSection("NEW ENTRIES", cycle.plan.entryActions, cycle.records ?? []));
     item.append(summary, content);
     node.append(item);
   });

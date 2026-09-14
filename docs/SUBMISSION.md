@@ -36,9 +36,9 @@ Always-on perpetual markets produce more symbols, evidence, and position state t
 
 - dynamic Demo stock-perpetual discovery and public market evidence;
 - lightweight scan → Qwen shortlist → separate management/entry deep evidence → Qwen `CycleDecisionPlan`;
-- `OPEN_LONG`, `OPEN_SHORT`, `HOLD`, `REDUCE`, and `CLOSE`;
-- deterministic owner policy/risk gate and `MAX_TOTAL_ACTIONS_PER_CYCLE=5`;
-- sequential `CLOSE → REDUCE → OPEN` writes with provider refresh between matched writes and ambiguity stopping remaining writes;
+- `OPEN_LONG`, `OPEN_SHORT`, `HOLD`, `INCREASE`, `REDUCE`, `CLOSE`, and `REVERSE`;
+- deterministic owner policy/risk gate, `MAX_TOTAL_ACTIONS_PER_CYCLE=5`, and `MAX_FINANCIAL_WRITES_PER_CYCLE=5`;
+- sequential `CLOSE/REVERSE-close → REDUCE → INCREASE → OPEN → REVERSE-open` writes with provider refresh between matched writes and ambiguity stopping remaining writes;
 - Bitget Demo UTA execution, readback, reconciliation, journal, and sanitized diagnostics;
 - Durable Object SQLite experiences, reflections, lessons, and bounded replay;
 - read-only `PROVIDER_LIVE` portfolio dashboard with multi-position Open Position page;
@@ -68,16 +68,16 @@ Public market operations may remain direct. The Worker does not store
 remain in the stable-egress gateway. The Worker stores only backend-only gateway,
 Qwen, owner-control, and optional EVA secrets.
 
-Qwen owns strategy, thesis, symbol, direction, exits, margin allocation, and leverage. Deterministic code owns PAPER-only mode, hard owner bounds, provider metadata, balance/margin validation, idempotency, readback, reconciliation, and fail-closed ambiguity handling.
+Qwen proposes strategy, thesis, symbol, direction, management intent, margin allocation, and leverage. Deterministic code owns PAPER-only mode, hard owner bounds, provider metadata, balance/margin validation, existing-side INCREASE semantics, reverse sequencing, idempotency, readback, reconciliation, and fail-closed ambiguity handling.
 
 ## Agent-quality evidence contract
 
-The current prompt contracts are `darwin-mandate-v5` and `darwin-decision-v3`. Each action must explain its decision rationale, supporting evidence, risk and invalidation conditions, evidence limitations, and lessons used. The dashboard exposes those fields grouped by cycle so a judge can distinguish model reasoning from deterministic risk authority. This PR intentionally changes financial behavior architecture; it is not SAFE_CLEANUP.
+The current prompt contracts are `darwin-mandate-v6` and `darwin-decision-v4`. Each action must explain its decision rationale, supporting evidence, risk and invalidation conditions, evidence limitations, and lessons used. INCREASE carries additional margin and preserves provider leverage; REVERSE carries previous side, target side, and two-leg verification. The dashboard exposes those fields grouped by cycle so a judge can distinguish model reasoning from deterministic risk authority. This PR intentionally changes financial behavior architecture; it is not SAFE_CLEANUP.
 
 ## Architectural differentiator for judging
 
 - **Decision explainability:** management and entry actions each retain evidence-attributed rationale, risk, confidence, and execution/reconciliation state.
-- **Agent architecture:** portfolio management cannot suppress unrelated opportunity discovery; an existing HOLD and a new entry can coexist.
+- **Agent architecture:** portfolio management cannot suppress unrelated opportunity discovery; an existing HOLD, INCREASE, REDUCE, CLOSE, or REVERSE and a new entry can coexist when deterministic rules allow it.
 - **Risk control:** deterministic five-action cap, current-position validation, refreshed portfolio risk checks, serialized writes, idempotency, and stop-on-ambiguity.
 - **Performance integrity:** no forced trades, HOLD remains valid, unresolved writes are not verified trades, and the Docker replay is not production history. No better returns are promised.
 

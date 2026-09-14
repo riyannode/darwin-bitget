@@ -9,12 +9,11 @@ const config: RuntimeConfig = {
 const instrument: Instrument = { symbol: "BTCUSDT", category: "USDT-FUTURES", baseCoin: "BTC", quoteCoin: "USDT", marginCoin: "USDT", symbolType: "crypto", isRwa: "NO", status: "online", minOrderQty: "0.001", maxOrderQty: "100", minOrderAmount: "10", pricePrecision: 2, quantityPrecision: 3, quantityStep: "0.001", leverageMin: "1", leverageMax: "10" };
 const account: AccountSnapshot = { balance: "1000", availableBalance: "1000", availableMargin: "1000", marginUsage: "0", positionNotional: "200", totalPositionNotional: "200", positionQuantity: "0.01", portfolioEquity: "1000", positions: [{ symbol: "BTCUSDT", positionSide: "LONG", quantity: "0.01", notional: "200", marginAllocated: "50", leverage: "4", entryPrice: "20000", unrealizedPnl: "0", realizedPnl: "0" }], realizedPnl: "0", unrealizedPnl: "0", openOrders: 0, openOrderSymbols: [], observedAt: "2026-09-12T00:00:00.000Z" };
 
-function decision(action: Action, marginAllocationPct = "10", leverage = "2", reductionPct: string | null = null): Decision {
-  const side = action === "OPEN_SHORT" || (action !== "OPEN_LONG" && action !== "HOLD" && action !== "REDUCE" && action !== "CLOSE" && false) ? "SHORT" : action === "REDUCE" || action === "CLOSE" ? "LONG" : action === "OPEN_LONG" ? "LONG" : null;
-  return { decisionId: "decision-1", cycleId: "cycle-1", action, positionSide: side, symbol: "BTCUSDT", marginAllocationPct, leverage, reductionPct, confidence: 0.7, thesis: "evidence", strategyThesis: "contextual futures hypothesis", supportingFactors: ["factor"], riskFactors: ["risk"], evidenceUsed: ["TICKER"], lessonsUsed: [], createdAt: "2026-09-12T00:00:00.000Z" };
+function decision(action: Action, marginAllocationPct = "10", leverage = "2", reductionPct: string | null = null, additionalMarginPct: string | null = null, positionSide: "LONG" | "SHORT" = "LONG", targetPositionSide: "LONG" | "SHORT" | null = null): Decision {
+  return { decisionId: "decision-1", cycleId: "cycle-1", action, positionSide, symbol: "BTCUSDT", marginAllocationPct, additionalMarginPct, leverage, reductionPct, targetPositionSide, confidence: 0.7, thesis: "evidence", strategyThesis: "contextual futures hypothesis", supportingFactors: ["factor"], riskFactors: ["risk"], evidenceUsed: ["TICKER"], lessonsUsed: [], createdAt: "2026-09-12T00:00:00.000Z" };
 }
 
-function context(next: Decision, availableMargin = account.availableMargin) { return { decision: next, instrument, account: { ...account, availableMargin }, evidenceObservedAt: account.observedAt, openOrderSymbols: [], supportedUniverse: ["BTCUSDT"], emergencyStop: false, dailyDrawdownBlocked: false, now: new Date(account.observedAt) }; }
+function context(next: Decision, availableMargin = account.availableMargin, accountOverride: AccountSnapshot = account) { return { decision: next, instrument, account: { ...accountOverride, availableMargin }, evidenceObservedAt: account.observedAt, openOrderSymbols: [], supportedUniverse: ["BTCUSDT"], emergencyStop: false, dailyDrawdownBlocked: false, now: new Date(account.observedAt) }; }
 
 describe("futures risk gate", () => {
   it("blocks public-only entries even when a position is already held", () => {
@@ -44,6 +43,31 @@ describe("futures risk gate", () => {
   it("allows a bounded reduction for the selected position side", () => {
     const result = evaluateRiskGate(config, context(decision("REDUCE", "0", "1", "25")));
     expect(result.status).toBe("PASS");
+  });
+
+  it("calculates INCREASE post-action margin against the hard cap", () => {
+    const twentyFourPercent: AccountSnapshot = { ...account, positions: [{ ...account.positions[0]!, marginAllocated: "240" }] };
+    const accepted = evaluateRiskGate(config, context(decision("INCREASE", "0", "4", null, "5"), "1000", twentyFourPercent));
+    expect(accepted.status).toBe("PASS");
+    const blocked = evaluateRiskGate(config, context(decision("INCREASE", "0", "2", null, "10"), "1000", twentyFourPercent));
+    expect(blocked.status).toBe("BLOCK");
+    expect(blocked.codes).toContain("MAX_SINGLE_POSITION_MARGIN_PCT");
+  });
+
+  it("uses the provider leverage for INCREASE and rejects model leverage overrides", () => {
+    const accepted = evaluateRiskGate(config, context(decision("INCREASE", "0", "4", null, "5")));
+    expect(accepted.status).toBe("PASS");
+    const override = evaluateRiskGate(config, context(decision("INCREASE", "0", "6", null, "5")));
+    expect(override.status).toBe("BLOCK");
+    expect(override.codes).toEqual(expect.arrayContaining(["LEVERAGE_CHANGE_NOT_ALLOWED", "MAX_LEVERAGE"]));
+  });
+
+  it("requires REVERSE to target the opposite side", () => {
+    const valid = evaluateRiskGate(config, context(decision("REVERSE", "10", "2", null, null, "LONG", "SHORT")));
+    expect(valid.status).toBe("PASS");
+    const invalid = evaluateRiskGate(config, context(decision("REVERSE", "10", "2", null, null, "LONG", "LONG")));
+    expect(invalid.status).toBe("BLOCK");
+    expect(invalid.codes).toContain("REVERSE_TARGET_SIDE_NOT_OPPOSITE");
   });
 
   it("blocks leverage above the owner boundary", () => {

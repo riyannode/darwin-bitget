@@ -113,6 +113,23 @@ describe("paper log export", () => {
     expect(exported.summary.verifiedExecutions).toBe(1);
   });
 
+  it("preserves REVERSE as one intent while counting its two physical writes separately", () => {
+    const reverse: Decision = { ...decision("cycle-reverse", "REVERSE", "decision-reverse", "2026-09-12T00:01:00.000Z"), positionSide: "LONG", targetPositionSide: "SHORT", marginAllocationPct: "10" };
+    const close = matchedExecution("CLOSE");
+    const open = matchedExecution("OPEN_LONG");
+    const records: DecisionExecutionRecord[] = [
+      { decision: { ...reverse, decisionId: "decision-reverse:close", action: "CLOSE", reductionPct: "100", marginAllocationPct: "0" }, parentDecisionId: reverse.decisionId, parentAction: "REVERSE", riskGateResult: { status: "PASS", codes: [], checkedAt: reverse.createdAt }, executionResult: close, reconciliationResult: matchedReconciliation(close) },
+      { decision: { ...reverse, decisionId: "decision-reverse:open", action: "OPEN_LONG", positionSide: "SHORT", targetPositionSide: null, reductionPct: null }, parentDecisionId: reverse.decisionId, parentAction: "REVERSE", riskGateResult: { status: "PASS", codes: [], checkedAt: reverse.createdAt }, executionResult: open, reconciliationResult: matchedReconciliation(open) },
+    ];
+    const current: TradingJournal = { cycleId: "cycle-reverse", agentVersion: "0.3.0", model: "qwen3.8-max", mode: "AUTONOMOUS", startedAt: reverse.createdAt, completedAt: reverse.createdAt, retrievedLessons: [], createdLessons: [], cyclePlan: { positionActions: [reverse as NonNullable<TradingJournal["cyclePlan"]>["positionActions"][number]], entryActions: [] }, executionRecords: records };
+    const exported = buildPaperLogExport({ generatedAt: reverse.createdAt, period: { start: null, end: null }, environment: "test", model: "qwen3.8-max", version: "0.3.0", commit: "test", cycles: [{ cycleId: current.cycleId, status: "COMPLETED", startedAt: current.startedAt, completedAt: current.completedAt ?? null }], journals: [current], experiences: [], events: [] });
+    expect(exported.decisions).toHaveLength(1);
+    expect(exported.decisions[0]?.action).toBe("REVERSE");
+    expect(exported.decisions[0]?.providerVerified).toBe(false);
+    expect(exported.decisions[0]?.physicalWrites).toHaveLength(2);
+    expect(exported.summary.verifiedExecutions).toBe(2);
+  });
+
   it("validates export periods deterministically", () => {
     expect(parsePaperLogPeriod("2026-09-12T00:00:00Z", "2026-09-12T01:00:00Z")).toEqual({ start: "2026-09-12T00:00:00.000Z", end: "2026-09-12T01:00:00.000Z" });
     expect(() => parsePaperLogPeriod("invalid", null)).toThrow("INVALID_EXPORT_PERIOD");

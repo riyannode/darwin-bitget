@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertOpenPositionCountWithinPlanLimit, cycleDecisionPlanSchema, buildDecisionPrompt, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
+import { assertOpenPositionCountWithinPlanLimit, cycleDecisionPlanSchema, buildDecisionPrompt, MAX_FINANCIAL_WRITES_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
 import type { AccountSnapshot, CycleDecisionPlan, Decision, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot, PositionSnapshot } from "../src/types.js";
 
 function snapshot(symbol: string, change = "1", volume = "100"): MarketSnapshot {
@@ -10,8 +10,8 @@ function instrument(symbol: string): Instrument {
   return { symbol, category: "USDT-FUTURES", baseCoin: symbol.replace("USDT", ""), quoteCoin: "USDT", marginCoin: "USDT", symbolType: "stock", isRwa: "YES", status: "online", minOrderQty: "0.01", maxOrderQty: "100", minOrderAmount: "5", pricePrecision: 2, quantityPrecision: 2, quantityStep: "0.01", leverageMin: "1", leverageMax: "5" };
 }
 
-function position(symbol: string, side: "LONG" | "SHORT" = "LONG"): PositionSnapshot {
-  return { symbol, positionSide: side, quantity: "1", notional: "100", marginAllocated: "10", leverage: "2", entryPrice: "100", unrealizedPnl: "0", realizedPnl: "0" };
+function position(symbol: string, side: "LONG" | "SHORT" = "LONG", marginAllocated = "10"): PositionSnapshot {
+  return { symbol, positionSide: side, quantity: "1", notional: "100", marginAllocated, leverage: "2", entryPrice: "100", unrealizedPnl: "0", realizedPnl: "0" };
 }
 
 function account(positions: PositionSnapshot[]): AccountSnapshot {
@@ -23,8 +23,9 @@ function bundle(symbol: string, positions: PositionSnapshot[] = []): EvidenceBun
   return { market, account: account(positions), instrument: instrument(symbol), evidence: [{ source: "test", observedAt: market.observedAt, type: "DEEP", symbol, payload: {} }] };
 }
 
-function decision(action: Decision["action"], symbol: string, side: "LONG" | "SHORT" | null, id = `${action}-${symbol}`): Decision {
-  return { decisionId: id, cycleId: "cycle-1", action, positionSide: side, symbol, marginAllocationPct: action === "HOLD" || action === "REDUCE" || action === "CLOSE" ? "0" : "1", leverage: "2", reductionPct: action === "REDUCE" ? "50" : null, confidence: 0.7, thesis: "bounded thesis", strategyThesis: "bounded strategy", supportingFactors: ["deep evidence"], riskFactors: ["risk"], evidenceUsed: ["DEEP"], lessonsUsed: [], createdAt: "2026-09-12T00:00:00.000Z" };
+function decision(action: Decision["action"], symbol: string, side: "LONG" | "SHORT" | null, id = `${action}-${symbol}`, overrides: Partial<Decision> = {}): Decision {
+  const target = side === "LONG" ? "SHORT" : side === "SHORT" ? "LONG" : null;
+  return { decisionId: id, cycleId: "cycle-1", action, positionSide: side, symbol, marginAllocationPct: action === "HOLD" || action === "INCREASE" || action === "REDUCE" || action === "CLOSE" ? "0" : "1", additionalMarginPct: action === "INCREASE" ? "5" : null, leverage: "2", reductionPct: action === "REDUCE" ? "50" : action === "CLOSE" ? "100" : null, targetPositionSide: action === "REVERSE" ? target : null, confidence: 0.7, thesis: "bounded thesis", strategyThesis: "bounded strategy", supportingFactors: ["deep evidence"], riskFactors: ["risk"], evidenceUsed: ["DEEP"], lessonsUsed: [], createdAt: "2026-09-12T00:00:00.000Z", ...overrides };
 }
 
 function context(positions: PositionSnapshot[], entrySymbols: string[] = ["NVDAUSDT"]): DecisionContext {
@@ -56,6 +57,11 @@ describe("cycle decision plan contract", () => {
     expect(() => validateCycleDecisionPlan(value, context([position("CRCLUSDT")]))).not.toThrow();
   });
 
+  it("allows CRCL INCREASE and NVDA OPEN_LONG in the same cycle", () => {
+    const value = plan([decision("INCREASE", "CRCLUSDT", "LONG")], [decision("OPEN_LONG", "NVDAUSDT", "LONG")]);
+    expect(() => validateCycleDecisionPlan(value, context([position("CRCLUSDT")]))).not.toThrow();
+  });
+
   it("rejects CRCL OPEN_LONG when CRCL is already open", () => {
     const value = plan([decision("HOLD", "CRCLUSDT", "LONG")], [decision("OPEN_LONG", "CRCLUSDT", "LONG")]);
     expect(() => validateCycleDecisionPlan(value, context([position("CRCLUSDT")], ["CRCLUSDT"]))).toThrow("ENTRY_SYMBOL_ALREADY_OPEN");
@@ -74,6 +80,17 @@ describe("cycle decision plan contract", () => {
   it("allows CRCL REDUCE and COIN OPEN_SHORT in the same cycle", () => {
     const value = plan([decision("REDUCE", "CRCLUSDT", "LONG")], [decision("OPEN_SHORT", "COINUSDT", "SHORT")]);
     expect(() => validateCycleDecisionPlan(value, context([position("CRCLUSDT"),], ["COINUSDT"]))).not.toThrow();
+  });
+
+  it("accepts INCREASE only for the actually open provider side", () => {
+    expect(() => validateCycleDecisionPlan(plan([decision("INCREASE", "CRCLUSDT", "LONG")]), context([position("CRCLUSDT", "LONG")], []))).not.toThrow();
+    expect(() => validateCycleDecisionPlan(plan([decision("INCREASE", "CRCLUSDT", "SHORT")]), context([position("CRCLUSDT", "LONG")], []))).toThrow("POSITION_NOT_OPEN");
+  });
+
+  it("requires REVERSE to target the opposite side", () => {
+    expect(() => validateCycleDecisionPlan(plan([decision("REVERSE", "CRCLUSDT", "LONG")]), context([position("CRCLUSDT", "LONG")], []))).not.toThrow();
+    expect(() => validateCycleDecisionPlan(plan([decision("REVERSE", "CRCLUSDT", "SHORT")]), context([position("CRCLUSDT", "SHORT")], []))).not.toThrow();
+    expect(() => validateCycleDecisionPlan(plan([decision("REVERSE", "CRCLUSDT", "LONG", "reverse-same", { targetPositionSide: "LONG" })]), context([position("CRCLUSDT", "LONG")], []))).toThrow("REVERSE_TARGET_SIDE_NOT_OPPOSITE");
   });
 
   it("requires exactly one management action for every existing position", () => {
@@ -118,8 +135,17 @@ describe("cycle decision plan contract", () => {
   });
 
   it("orders CLOSE before REDUCE before OPEN and HOLD", () => {
-    const ordered = orderCycleActions(plan([decision("HOLD", "ZUSDT", "LONG"), decision("REDUCE", "AUSDT", "LONG"), decision("CLOSE", "BUSDT", "LONG")], [decision("OPEN_LONG", "CUSDT", "LONG")]));
-    expect(ordered.map((item) => item.action)).toEqual(["CLOSE", "REDUCE", "OPEN_LONG", "HOLD"]);
+    const ordered = orderCycleActions(plan([decision("HOLD", "ZUSDT", "LONG"), decision("INCREASE", "DUSDT", "LONG"), decision("REDUCE", "AUSDT", "LONG"), decision("CLOSE", "BUSDT", "LONG")], [decision("OPEN_LONG", "CUSDT", "LONG")]));
+    expect(ordered.map((item) => item.action)).toEqual(["CLOSE", "REDUCE", "INCREASE", "OPEN_LONG", "HOLD"]);
+  });
+
+  it("rejects a five-intent plan whose reverse expansion would exceed the physical-write cap", () => {
+    const reverse = decision("REVERSE", "CRCLUSDT", "LONG");
+    const entries = ["NVDAUSDT", "COINUSDT", "MSTRUSDT", "TSLAUSDT"].map((symbol) => decision("OPEN_LONG", symbol, "LONG"));
+    const value = plan([reverse], entries);
+    const testContext = { ...context([position("CRCLUSDT")], entries.map((entry) => entry.symbol)), supportedUniverse: ["CRCLUSDT", ...entries.map((entry) => entry.symbol)] };
+    expect(MAX_FINANCIAL_WRITES_PER_CYCLE).toBe(5);
+    expect(() => validateCycleDecisionPlan(value, testContext)).toThrow("MAX_FINANCIAL_WRITES_PER_CYCLE");
   });
 
   it("labels management and entry evidence separately in the prompt", () => {
@@ -129,5 +155,6 @@ describe("cycle decision plan contract", () => {
     expect(prompt).toContain('"entryCandidateEvidence"');
     expect(prompt).toContain('"supportedUniverse"');
     expect(prompt).toContain('"maxTotalActionsPerCycle":5');
+    expect(prompt).toContain('"maxFinancialWritesPerCycle":5');
   });
 });

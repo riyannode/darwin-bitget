@@ -15,4 +15,15 @@ describe("paper futures execution request", () => {
     expect(request.tradeSide).toBe("open");
     expect(request.clientOrderId).toHaveLength(32);
   });
+
+  it("increases the existing side with additional margin and provider leverage", () => {
+    const increase: Decision = { ...decision, decisionId: "decision-increase", action: "INCREASE", marginAllocationPct: "0", additionalMarginPct: "5", leverage: "10", positionSide: "LONG" };
+    const existing = { symbol: "BTCUSDT", positionSide: "LONG" as const, quantity: "0.5", notional: "400.5", marginAllocated: "100.125", leverage: "4", entryPrice: "200.25", unrealizedPnl: "-2", realizedPnl: "0" };
+    const request = buildExecutionRequest(increase, { ...bundle, account: { ...bundle.account, positions: [existing] } }, "12345678-1234-1234-1234-123456789012");
+    expect(request.marginAllocated).toBe("50");
+    expect(request.positionNotional).toBe("200");
+    expect(request.leverage).toBe("4");
+    expect(request.providerSide).toBe("buy");
+    expect(request.tradeSide).toBe("open");
+  });
 });

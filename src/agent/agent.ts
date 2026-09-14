@@ -511,9 +511,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
       journal.cyclePlan = plan;
       const execution = await executeCyclePlan(plan, {
         refreshEvidence: async (symbol) => (await client.collectEvidence([symbol]))[0],
-        execute: async (action, actionBundle, decisionType) => {
+        execute: async (action, actionBundle, decisionType, parentDecision) => {
           this.setState({ ...this.state, runtimeStatus: "RISK_CHECK", currentStage: "RISK_CHECK" });
-          return this.executeDecision(client, config, action, actionBundle, cycleId, supportedUniverse, drawdown.blocked, startedAt, decisionType);
+          return this.executeDecision(client, config, action, actionBundle, cycleId, supportedUniverse, drawdown.blocked, startedAt, decisionType, parentDecision);
         },
         persist: async (record, actionBundle) => {
           await this.persistDecisionOutcome(config, record, actionBundle, experiences, lessons, cycleId, startedAt, journal, record.decision.action !== "HOLD");
@@ -577,12 +577,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
     dailyDrawdownBlocked: boolean,
     startedAt: string,
     decisionType: "POSITION_MANAGEMENT" | "NEW_ENTRY",
+    parentDecision?: Decision,
   ): Promise<DecisionExecutionRecord> {
     const riskGateResult = evaluateRiskGate(config, { decision, instrument: bundle.instrument, account: bundle.account, evidenceObservedAt: bundle.market.observedAt, openOrderSymbols: bundle.account.openOrderSymbols, supportedUniverse, emergencyStop: this.state.emergencyStop || config.ownerPolicy.emergencyStop, dailyDrawdownBlocked });
     this.recordEvent("DECISION_CREATED", cycleId, { action: decision.action, symbol: decision.symbol, decisionType });
     this.recordEvent(riskGateResult.status === "PASS" ? "RISK_GATE_PASS" : "RISK_GATE_BLOCK", cycleId, { codes: riskGateResult.codes.join(","), decisionType, symbol: decision.symbol });
     const positionBefore = findPosition(bundle.account.positions, decision.symbol, decision.positionSide);
-    const record: DecisionExecutionRecord = { decision, riskGateResult, ...(positionBefore ? { positionBefore } : {}) };
+    const record: DecisionExecutionRecord = { decision, riskGateResult, ...(parentDecision ? { parentDecisionId: parentDecision.decisionId, parentAction: "REVERSE" as const } : {}), ...(positionBefore ? { positionBefore } : {}) };
     if (riskGateResult.status === "BLOCK" || decision.action === "HOLD") return record;
     this.setState({ ...this.state, runtimeStatus: "EXECUTING", currentStage: "EXECUTING" });
     const executionRequest = buildExecutionRequest(decision, bundle, cycleId);
@@ -654,6 +655,23 @@ export class TraderAgent extends Agent<Env, AgentState> {
       saveExperience(this, openingExperience.experience, startedAt);
       journal.experienceId = openingExperience.experience.experienceId;
       journal.experienceIds = [...(journal.experienceIds ?? []), openingExperience.experience.experienceId];
+      return {};
+    }
+    if (decision.action === "INCREASE" && verified && currentExperience && executionResult) {
+      const index = experiences.indexOf(currentExperience);
+      const addedMargin = executionResult.marginAllocated;
+      const updatedExperience = {
+        ...currentExperience,
+        marginAllocated: record.positionAfter?.marginAllocated ?? (isDecimal(currentExperience.marginAllocated) && isDecimal(addedMargin) ? addDecimal(currentExperience.marginAllocated, addedMargin) : currentExperience.marginAllocated),
+        positionNotional: record.positionAfter?.notional ?? (isDecimal(currentExperience.positionNotional) && isDecimal(executionResult.positionNotional) ? addDecimal(currentExperience.positionNotional, executionResult.positionNotional) : currentExperience.positionNotional),
+        selectedLeverage: executionResult.leverage,
+        evidenceAtExit: bundle.evidence.map((evidence) => evidence.type),
+        lastAction: "INCREASE" as const,
+      };
+      if (index >= 0) experiences[index] = updatedExperience;
+      saveExperience(this, updatedExperience, startedAt);
+      journal.experienceId = updatedExperience.experienceId;
+      journal.experienceIds = [...(journal.experienceIds ?? []), updatedExperience.experienceId];
       return {};
     }
     if (!currentExperience || !executionResult) return {};
