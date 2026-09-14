@@ -1,10 +1,13 @@
 import { readFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 vi.mock("agents", () => ({ Agent: class {}, routeAgentRequest: vi.fn() }));
 import { z } from "zod";
-import { failureDiagnostic } from "../src/agent/agent.js";
+import { failureDiagnostic, TraderAgent } from "../src/agent/agent.js";
 import { cycleReadModel } from "../src/storage/journal-normalizer.js";
-import type { Decision, TradingJournal } from "../src/types.js";
+import { loadLatestValidCyclePlan, saveCycle, saveJournal, saveLatestValidCyclePlan } from "../src/storage/store.js";
+import type { SqlExecutor } from "../src/storage/schema.js";
+import type { CycleDecisionPlan, Decision, TradingJournal } from "../src/types.js";
 
 const baseJournal = {
   cycleId: "cycle-failed",
@@ -16,6 +19,16 @@ const baseJournal = {
   retrievedLessons: [],
   createdLessons: [],
 } as unknown as TradingJournal;
+
+const policy = {
+  paperOnly: true,
+  maxSinglePositionMarginPct: "30",
+  maxLeverage: "5",
+  maxDailyDrawdownPct: "10",
+  drawdownCooldownMinutes: 60,
+  scanIntervalMinutes: 15,
+  emergencyStop: false,
+};
 
 const hold = {
   decisionId: "hold-1",
@@ -40,6 +53,7 @@ describe("cycle status read model", () => {
   it("does not turn a failed pre-decision cycle into a valid zero-action plan", () => {
     const failed = cycleReadModel(baseJournal, "FAILED", "ZOD_VALIDATION_FAILED");
     expect(failed.status).toBe("FAILED");
+    expect(failed.hasPersistedPlan).toBe(false);
     expect(failed.hasValidPlan).toBe(false);
     expect(failed.plan.positionActions).toHaveLength(0);
     expect(failed.plan.entryActions).toHaveLength(0);
@@ -51,13 +65,85 @@ describe("cycle status read model", () => {
     expect(completed.plan.positionActions[0]?.action).toBe("HOLD");
   });
 
+  it("keeps a failed persisted plan as audit evidence but not as the primary valid plan", () => {
+    const failed = cycleReadModel({ ...baseJournal, cyclePlan: { positionActions: [hold], entryActions: [] } } as TradingJournal, "FAILED", "RUNTIME_ERROR");
+    expect(failed.hasPersistedPlan).toBe(true);
+    expect(failed.hasValidPlan).toBe(false);
+    expect(failed.plan.positionActions[0]?.action).toBe("HOLD");
+
+    const completed = cycleReadModel({ ...baseJournal, cycleId: "cycle-completed", cyclePlan: { positionActions: [hold], entryActions: [] } } as TradingJournal, "COMPLETED");
+    expect(completed.hasPersistedPlan).toBe(true);
+    expect(completed.hasValidPlan).toBe(true);
+  });
+
   it("renders failed cycles separately and preserves the last valid plan contract", () => {
     const dashboard = readFileSync(new URL("../public/dashboard.js", import.meta.url), "utf8");
     expect(dashboard).toContain("CYCLE FAILED BEFORE DECISION");
+    expect(dashboard).toContain("CYCLE FAILED AFTER PLAN CREATION");
     expect(dashboard).toContain("Decision plan not produced.");
-    expect(dashboard).toContain("const actionCount = cycle.hasValidPlan ? cycle.plan.positionActions.length + cycle.plan.entryActions.length : \"UNAVAILABLE\"");
+    expect(dashboard).toContain("const actionCount = cycle.hasPersistedPlan ? cycle.plan.positionActions.length + cycle.plan.entryActions.length : \"UNAVAILABLE\"");
+    expect(dashboard).toContain("FAILED-CYCLE AUDIT EVIDENCE");
     expect(dashboard).toContain("const validCycle = snapshot.cyclePlans.find((cycle) => cycle.status === \"COMPLETED\" && cycle.hasValidPlan)");
     expect(dashboard).toContain("No valid cycle plan recorded yet.");
+  });
+
+  it("loads the compact latest valid plan without depending on recent journal depth", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("CREATE TABLE risk_state (state_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)");
+    const queries: string[] = [];
+    const executor: SqlExecutor = {
+      sql<T>(strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) {
+        const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
+        queries.push(query);
+        const sqliteValues = values.map((value) => typeof value === "boolean" ? (value ? 1 : 0) : value) as (string | number | null)[];
+        if (query.trimStart().startsWith("SELECT")) return db.prepare(query).all(...sqliteValues) as T[];
+        db.prepare(query).run(...sqliteValues);
+        return [];
+      },
+    };
+    const plan = { positionActions: [hold], entryActions: [] } as unknown as CycleDecisionPlan;
+    saveLatestValidCyclePlan(executor, { cycleId: "cycle-completed", plan, startedAt: baseJournal.startedAt, completedAt: "2026-09-14T12:06:00.000Z" });
+    queries.length = 0;
+    expect(loadLatestValidCyclePlan(executor)).toMatchObject({ cycleId: "cycle-completed", plan });
+    expect(queries).toEqual(["SELECT payload FROM risk_state WHERE state_key = ?"]);
+  });
+
+  it("uses the compact completed plan after thirty newer failed cycles", async () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("CREATE TABLE cycles (cycle_id TEXT PRIMARY KEY, status TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT)");
+    db.exec("CREATE TABLE journals (cycle_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)");
+    db.exec("CREATE TABLE risk_state (state_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)");
+    db.exec("CREATE TABLE events (event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, cycle_id TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL)");
+    const executor: SqlExecutor = {
+      sql<T>(strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) {
+        const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
+        const sqliteValues = values.map((value) => typeof value === "boolean" ? (value ? 1 : 0) : value) as (string | number | null)[];
+        if (query.trimStart().startsWith("SELECT")) return db.prepare(query).all(...sqliteValues) as T[];
+        db.prepare(query).run(...sqliteValues);
+        return [];
+      },
+    };
+    const plan = { positionActions: [hold], entryActions: [] } as unknown as CycleDecisionPlan;
+    saveJournal(executor, { ...baseJournal, cycleId: "cycle-completed", startedAt: "2026-09-14T11:00:00.000Z", completedAt: "2026-09-14T11:01:00.000Z", cyclePlan: plan } as TradingJournal);
+    saveCycle(executor, "cycle-completed", "COMPLETED", "2026-09-14T11:00:00.000Z", "2026-09-14T11:01:00.000Z");
+    saveLatestValidCyclePlan(executor, { cycleId: "cycle-completed", plan, startedAt: "2026-09-14T11:00:00.000Z", completedAt: "2026-09-14T11:01:00.000Z" });
+    for (let index = 0; index < 30; index += 1) {
+      const cycleId = `cycle-failed-${index}`;
+      const startedAt = `2026-09-14T${String(12 + Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}:00.000Z`;
+      saveJournal(executor, { ...baseJournal, cycleId, startedAt } as TradingJournal);
+      saveCycle(executor, cycleId, "FAILED", startedAt, startedAt);
+    }
+    const fake = {
+      env: { TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_CATEGORY: "USDT-FUTURES" },
+      state: { runtimeStatus: "ONLINE", currentStage: "ONLINE", lastScanAt: null, nextScanAt: null, model: "qwen", temporaryScanIntervalExpiresAt: null, temporaryScanIntervalCompleted: true, paused: true, emergencyStop: false, lastStatus: "IDLE", cycleStartedAt: null },
+      ensureActivePolicy: () => policy,
+      activeScanIntervalMinutes: () => 15,
+      getSchedulerDiagnostics: async () => ({ nextScanAt: null, nextScanStale: true, configuredIntervalMinutes: 15, matchingScheduleCount: 0, schedulerHealthy: true }),
+      sql: executor.sql,
+    };
+    const snapshot = await TraderAgent.prototype.getDashboardSnapshot.call(fake as never);
+    expect(snapshot.latestCyclePlan).toMatchObject({ positionActions: [{ action: "HOLD", symbol: "CRCLUSDT" }] });
+    expect(snapshot.latestCycleStatus).toMatchObject({ cycleId: "cycle-failed-29", status: "FAILED", hasPersistedPlan: false, hasValidPlan: false });
   });
 });
 

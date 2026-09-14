@@ -1,8 +1,9 @@
-import type { ActivityEvent, BacktestReplay, Lesson, LessonEvaluation, OwnerPolicy, PositionContext, PositionSide, TradeExperience, TradingJournal } from "../types.js";
+import type { ActivityEvent, BacktestReplay, CycleDecisionPlan, LatestValidCyclePlan, Lesson, LessonEvaluation, OwnerPolicy, PositionContext, PositionSide, TradeExperience, TradingJournal } from "../types.js";
 import { parseExperience } from "../learning/experiences.js";
 import { parseLesson } from "../learning/lessons.js";
 import { parseDailyDrawdownState, type DailyDrawdownState } from "../trading/drawdown.js";
 import { parseOwnerPolicy } from "../trading/policy.js";
+import { normalizeCycleDecisions, journalHasPersistedPlan } from "./journal-normalizer.js";
 import type { SqlExecutor } from "./schema.js";
 
 interface LessonRow {
@@ -52,6 +53,7 @@ export const MAX_HISTORY_LIMIT = 100;
 
 const PERFORMANCE_STATE_KEY = "performance_aggregate";
 const POSITION_CONTEXT_BOOTSTRAP_KEY = "position_context_bootstrap";
+const LATEST_VALID_CYCLE_PLAN_STATE_KEY = "latest_valid_cycle_plan";
 const MAX_TARGETED_DECISION_ID_LENGTH = 256;
 
 export function clampHistoryLimit(limit: number, fallback = 25): number {
@@ -229,6 +231,56 @@ export function savePerformanceAggregate(executor: SqlExecutor, aggregate: unkno
     VALUES (${PERFORMANCE_STATE_KEY}, ${JSON.stringify(aggregate)}, ${updatedAt})
     ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
   `;
+}
+
+function isCycleDecisionPlan(value: unknown): value is CycleDecisionPlan {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    && Array.isArray((value as { positionActions?: unknown }).positionActions)
+    && Array.isArray((value as { entryActions?: unknown }).entryActions);
+}
+
+function isLatestValidCyclePlan(value: unknown): value is LatestValidCyclePlan {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Partial<LatestValidCyclePlan>;
+  return typeof candidate.cycleId === "string"
+    && isCycleDecisionPlan(candidate.plan)
+    && typeof candidate.startedAt === "string"
+    && typeof candidate.completedAt === "string";
+}
+
+export function loadLatestValidCyclePlan(executor: SqlExecutor): LatestValidCyclePlan | null {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${LATEST_VALID_CYCLE_PLAN_STATE_KEY}`;
+  if (!rows[0]) return null;
+  try {
+    const value: unknown = JSON.parse(rows[0].payload);
+    return isLatestValidCyclePlan(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveLatestValidCyclePlan(executor: SqlExecutor, readModel: LatestValidCyclePlan): void {
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${LATEST_VALID_CYCLE_PLAN_STATE_KEY}, ${JSON.stringify(readModel)}, ${readModel.completedAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+}
+
+export function loadLatestCompletedCyclePlanFromHistory(executor: SqlExecutor): LatestValidCyclePlan | null {
+  const statuses = new Map(loadAllStoredCycles(executor).map((cycle) => [cycle.cycleId, cycle]));
+  const journals = loadAllAutonomousJournals(executor);
+  for (let index = journals.length - 1; index >= 0; index -= 1) {
+    const journal = journals[index];
+    if (!journal || !journalHasPersistedPlan(journal)) continue;
+    const stored = statuses.get(journal.cycleId);
+    const status = stored?.status ?? (journal.completedAt ? "COMPLETED" : "RUNNING");
+    const completedAt = stored?.completedAt ?? journal.completedAt;
+    if (status !== "COMPLETED" || !completedAt) continue;
+    const normalized = normalizeCycleDecisions(journal);
+    return { cycleId: journal.cycleId, plan: normalized.plan, ...(normalized.discovery ? { discovery: normalized.discovery } : {}), startedAt: stored?.startedAt ?? journal.startedAt, completedAt };
+  }
+  return null;
 }
 
 export function loadPositionContext(executor: SqlExecutor, symbol: string, positionSide: PositionSide): PositionContext | null {

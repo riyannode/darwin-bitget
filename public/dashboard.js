@@ -136,7 +136,7 @@ function renderOpenPositions() {
 function appendDecisionDetails(node, decision, positionNotional, executionRecord) {
   const execution = executionRecord?.executionResult;
   const after = executionRecord?.positionAfter;
-  [detail("MARGIN", `${decision.marginAllocationPct}%`), detail("ADDITIONAL MARGIN", decision.additionalMarginPct ? `${decision.additionalMarginPct}%` : "—"), detail("TARGET SIDE", decision.targetPositionSide ?? "—"), detail("LEVERAGE", `${execution?.leverage ?? decision.leverage}x`), detail("CONFIDENCE", decision.confidence), detail("POSITION NOTIONAL", money(positionNotional ?? after?.notional ?? (decision.action === "HOLD" ? "0" : undefined))), detail("RESULTING MARGIN", money(after?.marginAllocated)), detail("STRATEGY THESIS", decision.strategyThesis, true), detail("SUPPORTING FACTORS", list(decision.supportingFactors), true), detail("RISK FACTORS", list(decision.riskFactors), true), detail("EVIDENCE USED", list(decision.evidenceUsed), true), detail("LESSONS USED", list(decision.lessonsUsed), true)].forEach((item) => node.append(item));
+  [detail("MARGIN", `${decision.marginAllocationPct}%`), detail("ADDITIONAL MARGIN", decision.additionalMarginPct ? `${decision.additionalMarginPct}%` : "—"), detail("TARGET SIDE", decision.targetPositionSide ?? "—"), detail("LEVERAGE", `${execution?.leverage ?? decision.leverage}x`), detail("CONFIDENCE", decision.confidence), detail("POSITION NOTIONAL", money(positionNotional ?? after?.notional ?? (decision.action === "HOLD" ? "0" : undefined))), detail("RESULTING MARGIN", money(after?.marginAllocated)), detail("THESIS", decision.thesis, true), detail("STRATEGY THESIS", decision.strategyThesis, true), detail("SUPPORTING FACTORS", list(decision.supportingFactors), true), detail("RISK FACTORS", list(decision.riskFactors), true), detail("EVIDENCE USED", list(decision.evidenceUsed), true), detail("LESSONS USED", list(decision.lessonsUsed), true)].forEach((item) => node.append(item));
 }
 
 function renderDecisionPanel(prefix, decision, positionNotional) {
@@ -171,7 +171,7 @@ function renderCycleStatus(prefix) {
   if (!status) { node.className = "cycle-status empty"; node.textContent = "No cycle status recorded yet."; return; }
   node.className = `cycle-status ${status.status.toLowerCase()}`;
   const title = document.createElement("strong");
-  title.textContent = status.status === "FAILED" ? (status.hasValidPlan ? "CYCLE FAILED AFTER PLAN CREATION" : "CYCLE FAILED BEFORE DECISION") : status.status === "RUNNING" ? "ANALYZING / IN PROGRESS" : "CYCLE COMPLETED";
+  title.textContent = status.status === "FAILED" ? (status.hasPersistedPlan ? "CYCLE FAILED AFTER PLAN CREATION" : "CYCLE FAILED BEFORE DECISION") : status.status === "RUNNING" ? "ANALYZING / IN PROGRESS" : "CYCLE COMPLETED";
   node.append(title, detail("STATUS", status.status), detail("CYCLE ID", status.cycleId), detail("STARTED", when(status.startedAt)));
   if (status.failureCode) node.append(detail("FAILURE", status.failureCode));
   if (status.failurePath) node.append(detail("PATH", status.failurePath));
@@ -219,15 +219,16 @@ function renderDecisionHistory() {
     item.open = openKeys.has(item.dataset.stableKey);
     const summary = document.createElement("summary");
     const status = cycle.status ?? "COMPLETED";
-    const actionCount = cycle.hasValidPlan ? cycle.plan.positionActions.length + cycle.plan.entryActions.length : "UNAVAILABLE";
+    const actionCount = cycle.hasPersistedPlan ? cycle.plan.positionActions.length + cycle.plan.entryActions.length : "UNAVAILABLE";
     summary.append(detail("CYCLE ID", cycle.cycleId || "RUN_UNKNOWN"), detail("TIMESTAMP", when(cycle.startedAt)), detail("STATUS", status), detail("ACTIONS", actionCount));
     const content = document.createElement("div");
     content.className = "detail-grid history-content";
     if (status === "FAILED") {
-      content.append(detail("STATUS", cycle.hasValidPlan ? "CYCLE FAILED AFTER PLAN CREATION" : "CYCLE FAILED BEFORE DECISION"), detail("DECISION PLAN", cycle.hasValidPlan ? "Persisted plan available." : "Decision plan not produced."));
+      content.append(detail("STATUS", cycle.hasPersistedPlan ? "CYCLE FAILED AFTER PLAN CREATION" : "CYCLE FAILED BEFORE DECISION"), detail("DECISION PLAN", cycle.hasPersistedPlan ? "Persisted plan retained as failed-cycle audit evidence." : "Decision plan not produced."));
       if (cycle.failureCode) content.append(detail("FAILURE", cycle.failureCode));
       if (cycle.failurePath) content.append(detail("PATH", cycle.failurePath));
       if (cycle.failureIssue) content.append(detail("ISSUE", cycle.failureIssue));
+      if (cycle.hasPersistedPlan) content.append(renderActionSection("FAILED-CYCLE AUDIT EVIDENCE — POSITION MANAGEMENT", cycle.plan.positionActions, cycle.records ?? []), renderActionSection("FAILED-CYCLE AUDIT EVIDENCE — NEW ENTRIES", cycle.plan.entryActions, cycle.records ?? []));
     } else if (status === "RUNNING") {
       content.textContent = "ANALYZING / IN PROGRESS";
     } else if (cycle.hasValidPlan) {
@@ -362,7 +363,7 @@ async function loadPage(page) {
   const endpoint = endpoints[page]; if (!endpoint) return;
   try {
     const data = await requestJson(endpoint);
-    if (page === "journal") { snapshot.decisions = data.decisions ?? []; snapshot.cyclePlans = data.cycles ?? data.cyclePlans ?? []; const validCycle = snapshot.cyclePlans.find((cycle) => cycle.status === "COMPLETED" && cycle.hasValidPlan); snapshot.latestCyclePlan = validCycle?.plan ?? null; snapshot.latestDiscovery = validCycle?.discovery ?? null; if (!snapshot.latestCyclePlan) snapshot.latestDecision = null; }
+    if (page === "journal") { snapshot.decisions = data.decisions ?? []; snapshot.cyclePlans = data.cycles ?? data.cyclePlans ?? []; const validCycle = snapshot.cyclePlans.find((cycle) => cycle.status === "COMPLETED" && cycle.hasValidPlan); const persistedPlan = validCycle?.plan ?? data.latestValidCyclePlan?.plan ?? snapshot.latestCyclePlan; snapshot.latestCyclePlan = persistedPlan ?? null; snapshot.latestDiscovery = validCycle?.discovery ?? data.latestValidCyclePlan?.discovery ?? snapshot.latestDiscovery; if (!snapshot.latestCyclePlan) snapshot.latestDecision = null; }
     if (page === "trade-history") snapshot.trades = data.trades ?? [];
     if (page === "learning-page") snapshot.learning = data.learning ?? snapshot.learning;
     if (page === "policy-page") { snapshot.riskControls = data.riskControls ?? snapshot.riskControls; snapshot.lastPolicyUpdate = data.lastPolicyUpdate ?? null; }

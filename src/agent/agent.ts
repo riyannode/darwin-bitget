@@ -1,6 +1,6 @@
 import { Agent } from "agents";
 import { ZodError } from "zod";
-import type { CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionSnapshot, ReflectionResult, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
+import type { CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionSnapshot, ReflectionResult, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
@@ -27,6 +27,9 @@ import {
   loadUsableLessons,
   loadPerformanceAggregate,
   savePerformanceAggregate,
+  loadLatestValidCyclePlan,
+  loadLatestCompletedCyclePlanFromHistory,
+  saveLatestValidCyclePlan,
   loadPositionContext,
   savePositionContext,
   loadPositionContextBootstrap,
@@ -81,7 +84,7 @@ interface AgentState {
 }
 
 const STALE_CYCLE_TIMEOUT_MS = 120_000;
-const USER_STORAGE_VERSION = 4;
+const USER_STORAGE_VERSION = 5;
 const SNAPSHOT_EVENT_LIMIT = 25;
 
 const MAX_FAILURE_DIAGNOSTIC_LENGTH = 240;
@@ -235,6 +238,20 @@ function cycleReadModelWithStatus(journal: TradingJournal, storedCycles: readonl
   };
 }
 
+function latestValidCycleReadModel(readModel: LatestValidCyclePlan): NormalizedCycleDecisions & { startedAt: string; completedAt: string } {
+  return {
+    cycleId: readModel.cycleId,
+    plan: readModel.plan,
+    records: [],
+    ...(readModel.discovery ? { discovery: readModel.discovery } : {}),
+    status: "COMPLETED",
+    hasPersistedPlan: true,
+    hasValidPlan: true,
+    startedAt: readModel.startedAt,
+    completedAt: readModel.completedAt,
+  };
+}
+
 export class TraderAgent extends Agent<Env, AgentState> {
   override initialState: AgentState = {
     emergencyStop: false,
@@ -255,11 +272,12 @@ export class TraderAgent extends Agent<Env, AgentState> {
   };
 
   public override async onStart(): Promise<void> {
-    if ((this.state.userStorageVersion ?? 0) < USER_STORAGE_VERSION) {
+    const needsLatestValidPlanMigration = (this.state.userStorageVersion ?? 0) < USER_STORAGE_VERSION;
+    if (needsLatestValidPlanMigration) {
       ensureStorage(this);
       this.setState({ ...this.state, userStorageVersion: USER_STORAGE_VERSION, temporaryScanIntervalExpiresAt: null, temporaryScanIntervalCompleted: false, temporaryScanIntervalDurationMs: 0 });
     }
-    this.ensureReadModels();
+    this.ensureReadModels(needsLatestValidPlanMigration);
     const policy = this.ensureActivePolicy();
     const config = loadConfig(this.env, policy);
     const activeCycle = this.state.lastStatus === "RUNNING";
@@ -423,10 +441,14 @@ export class TraderAgent extends Agent<Env, AgentState> {
     return temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : policy.scanIntervalMinutes;
   }
 
-  private ensureReadModels(): void {
+  private ensureReadModels(migrateLatestValidPlan = false): void {
     const initializedAt = new Date().toISOString();
     const performance = loadPerformanceAggregate<PerformanceAggregate>(this);
     const positionContextBootstrapped = loadPositionContextBootstrap(this);
+    if (migrateLatestValidPlan && !loadLatestValidCyclePlan(this)) {
+      const historicalLatestPlan = loadLatestCompletedCyclePlanFromHistory(this);
+      if (historicalLatestPlan) saveLatestValidCyclePlan(this, historicalLatestPlan);
+    }
     if (isPerformanceAggregate(performance) && positionContextBootstrapped?.version === POSITION_CONTEXT_READ_MODEL_VERSION) return;
     const history = this.readBootstrapHistory();
     if (!isPerformanceAggregate(performance)) savePerformanceAggregate(this, bootstrapPerformance(history.journals, history.experiences, initializedAt), initializedAt);
@@ -485,13 +507,16 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const journal = loadLatestJournal(this);
     const recentJournals = loadRecentJournals(this, 25);
     const storedCycles = loadRecentStoredCycles(this, 25);
+    const latestPersistedPlan = loadLatestValidCyclePlan(this);
     const events = loadRecentEvents(this, SNAPSHOT_EVENT_LIMIT);
     const recentCycles = recentJournals.map((entry) => cycleReadModelWithStatus(entry, storedCycles, events));
     const latestCycle = recentCycles[0];
-    const latestValidCycle = recentCycles.find((cycle) => cycle.status === "COMPLETED" && cycle.hasValidPlan);
+    const latestValidCycle = latestPersistedPlan
+      ? latestValidCycleReadModel(latestPersistedPlan)
+      : recentCycles.find((cycle) => cycle.status === "COMPLETED" && cycle.hasValidPlan);
     const latestCycleStatus = this.state.lastStatus === "RUNNING" && this.state.lastCycleId && this.state.cycleStartedAt
-      ? { cycleId: this.state.lastCycleId, status: "RUNNING" as const, startedAt: this.state.cycleStartedAt, completedAt: null, hasValidPlan: false }
-      : latestCycle?.status ? { cycleId: latestCycle.cycleId, status: latestCycle.status, startedAt: latestCycle.startedAt, completedAt: latestCycle.completedAt, hasValidPlan: latestCycle.hasValidPlan === true, ...(latestCycle.failureCode ? { failureCode: latestCycle.failureCode } : {}), ...(latestCycle.failurePath ? { failurePath: latestCycle.failurePath } : {}), ...(latestCycle.failureIssue ? { failureIssue: latestCycle.failureIssue } : {}) } : null;
+      ? { cycleId: this.state.lastCycleId, status: "RUNNING" as const, startedAt: this.state.cycleStartedAt, completedAt: null, hasPersistedPlan: false, hasValidPlan: false }
+      : latestCycle?.status ? { cycleId: latestCycle.cycleId, status: latestCycle.status, startedAt: latestCycle.startedAt, completedAt: latestCycle.completedAt, hasPersistedPlan: latestCycle.hasPersistedPlan === true, hasValidPlan: latestCycle.hasValidPlan === true, ...(latestCycle.failureCode ? { failureCode: latestCycle.failureCode } : {}), ...(latestCycle.failurePath ? { failurePath: latestCycle.failurePath } : {}), ...(latestCycle.failureIssue ? { failureIssue: latestCycle.failureIssue } : {}) } : null;
     const drawdown = loadDailyDrawdownState(this);
     const drawdownPct = drawdown ? calculateDrawdownPct(drawdown.baselineEquity, drawdown.lastEquity) : "0";
     const configuredIntervalMinutes = temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes;
@@ -576,7 +601,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const storedCycles = loadRecentStoredCycles(this, limit);
     const events = loadRecentEvents(this, limit);
     const cycles = journals.map((entry) => cycleReadModelWithStatus(entry, storedCycles, events));
-    return json({ journals, cycles, decisions: journals.flatMap((entry) => cyclePlanDecisions(entry)), limit });
+    return json({ journals, cycles, latestValidCyclePlan: loadLatestValidCyclePlan(this), decisions: journals.flatMap((entry) => cyclePlanDecisions(entry)), limit });
   }
 
   private getPositionContext(url: URL): Response {
@@ -711,6 +736,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       this.recordEvent("CYCLE_COMPLETED", cycleId, { durationMs: String(journal.durationMs) });
       saveJournal(this, journal);
       saveCycle(this, cycleId, "COMPLETED", startedAt, journal.completedAt);
+      saveLatestValidCyclePlan(this, { cycleId, plan, ...(journal.discovery ? { discovery: journal.discovery } : {}), startedAt, completedAt: journal.completedAt });
       this.setState({ ...this.state, runtimeStatus: drawdown.blocked ? "COOLDOWN" : "ONLINE", currentStage: drawdown.blocked ? "COOLDOWN" : "ONLINE", lastStatus: "COMPLETED", cycleStartedAt: null });
       return journal;
     } catch (error) {

@@ -203,8 +203,8 @@ function baseSnapshot(cycleId: string, proposed: Decision, cyclePlan: CycleDecis
     latestDecision: proposed,
     decisions: [proposed],
     latestCyclePlan: cyclePlan,
-    latestCycleStatus: { cycleId, status: "COMPLETED", startedAt: OBSERVED_AT, completedAt: OBSERVED_AT, hasValidPlan: true },
-    cyclePlans: [{ cycleId, plan: cyclePlan, records: [], status: "COMPLETED", hasValidPlan: true, startedAt: OBSERVED_AT, completedAt: OBSERVED_AT }],
+    latestCycleStatus: { cycleId, status: "COMPLETED", startedAt: OBSERVED_AT, completedAt: OBSERVED_AT, hasPersistedPlan: true, hasValidPlan: true },
+    cyclePlans: [{ cycleId, plan: cyclePlan, records: [], status: "COMPLETED", hasPersistedPlan: true, hasValidPlan: true, startedAt: OBSERVED_AT, completedAt: OBSERVED_AT }],
     latestDiscovery: { scannedUniverseCount: SUPPORTED_UNIVERSE.length, selectedEntryCandidateSymbols: cyclePlan.entryActions.map((decision) => decision.symbol), managedExistingPositionSymbols: cyclePlan.positionActions.map((decision) => decision.symbol), financialWritesPerformed: 0 },
     executionEvidence: isRecordedOpen ? {
       provider: "Bitget Demo (recorded evidence)",

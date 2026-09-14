@@ -324,7 +324,16 @@ export interface NormalizedCycleDecisions {
   failureCode?: string;
   failurePath?: string;
   failureIssue?: string;
+  hasPersistedPlan?: boolean;
   hasValidPlan?: boolean;
+}
+
+export interface LatestValidCyclePlan {
+  cycleId: string;
+  plan: CycleDecisionPlan;
+  discovery?: CycleDiscovery;
+  startedAt: string;
+  completedAt: string;
 }
 
 export interface AutonomousDecisionSet {
@@ -523,6 +532,7 @@ export interface DashboardSnapshot {
     status: "RUNNING" | "COMPLETED" | "FAILED";
     startedAt: string;
     completedAt: string | null;
+    hasPersistedPlan: boolean;
     hasValidPlan: boolean;
     failureCode?: string;
     failurePath?: string;
