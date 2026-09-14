@@ -3,7 +3,7 @@ import type { CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, De
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
-import { decide, rankMarketCandidates, selectCandidates } from "./decision.js";
+import { assertOpenPositionCountWithinPlanLimit, decide, rankMarketCandidates, selectCandidates } from "./decision.js";
 import { reconcileTradingSchedule, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES, type SchedulerReconciliationResult } from "./scheduler.js";
 import { authorizeOwner } from "./owner-auth.js";
 import { retrieveLessons } from "../learning/lesson-retrieval.js";
@@ -351,7 +351,6 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const recentJournals = loadRecentJournals(this, 25);
     const recentCycles = recentJournals.map((entry) => ({ ...normalizeCycleDecisions(entry), startedAt: entry.startedAt, completedAt: entry.completedAt ?? null }));
     const latestCycle = recentCycles[0];
-    const latestDecisions = latestCycle ? [...latestCycle.plan.positionActions, ...latestCycle.plan.entryActions] : [];
     const events = loadRecentEvents(this, SNAPSHOT_EVENT_LIMIT);
     const drawdown = loadDailyDrawdownState(this);
     const drawdownPct = drawdown ? calculateDrawdownPct(drawdown.baselineEquity, drawdown.lastEquity) : "0";
@@ -374,7 +373,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       portfolioFreshness: { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" },
       performance: { ...unavailablePerformance(), dailyDrawdown: drawdownPct },
       trades: [],
-      latestDecision: latestDecisions[0] ?? journal?.decision ?? null,
+      latestDecision: journal?.cyclePlan ? null : journal?.decision ?? null,
       decisions: recentJournals.flatMap((entry) => cyclePlanDecisions(entry)),
       latestCyclePlan: latestCycle?.plan ?? null,
       cyclePlans: recentCycles,
@@ -483,6 +482,12 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const openPositions = [...new Map((bundles.flatMap((bundle) => bundle.account.positions).length ? bundles.flatMap((bundle) => bundle.account.positions) : account.positions).map((position) => [`${position.symbol}:${position.positionSide}`, position])).values()];
       const discovery: CycleDiscovery = { scannedUniverseCount: scan.length, selectedEntryCandidateSymbols, managedExistingPositionSymbols: openPositions.filter((position) => Number(position.quantity) > 0).map((position) => position.symbol).sort(), financialWritesPerformed: 0 };
       journal.discovery = discovery;
+      try {
+        assertOpenPositionCountWithinPlanLimit(openPositions);
+      } catch (error) {
+        this.recordEvent("PLAN_REJECTED", cycleId, { code: "OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT", openPositionCount: String(openPositions.filter((position) => Number(position.quantity) > 0).length), maxActions: "5" });
+        throw error;
+      }
       journal.positionDiscrepancies = this.recordPositionDiscrepancies(experiences, openPositions, cycleId);
       recordLessonRetrieval(this, lessons.map((lesson) => lesson.lessonId), cycleId, startedAt);
       const drawdown = evaluateDrawdown(config.ownerPolicy, loadDailyDrawdownState(this), account.portfolioEquity, new Date());

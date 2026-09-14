@@ -11,6 +11,8 @@ The repository is intended to verify the following through typecheck, unit tests
 - management actions may target existing positions outside `supportedUniverse`;
 - new entries require supported-universe membership and current deep evidence;
 - `MAX_TOTAL_ACTIONS_PER_CYCLE=5` rejects over-cap intent without truncation;
+- `OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT` rejects live open-position counts above five before model financial planning and records a visible rejection without writes;
+- entry actions targeting any already-open symbol are rejected with `ENTRY_SYMBOL_ALREADY_OPEN` (no pyramiding, hedge, or reversal through entryActions);
 - `CLOSE → REDUCE → OPEN` ordering is deterministic and financial writes are sequential;
 - provider evidence and portfolio state refresh between matched writes;
 - ambiguous/unresolved writes stop remaining writes without blind retry;
@@ -19,6 +21,7 @@ The repository is intended to verify the following through typecheck, unit tests
 - paper-log effective execution/reconciliation fallback marks legacy matched primary executions verified;
 - paper-log action category, cycle discovery, and lifecycle metrics do not count HOLD or unresolved writes as verified trades;
 - dashboard and Judge Demo render grouped cycle plans and discovery evidence;
+- new cycle-plan journals hide the legacy single-action headline; legacy journals retain the fallback Latest Decision view;
 - frontend has no provider credentials or manual financial controls.
 
 The prompt contracts are code-checked as `darwin-mandate-v5` and `darwin-decision-v3`. Reflection/backtest prompt versions remain unchanged.

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cycleDecisionPlanSchema, buildDecisionPrompt, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
+import { assertOpenPositionCountWithinPlanLimit, cycleDecisionPlanSchema, buildDecisionPrompt, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
 import type { AccountSnapshot, CycleDecisionPlan, Decision, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot, PositionSnapshot } from "../src/types.js";
 
 function snapshot(symbol: string, change = "1", volume = "100"): MarketSnapshot {
@@ -56,6 +56,16 @@ describe("cycle decision plan contract", () => {
     expect(() => validateCycleDecisionPlan(value, context([position("CRCLUSDT")]))).not.toThrow();
   });
 
+  it("rejects CRCL OPEN_LONG when CRCL is already open", () => {
+    const value = plan([decision("HOLD", "CRCLUSDT", "LONG")], [decision("OPEN_LONG", "CRCLUSDT", "LONG")]);
+    expect(() => validateCycleDecisionPlan(value, context([position("CRCLUSDT")], ["CRCLUSDT"]))).toThrow("ENTRY_SYMBOL_ALREADY_OPEN");
+  });
+
+  it("rejects CRCL OPEN_SHORT when CRCL is already open", () => {
+    const value = plan([decision("HOLD", "CRCLUSDT", "LONG")], [decision("OPEN_SHORT", "CRCLUSDT", "SHORT")]);
+    expect(() => validateCycleDecisionPlan(value, context([position("CRCLUSDT")], ["CRCLUSDT"]))).toThrow("ENTRY_SYMBOL_ALREADY_OPEN");
+  });
+
   it("allows CRCL CLOSE and NVDA OPEN_LONG in the same cycle", () => {
     const value = plan([decision("CLOSE", "CRCLUSDT", "LONG")], [decision("OPEN_LONG", "NVDAUSDT", "LONG")]);
     expect(() => validateCycleDecisionPlan(value, context([position("CRCLUSDT")]))).not.toThrow();
@@ -75,6 +85,12 @@ describe("cycle decision plan contract", () => {
 
   it("accepts an empty no-write plan when no positions or opportunities exist", () => {
     expect(() => validateCycleDecisionPlan(plan(), context([], []))).not.toThrow();
+  });
+
+  it("rejects more open positions than the five-action plan can represent", () => {
+    const positions = Array.from({ length: MAX_TOTAL_ACTIONS_PER_CYCLE + 1 }, (_, index) => position(`OPEN${index}USDT`));
+    expect(() => assertOpenPositionCountWithinPlanLimit(positions)).toThrow("OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT");
+    expect(() => validateCycleDecisionPlan(plan(positions.map((item) => decision("HOLD", item.symbol, item.positionSide))), context(positions, []))).toThrow("OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT");
   });
 
   it("accepts exactly five total actions and rejects six", () => {

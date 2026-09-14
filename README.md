@@ -64,6 +64,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/LIVE.md](docs/LIVE.md), 
 - Owner policy limits margin allocation, leverage, drawdown, cooldown, and scheduler cadence.
 - Every financial action passes one deterministic risk gate.
 - The plan is bounded to at most five total proposed actions per cycle; zero writes is valid.
+- If more than five provider positions are open, the cycle fails closed with `OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT` before model financial planning; positions are never silently omitted and the cap is not increased.
 - Financial writes are serialized in `CLOSE → REDUCE → OPEN` order, with provider portfolio refresh between matched writes.
 - Bitget readback and reconciliation are required before a write is treated as verified.
 - An ambiguous write stops remaining writes for that cycle; no blind retry is used.

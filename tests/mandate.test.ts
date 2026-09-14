@@ -29,5 +29,10 @@ describe("judge-facing mandate contract", () => {
   it("renders evidence used beside the other decision explanations", () => {
     const dashboard = readFileSync(new URL("../public/dashboard.js", import.meta.url), "utf8");
     expect(dashboard).toContain('detail("EVIDENCE USED", list(decision.evidenceUsed), true)');
+    expect(dashboard).toContain("const hasCyclePlan = Boolean(snapshot.latestCyclePlan)");
+    expect(dashboard).toContain("[data-legacy-decision-panel]");
+    expect(dashboard).toContain("if (!hasCyclePlan)");
+    const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+    expect(html).toContain("data-legacy-decision-panel");
   });
 });

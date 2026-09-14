@@ -199,10 +199,16 @@ function liveOpenPositions(positions: readonly PositionSnapshot[]): PositionSnap
   return positions.filter((position) => Number(position.quantity) > 0);
 }
 
+export function assertOpenPositionCountWithinPlanLimit(openPositions: readonly PositionSnapshot[]): void {
+  if (liveOpenPositions(openPositions).length > MAX_TOTAL_ACTIONS_PER_CYCLE) throw new Error("OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT");
+}
+
 export function validateCycleDecisionPlan(plan: CycleDecisionPlan, context: DecisionContext): void {
-  if (plan.positionActions.length + plan.entryActions.length > MAX_TOTAL_ACTIONS_PER_CYCLE) throw new Error("MAX_TOTAL_ACTIONS_PER_CYCLE");
   const currentPositions = liveOpenPositions(context.openPositions);
+  assertOpenPositionCountWithinPlanLimit(currentPositions);
+  if (plan.positionActions.length + plan.entryActions.length > MAX_TOTAL_ACTIONS_PER_CYCLE) throw new Error("MAX_TOTAL_ACTIONS_PER_CYCLE");
   const currentKeys = new Set(currentPositions.map((position) => positionKey(position.symbol, position.positionSide)));
+  const currentSymbols = new Set(currentPositions.map((position) => position.symbol));
   const managementKeys = new Set<string>();
   for (const action of plan.positionActions) {
     if (!action.positionSide) throw new Error("POSITION_SIDE_REQUIRED");
@@ -219,6 +225,7 @@ export function validateCycleDecisionPlan(plan: CycleDecisionPlan, context: Deci
     if (action.positionSide !== expectedSide) throw new Error("INVALID_POSITION_SIDE");
     if (!context.supportedUniverse.includes(action.symbol)) throw new Error("SYMBOL_NOT_ALLOWED");
     if (!deepSymbols.has(action.symbol)) throw new Error("ENTRY_EVIDENCE_REQUIRED");
+    if (currentSymbols.has(action.symbol)) throw new Error("ENTRY_SYMBOL_ALREADY_OPEN");
     if (entrySymbols.has(action.symbol)) throw new Error("DUPLICATE_ENTRY_ACTION");
     entrySymbols.add(action.symbol);
   }

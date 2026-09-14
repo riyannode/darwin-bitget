@@ -160,9 +160,13 @@ function renderCyclePlan(prefix, plan, discovery) {
 }
 
 function renderDecision() {
-  const decision = snapshot.latestDecision;
-  renderDecisionPanel("", decision, snapshot.executionEvidence?.positionNotional);
-  renderDecisionPanel("dashboard", decision, snapshot.executionEvidence?.positionNotional);
+  const hasCyclePlan = Boolean(snapshot.latestCyclePlan);
+  document.querySelectorAll("[data-legacy-decision-panel]").forEach((panel) => { panel.hidden = hasCyclePlan; });
+  if (!hasCyclePlan) {
+    const decision = snapshot.latestDecision;
+    renderDecisionPanel("", decision, snapshot.executionEvidence?.positionNotional);
+    renderDecisionPanel("dashboard", decision, snapshot.executionEvidence?.positionNotional);
+  }
   renderCyclePlan("dashboard", snapshot.latestCyclePlan, snapshot.latestDiscovery);
 }
 
@@ -288,7 +292,7 @@ async function loadPage(page) {
   const endpoint = endpoints[page]; if (!endpoint) return;
   try {
     const data = await requestJson(endpoint);
-    if (page === "journal") { snapshot.decisions = data.decisions ?? []; snapshot.cyclePlans = data.cycles ?? data.cyclePlans ?? []; snapshot.latestDecision = snapshot.decisions[0] ?? snapshot.latestDecision; snapshot.latestCyclePlan = snapshot.cyclePlans[0]?.plan ?? snapshot.latestCyclePlan; snapshot.latestDiscovery = snapshot.cyclePlans[0]?.discovery ?? snapshot.latestDiscovery; }
+    if (page === "journal") { snapshot.decisions = data.decisions ?? []; snapshot.cyclePlans = data.cycles ?? data.cyclePlans ?? []; snapshot.latestCyclePlan = snapshot.cyclePlans[0]?.plan ?? snapshot.latestCyclePlan; snapshot.latestDiscovery = snapshot.cyclePlans[0]?.discovery ?? snapshot.latestDiscovery; if (!snapshot.latestCyclePlan) snapshot.latestDecision = snapshot.decisions[0] ?? snapshot.latestDecision; }
     if (page === "trade-history") snapshot.trades = data.trades ?? [];
     if (page === "learning-page") snapshot.learning = data.learning ?? snapshot.learning;
     if (page === "policy-page") { snapshot.riskControls = data.riskControls ?? snapshot.riskControls; snapshot.lastPolicyUpdate = data.lastPolicyUpdate ?? null; }

@@ -46,6 +46,8 @@ Public market operations may remain direct because they do not require private B
 
 `MAX_TOTAL_ACTIONS_PER_CYCLE = 5` is enforced by the Zod output schema and deterministic contextual validation. The backend rejects over-cap, missing, duplicate, nonexistent-position, unsupported-entry, and stale-evidence intent. It never silently truncates financial intent. A zero-write plan is valid.
 
+Because every open provider position requires one management action, a live account with more than five open positions cannot be represented by this bounded contract. DARWIN fails before model financial planning with `OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT`, records a visible `PLAN_REJECTED` event, performs no financial write, and does not omit positions or raise the cap. The symbols may still be scanned and used for management evidence before the guard is evaluated.
+
 The new mandate/decision contracts are `darwin-mandate-v5` and `darwin-decision-v3`. Reflection and backtest prompt versions remain unchanged.
 
 ## Authority boundary
