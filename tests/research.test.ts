@@ -46,6 +46,18 @@ describe("Bitget Signal research router", () => {
   it("enforces the research request cap", () => {
     expect(() => researchPlanSchema.parse({ requests: Array.from({ length: MAX_RESEARCH_REQUESTS_PER_CYCLE + 1 }, () => request()) })).toThrow();
   });
+
+  it("enforces MCP tool cost, not only request count", () => {
+    const expensiveInput: ResearchRouterInput = {
+      ...input,
+      availableResearchSkills: [{ ...availableResearchCapabilities()[0]!, callsPerRequest: 2 }],
+      researchBudget: { ...input.researchBudget, maxMcpToolCalls: 3 },
+    };
+    const plan = researchPlanSchema.parse({ requests: [request(), request("CRCLUSDT")] });
+    const result = validateResearchPlan(plan, expensiveInput);
+    expect(result.accepted).toHaveLength(1);
+    expect(result.rejected[0]?.reason).toBe("MAX_MCP_TOOL_CALLS_PER_CYCLE");
+  });
 });
 
 describe("bounded research execution", () => {
@@ -56,6 +68,8 @@ describe("bounded research execution", () => {
     expect(evidence.facts.length).toBeLessThanOrEqual(5);
     expect(JSON.stringify(evidence)).not.toContain("x".repeat(1_000));
     expect(new TextEncoder().encode(JSON.stringify(evidence)).byteLength).toBeLessThanOrEqual(6 * 1024);
+    const oversized = normalizeResearchEvidence("technical-analysis", "COINUSDT", { content: [{ type: "text", text: "x".repeat(70_000) }] }, "2026-09-15T00:00:00.000Z");
+    expect(oversized.status).toBe("UNAVAILABLE");
   });
 
   it("bounds concurrency, degrades errors, and caches successful results", async () => {

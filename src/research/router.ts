@@ -110,6 +110,8 @@ export function validateResearchPlan(plan: ResearchPlan, input: ResearchRouterIn
   const rejected: Array<{ request: ResearchRequest; reason: string }> = [];
   const allowedSymbols = new Set([...input.openPositionSymbols, ...input.entryCandidateSymbols]);
   const capabilities = new Map(input.availableResearchSkills.map((capability) => [capability.skill, capability]));
+  const maxMcpToolCalls = Math.min(MAX_MCP_TOOL_CALLS_PER_CYCLE, Math.max(0, Math.floor(input.researchBudget.maxMcpToolCalls)));
+  let mcpToolCalls = 0;
 
   for (const request of plan.requests) {
     if (accepted.length >= MAX_RESEARCH_REQUESTS_PER_CYCLE) {
@@ -133,7 +135,13 @@ export function validateResearchPlan(plan: ResearchPlan, input: ResearchRouterIn
       rejected.push({ request, reason: "SYMBOL_UNSUPPORTED_BY_CAPABILITY" });
       continue;
     }
+    const requestedToolCalls = Math.max(1, Math.floor(capability.callsPerRequest));
+    if (mcpToolCalls + requestedToolCalls > maxMcpToolCalls) {
+      rejected.push({ request, reason: "MAX_MCP_TOOL_CALLS_PER_CYCLE" });
+      continue;
+    }
     accepted.push({ ...request, purpose: request.purpose.trim().slice(0, 240) });
+    mcpToolCalls += requestedToolCalls;
   }
   return { accepted, rejected };
 }

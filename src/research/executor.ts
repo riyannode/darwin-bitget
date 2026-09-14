@@ -27,6 +27,9 @@ interface CachedEvidence {
   evidence: ResearchEvidence;
 }
 
+const MAX_RESEARCH_CACHE_ENTRIES = 32;
+const MAX_RAW_MCP_TEXT_BYTES = 64 * 1024;
+
 function timeoutFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   const timeoutSignal = AbortSignal.timeout(RESEARCH_TOOL_TIMEOUT_MS);
   const signals = [timeoutSignal, init.signal].filter((signal): signal is AbortSignal => Boolean(signal));
@@ -54,18 +57,33 @@ function boundedText(value: unknown, limit = 240): string {
   return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, limit);
 }
 
-function resultText(raw: unknown): string {
-  if (typeof raw === "string") return raw;
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    const value = raw as Record<string, unknown>;
-    if (typeof value.structuredContent === "object" && value.structuredContent !== null) return JSON.stringify(value.structuredContent);
-    if (Array.isArray(value.content)) return value.content.filter((item) => item && typeof item === "object" && (item as Record<string, unknown>).type === "text").map((item) => String((item as Record<string, unknown>).text ?? "")).join("\n");
-  }
-  return JSON.stringify(raw ?? null);
+function boundedRawText(value: string): { text: string; oversized: boolean } {
+  if (new TextEncoder().encode(value).byteLength <= MAX_RAW_MCP_TEXT_BYTES) return { text: value, oversized: false };
+  return { text: value.slice(0, MAX_RAW_MCP_TEXT_BYTES), oversized: true };
 }
 
-function collectFacts(value: unknown, path: string, facts: string[], limitations: string[]): void {
-  if (facts.length >= 5 || value === null || value === undefined) return;
+function resultText(raw: unknown): { text: string; oversized: boolean; structuredContent?: unknown } {
+  if (typeof raw === "string") return boundedRawText(raw);
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const value = raw as Record<string, unknown>;
+    if (typeof value.structuredContent === "object" && value.structuredContent !== null) return { text: "", oversized: false, structuredContent: value.structuredContent };
+    if (Array.isArray(value.content)) {
+      let text = "";
+      for (const item of value.content) {
+        if (!item || typeof item !== "object" || (item as Record<string, unknown>).type !== "text") continue;
+        const next = `${text}${text ? "\n" : ""}${String((item as Record<string, unknown>).text ?? "")}`;
+        const bounded = boundedRawText(next);
+        text = bounded.text;
+        if (bounded.oversized) return { text, oversized: true };
+      }
+      return { text, oversized: false };
+    }
+  }
+  return { text: "", oversized: false, structuredContent: raw };
+}
+
+function collectFacts(value: unknown, path: string, facts: string[], limitations: string[], depth = 0): void {
+  if (facts.length >= 5 || value === null || value === undefined || depth > 4) return;
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
     const text = boundedText(value, 180);
     if (!text) return;
@@ -77,11 +95,11 @@ function collectFacts(value: unknown, path: string, facts: string[], limitations
     return;
   }
   if (Array.isArray(value)) {
-    value.slice(0, 5).forEach((item, index) => collectFacts(item, `${path}[${index}]`, facts, limitations));
+    value.slice(0, 5).forEach((item, index) => collectFacts(item, `${path}[${index}]`, facts, limitations, depth + 1));
     return;
   }
   if (typeof value === "object") {
-    Object.entries(value as Record<string, unknown>).slice(0, 20).forEach(([key, item]) => collectFacts(item, path ? `${path}.${key}` : key, facts, limitations));
+    Object.entries(value as Record<string, unknown>).slice(0, 20).forEach(([key, item]) => collectFacts(item, path ? `${path}.${key}` : key, facts, limitations, depth + 1));
   }
 }
 
@@ -92,13 +110,18 @@ function evidenceBytes(evidence: ResearchEvidence): number {
 export function normalizeResearchEvidence(skill: ResearchRequest["skill"], scope: string, raw: unknown, observedAt: string): ResearchEvidence {
   const base: ResearchEvidence = { skill, scope, observedAt, status: "AVAILABLE", facts: [], limitations: [] };
   const rawRecord = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : undefined;
-  const text = resultText(raw);
-  let parsed: unknown = raw;
-  try { parsed = JSON.parse(text); } catch { parsed = text; }
+  const result = resultText(raw);
+  let parsed: unknown = result.structuredContent ?? raw;
+  if (result.oversized) {
+    base.status = "UNAVAILABLE";
+    base.limitations.push("MCP payload exceeded the raw normalization byte limit.");
+  } else if (result.text) {
+    try { parsed = JSON.parse(result.text); } catch { parsed = result.text; }
+  }
   if (rawRecord?.isError === true) {
     base.status = "UNAVAILABLE";
     base.limitations.push("MCP tool returned an error result.");
-  } else {
+  } else if (base.status === "AVAILABLE") {
     collectFacts(parsed, "research", base.facts, base.limitations);
     if (base.limitations.length > 0 && base.facts.length === 0) base.status = "UNAVAILABLE";
     if (base.facts.length === 0 && base.status === "AVAILABLE") {
@@ -149,6 +172,13 @@ function recipe(request: ResearchRequest): { tool: string; argumentsValue: Recor
   throw new Error("UNSUPPORTED_RESEARCH_RECIPE");
 }
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, code: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(code)), timeoutMs)),
+  ]);
+}
+
 export class ResearchExecutor {
   private readonly cache = new Map<string, CachedEvidence>();
 
@@ -156,8 +186,25 @@ export class ResearchExecutor {
 
   public cacheSize(): number { return this.cache.size; }
 
+  private pruneCache(nowMs: number): void {
+    for (const [key, cached] of this.cache) {
+      if (nowMs - cached.cachedAt > RESEARCH_CACHE_TTL_MS) this.cache.delete(key);
+    }
+    while (this.cache.size >= MAX_RESEARCH_CACHE_ENTRIES) {
+      const oldest = this.cache.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.cache.delete(oldest);
+    }
+  }
+
+  private cacheEvidence(key: string, evidence: ResearchEvidence, cachedAt: number): void {
+    this.pruneCache(cachedAt);
+    this.cache.set(key, { cachedAt, evidence });
+  }
+
   public async execute(requests: readonly ResearchRequest[], now = new Date()): Promise<ResearchEvidence[]> {
     const phaseStartedAt = Date.now();
+    this.pruneCache(now.getTime());
     const boundedRequests = requests.slice(0, Math.min(MAX_RESEARCH_REQUESTS_PER_CYCLE, MAX_MCP_TOOL_CALLS_PER_CYCLE));
     const results: Array<ResearchEvidence | undefined> = Array.from({ length: boundedRequests.length });
     const pending: Array<{ index: number; request: ResearchRequest; key: string }> = [];
@@ -171,8 +218,10 @@ export class ResearchExecutor {
 
     let client: McpResearchClient | undefined;
     try {
-      client = await this.factory.connect();
+      const remainingForConnection = Math.max(1, RESEARCH_PHASE_TIMEOUT_MS - (Date.now() - phaseStartedAt));
+      client = await withTimeout(this.factory.connect(), Math.min(RESEARCH_TOOL_TIMEOUT_MS, remainingForConnection), "RESEARCH_CONNECTION_TIMEOUT");
       let next = 0;
+      let toolCallCount = 0;
       const worker = async (): Promise<void> => {
         while (next < pending.length) {
           const current = pending[next++];
@@ -180,6 +229,8 @@ export class ResearchExecutor {
           const observedAt = new Date().toISOString();
           try {
             const prepared = recipe(current.request);
+            if (toolCallCount >= MAX_MCP_TOOL_CALLS_PER_CYCLE) throw new Error("MAX_MCP_TOOL_CALLS_PER_CYCLE");
+            toolCallCount += 1;
             const remainingMs = Math.max(1, RESEARCH_PHASE_TIMEOUT_MS - (Date.now() - phaseStartedAt));
             const raw = await Promise.race([
               client!.callTool(prepared.tool, prepared.argumentsValue),
@@ -187,11 +238,11 @@ export class ResearchExecutor {
             ]);
             const evidence = normalizeResearchEvidence(current.request.skill, current.request.symbol ?? "GLOBAL", raw, observedAt);
             results[current.index] = evidence;
-            this.cache.set(current.key, { cachedAt: now.getTime(), evidence });
+            this.cacheEvidence(current.key, evidence, now.getTime());
           } catch (error) {
             const evidence = unavailableResearchEvidence(current.request, "UNAVAILABLE", error instanceof Error ? error.message : "Research tool unavailable.", observedAt);
             results[current.index] = evidence;
-            this.cache.set(current.key, { cachedAt: now.getTime(), evidence });
+            this.cacheEvidence(current.key, evidence, now.getTime());
           }
         }
       };
@@ -202,7 +253,7 @@ export class ResearchExecutor {
     } catch {
       for (const item of pending) if (!results[item.index]) results[item.index] = unavailableResearchEvidence(item.request, "UNAVAILABLE", "MCP connection unavailable.", new Date().toISOString());
     } finally {
-      await client?.close?.();
+      if (client?.close) await withTimeout(client.close(), 250, "RESEARCH_CLOSE_TIMEOUT").catch(() => undefined);
     }
     return enforceCycleBudget(results.map((item, index) => item ?? unavailableResearchEvidence(boundedRequests[index]!, "UNAVAILABLE", "Research result unavailable.", new Date().toISOString())));
   }

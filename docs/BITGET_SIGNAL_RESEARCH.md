@@ -122,10 +122,12 @@ Research is disabled unless `BITGET_SIGNAL_ENABLED=true`. A missing flag, router
 - Total MCP phase: 15 seconds.
 - One deterministic recipe attempt; no recursive loop and no blind retry.
 - Cache: ephemeral in-memory `Map`, ten-minute TTL, key = skill + scope + recipe version.
+- Cache is pruned on access and capped at 32 entries; expired entries do not accumulate in a long-lived Durable Object.
+- Raw MCP text is bounded at 64 KiB before JSON parsing/normalization; deeply nested values are depth-bounded during fact extraction.
 - Normalized evidence: at most five facts, three limitations, 6 KiB per item, 16 KiB per cycle using `TextEncoder` byte counts.
 - Raw MCP responses, full feeds, prompts, model output, and arbitrary JSON are not stored or passed to the main decision prompt.
 
-The cold MCP connection requires one standards-compliant initialization request. Because v1 has one MCP call per accepted request and accepts at most three requests, cold enrichment is at most:
+The validator accounts for each recipe's declared `callsPerRequest` cost, not just the number of requests. The cold MCP connection requires one standards-compliant initialization request. Because v1 has one MCP call per accepted request and accepts at most three requests, cold enrichment is at most:
 
 ```text
 1 research-router Qwen request
