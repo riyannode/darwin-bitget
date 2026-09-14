@@ -40,6 +40,7 @@ export function loadConfig(env: Omit<Env, "TRADER_AGENT">, activePolicy?: OwnerP
     ...(env.BITGET_GATEWAY_SERVICE_SECRET?.trim() ? { bitgetGatewayServiceSecret: env.BITGET_GATEWAY_SERVICE_SECRET.trim() } : {}),
     qwenBaseUrl: required(env.QWEN_BASE_URL, "https://hackathon.bitgetops.com/v1"),
     qwenModel: required(env.QWEN_MODEL, "qwen3.8-max"),
+    bitgetSignalEnabled: env.BITGET_SIGNAL_ENABLED === "true",
     version: required(env.APP_VERSION, "0.2.0"),
     commit: required(env.GIT_COMMIT_SHA, "local"),
     environment: required(env.ENVIRONMENT, "production"),

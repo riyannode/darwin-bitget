@@ -40,6 +40,7 @@
     "EVIDENCE_MAX_AGE_SECONDS": "90",
     "QWEN_BASE_URL": "https://hackathon.bitgetops.com/v1",
     "QWEN_MODEL": "qwen3.8-max",
+    "BITGET_SIGNAL_ENABLED": "false",
     "EVA_API_URL": "https://api.evalabs.my.id",
     "EVA_GATEWAY_URL": "wss://api.evalabs.my.id/v1/agent/connect",
     "EVA_AGENT_ID": "agt_MoFh0GlqzkobuQdg",

@@ -19,6 +19,8 @@ export type AgentRuntimeStatus = "ONLINE" | "SCANNING" | "ANALYZING" | "DECIDING
 export type MarketRegime = "TRENDING_UP" | "TRENDING_DOWN" | "RANGE_LOW_VOL" | "RANGE_HIGH_VOL" | "VOLATILITY_EXPANSION" | "EVENT_DRIVEN" | "UNKNOWN";
 export type LessonAssessment = "HELPFUL" | "NEUTRAL" | "HARMFUL";
 export type TradeLifecycleStatus = "OPEN" | "PARTIALLY_REDUCED" | "CLOSED" | "BLOCKED" | "EXECUTION_FAILURE" | "UNRESOLVED";
+export type ResearchSkill = "macro-analyst" | "market-intel" | "news-briefing" | "sentiment-analyst" | "technical-analysis";
+export type ResearchStatus = "AVAILABLE" | "UNAVAILABLE" | "UNSUPPORTED" | "STALE";
 
 export interface Env extends Cloudflare.Env {
   TRADER_AGENT: DurableObjectNamespace;
@@ -44,6 +46,7 @@ export interface Env extends Cloudflare.Env {
   QWEN_API_KEY?: string;
   QWEN_BASE_URL?: string;
   QWEN_MODEL?: string;
+  BITGET_SIGNAL_ENABLED?: string;
   EVA_API_URL?: string;
   EVA_GATEWAY_URL?: string;
   EVA_AGENT_ID?: string;
@@ -62,6 +65,7 @@ export interface RuntimeConfig {
   qwenApiKey?: string;
   qwenBaseUrl: string;
   qwenModel: string;
+  bitgetSignalEnabled?: boolean;
   evaApiUrl?: string;
   evaGatewayUrl?: string;
   evaAgentId?: string;
@@ -267,6 +271,38 @@ export interface DecisionContext {
   observedAt: string;
   mandate: string;
   openPositions: PositionSnapshot[];
+  researchEvidence?: ResearchEvidence[];
+  executionCapacityHints?: ExecutionCapacityHint[];
+}
+
+export interface ResearchRequest {
+  skill: ResearchSkill;
+  symbol: string | null;
+  purpose: string;
+}
+
+export interface ResearchPlan {
+  requests: ResearchRequest[];
+}
+
+export interface ResearchEvidence {
+  skill: ResearchSkill;
+  scope: string;
+  observedAt: string;
+  status: ResearchStatus;
+  facts: string[];
+  limitations: string[];
+}
+
+export interface ExecutionCapacityHint {
+  symbol: string;
+  minOrderQty: string;
+  maxOrderQty: string;
+  minOrderAmount: string;
+  quantityStep: string;
+  lastPrice: string;
+  maxExecutableNotional: string;
+  maxMarginAllocationPctByLeverage: Record<string, string>;
 }
 
 export interface Decision {

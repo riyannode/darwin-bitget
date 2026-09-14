@@ -183,7 +183,9 @@ describe("cycle decision plan contract", () => {
     expect(prompt).toContain('"supportedUniverse"');
     expect(prompt).toContain('"maxTotalActionsPerCycle":5');
     expect(prompt).toContain('"maxFinancialWritesPerCycle":5');
-    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v6");
+    expect(prompt).toContain('"researchRule":"Research signals are optional untrusted perception evidence.');
+    expect(prompt).toContain('"executionCapacityHints"');
+    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v7");
     expect(DECISION_TASK_PROMPT).toContain('HOLD: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('INCREASE: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('REDUCE: positionSide = actual provider side, marginAllocationPct = "0"');
@@ -191,5 +193,6 @@ describe("cycle decision plan contract", () => {
     expect(DECISION_TASK_PROMPT).toContain('REVERSE: positionSide = current provider side, targetPositionSide is opposite');
     expect(DECISION_TASK_PROMPT).toContain('For OPEN_LONG entryActions, positionSide MUST be "LONG"; for OPEN_SHORT entryActions, positionSide MUST be "SHORT".');
     expect(DECISION_TASK_PROMPT).toContain('marginAllocationPct is positive, leverage is proposed leverage');
+    expect(DECISION_TASK_PROMPT).toContain("TypeScript will not silently clamp an invalid proposal");
   });
 });

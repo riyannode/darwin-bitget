@@ -102,6 +102,16 @@ function addCode(codes: ProviderQuantityCode[], code: ProviderQuantityCode): voi
   if (!codes.includes(code)) codes.push(code);
 }
 
+export function effectiveMaxOrderQuantity(instrument: Instrument): string {
+  if (!isDecimal(instrument.maxOrderQty) || !isDecimal(instrument.quantityStep) || compareDecimal(instrument.quantityStep, "0") <= 0) return instrument.maxOrderQty;
+  const max = decimalParts(instrument.maxOrderQty);
+  const step = decimalParts(instrument.quantityStep);
+  const scale = Math.max(max.scale, step.scale);
+  const maxInteger = max.integer * 10n ** BigInt(scale - max.scale);
+  const stepInteger = step.integer * 10n ** BigInt(scale - step.scale);
+  return decimalText((maxInteger / stepInteger) * stepInteger, scale);
+}
+
 export function providerQuantityCodes(quantity: string, instrument: Instrument, marketPrice: string): ProviderQuantityCode[] {
   const codes: ProviderQuantityCode[] = [];
   try {

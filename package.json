@@ -16,6 +16,7 @@
   "dependencies": {
     "@ai-sdk/openai-compatible": "3.0.47",
     "@bitget-ai/bitget-agent-sdk": "3.3.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "agents": "0.23.0",
     "ai": "7.0.97",
     "zod": "4.6.2"
