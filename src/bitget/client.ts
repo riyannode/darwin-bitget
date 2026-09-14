@@ -35,7 +35,20 @@ export function executableIntersection(publicInstruments: readonly Instrument[],
 
 export type BitgetHoldingMode = "hedge_mode" | "one_way_mode";
 
+export const GATEWAY_FAILURE_CLASSES = [
+  "GATEWAY_HTTP_502",
+  "GATEWAY_TIMEOUT",
+  "GATEWAY_UNREACHABLE",
+  "GATEWAY_INVALID_RESPONSE",
+  "PROVIDER_REJECTED",
+  "PROVIDER_NOT_FOUND",
+  "GATEWAY_INTERNAL_ERROR",
+] as const;
+
+export type GatewayFailureClass = (typeof GATEWAY_FAILURE_CLASSES)[number];
+
 export interface ProviderErrorDetails {
+  classification?: GatewayFailureClass;
   code?: string;
   message?: string;
 }
@@ -49,7 +62,10 @@ function textValue(value: unknown): string {
 }
 
 function sanitizeProviderMessage(value: string): string {
-  return value.replace(/(ACCESS-(?:KEY|SIGN|PASSPHRASE|TIMESTAMP)|apiKey|secretKey|passphrase)([=:])[^,\s]+/gi, "$1$2REDACTED").slice(0, 240);
+  return value
+    .replace(/(ACCESS-(?:KEY|SIGN|PASSPHRASE|TIMESTAMP)|apiKey|secretKey|passphrase|authorization)(\s*[=:]\s*)(?:bearer\s+)?[^,;\s]+/gi, "$1$2REDACTED")
+    .replace(/\bbearer\s+[^,;\s]+/gi, "Bearer REDACTED")
+    .slice(0, 240);
 }
 
 function parseHoldingMode(value: unknown): BitgetHoldingMode {
@@ -82,9 +98,11 @@ export function normalizeBitgetOrderStatus(value: unknown): ExecutionResult["sta
 export function extractProviderError(error: unknown): ProviderErrorDetails {
   const record = isRecord(error) ? error : null;
   const details = isRecord(record?.details) ? record.details : null;
+  const classification = textValue(details?.classification) || textValue(record?.classification);
   const code = textValue(details?.code) || textValue(record?.code) || textValue(record?.type);
   const message = sanitizeProviderMessage(textValue(details?.message) || (error instanceof Error ? error.message : textValue(record?.message) || textValue(record?.msg)));
   return {
+    ...(isGatewayFailureClass(classification) ? { classification } : {}),
     ...(code ? { code } : {}),
     ...(message ? { message } : {}),
   };
@@ -114,11 +132,17 @@ export function buildUnresolvedExecution(
     status: "unknown",
     submittedAt,
     readBackAt: new Date().toISOString(),
+    ...(writeDetails.classification ? { providerFailureClass: writeDetails.classification } : {}),
     ...(writeDetails.code ? { providerCode: writeDetails.code } : {}),
     providerMessage: writeDetails.message ?? "PROVIDER_WRITE_UNKNOWN",
+    ...(readbackDetails.classification ? { providerReadbackFailureClass: readbackDetails.classification } : {}),
     ...(readbackDetails.code ? { providerReadbackCode: readbackDetails.code } : {}),
     ...(readbackDetails.message ? { providerReadbackMessage: readbackDetails.message } : {}),
   };
+}
+
+function isGatewayFailureClass(value: string): value is GatewayFailureClass {
+  return (GATEWAY_FAILURE_CLASSES as readonly string[]).includes(value);
 }
 
 export class BitgetClient {

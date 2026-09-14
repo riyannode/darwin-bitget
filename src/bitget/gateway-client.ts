@@ -1,4 +1,14 @@
-import type { ProviderErrorDetails } from "./client.js";
+import type { GatewayFailureClass, ProviderErrorDetails } from "./client.js";
+
+const GATEWAY_FAILURE_CLASS_VALUES: readonly GatewayFailureClass[] = [
+  "GATEWAY_HTTP_502",
+  "GATEWAY_TIMEOUT",
+  "GATEWAY_UNREACHABLE",
+  "GATEWAY_INVALID_RESPONSE",
+  "PROVIDER_REJECTED",
+  "PROVIDER_NOT_FOUND",
+  "GATEWAY_INTERNAL_ERROR",
+];
 
 export const PRIVATE_BITGET_OPERATIONS = [
   "getAccountAssets",
@@ -76,11 +86,14 @@ export class BitgetGatewayClient {
         body: JSON.stringify(args),
         signal: controller.signal,
       });
-      const payload = await response.json().catch(() => null) as unknown;
+      const rawBody = await response.text();
+      const payload = parseJson(rawBody);
       if (!response.ok || !isGatewayResponse(payload)) {
         const provider = isRecord(payload) && isRecord(payload.provider) ? payload.provider : {};
         const symbol = typeof provider.symbol === "string" ? provider.symbol : typeof args.symbol === "string" ? args.symbol : "ACCOUNT";
+        const classification = failureClassFromResponse(response.status, payload, rawBody);
         throw new BitgetGatewayError(operation, symbol, {
+          classification,
           ...(typeof provider.code === "string" ? { code: provider.code } : {}),
           ...(typeof provider.message === "string" ? { message: sanitizeMessage(provider.message, this.serviceSecret) } : {}),
         });
@@ -88,8 +101,12 @@ export class BitgetGatewayClient {
       return payload as BitgetGatewayResponse<T>;
     } catch (error) {
       if (error instanceof BitgetGatewayError) throw error;
-      const message = error instanceof Error && error.name === "AbortError" ? "BITGET_GATEWAY_TIMEOUT" : error instanceof Error ? sanitizeMessage(error.message, this.serviceSecret) : "BITGET_GATEWAY_REQUEST_FAILED";
-      throw new BitgetGatewayError(operation, typeof args.symbol === "string" ? args.symbol : "ACCOUNT", { message });
+      const classification: GatewayFailureClass = error instanceof Error && error.name === "AbortError"
+        ? "GATEWAY_TIMEOUT"
+        : error instanceof TypeError
+          ? "GATEWAY_UNREACHABLE"
+          : "GATEWAY_INVALID_RESPONSE";
+      throw new BitgetGatewayError(operation, typeof args.symbol === "string" ? args.symbol : "ACCOUNT", { classification });
     } finally {
       clearTimeout(timeout);
     }
@@ -104,9 +121,37 @@ function isGatewayResponse(value: unknown): value is BitgetGatewayResponse<unkno
   return isRecord(value) && typeof value.endpoint === "string" && typeof value.requestTime === "string" && "data" in value;
 }
 
+function parseJson(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function failureClassFromResponse(status: number, payload: unknown, rawBody: string): GatewayFailureClass {
+  const payloadClass = isRecord(payload) && typeof payload.classification === "string" ? payload.classification : "";
+  const provider = isRecord(payload) && isRecord(payload.provider) ? payload.provider : null;
+  const providerClass = provider && typeof provider.classification === "string" ? provider.classification : "";
+  if (isGatewayFailureClass(payloadClass)) return payloadClass;
+  if (isGatewayFailureClass(providerClass)) return providerClass;
+  if (provider && (typeof provider.code === "string" || typeof provider.message === "string")) {
+    return /order does not exist|not found/i.test(String(provider.message ?? "")) ? "PROVIDER_NOT_FOUND" : "PROVIDER_REJECTED";
+  }
+  if (status === 502) return "GATEWAY_HTTP_502";
+  if (status === 504) return "GATEWAY_TIMEOUT";
+  if (!rawBody.trim() || status >= 500) return "GATEWAY_INVALID_RESPONSE";
+  return "GATEWAY_INVALID_RESPONSE";
+}
+
+function isGatewayFailureClass(value: string): value is GatewayFailureClass {
+  return GATEWAY_FAILURE_CLASS_VALUES.includes(value as GatewayFailureClass);
+}
+
 function sanitizeMessage(value: string, serviceSecret: string): string {
   return value
     .split(serviceSecret).join("[REDACTED]")
-    .replace(/(ACCESS-(?:KEY|SIGN|PASSPHRASE|TIMESTAMP)|apiKey|secretKey|passphrase|authorization)([=:])[^,\s]+/gi, "$1$2[REDACTED]")
+    .replace(/(ACCESS-(?:KEY|SIGN|PASSPHRASE|TIMESTAMP)|apiKey|secretKey|passphrase|authorization)(\s*[=:]\s*)(?:bearer\s+)?[^,;\s]+/gi, "$1$2[REDACTED]")
+    .replace(/\bbearer\s+[^,;\s]+/gi, "Bearer [REDACTED]")
     .slice(0, 240);
 }

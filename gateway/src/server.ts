@@ -2,11 +2,15 @@ import { createServer, type IncomingMessage } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { BitgetRestClient, loadConfig as loadBitgetConfig } from "@bitget-ai/bitget-agent-sdk";
 import { z } from "zod";
+import type { GatewayFailureClass } from "../../src/bitget/client.js";
 import type { PrivateBitgetOperation } from "../../src/bitget/gateway-client.js";
 
 export interface GatewayProvider {
   call(operation: PrivateBitgetOperation, args: Record<string, unknown>): Promise<{ endpoint: string; requestTime: string; data: unknown }>;
 }
+
+export type GatewayLogRecord = Record<string, string | number>;
+export type GatewayLogger = (record: GatewayLogRecord) => void;
 
 const emptyBody = z.object({}).strict();
 const categoryBody = z.object({ category: z.enum(["USDT-FUTURES"]) }).strict();
@@ -85,8 +89,9 @@ export class BitgetGatewayProvider implements GatewayProvider {
   }
 }
 
-export function createGatewayHandler(options: { serviceSecret: string; provider: GatewayProvider }): (request: Request) => Promise<Response> {
+export function createGatewayHandler(options: { serviceSecret: string; provider: GatewayProvider; logger?: GatewayLogger }): (request: Request) => Promise<Response> {
   if (!options.serviceSecret) throw new Error("GATEWAY_SERVICE_SECRET_REQUIRED");
+  const logger = options.logger ?? ((record: GatewayLogRecord) => console.info(JSON.stringify(record)));
   return async (request) => {
     if (request.method === "GET" && new URL(request.url).pathname === "/healthz") return json({ ok: true, mode: "PAPER", demo: true });
     if (request.method !== "POST") return json({ error: "NOT_FOUND" }, 404);
@@ -95,26 +100,64 @@ export function createGatewayHandler(options: { serviceSecret: string; provider:
     const match = path.match(/^\/v1\/bitget\/([a-z-]+)$/);
     const actionName = match?.[1];
     if (!actionName || !ACTIONS[actionName]) return json({ error: "NOT_FOUND" }, 404);
-    if (!constantTimeEqual(request.headers.get("authorization") ?? "", `Bearer ${options.serviceSecret}`)) return json({ error: "UNAUTHORIZED" }, 401);
-
     const action = ACTIONS[actionName];
+    const requestId = request.headers.get("x-request-id")?.match(/^[A-Za-z0-9._:-]{1,80}$/)?.[0] ?? crypto.randomUUID();
+    const startedAt = new Date().toISOString();
+    let symbol = "ACCOUNT";
+    const emit = (record: GatewayLogRecord): void => {
+      try {
+        logger(record);
+      } catch {
+        // Observability must never change gateway behavior.
+      }
+    };
+    emit({ event: "GATEWAY_REQUEST_START", requestId, operation: action.operation, symbol, startedAt });
+    const finish = (status: string, httpStatus: number, provider?: { code?: string; message?: string }): void => {
+      emit({
+        event: "GATEWAY_REQUEST_END",
+        requestId,
+        operation: action.operation,
+        symbol,
+        status,
+        httpStatus,
+        durationMs: Math.max(0, Date.now() - Date.parse(startedAt)),
+        ...(provider?.code ? { providerCode: provider.code } : {}),
+        ...(provider?.message ? { providerMessage: provider.message } : {}),
+      });
+    };
+    if (!constantTimeEqual(request.headers.get("authorization") ?? "", `Bearer ${options.serviceSecret}`)) {
+      finish("AUTH_REJECTED", 401);
+      return json({ error: "UNAUTHORIZED" }, 401);
+    }
     let body: unknown;
     try {
       const contentLength = Number(request.headers.get("content-length") ?? "0");
-      if (contentLength > MAX_BODY_BYTES) return json({ error: "BODY_TOO_LARGE" }, 413);
+      if (contentLength > MAX_BODY_BYTES) {
+        finish("INVALID_REQUEST", 413);
+        return json({ error: "BODY_TOO_LARGE" }, 413);
+      }
       body = await request.json();
     } catch {
+      finish("INVALID_REQUEST", 400);
       return json({ error: "INVALID_JSON" }, 400);
     }
     const parsed = action.schema.safeParse(body);
-    if (!parsed.success) return json({ error: "INVALID_REQUEST" }, 400);
+    if (!parsed.success) {
+      finish("INVALID_REQUEST", 400);
+      return json({ error: "INVALID_REQUEST" }, 400);
+    }
+    if (typeof parsed.data.symbol === "string") symbol = parsed.data.symbol;
 
     try {
       const result = await options.provider.call(action.operation, parsed.data);
+      finish("SUCCESS", 200);
       return json(result);
     } catch (error) {
-      const provider = sanitizeProviderError(error, action.operation, typeof parsed.data.symbol === "string" ? parsed.data.symbol : "ACCOUNT");
-      return json({ error: `BITGET_GATEWAY_FAILED_${action.operation}`, provider }, 502);
+      const provider = sanitizeProviderError(error, action.operation, symbol);
+      const classification = classifyGatewayError(error, provider);
+      const httpStatus = providerFailure(classification) ? 424 : 502;
+      finish(classification, httpStatus, provider);
+      return json({ error: `BITGET_GATEWAY_FAILED_${action.operation}`, classification, provider }, httpStatus);
     }
   };
 }
@@ -171,9 +214,22 @@ function sanitizeProviderError(error: unknown, operation: PrivateBitgetOperation
   return { operation, symbol, ...(code ? { code } : {}), ...(message ? { message } : {}) };
 }
 
+function classifyGatewayError(error: unknown, provider: { code?: string; message?: string }): GatewayFailureClass {
+  const textValue = `${provider.message ?? ""} ${error instanceof Error ? error.message : ""}`;
+  if (/timeout|timed out|ETIMEDOUT|AbortError/i.test(textValue)) return "GATEWAY_TIMEOUT";
+  if (/order does not exist|not found/i.test(provider.message ?? "")) return "PROVIDER_NOT_FOUND";
+  if (provider.code || provider.message) return "PROVIDER_REJECTED";
+  return "GATEWAY_INTERNAL_ERROR";
+}
+
+function providerFailure(classification: GatewayFailureClass): boolean {
+  return classification === "PROVIDER_NOT_FOUND";
+}
+
 function sanitizeMessage(value: string): string {
   return value
-    .replace(/(ACCESS-(?:KEY|SIGN|PASSPHRASE|TIMESTAMP)|apiKey|secretKey|passphrase|authorization)([=:])[^,\s]+/gi, "$1$2REDACTED")
+    .replace(/(ACCESS-(?:KEY|SIGN|PASSPHRASE|TIMESTAMP)|apiKey|secretKey|passphrase|authorization)(\s*[=:]\s*)(?:bearer\s+)?[^,;\s]+/gi, "$1$2REDACTED")
+    .replace(/\bbearer\s+[^,;\s]+/gi, "Bearer REDACTED")
     .slice(0, 240);
 }
 
