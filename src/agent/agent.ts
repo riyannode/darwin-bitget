@@ -122,9 +122,9 @@ function tradeLogEntries(experiences: readonly TradeExperience[], journals: read
     const journal = journals.find((entry) => entry.experienceId === experience.experienceId || (entry.experienceIds ?? []).includes(experience.experienceId) || entry.decision?.decisionId === experience.exitDecisionId || entry.decision?.decisionId === experience.entryDecisionId);
     const record = journal ? normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === experience.exitDecisionId || candidate.decision.decisionId === experience.entryDecisionId) : undefined;
     const action = (experience.lastAction && experience.lastAction !== "HOLD" ? experience.lastAction : experience.action) as Exclude<TradeExperience["action"], "HOLD">;
-    const entryReasoning = context?.entryDecisionId === experience.entryDecisionId && verifiedOpenIds.has(experience.entryDecisionId) ? context.entryReasoning : entryDecision ? decisionReasoning(entryDecision) : undefined;
+    const entryReasoning = context?.entryDecisionId === experience.entryDecisionId ? context.entryReasoning : entryDecision ? decisionReasoning(entryDecision) : undefined;
     const exitReasoning = exitDecision ? decisionReasoning(exitDecision) : undefined;
-    const managementEvents = context?.entryDecisionId === experience.entryDecisionId && verifiedOpenIds.has(experience.entryDecisionId) ? context.managementEvents : lifecycleDecisions.map(decisionReasoning);
+    const managementEvents = context?.entryDecisionId === experience.entryDecisionId ? context.managementEvents : lifecycleDecisions.map(decisionReasoning);
     return {
       tradeId: experience.experienceId,
       timestamp: experience.entryTime,
