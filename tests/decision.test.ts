@@ -67,6 +67,18 @@ describe("cycle decision plan contract", () => {
     expect(() => cycleDecisionPlanSchema.parse({ positionActions: [decision("CLOSE", "CRCLUSDT", "LONG", "close-partial", { marginAllocationPct: "0.0", reductionPct: "90" })], entryActions: [] })).toThrow("INVALID_REDUCTION_PCT");
   });
 
+  it("accepts OPEN_LONG only with LONG positionSide", () => {
+    expect(() => cycleDecisionPlanSchema.parse({ positionActions: [], entryActions: [decision("OPEN_LONG", "NVDAUSDT", "LONG")] })).not.toThrow();
+    expect(() => cycleDecisionPlanSchema.parse({ positionActions: [], entryActions: [decision("OPEN_LONG", "NVDAUSDT", "SHORT")] })).toThrow("INVALID_POSITION_SIDE");
+    expect(() => cycleDecisionPlanSchema.parse({ positionActions: [], entryActions: [decision("OPEN_LONG", "NVDAUSDT", null)] })).toThrow("INVALID_POSITION_SIDE");
+  });
+
+  it("accepts OPEN_SHORT only with SHORT positionSide", () => {
+    expect(() => cycleDecisionPlanSchema.parse({ positionActions: [], entryActions: [decision("OPEN_SHORT", "NVDAUSDT", "SHORT")] })).not.toThrow();
+    expect(() => cycleDecisionPlanSchema.parse({ positionActions: [], entryActions: [decision("OPEN_SHORT", "NVDAUSDT", "LONG")] })).toThrow("INVALID_POSITION_SIDE");
+    expect(() => cycleDecisionPlanSchema.parse({ positionActions: [], entryActions: [decision("OPEN_SHORT", "NVDAUSDT", null)] })).toThrow("INVALID_POSITION_SIDE");
+  });
+
   it("allows CRCL HOLD and NVDA OPEN_LONG in the same cycle", () => {
     const value = plan([decision("HOLD", "CRCLUSDT", "LONG")], [decision("OPEN_LONG", "NVDAUSDT", "LONG")]);
     expect(() => validateCycleDecisionPlan(value, context([position("CRCLUSDT")]))).not.toThrow();
@@ -171,12 +183,13 @@ describe("cycle decision plan contract", () => {
     expect(prompt).toContain('"supportedUniverse"');
     expect(prompt).toContain('"maxTotalActionsPerCycle":5');
     expect(prompt).toContain('"maxFinancialWritesPerCycle":5');
-    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v5");
+    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v6");
     expect(DECISION_TASK_PROMPT).toContain('HOLD: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('INCREASE: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('REDUCE: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('CLOSE: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('REVERSE: positionSide = current provider side, targetPositionSide is opposite');
-    expect(DECISION_TASK_PROMPT).toContain('For OPEN_LONG / OPEN_SHORT entryActions, marginAllocationPct is positive');
+    expect(DECISION_TASK_PROMPT).toContain('For OPEN_LONG entryActions, positionSide MUST be "LONG"; for OPEN_SHORT entryActions, positionSide MUST be "SHORT".');
+    expect(DECISION_TASK_PROMPT).toContain('marginAllocationPct is positive, leverage is proposed leverage');
   });
 });
