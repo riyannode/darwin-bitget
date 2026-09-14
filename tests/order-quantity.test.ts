@@ -40,6 +40,11 @@ describe("provider quantity validation", () => {
     expect(result.codes).toContain("MAX_ORDER_QTY");
   });
 
+  it("blocks the KORU paper maximum without clamping the requested quantity", () => {
+    const koru = { ...instrument, maxOrderQty: "100" };
+    expect(providerQuantityCodes("116.33", koru, "19.371")).toContain("MAX_ORDER_QTY");
+  });
+
   it("rejects quantities that do not match provider precision or step", () => {
     expect(providerQuantityCodes("1.005", instrument, market.lastPrice)).toEqual(["INVALID_ORDER_QUANTITY"]);
     expect(providerQuantityCodes("0.001", instrument, market.lastPrice)).toEqual(expect.arrayContaining(["MIN_ORDER_QTY", "INVALID_ORDER_QUANTITY"]));

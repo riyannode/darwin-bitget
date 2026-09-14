@@ -4,7 +4,7 @@ import type { Instrument, MarketSnapshot } from "../src/types.js";
 
 describe("Bitget provider readback", () => {
   it("preserves tokenized stock metadata from the instrument catalog", () => {
-    expect(parseInstruments([{ symbol: "NVDAUSDT", category: "USDT-FUTURES", symbolType: "stock", isRwa: "YES", status: "online", minOrderQty: "0.01", minOrderAmount: "5", maxOrderQty: "100", pricePrecision: "2", quantityPrecision: "2", sizeMultiplier: "0.01", minLeverage: "1", maxLeverage: "100" }])[0]).toMatchObject({ symbol: "NVDAUSDT", symbolType: "stock", isRwa: "YES", status: "online", minOrderQty: "0.01", minOrderAmount: "5", leverageMin: "1", leverageMax: "100" });
+    expect(parseInstruments([{ symbol: "NVDAUSDT", category: "USDT-FUTURES", symbolType: "stock", isRwa: "YES", status: "online", minOrderQty: "0.01", minOrderAmount: "5", maxOrderQty: "500", maxMarketOrderQty: "100", pricePrecision: "2", quantityPrecision: "2", sizeMultiplier: "0.01", minLeverage: "1", maxLeverage: "100" }])[0]).toMatchObject({ symbol: "NVDAUSDT", symbolType: "stock", isRwa: "YES", status: "online", minOrderQty: "0.01", maxOrderQty: "100", minOrderAmount: "5", leverageMin: "1", leverageMax: "100" });
   });
 
   it("preserves the provider short side and quantity fields", () => {

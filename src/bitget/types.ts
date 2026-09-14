@@ -30,7 +30,7 @@ export function parseInstruments(value: unknown): Instrument[] {
     isRwa: text(entry.isRwa),
     status: text(entry.status),
     minOrderQty: text(entry.minOrderQty),
-    maxOrderQty: text(entry.maxOrderQty),
+    maxOrderQty: text(entry.maxMarketOrderQty, text(entry.maxOrderQty)),
     minOrderAmount: text(entry.minOrderAmount),
     pricePrecision: integer(entry.pricePrecision),
     quantityPrecision: integer(entry.quantityPrecision),
