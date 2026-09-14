@@ -35,6 +35,12 @@ export function normalizeCycleDecisions(journal: TradingJournal): NormalizedCycl
   };
 }
 
+export function cycleReadModel(journal: TradingJournal, status: "RUNNING" | "COMPLETED" | "FAILED", failureCode?: string): NormalizedCycleDecisions {
+  const normalized = normalizeCycleDecisions(journal);
+  const hasValidPlan = status === "COMPLETED" && Boolean(journal.cyclePlan || journal.decision || journal.exitDecisions?.length);
+  return { ...normalized, status, hasValidPlan, ...(failureCode ? { failureCode } : {}) };
+}
+
 export function cyclePlanDecisions(journal: TradingJournal | null | undefined): Decision[] {
   if (!journal) return [];
   const normalized = normalizeCycleDecisions(journal);

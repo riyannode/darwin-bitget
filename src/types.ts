@@ -320,6 +320,11 @@ export interface NormalizedCycleDecisions {
   plan: CycleDecisionPlan;
   records: DecisionExecutionRecord[];
   discovery?: CycleDiscovery;
+  status?: "RUNNING" | "COMPLETED" | "FAILED";
+  failureCode?: string;
+  failurePath?: string;
+  failureIssue?: string;
+  hasValidPlan?: boolean;
 }
 
 export interface AutonomousDecisionSet {
@@ -513,6 +518,16 @@ export interface DashboardSnapshot {
   latestDecision: Decision | null;
   decisions: Decision[];
   latestCyclePlan: CycleDecisionPlan | null;
+  latestCycleStatus: {
+    cycleId: string;
+    status: "RUNNING" | "COMPLETED" | "FAILED";
+    startedAt: string;
+    completedAt: string | null;
+    hasValidPlan: boolean;
+    failureCode?: string;
+    failurePath?: string;
+    failureIssue?: string;
+  } | null;
   cyclePlans: Array<NormalizedCycleDecisions & { startedAt: string; completedAt: string | null }>;
   latestDiscovery: CycleDiscovery | null;
   executionEvidence: {

@@ -15,6 +15,7 @@ let snapshot = {
   latestDecision: null,
   decisions: [],
   latestCyclePlan: null,
+  latestCycleStatus: null,
   cyclePlans: [],
   latestDiscovery: null,
   executionEvidence: null,
@@ -162,11 +163,28 @@ function renderActionSection(title, actions, records = []) {
   return section;
 }
 
-function renderCyclePlan(prefix, plan, discovery) {
-  const node = $(prefix === "dashboard" ? "dashboard-cycle-plan" : "cycle-plan");
+function renderCycleStatus(prefix) {
+  const node = $(prefix === "dashboard" ? "dashboard-cycle-status" : "journal-cycle-status");
   if (!node) return;
   node.replaceChildren();
-  if (!plan) { node.className = "stack empty"; node.textContent = "No cycle plan recorded yet."; return; }
+  const status = snapshot.latestCycleStatus;
+  if (!status) { node.className = "cycle-status empty"; node.textContent = "No cycle status recorded yet."; return; }
+  node.className = `cycle-status ${status.status.toLowerCase()}`;
+  const title = document.createElement("strong");
+  title.textContent = status.status === "FAILED" ? (status.hasValidPlan ? "CYCLE FAILED AFTER PLAN CREATION" : "CYCLE FAILED BEFORE DECISION") : status.status === "RUNNING" ? "ANALYZING / IN PROGRESS" : "CYCLE COMPLETED";
+  node.append(title, detail("STATUS", status.status), detail("CYCLE ID", status.cycleId), detail("STARTED", when(status.startedAt)));
+  if (status.failureCode) node.append(detail("FAILURE", status.failureCode));
+  if (status.failurePath) node.append(detail("PATH", status.failurePath));
+  if (status.failureIssue) node.append(detail("ISSUE", status.failureIssue));
+}
+
+function renderCyclePlan(prefix, plan, discovery) {
+  renderCycleStatus(prefix);
+  const node = $(prefix === "dashboard" ? "dashboard-cycle-plan" : "cycle-plan");
+
+  if (!node) return;
+  node.replaceChildren();
+  if (!plan) { node.className = "stack empty"; node.textContent = "No valid cycle plan recorded yet."; return; }
   node.className = "cycle-plan stack";
   node.append(renderActionSection("POSITION MANAGEMENT", plan.positionActions, plan.records ?? []), renderActionSection("NEW ENTRY ACTIONS", plan.entryActions, plan.records ?? []));
   const discoveryNode = $(prefix === "dashboard" ? "dashboard-market-discovery" : "market-discovery");
@@ -200,10 +218,23 @@ function renderDecisionHistory() {
     item.dataset.stableKey = cycle.cycleId || "RUN_UNKNOWN";
     item.open = openKeys.has(item.dataset.stableKey);
     const summary = document.createElement("summary");
-    summary.append(detail("CYCLE ID", cycle.cycleId || "RUN_UNKNOWN"), detail("TIMESTAMP", when(cycle.startedAt)), detail("ACTIONS", cycle.plan.positionActions.length + cycle.plan.entryActions.length));
+    const status = cycle.status ?? "COMPLETED";
+    const actionCount = cycle.hasValidPlan ? cycle.plan.positionActions.length + cycle.plan.entryActions.length : "UNAVAILABLE";
+    summary.append(detail("CYCLE ID", cycle.cycleId || "RUN_UNKNOWN"), detail("TIMESTAMP", when(cycle.startedAt)), detail("STATUS", status), detail("ACTIONS", actionCount));
     const content = document.createElement("div");
     content.className = "detail-grid history-content";
-    content.append(renderActionSection("POSITION MANAGEMENT", cycle.plan.positionActions, cycle.records ?? []), renderActionSection("NEW ENTRIES", cycle.plan.entryActions, cycle.records ?? []));
+    if (status === "FAILED") {
+      content.append(detail("STATUS", cycle.hasValidPlan ? "CYCLE FAILED AFTER PLAN CREATION" : "CYCLE FAILED BEFORE DECISION"), detail("DECISION PLAN", cycle.hasValidPlan ? "Persisted plan available." : "Decision plan not produced."));
+      if (cycle.failureCode) content.append(detail("FAILURE", cycle.failureCode));
+      if (cycle.failurePath) content.append(detail("PATH", cycle.failurePath));
+      if (cycle.failureIssue) content.append(detail("ISSUE", cycle.failureIssue));
+    } else if (status === "RUNNING") {
+      content.textContent = "ANALYZING / IN PROGRESS";
+    } else if (cycle.hasValidPlan) {
+      content.append(renderActionSection("POSITION MANAGEMENT", cycle.plan.positionActions, cycle.records ?? []), renderActionSection("NEW ENTRIES", cycle.plan.entryActions, cycle.records ?? []));
+    } else {
+      content.textContent = "No valid cycle plan recorded.";
+    }
     item.append(summary, content);
     node.append(item);
   });
@@ -331,7 +362,7 @@ async function loadPage(page) {
   const endpoint = endpoints[page]; if (!endpoint) return;
   try {
     const data = await requestJson(endpoint);
-    if (page === "journal") { snapshot.decisions = data.decisions ?? []; snapshot.cyclePlans = data.cycles ?? data.cyclePlans ?? []; snapshot.latestCyclePlan = snapshot.cyclePlans[0]?.plan ?? snapshot.latestCyclePlan; snapshot.latestDiscovery = snapshot.cyclePlans[0]?.discovery ?? snapshot.latestDiscovery; if (!snapshot.latestCyclePlan) snapshot.latestDecision = snapshot.decisions[0] ?? snapshot.latestDecision; }
+    if (page === "journal") { snapshot.decisions = data.decisions ?? []; snapshot.cyclePlans = data.cycles ?? data.cyclePlans ?? []; const validCycle = snapshot.cyclePlans.find((cycle) => cycle.status === "COMPLETED" && cycle.hasValidPlan); snapshot.latestCyclePlan = validCycle?.plan ?? null; snapshot.latestDiscovery = validCycle?.discovery ?? null; if (!snapshot.latestCyclePlan) snapshot.latestDecision = null; }
     if (page === "trade-history") snapshot.trades = data.trades ?? [];
     if (page === "learning-page") snapshot.learning = data.learning ?? snapshot.learning;
     if (page === "policy-page") { snapshot.riskControls = data.riskControls ?? snapshot.riskControls; snapshot.lastPolicyUpdate = data.lastPolicyUpdate ?? null; }

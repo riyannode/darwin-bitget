@@ -1,5 +1,6 @@
 import { Agent } from "agents";
-import type { CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, Lesson, OwnerPolicy, PositionContext, PositionSnapshot, ReflectionResult, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
+import { ZodError } from "zod";
+import type { CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionSnapshot, ReflectionResult, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
@@ -17,6 +18,7 @@ import {
   loadAllEvents,
   loadAllExperiences,
   loadAllStoredCycles,
+  loadRecentStoredCycles,
   loadRecentJournals,
   loadRecentEvents,
   loadRecentLessons,
@@ -46,7 +48,7 @@ import {
   saveLesson,
 } from "../storage/store.js";
 import { buildPaperLogExport, parsePaperLogPeriod, paperLogToCsv } from "../storage/paper-log.js";
-import { cyclePlanDecisions, normalizeCycleDecisions } from "../storage/journal-normalizer.js";
+import { cyclePlanDecisions, cycleReadModel, normalizeCycleDecisions } from "../storage/journal-normalizer.js";
 import { evaluateRiskGate } from "../trading/risk-gate.js";
 import { evaluateDrawdown } from "../trading/drawdown.js";
 import { loadOwnerPolicy, updateOwnerPolicy } from "../trading/policy.js";
@@ -82,8 +84,44 @@ const STALE_CYCLE_TIMEOUT_MS = 120_000;
 const USER_STORAGE_VERSION = 4;
 const SNAPSHOT_EVENT_LIMIT = 25;
 
-function failureCode(codes: string[]): string {
-  return codes.join(",") || "";
+const MAX_FAILURE_DIAGNOSTIC_LENGTH = 240;
+
+function boundedDiagnosticText(value: unknown, limit = MAX_FAILURE_DIAGNOSTIC_LENGTH): string {
+  return String(value ?? "").replace(/\s+/g, " ").replace(/Bearer\s+[^\s,;]+/gi, "Bearer [REDACTED]").replace(/((?:api[_-]?key|token|secret|password)\s*[=:]\s*)[^\s,;]+/gi, "$1[REDACTED]").slice(0, limit);
+}
+
+function safeDiagnosticMessage(value: unknown, fallback: string): string {
+  const text = boundedDiagnosticText(value);
+  if (!text || /(prompt|system\s+message|api[_-]?key|bearer\s|secret|password|authorization)/i.test(text)) return fallback;
+  return text;
+}
+
+export function failureDiagnostic(error: unknown): Record<string, string> {
+  if (error instanceof ZodError) {
+    const issues = error.issues.slice(0, 3);
+    const first = issues[0];
+    const diagnostic: Record<string, string> = {
+      category: "ZOD_VALIDATION_FAILED",
+      code: "ZOD_VALIDATION_FAILED",
+      issueCount: String(Math.min(error.issues.length, 999)),
+      firstIssuePath: boundedDiagnosticText(first?.path.map(String).join(".") || "root"),
+      firstIssueCode: boundedDiagnosticText(first?.code || "unknown", 80),
+      firstIssueMessage: safeDiagnosticMessage(first?.message, "Validation failed"),
+    };
+    issues.slice(1).forEach((issue, index) => {
+      const number = index + 2;
+      diagnostic[`issue${number}Path`] = boundedDiagnosticText(issue.path.map(String).join(".") || "root");
+      diagnostic[`issue${number}Code`] = boundedDiagnosticText(issue.code || "unknown", 80);
+      diagnostic[`issue${number}Message`] = safeDiagnosticMessage(issue.message, "Validation failed");
+    });
+    return diagnostic;
+  }
+  const rawMessage = error instanceof Error ? error.message : "Unknown runtime error";
+  const normalizedMessage = boundedDiagnosticText(rawMessage);
+  const candidateCode = normalizedMessage.split(":", 1)[0]?.trim() ?? "";
+  const code = /^[A-Z][A-Z0-9_]{1,79}$/.test(candidateCode) ? candidateCode : "RUNTIME_ERROR";
+  const detail = normalizedMessage.includes(":") ? normalizedMessage.slice(normalizedMessage.indexOf(":") + 1).trim() : "Runtime error";
+  return { category: "RUNTIME_ERROR", code, message: safeDiagnosticMessage(detail, "Runtime error") };
 }
 
 function schedulerMetrics(events: readonly { type: string; metadata?: Record<string, string> }[]): DashboardSnapshot["scheduler"] {
@@ -181,6 +219,22 @@ function json(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 }
 
+function cycleReadModelWithStatus(journal: TradingJournal, storedCycles: readonly { cycleId: string; status: string; startedAt: string; completedAt: string | null }[], events: readonly { type: string; cycleId: string; metadata?: Record<string, string> }[]): NormalizedCycleDecisions & { startedAt: string; completedAt: string | null } {
+  const stored = storedCycles.find((cycle) => cycle.cycleId === journal.cycleId);
+  const status = stored?.status === "RUNNING" || stored?.status === "COMPLETED" || stored?.status === "FAILED"
+    ? stored.status
+    : journal.completedAt ? "COMPLETED" : "RUNNING";
+  const failureEvent = status === "FAILED" ? events.find((event) => event.type === "CYCLE_FAILED" && event.cycleId === journal.cycleId) : undefined;
+  const failureCode = failureEvent?.metadata?.category ?? failureEvent?.metadata?.code;
+  return {
+    ...cycleReadModel(journal, status, failureCode),
+    ...(failureEvent?.metadata?.firstIssuePath ? { failurePath: failureEvent.metadata.firstIssuePath } : {}),
+    ...(failureEvent?.metadata?.firstIssueCode ? { failureIssue: failureEvent.metadata.firstIssueCode } : {}),
+    startedAt: stored?.startedAt ?? journal.startedAt,
+    completedAt: stored?.completedAt ?? journal.completedAt ?? null,
+  };
+}
+
 export class TraderAgent extends Agent<Env, AgentState> {
   override initialState: AgentState = {
     emergencyStop: false,
@@ -272,10 +326,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
       await this.ensureTradingSchedule(config);
       await this.runCycle();
     } catch (error) {
-      const code = error instanceof Error ? error.message.split(":", 1)[0] ?? "SCHEDULE_CALLBACK_FAILED" : "SCHEDULE_CALLBACK_FAILED";
-      if (code === "CYCLE_IN_PROGRESS") this.recordEventBestEffort("CYCLE_IN_PROGRESS", this.state.lastCycleId ?? "UNKNOWN", { code });
-      if (code.includes("TIMEOUT")) this.recordEventBestEffort("CYCLE_TIMEOUT", this.state.lastCycleId ?? "UNKNOWN", { code });
-      this.recordEventBestEffort("SCHEDULE_CALLBACK_FAILED", "CONTROL", { code });
+      const diagnostic = failureDiagnostic(error);
+      const diagnosticCode = diagnostic.code ?? "RUNTIME_ERROR";
+      if (diagnosticCode === "CYCLE_IN_PROGRESS") this.recordEventBestEffort("CYCLE_IN_PROGRESS", this.state.lastCycleId ?? "UNKNOWN", diagnostic);
+      if (diagnosticCode.includes("TIMEOUT")) this.recordEventBestEffort("CYCLE_TIMEOUT", this.state.lastCycleId ?? "UNKNOWN", diagnostic);
+      this.recordEventBestEffort("SCHEDULE_CALLBACK_FAILED", "CONTROL", diagnostic);
       return;
     }
   }
@@ -429,9 +484,14 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const config = loadConfig(this.env, this.ensureActivePolicy());
     const journal = loadLatestJournal(this);
     const recentJournals = loadRecentJournals(this, 25);
-    const recentCycles = recentJournals.map((entry) => ({ ...normalizeCycleDecisions(entry), startedAt: entry.startedAt, completedAt: entry.completedAt ?? null }));
-    const latestCycle = recentCycles[0];
+    const storedCycles = loadRecentStoredCycles(this, 25);
     const events = loadRecentEvents(this, SNAPSHOT_EVENT_LIMIT);
+    const recentCycles = recentJournals.map((entry) => cycleReadModelWithStatus(entry, storedCycles, events));
+    const latestCycle = recentCycles[0];
+    const latestValidCycle = recentCycles.find((cycle) => cycle.status === "COMPLETED" && cycle.hasValidPlan);
+    const latestCycleStatus = this.state.lastStatus === "RUNNING" && this.state.lastCycleId && this.state.cycleStartedAt
+      ? { cycleId: this.state.lastCycleId, status: "RUNNING" as const, startedAt: this.state.cycleStartedAt, completedAt: null, hasValidPlan: false }
+      : latestCycle?.status ? { cycleId: latestCycle.cycleId, status: latestCycle.status, startedAt: latestCycle.startedAt, completedAt: latestCycle.completedAt, hasValidPlan: latestCycle.hasValidPlan === true, ...(latestCycle.failureCode ? { failureCode: latestCycle.failureCode } : {}), ...(latestCycle.failurePath ? { failurePath: latestCycle.failurePath } : {}), ...(latestCycle.failureIssue ? { failureIssue: latestCycle.failureIssue } : {}) } : null;
     const drawdown = loadDailyDrawdownState(this);
     const drawdownPct = drawdown ? calculateDrawdownPct(drawdown.baselineEquity, drawdown.lastEquity) : "0";
     const configuredIntervalMinutes = temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes;
@@ -470,11 +530,12 @@ export class TraderAgent extends Agent<Env, AgentState> {
       portfolioFreshness: { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" },
       performance,
       trades: [],
-      latestDecision: journal?.cyclePlan ? null : journal?.decision ?? null,
+      latestDecision: latestValidCycle?.plan.entryActions[0] ?? latestValidCycle?.plan.positionActions[0] ?? null,
       decisions: recentJournals.flatMap((entry) => cyclePlanDecisions(entry)),
-      latestCyclePlan: latestCycle?.plan ?? null,
+      latestCyclePlan: latestValidCycle?.plan ?? null,
+      latestCycleStatus,
       cyclePlans: recentCycles,
-      latestDiscovery: latestCycle?.discovery ?? journal?.discovery ?? null,
+      latestDiscovery: latestValidCycle?.discovery ?? null,
       executionEvidence: executionEvidence(journal),
       learning: { reflection: journal?.reflection ?? null, lessons: [], lessonsUsed: journal ? cyclePlanDecisions(journal).flatMap((decision) => decision.lessonsUsed) : [], backtest: null, recentExperiences: [] },
       riskControls: { ...config.ownerPolicy, scanIntervalMinutes: temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes, temporaryScanIntervalExpiresAt: this.state.temporaryScanIntervalExpiresAt, drawdownBlocked: Boolean(drawdown?.cooldownUntil && new Date(drawdown.cooldownUntil).getTime() > Date.now()), drawdownCode: drawdown?.cooldownUntil ? "DRAWDOWN_COOLDOWN" : "NONE", cooldownUntil: drawdown?.cooldownUntil ?? null },
@@ -512,7 +573,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
   private getAgentJournal(url: URL): Response {
     const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
     const journals = loadRecentJournals(this, limit);
-    const cycles = journals.map((entry) => ({ ...normalizeCycleDecisions(entry), startedAt: entry.startedAt, completedAt: entry.completedAt ?? null }));
+    const storedCycles = loadRecentStoredCycles(this, limit);
+    const events = loadRecentEvents(this, limit);
+    const cycles = journals.map((entry) => cycleReadModelWithStatus(entry, storedCycles, events));
     return json({ journals, cycles, decisions: journals.flatMap((entry) => cyclePlanDecisions(entry)), limit });
   }
 
@@ -655,9 +718,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
       journal.durationMs = Math.max(0, new Date(journal.completedAt).getTime() - new Date(startedAt).getTime());
       saveJournal(this, journal);
       saveCycle(this, cycleId, "FAILED", startedAt, journal.completedAt);
-      const code = error instanceof Error ? error.message.split(":", 1)[0] ?? "CYCLE_FAILED" : "CYCLE_FAILED";
-      this.recordEvent("CYCLE_FAILED", cycleId, { code, durationMs: String(journal.durationMs) });
-      if (code.includes("TIMEOUT")) this.recordEvent("CYCLE_TIMEOUT", cycleId, { code });
+      const diagnostic = failureDiagnostic(error);
+      this.recordEvent("CYCLE_FAILED", cycleId, { ...diagnostic, durationMs: String(journal.durationMs) });
+      if ((diagnostic.code ?? "").includes("TIMEOUT")) this.recordEvent("CYCLE_TIMEOUT", cycleId, diagnostic);
       this.setState({ ...this.state, runtimeStatus: "ERROR", currentStage: "ERROR", lastStatus: "FAILED", cycleStartedAt: null });
       throw error;
     }
@@ -753,7 +816,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     this.updatePerformanceReadModel(record, bundle, verified);
     const currentExperience = experiences.find((experience) => experience.outcomeStatus === "OPEN" && experience.symbol === decision.symbol && experience.positionSide === decision.positionSide);
     if (!currentExperience && allowFailureReflection && (record.riskGateResult.status === "BLOCK" || (executionResult && !verified))) {
-      const failure = failureCode(record.riskGateResult.codes.length ? record.riskGateResult.codes : ["EXECUTION_FAILURE"]);
+      const failure = record.riskGateResult.codes.length ? record.riskGateResult.codes.join(",") : "EXECUTION_FAILURE";
       const failureResult = reflect({ decision, outcome: record.riskGateResult.status === "BLOCK" ? "RISK_BLOCKED" : "EXECUTION_FAILURE", failureCode: failure, symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", experienceStatus: record.riskGateResult.status === "BLOCK" ? "BLOCKED" : "EXECUTION_FAILURE", entryPrice: bundle.market.lastPrice, exitPrice: bundle.market.lastPrice, evidenceAtEntry: bundle.evidence.map((evidence) => evidence.type), evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: decision.lessonsUsed, marginAllocated: record.executionRequest?.marginAllocated ?? "0", positionNotional: record.executionRequest?.positionNotional ?? "0" });
       saveExperience(this, failureResult.experience, startedAt);
       saveLesson(this, failureResult.lesson);
@@ -840,13 +903,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
           journal.reflection = result.reflection;
           return { reflection: result.reflection, lesson: result.lesson };
         } catch (error) {
-          this.recordEvent("REFLECTION_FAILED", cycleId, { code: error instanceof Error ? error.message.split(":", 1)[0] ?? "REFLECTION_FAILED" : "REFLECTION_FAILED", symbol: decision.symbol });
+          this.recordEvent("REFLECTION_FAILED", cycleId, { ...failureDiagnostic(error), symbol: decision.symbol });
         }
       }
       return {};
     }
     if (allowFailureReflection && (record.riskGateResult.status === "BLOCK" || (executionResult && !verified))) {
-      const failure = failureCode(record.riskGateResult.codes.length ? record.riskGateResult.codes : ["EXECUTION_FAILURE"]);
+      const failure = record.riskGateResult.codes.length ? record.riskGateResult.codes.join(",") : "EXECUTION_FAILURE";
       const failureResult = reflect({ decision, outcome: record.riskGateResult.status === "BLOCK" ? "RISK_BLOCKED" : "EXECUTION_FAILURE", failureCode: failure, symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", experienceStatus: record.riskGateResult.status === "BLOCK" ? "BLOCKED" : "EXECUTION_FAILURE", entryPrice: bundle.market.lastPrice, exitPrice: bundle.market.lastPrice, evidenceAtEntry: bundle.evidence.map((evidence) => evidence.type), evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: decision.lessonsUsed, marginAllocated: record.executionRequest?.marginAllocated ?? "0", positionNotional: record.executionRequest?.positionNotional ?? "0" });
       saveExperience(this, failureResult.experience, startedAt);
       saveLesson(this, failureResult.lesson);

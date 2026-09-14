@@ -359,6 +359,11 @@ export function loadAllStoredCycles(executor: SqlExecutor, from?: string, to?: s
   return rows.map((row) => ({ cycleId: row.cycle_id, status: row.status, startedAt: row.started_at, completedAt: row.completed_at }));
 }
 
+export function loadRecentStoredCycles(executor: SqlExecutor, limit = 25): StoredCycle[] {
+  const rows = executor.sql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>`SELECT cycle_id, status, started_at, completed_at FROM cycles ORDER BY started_at DESC, cycle_id DESC LIMIT ${clampHistoryLimit(limit, 25)}`;
+  return rows.map((row) => ({ cycleId: row.cycle_id, status: row.status, startedAt: row.started_at, completedAt: row.completed_at }));
+}
+
 export function loadLatestBacktest(executor: SqlExecutor): BacktestReplay | null {
   const rows = executor.sql<BacktestRow>`SELECT payload FROM backtests ORDER BY created_at DESC LIMIT 1`;
   if (rows.length === 0) return null;
