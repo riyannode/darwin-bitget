@@ -48,6 +48,8 @@ export function upsertPositionContext(
       updatedAt: observedAt,
     };
   }
+  const entryBoundary = current?.entryReasoning?.entryTime ?? current?.entryReasoning?.createdAt;
+  if (entryBoundary && decision.createdAt < entryBoundary) return current;
   const latestManagement = decisionReasoning(management);
   const managementEvents = [...(current?.managementEvents ?? []), latestManagement].slice(-20);
   return {
@@ -89,8 +91,10 @@ export function bootstrapPositionContexts(journals: readonly TradingJournal[], e
     for (const decision of cyclePlanDecisions(journal)) {
       if (decision.action === "OPEN_LONG" || decision.action === "OPEN_SHORT" || !decision.positionSide) continue;
       const key = `${decision.symbol}:${decision.positionSide}`;
-      if (contexts.has(key)) {
-        const next = upsertPositionContext(contexts.get(key) ?? null, decision, decision.createdAt || initializedAt);
+      const current = contexts.get(key);
+      const entryBoundary = current?.entryReasoning?.entryTime ?? current?.entryReasoning?.createdAt;
+      if (current && (!entryBoundary || decision.createdAt >= entryBoundary)) {
+        const next = upsertPositionContext(current, decision, decision.createdAt || initializedAt);
         if (next) contexts.set(key, next);
       }
     }

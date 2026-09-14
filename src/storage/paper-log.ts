@@ -372,7 +372,7 @@ export function buildPaperLogExport(input: {
   const physicalWrites = decisions.flatMap((decision) => decision.physicalWrites);
   const verifiedExecutions = decisions.filter((decision) => decision.action !== "REVERSE" && decision.providerVerified).length + physicalWrites.filter((write) => write.providerVerified).length;
   const unresolvedExecutions = decisions.filter((decision) => decision.action !== "REVERSE" && decision.executionResult && !decision.providerVerified).length + physicalWrites.filter((write) => write.executionStatus !== null && !write.providerVerified).length;
-  const closed = experiences.filter((experience) => ["PROFITABLE", "LOSING", "BREAK_EVEN"].includes(experience.outcomeStatus));
+  const closed = experiences.filter((experience) => ["PROFITABLE", "LOSING", "BREAK_EVEN", "CLOSED_UNCLASSIFIED"].includes(experience.outcomeStatus));
   const realizedPnl = experiences.filter((experience) => experience.realizedPnlVerified && typeof experience.realizedPnl === "string" && isDecimal(experience.realizedPnl)).reduce((total, experience) => addDecimal(total, experience.realizedPnl ?? "0"), "0");
   const drawdown = summarizeDrawdown(journals);
   return {

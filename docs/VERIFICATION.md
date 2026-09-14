@@ -29,7 +29,10 @@ The repository is intended to verify the following through typecheck, unit tests
 - `/api/live/portfolio` remains provider-only with zero Durable Object reads;
 - account-level realized PnL is preferred, signed position-level realized PnL is the fallback, and missing realized data remains unavailable;
 - the compact performance aggregate is read O(1) from Durable Object state and is updated incrementally rather than reconstructed during `/api/snapshot`;
+- provider-verified closes increment `closedTrades` without requiring realized-PnL enrichment, while win rate uses only classified outcomes;
+- one-time bootstrap targets current OPEN experiences and their entry decision IDs beyond the recent-journal window;
 - the bounded position-context path joins exact symbol + side, preserves original verified entry evidence, and exposes latest management evidence without Qwen calls;
+- same-side re-entry resets management history and excludes decisions created before the current entry boundary;
 - Open Position and Trade History distinguish provider-live facts from persisted DARWIN decision evidence.
 
 The prompt contracts are code-checked as `darwin-mandate-v6` and `darwin-decision-v4`. Reflection/backtest prompt versions remain unchanged.

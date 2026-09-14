@@ -3,7 +3,7 @@ import { cyclePlanDecisions, effectiveExecutionResult, effectiveReconciliationRe
 import { addDecimal, isDecimal, subtractDecimal } from "./decimal.js";
 
 export const PERFORMANCE_READ_MODEL_VERSION = "performance-v1";
-export const POSITION_CONTEXT_READ_MODEL_VERSION = "position-context-v1";
+export const POSITION_CONTEXT_READ_MODEL_VERSION = "position-context-v2";
 export const MAX_PERSISTED_PERFORMANCE_DAYS = 62;
 
 export interface PerformanceDay {
@@ -111,11 +111,11 @@ export function recordVerifiedOpen(performance: PerformanceAggregate, equity: st
   };
 }
 
-export function recordVerifiedClose(performance: PerformanceAggregate, realizedPnl: string, equity: string, observedAt: string): PerformanceAggregate {
-  if (!isDecimal(realizedPnl)) return updateEquity(performance, equity, observedAt);
+export function recordVerifiedClose(performance: PerformanceAggregate, realizedPnl: string | undefined, equity: string, observedAt: string): PerformanceAggregate {
   const updated = updateEquity(performance, equity, observedAt);
-  const pnl = Number(realizedPnl);
   const closed = updated.closedTrades + 1;
+  if (!isDecimal(realizedPnl)) return { ...updated, openTrades: Math.max(0, updated.openTrades - 1), closedTrades: closed, winRate: classifiedWinRate(updated.wins, updated.losses, updated.breakeven) };
+  const pnl = Number(realizedPnl);
   const wins = updated.wins + (pnl > 0 ? 1 : 0);
   const losses = updated.losses + (pnl < 0 ? 1 : 0);
   const breakeven = updated.breakeven + (pnl === 0 ? 1 : 0);
@@ -126,7 +126,7 @@ export function recordVerifiedClose(performance: PerformanceAggregate, realizedP
     wins,
     losses,
     breakeven,
-    winRate: ratioPercent(wins, closed),
+    winRate: classifiedWinRate(wins, losses, breakeven),
     verifiedRealizedPnl: updated.verifiedRealizedPnl ? addDecimal(updated.verifiedRealizedPnl, realizedPnl) : realizedPnl,
   };
 }
@@ -146,10 +146,10 @@ export function bootstrapPerformance(journals: readonly TradingJournal[], experi
   const facts = verifiedLifecycleFacts(journals);
   let result = { ...performance, totalTrades: facts.verifiedOpenIds.size };
   const closedExperiences = experiences.filter((experience) => {
-    const closed = experience.outcomeStatus === "PROFITABLE" || experience.outcomeStatus === "LOSING" || experience.outcomeStatus === "BREAK_EVEN";
-    if (closed && facts.verifiedOpenIds.has(experience.entryDecisionId) && facts.verifiedCloseIds.has(experience.exitDecisionId) && experience.realizedPnlVerified === true) {
+    const closed = experience.outcomeStatus === "PROFITABLE" || experience.outcomeStatus === "LOSING" || experience.outcomeStatus === "BREAK_EVEN" || experience.outcomeStatus === "CLOSED_UNCLASSIFIED";
+    if (closed && facts.verifiedOpenIds.has(experience.entryDecisionId) && facts.verifiedCloseIds.has(experience.exitDecisionId)) {
       facts.verifiedClosedIds.add(experience.experienceId);
-      facts.realizedPnlByClosedId.set(experience.experienceId, experience.realizedPnl);
+      if (experience.realizedPnlVerified === true && isDecimal(experience.realizedPnl)) facts.realizedPnlByClosedId.set(experience.experienceId, experience.realizedPnl);
       return true;
     }
     return false;
@@ -167,7 +167,7 @@ export function bootstrapPerformance(journals: readonly TradingJournal[], experi
       verifiedRealizedPnl: result.verifiedRealizedPnl ? addDecimal(result.verifiedRealizedPnl, pnl) : pnl,
     };
   }
-  result = { ...result, winRate: result.closedTrades ? ratioPercent(result.wins, result.closedTrades) : "UNAVAILABLE" };
+  result = { ...result, winRate: classifiedWinRate(result.wins, result.losses, result.breakeven) };
   const latestPortfolio = journals.find((journal) => journal.portfolio?.portfolioEquity);
   if (latestPortfolio?.portfolio && isDecimal(latestPortfolio.portfolio.portfolioEquity) && Number(latestPortfolio.portfolio.portfolioEquity) > 0) {
     result = {
@@ -213,6 +213,10 @@ function percentage(value: string, denominator: string): string {
 function ratioPercent(numerator: number, denominator: number): string {
   if (denominator <= 0) return "UNAVAILABLE";
   return decimalText(BigInt(numerator) * 10000000000n / BigInt(denominator), 8);
+}
+
+function classifiedWinRate(wins: number, losses: number, breakeven: number): string {
+  return ratioPercent(wins, wins + losses + breakeven);
 }
 
 function decimalParts(value: string): { integer: bigint; scale: number } {

@@ -14,7 +14,7 @@ export type ExecutionStatus =
   | "not_found"
   | "unknown";
 export type LessonStatus = "CANDIDATE" | "ACTIVE" | "WEAKENED" | "CONTRADICTED" | "RETIRED";
-export type ExperienceOutcomeStatus = "PROFITABLE" | "LOSING" | "BREAK_EVEN" | "BLOCKED" | "EXECUTION_FAILURE" | "OPEN";
+export type ExperienceOutcomeStatus = "PROFITABLE" | "LOSING" | "BREAK_EVEN" | "CLOSED_UNCLASSIFIED" | "BLOCKED" | "EXECUTION_FAILURE" | "OPEN";
 export type AgentRuntimeStatus = "ONLINE" | "SCANNING" | "ANALYZING" | "DECIDING" | "RISK_CHECK" | "EXECUTING" | "RECONCILING" | "REFLECTING" | "BACKTESTING" | "COOLDOWN" | "PAUSED" | "ERROR";
 export type MarketRegime = "TRENDING_UP" | "TRENDING_DOWN" | "RANGE_LOW_VOL" | "RANGE_HIGH_VOL" | "VOLATILITY_EXPANSION" | "EVENT_DRIVEN" | "UNKNOWN";
 export type LessonAssessment = "HELPFUL" | "NEUTRAL" | "HARMFUL";

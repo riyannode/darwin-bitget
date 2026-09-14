@@ -20,6 +20,8 @@ import {
   loadRecentJournals,
   loadRecentEvents,
   loadRecentLessons,
+  loadOpenExperiences,
+  loadJournalsForDecisionIds,
   loadUsableLessons,
   loadPerformanceAggregate,
   savePerformanceAggregate,
@@ -52,7 +54,7 @@ import { buildExecutionRequest, executePaperOrder } from "../trading/execution.j
 import { executeCyclePlan } from "../trading/execution-planner.js";
 import { reconcileExecution } from "../trading/reconcile.js";
 import { addDecimal, isDecimal } from "../trading/decimal.js";
-import { bootstrapPerformance, currentMonthDailyPnl, emptyPerformance, isPerformanceAggregate, performanceTotalPnl, recordVerifiedClose, recordVerifiedOpen, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate } from "../trading/performance.js";
+import { bootstrapPerformance, currentMonthDailyPnl, emptyPerformance, isPerformanceAggregate, performanceTotalPnl, POSITION_CONTEXT_READ_MODEL_VERSION, recordVerifiedClose, recordVerifiedOpen, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate } from "../trading/performance.js";
 import { bootstrapPositionContexts, decisionReasoning, upsertPositionContext } from "./position-context.js";
 import { EvaClient } from "../eva/client.js";
 import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
@@ -104,7 +106,7 @@ function schedulerMetrics(events: readonly { type: string; metadata?: Record<str
 
 function tradeLifecycleStatus(experience: TradeExperience): TradeLifecycleStatus {
   if (experience.outcomeStatus === "OPEN") return experience.lastAction === "REDUCE" ? "PARTIALLY_REDUCED" : "OPEN";
-  if (experience.outcomeStatus === "PROFITABLE" || experience.outcomeStatus === "LOSING" || experience.outcomeStatus === "BREAK_EVEN") return "CLOSED";
+  if (experience.outcomeStatus === "PROFITABLE" || experience.outcomeStatus === "LOSING" || experience.outcomeStatus === "BREAK_EVEN" || experience.outcomeStatus === "CLOSED_UNCLASSIFIED") return "CLOSED";
   if (experience.outcomeStatus === "BLOCKED") return "BLOCKED";
   return "EXECUTION_FAILURE";
 }
@@ -369,17 +371,23 @@ export class TraderAgent extends Agent<Env, AgentState> {
   private ensureReadModels(): void {
     const initializedAt = new Date().toISOString();
     const performance = loadPerformanceAggregate<PerformanceAggregate>(this);
-    if (!isPerformanceAggregate(performance)) {
-      const bootstrapJournals = loadRecentJournals(this, 100);
-      const bootstrapExperiences = loadExperiences(this, 100);
-      savePerformanceAggregate(this, bootstrapPerformance(bootstrapJournals, bootstrapExperiences, initializedAt), initializedAt);
+    const positionContextBootstrapped = loadPositionContextBootstrap(this);
+    if (isPerformanceAggregate(performance) && positionContextBootstrapped?.version === POSITION_CONTEXT_READ_MODEL_VERSION) return;
+    const history = this.readBootstrapHistory();
+    if (!isPerformanceAggregate(performance)) savePerformanceAggregate(this, bootstrapPerformance(history.journals, history.experiences, initializedAt), initializedAt);
+    if (positionContextBootstrapped?.version !== POSITION_CONTEXT_READ_MODEL_VERSION) {
+      for (const context of bootstrapPositionContexts(history.journals, history.experiences, initializedAt)) savePositionContext(this, context);
+      savePositionContextBootstrap(this, POSITION_CONTEXT_READ_MODEL_VERSION, initializedAt);
     }
-    if (!loadPositionContextBootstrap(this)) {
-      const bootstrapJournals = loadRecentJournals(this, 100);
-      const bootstrapExperiences = loadExperiences(this, 100);
-      for (const context of bootstrapPositionContexts(bootstrapJournals, bootstrapExperiences, initializedAt)) savePositionContext(this, context);
-      savePositionContextBootstrap(this, "position-context-v1", initializedAt);
-    }
+  }
+
+  private readBootstrapHistory(): { journals: TradingJournal[]; experiences: TradeExperience[] } {
+    const openExperiences = loadOpenExperiences(this, 100);
+    const recentJournals = loadRecentJournals(this, 100);
+    const targetedJournals = loadJournalsForDecisionIds(this, openExperiences.map((experience) => experience.entryDecisionId), 100);
+    const journals = [...new Map([...recentJournals, ...targetedJournals].map((journal) => [journal.cycleId, journal])).values()];
+    const experiences = [...new Map([...loadExperiences(this, 100), ...openExperiences].map((experience) => [experience.experienceId, experience])).values()];
+    return { journals, experiences };
   }
 
   private updatePerformanceReadModel(record: DecisionExecutionRecord, bundle: EvidenceBundle, verified: boolean): void {
@@ -388,7 +396,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const equity = record.accountAfter?.portfolioEquity ?? bundle.account.portfolioEquity;
     let performance = this.performanceWithEquity(equity, observedAt);
     if (record.decision.action === "OPEN_LONG" || record.decision.action === "OPEN_SHORT") performance = recordVerifiedOpen(performance, equity, observedAt);
-    if (record.decision.action === "CLOSE" && isDecimal(record.executionResult.realizedPnl)) performance = recordVerifiedClose(performance, record.executionResult.realizedPnl, equity, observedAt);
+    if (record.decision.action === "CLOSE") performance = recordVerifiedClose(performance, record.executionResult.realizedPnl, equity, observedAt);
     savePerformanceAggregate(this, performance, observedAt);
   }
 
@@ -788,7 +796,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const cumulativePnl = realizedPnl && isDecimal(currentExperience.realizedPnl) ? addDecimal(currentExperience.realizedPnl, realizedPnl) : currentExperience.realizedPnl;
     const sharedInput = { decision, symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", entryPrice: currentExperience.entryPrice, exitPrice: executionResult.averageFillPrice ?? bundle.market.lastPrice, evidenceAtEntry: currentExperience.evidenceAtEntry, evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: [...new Set([...currentExperience.lessonsUsed, ...decision.lessonsUsed])], lessons: lessons.filter((lesson) => currentExperience.lessonsUsed.includes(lesson.lessonId) || decision.lessonsUsed.includes(lesson.lessonId)), marginAllocated: currentExperience.marginAllocated, positionNotional: record.positionAfter?.notional ?? currentExperience.positionNotional, realizedPnl: cumulativePnl, realizedPnlPct: executionResult.realizedPnlPct ?? currentExperience.realizedPnlPct, realizedPnlVerified: Boolean(realizedPnl), ...(executionResult.fees ? { fees: executionResult.fees } : {}), ...(executionResult.funding ? { funding: executionResult.funding } : {}) };
     if (decision.action === "CLOSE" && verified) {
-      const closeInput = { ...sharedInput, outcome: realizedPnl ? "CLOSED" : "CLOSED_PNL_UNVERIFIED", failureCode: realizedPnl ? "" : "REALIZED_PNL_UNAVAILABLE", experienceStatus: realizedPnl ? outcomeFromPnl(cumulativePnl) : "EXECUTION_FAILURE" as const, existingExperience: currentExperience };
+      const closeInput = { ...sharedInput, outcome: realizedPnl ? "CLOSED" : "CLOSED_PNL_UNVERIFIED", failureCode: "", experienceStatus: realizedPnl ? outcomeFromPnl(cumulativePnl) : "CLOSED_UNCLASSIFIED" as const, existingExperience: currentExperience };
       const local = reflect(closeInput);
       const index = experiences.indexOf(currentExperience);
       if (index >= 0) experiences[index] = local.experience;

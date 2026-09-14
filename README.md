@@ -92,7 +92,7 @@ The Judge Demo is not a live Bitget session. It exists to make the architecture 
 
 ## Live Production
 
-The live site reads provider-only `/api/live/portfolio` for current `PROVIDER_LIVE` portfolio state, provider realized PnL, funding/fees when available, and current provider unrealized PnL. `/api/snapshot` is the slower Durable Object runtime/performance read and is not the live portfolio polling path. `/api/position-context` is a bounded persisted reasoning read keyed by symbol + side. If the account or position provider read fails, the UI shows provider state as unavailable and does not show journal portfolio fallback. The detailed Open Position page is read-only. The dashboard is not a substitute for the full historical export.
+The live site reads provider-only `/api/live/portfolio` for current `PROVIDER_LIVE` portfolio state, provider realized PnL, funding/fees when available, and current provider unrealized PnL. `/api/snapshot` is the slower Durable Object runtime/performance read and is not the live portfolio polling path. `/api/position-context` is a bounded persisted reasoning read keyed by symbol + side. The performance aggregate preserves provider-verified closures even when PnL enrichment is unavailable and keeps those outcomes out of win-rate classification. If the account or position provider read fails, the UI shows provider state as unavailable and does not show journal portfolio fallback. The detailed Open Position page is read-only. The dashboard is not a substitute for the full historical export.
 
 ## Deploy Your Own
 

@@ -41,6 +41,15 @@ describe("persisted performance aggregate", () => {
     expect(value).toMatchObject({ totalTrades: 3, openTrades: 0, closedTrades: 3, wins: 1, losses: 1, breakeven: 1, winRate: "33.33333333", verifiedRealizedPnl: "1.25" });
   });
 
+  it("counts a verified close without PnL as closed but leaves outcomes unclassified", () => {
+    let value = recordVerifiedOpen(emptyPerformance(at), "1000", at);
+    value = recordVerifiedClose(value, undefined, "1000", at);
+    expect(value).toMatchObject({ totalTrades: 1, openTrades: 0, closedTrades: 1, wins: 0, losses: 0, breakeven: 0, winRate: "UNAVAILABLE", verifiedRealizedPnl: "" });
+    value = recordVerifiedOpen(value, "1000", at);
+    value = recordVerifiedClose(value, "2", "1002", at);
+    expect(value).toMatchObject({ closedTrades: 2, wins: 1, losses: 0, breakeven: 0, winRate: "100" });
+  });
+
   it("keeps the baseline stable and calculates equity delta", () => {
     let value = emptyPerformance(at);
     value = updateEquity(value, "1000", at);

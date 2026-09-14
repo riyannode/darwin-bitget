@@ -28,7 +28,7 @@ const experienceSchema = z.object({
   evidenceAtExit: z.array(z.string()),
   lessonsUsed: z.array(z.string()),
   marketContext: z.string(),
-  outcomeStatus: z.enum(["PROFITABLE", "LOSING", "BREAK_EVEN", "BLOCKED", "EXECUTION_FAILURE", "OPEN"]),
+  outcomeStatus: z.enum(["PROFITABLE", "LOSING", "BREAK_EVEN", "CLOSED_UNCLASSIFIED", "BLOCKED", "EXECUTION_FAILURE", "OPEN"]),
   lastAction: z.enum(["OPEN_LONG", "OPEN_SHORT", "HOLD", "INCREASE", "REDUCE", "CLOSE", "REVERSE"]).optional(),
   fees: z.string().optional(),
   funding: z.string().optional(),

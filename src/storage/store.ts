@@ -163,6 +163,35 @@ export function loadExperiences(executor: SqlExecutor, limit = MAX_HISTORY_LIMIT
   });
 }
 
+export function loadOpenExperiences(executor: SqlExecutor, limit = MAX_HISTORY_LIMIT): TradeExperience[] {
+  const rows = executor.sql<ExperienceRow>`SELECT payload FROM experiences WHERE outcome_status = 'OPEN' ORDER BY created_at DESC, experience_id ASC LIMIT ${clampHistoryLimit(limit, MAX_HISTORY_LIMIT)}`;
+  return rows.flatMap((row) => {
+    try {
+      const experience = parseExperience(JSON.parse(row.payload));
+      return experience.outcomeStatus === "OPEN" ? [experience] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: readonly string[], limit = MAX_HISTORY_LIMIT): TradingJournal[] {
+  const journals = new Map<string, TradingJournal>();
+  for (const decisionId of [...new Set(decisionIds)].slice(0, limit)) {
+    const marker = `%"decisionId":"${decisionId}"%`;
+    const rows = executor.sql<JournalRow>`SELECT payload FROM journals WHERE payload LIKE ${marker} ORDER BY created_at DESC LIMIT 2`;
+    for (const row of rows) {
+      try {
+        const journal = JSON.parse(row.payload) as TradingJournal;
+        journals.set(journal.cycleId, journal);
+      } catch {
+        // Ignore malformed historical journal rows during bounded bootstrap.
+      }
+    }
+  }
+  return [...journals.values()];
+}
+
 export function loadAllExperiences(executor: SqlExecutor): TradeExperience[] {
   const rows = executor.sql<ExperienceRow>`SELECT payload FROM experiences ORDER BY created_at ASC, experience_id ASC`;
   return rows.flatMap((row) => {
