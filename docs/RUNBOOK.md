@@ -51,3 +51,11 @@ The opt-in `npm run test:paper` suite requires explicit credentials and `PAPER_C
 ## Operational safety
 
 An unresolved provider write remains unknown/unresolved and is not silently converted to a fill or failure. The cycle stops remaining financial writes after ambiguity. Provider diagnostics are sanitized before journaling and exporting.
+
+## Cycle-plan rollout and acceptance
+
+This is an intentional financial behavior architecture change, not SAFE_CLEANUP. Before deployment, inspect the provider and scheduler read-only, verify the runtime is idle, confirm no unresolved execution requires investigation, manually `PAUSE`, and verify matching schedule count is zero. Preserve current provider positions; do not manually close CRCL or force a new entry.
+
+Deploy the exact PR HEAD. Verify the Worker commit marker, `/api/snapshot`, `/api/live/portfolio`, gateway health, and scheduler configuration, then manually `RESUME`. Observe at least two completed cycles. For each, verify `MARKET_SCAN` with count greater than zero, a separate entry shortlist, every existing provider position represented in Position Management, independent entry evaluation, total proposed actions no greater than five, scheduler health, and `PROVIDER_LIVE`. A no-write cycle is valid. Any natural write needs provider readback and `MATCHED` reconciliation.
+
+Generate a temporary fresh paper-log export after deployment. Confirm legacy journals remain readable/exportable, new multi-action cycles export separately, matched legacy primary executions are verified, summary verified/unresolved counts reconcile, and Docker/demo records are absent from autonomous metrics. Do not freeze this temporary export as the final competition log.

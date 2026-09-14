@@ -3,6 +3,7 @@ import { evaluateRiskGate } from "../src/trading/risk-gate.js";
 import type {
   AccountSnapshot,
   ActivityEvent,
+  CycleDecisionPlan,
   DashboardSnapshot,
   Decision,
   Instrument,
@@ -164,7 +165,7 @@ function trade(): TradeLogEntry {
   };
 }
 
-function baseSnapshot(cycleId: string, proposed: Decision, riskGateResult: RiskGateResult, preTradeAccount: AccountSnapshot, postTradeAccount: AccountSnapshot, scenario: DemoScenario, title: string, evidenceLabel: DemoSnapshot["demo"]["evidenceLabel"], activities: string[]): DemoSnapshot {
+function baseSnapshot(cycleId: string, proposed: Decision, cyclePlan: CycleDecisionPlan, riskGateResult: RiskGateResult, preTradeAccount: AccountSnapshot, postTradeAccount: AccountSnapshot, scenario: DemoScenario, title: string, evidenceLabel: DemoSnapshot["demo"]["evidenceLabel"], activities: string[]): DemoSnapshot {
   const portfolio = postTradeAccount;
   const isRecordedOpen = scenario === "verified-open";
   return {
@@ -195,6 +196,9 @@ function baseSnapshot(cycleId: string, proposed: Decision, riskGateResult: RiskG
     trades: isRecordedOpen ? [trade()] : [],
     latestDecision: proposed,
     decisions: [proposed],
+    latestCyclePlan: cyclePlan,
+    cyclePlans: [{ cycleId, plan: cyclePlan, records: [], startedAt: OBSERVED_AT, completedAt: OBSERVED_AT }],
+    latestDiscovery: { scannedUniverseCount: SUPPORTED_UNIVERSE.length, selectedEntryCandidateSymbols: cyclePlan.entryActions.map((decision) => decision.symbol), managedExistingPositionSymbols: cyclePlan.positionActions.map((decision) => decision.symbol), financialWritesPerformed: 0 },
     executionEvidence: isRecordedOpen ? {
       provider: "Bitget Demo (recorded evidence)",
       action: "OPEN_LONG",
@@ -234,18 +238,19 @@ export function buildDemoSnapshot(scenario: DemoScenario): DemoSnapshot {
     const preTradeAccount = account([]);
     const postTradeAccount = account([position()]);
     const proposed = decision(cycleId, "OPEN_LONG", "LONG", "CRCLUSDT", "3", "Recorded CRCLUSDT OPEN_LONG evidence shows a bounded proposal followed by provider fill, readback, and matched reconciliation.");
-    return baseSnapshot(cycleId, proposed, riskResult(preTradeAccount, proposed), preTradeAccount, postTradeAccount, scenario, "Verified Open Replay", "RECORDED_PROVIDER_REPLAY", ["RECORDED_PROVIDER_FILL", "PROVIDER_READBACK", "RECONCILIATION_MATCHED"]);
+    return baseSnapshot(cycleId, proposed, { positionActions: [], entryActions: [proposed as CycleDecisionPlan["entryActions"][number]] }, riskResult(preTradeAccount, proposed), preTradeAccount, postTradeAccount, scenario, "Verified Open Replay", "RECORDED_PROVIDER_REPLAY", ["RECORDED_PROVIDER_FILL", "PROVIDER_READBACK", "RECONCILIATION_MATCHED"]);
   }
   if (scenario === "hold") {
     const preTradeAccount = account([position()]);
     const postTradeAccount = account([position()]);
     const proposed = decision(cycleId, "HOLD", "LONG", "CRCLUSDT", "3", "Fresh replay evidence does not justify changing the existing CRCLUSDT LONG position; no financial write is proposed.");
-    return baseSnapshot(cycleId, proposed, riskResult(preTradeAccount, proposed), preTradeAccount, postTradeAccount, scenario, "Hold Existing Position", "RECORDED_PROVIDER_REPLAY", ["POSITION_READBACK", "DECISION_CREATED", "NO_FINANCIAL_WRITE"]);
+    const entry = decision(cycleId, "OPEN_LONG", "LONG", "NVDAUSDT", "2", "Independent recorded NVDAUSDT entry evidence justifies a bounded opportunity while CRCLUSDT remains HOLD.");
+    return baseSnapshot(cycleId, proposed, { positionActions: [proposed as CycleDecisionPlan["positionActions"][number]], entryActions: [entry as CycleDecisionPlan["entryActions"][number]] }, riskResult(preTradeAccount, proposed), preTradeAccount, postTradeAccount, scenario, "Independent Management and Entry Replay", "RECORDED_PROVIDER_REPLAY", ["MARKET_SCAN", "POSITION_READBACK", "DECISION_CREATED", "NO_FINANCIAL_WRITE"]);
   }
   const preTradeAccount = account([]);
   const postTradeAccount = account([]);
   const proposed = decision(cycleId, "OPEN_LONG", "LONG", "CRCLUSDT", "6", "Synthetic proposal intentionally exceeds the owner leverage boundary to demonstrate deterministic rejection.");
-  return baseSnapshot(cycleId, proposed, riskResult(preTradeAccount, proposed), preTradeAccount, postTradeAccount, scenario, "Risk Reject", "DETERMINISTIC_RISK_REPLAY", ["DECISION_CREATED", "RISK_GATE_BLOCK", "NO_ORDER_SUBMISSION"]);
+  return baseSnapshot(cycleId, proposed, { positionActions: [], entryActions: [proposed as CycleDecisionPlan["entryActions"][number]] }, riskResult(preTradeAccount, proposed), preTradeAccount, postTradeAccount, scenario, "Risk Reject", "DETERMINISTIC_RISK_REPLAY", ["DECISION_CREATED", "RISK_GATE_BLOCK", "NO_ORDER_SUBMISSION"]);
 }
 
 export function normalizeScenario(value: string | null): DemoScenario {

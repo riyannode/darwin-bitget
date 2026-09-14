@@ -254,6 +254,8 @@ export interface BacktestReplay {
 export interface DecisionContext {
   bundles: EvidenceBundle[];
   supportedUniverse: string[];
+  openPositionSymbols: string[];
+  entryCandidateSymbols: string[];
   experiences: TradeExperience[];
   openExperiences: TradeExperience[];
   lessons: Lesson[];
@@ -281,9 +283,40 @@ export interface Decision {
   createdAt: string;
 }
 
+export type PositionManagementAction = "HOLD" | "REDUCE" | "CLOSE";
+export type EntryAction = "OPEN_LONG" | "OPEN_SHORT";
+
+export interface PositionManagementDecision extends Decision {
+  action: PositionManagementAction;
+  positionSide: PositionSide;
+}
+
+export interface EntryDecision extends Decision {
+  action: EntryAction;
+  positionSide: PositionSide;
+}
+
+export interface CycleDecisionPlan {
+  positionActions: PositionManagementDecision[];
+  entryActions: EntryDecision[];
+}
+
+export interface CycleDiscovery {
+  scannedUniverseCount: number;
+  selectedEntryCandidateSymbols: string[];
+  managedExistingPositionSymbols: string[];
+  financialWritesPerformed: number;
+}
+
+export interface NormalizedCycleDecisions {
+  cycleId: string;
+  plan: CycleDecisionPlan;
+  records: DecisionExecutionRecord[];
+  discovery?: CycleDiscovery;
+}
+
 export interface AutonomousDecisionSet {
-  decision: Decision;
-  exitDecisions: Decision[];
+  plan: CycleDecisionPlan;
   ignoredLessonIds: string[];
 }
 
@@ -400,6 +433,9 @@ export interface TradingJournal {
   portfolio?: AccountSnapshot;
   evidence?: Evidence[];
   retrievedLessons: string[];
+  cyclePlan?: CycleDecisionPlan;
+  executionRecords?: DecisionExecutionRecord[];
+  discovery?: CycleDiscovery;
   decision?: Decision;
   exitDecisions?: Decision[];
   exitExecutions?: DecisionExecutionRecord[];
@@ -460,6 +496,9 @@ export interface DashboardSnapshot {
   trades: TradeLogEntry[];
   latestDecision: Decision | null;
   decisions: Decision[];
+  latestCyclePlan: CycleDecisionPlan | null;
+  cyclePlans: Array<NormalizedCycleDecisions & { startedAt: string; completedAt: string | null }>;
+  latestDiscovery: CycleDiscovery | null;
   executionEvidence: {
     provider: string;
     action: Exclude<Action, "HOLD">;

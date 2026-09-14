@@ -14,6 +14,9 @@ let snapshot = {
   trades: [],
   latestDecision: null,
   decisions: [],
+  latestCyclePlan: null,
+  cyclePlans: [],
+  latestDiscovery: null,
   executionEvidence: null,
   scheduler: { completedCycles: 0, averageDurationMs: 0, maxDurationMs: 0, inProgressCount: 0, staleCount: 0, failureCount: 0, timeoutCount: 0 },
   learning: { reflection: null, lessons: [], lessonsUsed: [], backtest: null, recentExperiences: [] },
@@ -134,29 +137,52 @@ function renderDecisionPanel(prefix, decision, positionNotional) {
   appendDecisionDetails(node, decision, positionNotional);
 }
 
+function renderActionSection(title, actions) {
+  const section = document.createElement("section");
+  const heading = document.createElement("h3"); heading.textContent = title; section.append(heading);
+  if (!actions?.length) { const empty = document.createElement("p"); empty.className = "subtle"; empty.textContent = title === "NEW ENTRY ACTIONS" || title === "NEW ENTRIES" ? "No new entry justified this cycle." : "No position management actions recorded."; section.append(empty); return section; }
+  actions.forEach((action) => { const item = document.createElement("details"); item.className = "history-item"; const summary = document.createElement("summary"); summary.append(detail("SYMBOL / SIDE", `${action.symbol} / ${action.positionSide ?? "—"}`), detail("ACTION", action.action), detail("CONFIDENCE", action.confidence)); const content = document.createElement("div"); content.className = "detail-grid history-content"; appendDecisionDetails(content, action); item.append(summary, content); section.append(item); });
+  return section;
+}
+
+function renderCyclePlan(prefix, plan, discovery) {
+  const node = $(prefix === "dashboard" ? "dashboard-cycle-plan" : "cycle-plan");
+  if (!node) return;
+  node.replaceChildren();
+  if (!plan) { node.className = "stack empty"; node.textContent = "No cycle plan recorded yet."; return; }
+  node.className = "cycle-plan stack";
+  node.append(renderActionSection("POSITION MANAGEMENT", plan.positionActions), renderActionSection("NEW ENTRY ACTIONS", plan.entryActions));
+  const discoveryNode = $(prefix === "dashboard" ? "dashboard-market-discovery" : "market-discovery");
+  if (discoveryNode) {
+    discoveryNode.replaceChildren();
+    discoveryNode.append(detail("UNIVERSE SCANNED", discovery?.scannedUniverseCount ?? "—"), detail("ENTRY CANDIDATES", list(discovery?.selectedEntryCandidateSymbols), true), detail("EXISTING POSITIONS MANAGED", list(discovery?.managedExistingPositionSymbols), true), detail("TOTAL PROPOSED ACTIONS", (plan.positionActions?.length ?? 0) + (plan.entryActions?.length ?? 0)), detail("FINANCIAL WRITES", discovery?.financialWritesPerformed ?? 0));
+  }
+}
+
 function renderDecision() {
   const decision = snapshot.latestDecision;
   renderDecisionPanel("", decision, snapshot.executionEvidence?.positionNotional);
   renderDecisionPanel("dashboard", decision, snapshot.executionEvidence?.positionNotional);
+  renderCyclePlan("dashboard", snapshot.latestCyclePlan, snapshot.latestDiscovery);
 }
 
 function renderDecisionHistory() {
   const node = $("decision-history");
-  const decisions = Array.isArray(snapshot.decisions) ? snapshot.decisions.slice(0, 25) : snapshot.latestDecision ? [snapshot.latestDecision] : [];
+  const cycles = Array.isArray(snapshot.cyclePlans) ? snapshot.cyclePlans.slice(0, 25) : [];
   const openKeys = new Set([...node.querySelectorAll("details[data-stable-key]")].filter((item) => item.open).map((item) => item.dataset.stableKey));
   node.replaceChildren();
-  node.className = decisions.length ? "decision-history" : "decision-history empty";
-  if (!decisions.length) { node.textContent = "No decisions recorded yet."; return; }
-  decisions.forEach((decision) => {
+  node.className = cycles.length ? "decision-history" : "decision-history empty";
+  if (!cycles.length) { node.textContent = "No decisions recorded yet."; return; }
+  cycles.forEach((cycle) => {
     const item = document.createElement("details");
     item.className = "history-item";
-    item.dataset.stableKey = decision.cycleId || decision.decisionId || "RUN_UNKNOWN";
+    item.dataset.stableKey = cycle.cycleId || "RUN_UNKNOWN";
     item.open = openKeys.has(item.dataset.stableKey);
     const summary = document.createElement("summary");
-    summary.append(detail("RUN ID", decision.cycleId || decision.decisionId || "RUN_UNKNOWN"), detail("TIMESTAMP", when(decision.createdAt)), detail("ACTION", decision.action), detail("SYMBOL", decision.symbol));
+    summary.append(detail("CYCLE ID", cycle.cycleId || "RUN_UNKNOWN"), detail("TIMESTAMP", when(cycle.startedAt)), detail("ACTIONS", cycle.plan.positionActions.length + cycle.plan.entryActions.length));
     const content = document.createElement("div");
     content.className = "detail-grid history-content";
-    appendDecisionDetails(content, decision);
+    content.append(renderActionSection("POSITION MANAGEMENT", cycle.plan.positionActions), renderActionSection("NEW ENTRIES", cycle.plan.entryActions));
     item.append(summary, content);
     node.append(item);
   });
@@ -215,7 +241,7 @@ function renderPolicy() {
   const version = document.createElement("span"); version.className = "subtle"; version.textContent = `Last update: ${when(snapshot.lastPolicyUpdate?.createdAt)} · ${snapshot.version} · ${snapshot.commit} · ${snapshot.environment}`; editor.append(version);
 }
 
-function render() { renderAgent(); renderPerformance(); renderCalendar(); renderPortfolio(); renderOpenPositions(); renderDecision(); renderDecisionHistory(); renderLearning(); renderRecentTrades(); renderLatestTrade(); renderActivity(); renderTradeTable(); renderLessons(); renderPolicy(); const banner = $("judge-demo-banner"); banner.hidden = !judgeDemo; if (judgeDemo) { document.querySelectorAll("[data-action]").forEach((button) => { button.hidden = true; button.disabled = true; }); document.querySelectorAll(".label").forEach((node) => { if (node.textContent === "LIVE READBACK") node.textContent = "RECORDED REPLAY"; }); banner.dataset.scenario = snapshot.demo?.title ?? "DETERMINISTIC REPLAY"; $("judge-demo-result").textContent = `RISK GATE ${snapshot.demoRiskGate?.status ?? "—"}${snapshot.demoRiskGate?.codes?.length ? ` · ${snapshot.demoRiskGate.codes.join(" / ")}` : ""}`; } }
+function render() { renderAgent(); renderPerformance(); renderCalendar(); renderPortfolio(); renderOpenPositions(); renderDecision(); renderCyclePlan("journal", snapshot.latestCyclePlan, snapshot.latestDiscovery); renderDecisionHistory(); renderLearning(); renderRecentTrades(); renderLatestTrade(); renderActivity(); renderTradeTable(); renderLessons(); renderPolicy(); const banner = $("judge-demo-banner"); banner.hidden = !judgeDemo; if (judgeDemo) { document.querySelectorAll("[data-action]").forEach((button) => { button.hidden = true; button.disabled = true; }); document.querySelectorAll(".label").forEach((node) => { if (node.textContent === "LIVE READBACK") node.textContent = "RECORDED REPLAY"; }); banner.dataset.scenario = snapshot.demo?.title ?? "DETERMINISTIC REPLAY"; $("judge-demo-result").textContent = `RISK GATE ${snapshot.demoRiskGate?.status ?? "—"}${snapshot.demoRiskGate?.codes?.length ? ` · ${snapshot.demoRiskGate.codes.join(" / ")}` : ""}`; } }
 
 async function requestJson(path) { const response = await fetch(path, { cache: "no-store" }); if (!response.ok) throw new Error(`HTTP_${response.status}`); return response.json(); }
 async function refreshSnapshot() {
@@ -226,6 +252,7 @@ async function refreshSnapshot() {
     const retained = {
       trades: loadedPages.has("trade-history") ? snapshot.trades : data.trades,
       decisions: loadedPages.has("journal") ? snapshot.decisions : data.decisions,
+      cyclePlans: loadedPages.has("journal") ? snapshot.cyclePlans : data.cyclePlans,
       learning: loadedPages.has("learning-page") ? snapshot.learning : data.learning,
       riskControls: loadedPages.has("policy-page") ? snapshot.riskControls : data.riskControls,
     };
@@ -261,7 +288,7 @@ async function loadPage(page) {
   const endpoint = endpoints[page]; if (!endpoint) return;
   try {
     const data = await requestJson(endpoint);
-    if (page === "journal") { snapshot.decisions = data.decisions ?? []; snapshot.latestDecision = snapshot.decisions[0] ?? snapshot.latestDecision; }
+    if (page === "journal") { snapshot.decisions = data.decisions ?? []; snapshot.cyclePlans = data.cycles ?? data.cyclePlans ?? []; snapshot.latestDecision = snapshot.decisions[0] ?? snapshot.latestDecision; snapshot.latestCyclePlan = snapshot.cyclePlans[0]?.plan ?? snapshot.latestCyclePlan; snapshot.latestDiscovery = snapshot.cyclePlans[0]?.discovery ?? snapshot.latestDiscovery; }
     if (page === "trade-history") snapshot.trades = data.trades ?? [];
     if (page === "learning-page") snapshot.learning = data.learning ?? snapshot.learning;
     if (page === "policy-page") { snapshot.riskControls = data.riskControls ?? snapshot.riskControls; snapshot.lastPolicyUpdate = data.lastPolicyUpdate ?? null; }

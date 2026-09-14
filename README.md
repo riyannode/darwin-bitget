@@ -22,15 +22,31 @@ DARWIN Bitget is an autonomous PAPER futures trading agent for Bitget's 24/7 US-
 
 ## What DARWIN Does
 
-Each cycle discovers the current executable Bitget Demo stock-perpetual universe, performs a bounded market scan, asks Qwen to select candidates and form a futures decision, validates the proposed action with deterministic policy controls, and only then uses the Bitget Demo execution path. Provider readback and reconciliation decide whether a write is verified. Journals, experiences, reflections, and lessons persist in Durable Object SQLite.
+Each autonomous cycle independently manages every currently open PAPER position and evaluates unrelated new opportunities from the current executable Bitget Demo stock-perpetual universe. Qwen returns a bounded cycle plan; deterministic validation, risk controls, provider readback, and reconciliation own financial authority. Journals, experiences, reflections, and lessons persist in Durable Object SQLite. An existing HOLD does not consume the new-entry opportunity slot.
 
 ```text
-Demo executable universe → lightweight scan → Qwen shortlist → deep evidence
-→ Qwen decision → deterministic risk gate → Bitget Demo PAPER
-→ provider readback → reconciliation → journal → reflection / learning
+Executable Demo universe → lightweight scan → bounded entry shortlist
+                    ↘
+Open provider positions → management evidence
+                    ↘
+             Qwen CycleDecisionPlan
+             ├ positionActions[]
+             └ entryActions[]
+                    ↓
+       deterministic validation (max 5)
+                    ↓
+   CLOSE → REDUCE → OPEN sequential planner
+                    ↓
+     risk check → PAPER write → readback
+                    ↓
+              reconciliation
+                    ↓
+        refreshed provider portfolio → next action
+                    ↓
+             journal / learning
 ```
 
-Qwen owns strategy selection, symbol selection, `OPEN_LONG` / `OPEN_SHORT` / `HOLD` / `REDUCE` / `CLOSE`, thesis, margin allocation, and leverage selection. Deterministic code owns financial authority and safety boundaries. No profitability guarantee is claimed.
+Qwen proposes strategy, rationale, and bounded actions. Deterministic TypeScript owns `MAX_TOTAL_ACTIONS_PER_CYCLE=5`, position/universe/evidence validation, risk gates, idempotency, execution order, sequential writes, provider refresh between writes, and stop-on-ambiguity behavior. No profitability guarantee is claimed and five actions are not five required trades.
 
 ## Why It Exists
 
@@ -47,6 +63,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/LIVE.md](docs/LIVE.md), 
 - `TRADING_MODE=PAPER` and `PAPER_ONLY=true` are required.
 - Owner policy limits margin allocation, leverage, drawdown, cooldown, and scheduler cadence.
 - Every financial action passes one deterministic risk gate.
+- The plan is bounded to at most five total proposed actions per cycle; zero writes is valid.
+- Financial writes are serialized in `CLOSE → REDUCE → OPEN` order, with provider portfolio refresh between matched writes.
 - Bitget readback and reconciliation are required before a write is treated as verified.
 - An ambiguous write stops remaining writes for that cycle; no blind retry is used.
 - External/provider text cannot change policy, auth, PAPER mode, tools, or schemas.

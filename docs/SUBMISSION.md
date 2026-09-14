@@ -2,7 +2,7 @@
 
 ## Positioning
 
-DARWIN Bitget is an autonomous PAPER futures agent for Bitget's 24/7 US-stock / RWA perpetual market. Qwen selects contextual trading behavior; deterministic code controls financial authority.
+DARWIN Bitget is an autonomous PAPER futures agent for Bitget's 24/7 US-stock / RWA perpetual market. DARWIN separates portfolio responsibility from opportunity discovery: every cycle re-evaluates each existing position while independently searching the current executable universe for new opportunities. Qwen proposes a bounded multi-action plan; deterministic code controls financial authority.
 
 ## Hackathon / Track
 
@@ -35,10 +35,10 @@ Always-on perpetual markets produce more symbols, evidence, and position state t
 ## What is implemented
 
 - dynamic Demo stock-perpetual discovery and public market evidence;
-- lightweight scan → Qwen shortlist → deep evidence → Qwen futures decision;
+- lightweight scan → Qwen shortlist → separate management/entry deep evidence → Qwen `CycleDecisionPlan`;
 - `OPEN_LONG`, `OPEN_SHORT`, `HOLD`, `REDUCE`, and `CLOSE`;
-- deterministic owner policy/risk gate and one new entry maximum per cycle;
-- multiple sequential exits with ambiguity stopping remaining writes;
+- deterministic owner policy/risk gate and `MAX_TOTAL_ACTIONS_PER_CYCLE=5`;
+- sequential `CLOSE → REDUCE → OPEN` writes with provider refresh between matched writes and ambiguity stopping remaining writes;
 - Bitget Demo UTA execution, readback, reconciliation, journal, and sanitized diagnostics;
 - Durable Object SQLite experiences, reflections, lessons, and bounded replay;
 - read-only `PROVIDER_LIVE` portfolio dashboard with multi-position Open Position page;
@@ -47,9 +47,13 @@ Always-on perpetual markets produce more symbols, evidence, and position state t
 ## Architecture and responsibility
 
 ```text
-Demo executable universe → scan → Qwen shortlist → deep evidence
-→ Qwen strategy/action → risk gate → Bitget Demo PAPER
-→ readback → reconciliation → journal → learning
+Demo executable universe → scan → bounded entry shortlist
+open provider positions → management evidence
+entry candidates → entry evidence
+→ Qwen CycleDecisionPlan { positionActions[], entryActions[] }
+→ deterministic validation → CLOSE → REDUCE → OPEN sequential planner
+→ risk gate → PAPER write → readback → reconciliation → refreshed portfolio
+→ journal → learning
 ```
 
 Private authenticated Bitget operations use the following transport:
@@ -68,12 +72,14 @@ Qwen owns strategy, thesis, symbol, direction, exits, margin allocation, and lev
 
 ## Agent-quality evidence contract
 
-The current prompt contract is `darwin-mandate-v4`. Each decision must explain its
-decision rationale, supporting evidence, risk and invalidation conditions, evidence
-limitations, and lessons used. The dashboard exposes those fields directly so a
-judge can distinguish model reasoning from deterministic risk authority. The
-decision schema and risk gate remain unchanged; this is wording and presentation
-polish only.
+The current prompt contracts are `darwin-mandate-v5` and `darwin-decision-v3`. Each action must explain its decision rationale, supporting evidence, risk and invalidation conditions, evidence limitations, and lessons used. The dashboard exposes those fields grouped by cycle so a judge can distinguish model reasoning from deterministic risk authority. This PR intentionally changes financial behavior architecture; it is not SAFE_CLEANUP.
+
+## Architectural differentiator for judging
+
+- **Decision explainability:** management and entry actions each retain evidence-attributed rationale, risk, confidence, and execution/reconciliation state.
+- **Agent architecture:** portfolio management cannot suppress unrelated opportunity discovery; an existing HOLD and a new entry can coexist.
+- **Risk control:** deterministic five-action cap, current-position validation, refreshed portfolio risk checks, serialized writes, idempotency, and stop-on-ambiguity.
+- **Performance integrity:** no forced trades, HOLD remains valid, unresolved writes are not verified trades, and the Docker replay is not production history. No better returns are promised.
 
 ## Bitget integration
 

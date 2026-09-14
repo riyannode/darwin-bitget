@@ -1,9 +1,9 @@
 import { Agent } from "agents";
-import type { DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, Lesson, OwnerPolicy, PositionSnapshot, ReflectionResult, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
+import type { CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, Lesson, OwnerPolicy, PositionSnapshot, ReflectionResult, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
-import { boundExitDecisions, decide, rankMarketCandidates, selectCandidates } from "./decision.js";
+import { decide, rankMarketCandidates, selectCandidates } from "./decision.js";
 import { reconcileTradingSchedule, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES, type SchedulerReconciliationResult } from "./scheduler.js";
 import { authorizeOwner } from "./owner-auth.js";
 import { retrieveLessons } from "../learning/lesson-retrieval.js";
@@ -38,10 +38,12 @@ import {
   saveLesson,
 } from "../storage/store.js";
 import { buildPaperLogExport, parsePaperLogPeriod, paperLogToCsv } from "../storage/paper-log.js";
+import { cyclePlanDecisions, normalizeCycleDecisions } from "../storage/journal-normalizer.js";
 import { evaluateRiskGate } from "../trading/risk-gate.js";
 import { evaluateDrawdown } from "../trading/drawdown.js";
 import { loadOwnerPolicy, updateOwnerPolicy } from "../trading/policy.js";
 import { buildExecutionRequest, executePaperOrder } from "../trading/execution.js";
+import { executeCyclePlan } from "../trading/execution-planner.js";
 import { reconcileExecution } from "../trading/reconcile.js";
 import { addDecimal, isDecimal } from "../trading/decimal.js";
 import { EvaClient } from "../eva/client.js";
@@ -101,7 +103,8 @@ function tradeLifecycleStatus(experience: TradeExperience): TradeLifecycleStatus
 
 function tradeLogEntries(experiences: readonly TradeExperience[], journals: readonly TradingJournal[]): DashboardSnapshot["trades"] {
   return experiences.filter((experience) => experience.action !== "HOLD").map((experience) => {
-    const journal = journals.find((entry) => entry.experienceId === experience.experienceId || entry.decision?.decisionId === experience.exitDecisionId || entry.decision?.decisionId === experience.entryDecisionId);
+    const journal = journals.find((entry) => entry.experienceId === experience.experienceId || (entry.experienceIds ?? []).includes(experience.experienceId) || entry.decision?.decisionId === experience.exitDecisionId || entry.decision?.decisionId === experience.entryDecisionId);
+    const record = journal ? normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === experience.exitDecisionId || candidate.decision.decisionId === experience.entryDecisionId) : undefined;
     const action = (experience.lastAction && experience.lastAction !== "HOLD" ? experience.lastAction : experience.action) as Exclude<TradeExperience["action"], "HOLD">;
     return {
       tradeId: experience.experienceId,
@@ -117,7 +120,7 @@ function tradeLogEntries(experiences: readonly TradeExperience[], journals: read
       realizedPnl: experience.realizedPnl,
       status: tradeLifecycleStatus(experience),
       thesis: experience.entryThesis,
-      orderReference: journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
+      orderReference: record?.executionResult?.providerOrderId ?? record?.executionResult?.clientOrderId ?? journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
       positionSide: experience.positionSide,
       openedAt: experience.entryTime,
       ...(experience.exitTime ? { closedAt: experience.exitTime } : {}),
@@ -126,22 +129,25 @@ function tradeLogEntries(experiences: readonly TradeExperience[], journals: read
 }
 
 function executionEvidence(journal: TradingJournal | null): DashboardSnapshot["executionEvidence"] {
-  if (!journal?.executionResult || !journal.reconciliationResult) return null;
+  const record = journal ? normalizeCycleDecisions(journal).records.find((candidate) => candidate.executionResult && candidate.reconciliationResult) : undefined;
+  const execution = record?.executionResult ?? journal?.executionResult;
+  const reconciliation = record?.reconciliationResult ?? journal?.reconciliationResult;
+  if (!execution || !reconciliation) return null;
   return {
-    provider: journal.executionResult.provider,
-    action: journal.executionResult.action,
-    symbol: journal.executionResult.symbol,
-    marginAllocated: journal.executionResult.marginAllocated,
-    leverage: journal.executionResult.leverage,
-    positionNotional: journal.executionResult.positionNotional,
-    orderReference: journal.executionResult.providerOrderId ?? journal.executionResult.clientOrderId,
-    executionStatus: journal.executionResult.status,
-    reconciliationStatus: journal.reconciliationResult.status,
-    ...(journal.executionResult.providerCode ? { providerCode: journal.executionResult.providerCode } : {}),
-    ...(journal.executionResult.providerMessage ? { providerMessage: journal.executionResult.providerMessage } : {}),
-    ...(journal.executionResult.providerReadbackCode ? { providerReadbackCode: journal.executionResult.providerReadbackCode } : {}),
-    ...(journal.executionResult.providerReadbackMessage ? { providerReadbackMessage: journal.executionResult.providerReadbackMessage } : {}),
-    timestamp: journal.executionResult.readBackAt,
+    provider: execution.provider,
+    action: execution.action,
+    symbol: execution.symbol,
+    marginAllocated: execution.marginAllocated,
+    leverage: execution.leverage,
+    positionNotional: execution.positionNotional,
+    orderReference: execution.providerOrderId ?? execution.clientOrderId,
+    executionStatus: execution.status,
+    reconciliationStatus: reconciliation.status,
+    ...(execution.providerCode ? { providerCode: execution.providerCode } : {}),
+    ...(execution.providerMessage ? { providerMessage: execution.providerMessage } : {}),
+    ...(execution.providerReadbackCode ? { providerReadbackCode: execution.providerReadbackCode } : {}),
+    ...(execution.providerReadbackMessage ? { providerReadbackMessage: execution.providerReadbackMessage } : {}),
+    timestamp: execution.readBackAt,
   };
 }
 
@@ -342,6 +348,10 @@ export class TraderAgent extends Agent<Env, AgentState> {
   public async getDashboardSnapshot(): Promise<DashboardSnapshot> {
     const config = loadConfig(this.env, this.ensureActivePolicy());
     const journal = loadLatestJournal(this);
+    const recentJournals = loadRecentJournals(this, 25);
+    const recentCycles = recentJournals.map((entry) => ({ ...normalizeCycleDecisions(entry), startedAt: entry.startedAt, completedAt: entry.completedAt ?? null }));
+    const latestCycle = recentCycles[0];
+    const latestDecisions = latestCycle ? [...latestCycle.plan.positionActions, ...latestCycle.plan.entryActions] : [];
     const events = loadRecentEvents(this, SNAPSHOT_EVENT_LIMIT);
     const drawdown = loadDailyDrawdownState(this);
     const drawdownPct = drawdown ? calculateDrawdownPct(drawdown.baselineEquity, drawdown.lastEquity) : "0";
@@ -364,10 +374,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
       portfolioFreshness: { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" },
       performance: { ...unavailablePerformance(), dailyDrawdown: drawdownPct },
       trades: [],
-      latestDecision: journal?.decision ?? null,
-      decisions: journal?.decision ? [journal.decision] : [],
+      latestDecision: latestDecisions[0] ?? journal?.decision ?? null,
+      decisions: recentJournals.flatMap((entry) => cyclePlanDecisions(entry)),
+      latestCyclePlan: latestCycle?.plan ?? null,
+      cyclePlans: recentCycles,
+      latestDiscovery: latestCycle?.discovery ?? journal?.discovery ?? null,
       executionEvidence: executionEvidence(journal),
-      learning: { reflection: journal?.reflection ?? null, lessons: [], lessonsUsed: journal?.decision?.lessonsUsed ?? [], backtest: null, recentExperiences: [] },
+      learning: { reflection: journal?.reflection ?? null, lessons: [], lessonsUsed: journal ? cyclePlanDecisions(journal).flatMap((decision) => decision.lessonsUsed) : [], backtest: null, recentExperiences: [] },
       riskControls: { ...config.ownerPolicy, scanIntervalMinutes: temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes, temporaryScanIntervalExpiresAt: this.state.temporaryScanIntervalExpiresAt, drawdownBlocked: Boolean(drawdown?.cooldownUntil && new Date(drawdown.cooldownUntil).getTime() > Date.now()), drawdownCode: drawdown?.cooldownUntil ? "DRAWDOWN_COOLDOWN" : "NONE", cooldownUntil: drawdown?.cooldownUntil ?? null },
       activity: events,
       lastPolicyUpdate: events.find((event) => event.type === "POLICY_UPDATED") ?? null,
@@ -403,7 +416,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
   private getAgentJournal(url: URL): Response {
     const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
     const journals = loadRecentJournals(this, limit);
-    return json({ journals, decisions: journals.flatMap((entry) => entry.decision ? [entry.decision] : []), limit });
+    const cycles = journals.map((entry) => ({ ...normalizeCycleDecisions(entry), startedAt: entry.startedAt, completedAt: entry.completedAt ?? null }));
+    return json({ journals, cycles, decisions: journals.flatMap((entry) => cyclePlanDecisions(entry)), limit });
   }
 
   private getTradeHistory(url: URL): Response {
@@ -417,7 +431,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   private getLearning(url: URL): Response {
     const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
     const journal = loadLatestJournal(this);
-    return json({ learning: { reflection: journal?.reflection ?? null, lessons: loadRecentLessons(this, limit), lessonsUsed: journal?.decision?.lessonsUsed ?? [], backtest: loadLatestBacktest(this), recentExperiences: loadExperiences(this, limit) }, limit });
+    return json({ learning: { reflection: journal?.reflection ?? null, lessons: loadRecentLessons(this, limit), lessonsUsed: cyclePlanDecisions(journal).flatMap((decision) => decision.lessonsUsed), backtest: loadLatestBacktest(this), recentExperiences: loadExperiences(this, limit) }, limit });
   }
 
   private getPolicyRead(): Response {
@@ -458,16 +472,17 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const rankedScan = rankMarketCandidates(scan);
       this.recordEvent("MARKET_SCAN", cycleId, { symbols: String(scan.length), preRanked: String(rankedScan.length) });
       this.setState({ ...this.state, runtimeStatus: "ANALYZING", currentStage: "ANALYZING" });
-      const selectedSymbols = rankedScan.length ? await selectCandidates(config, supportedUniverse, rankedScan) : [];
-      const candidateSymbols = [...new Set([...openPositionSymbols, ...selectedSymbols])];
-      this.recordEvent("CANDIDATE_SELECTED", cycleId, { symbols: candidateSymbols.join(",") });
-      const bundles = await client.collectEvidence(candidateSymbols);
+      const selectedEntryCandidateSymbols = rankedScan.length ? await selectCandidates(config, supportedUniverse, rankedScan) : [];
+      const evidenceSymbols = [...new Set([...openPositionSymbols, ...selectedEntryCandidateSymbols])];
+      this.recordEvent("CANDIDATE_SELECTED", cycleId, { symbols: selectedEntryCandidateSymbols.join(",") });
+      const bundles = await client.collectEvidence(evidenceSymbols);
       const lessons = bundles.flatMap((bundle) => retrieveLessons(allLessons, { symbol: bundle.instrument.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN" }, 3))
         .filter((lesson, index, list) => list.findIndex((candidate) => candidate.lessonId === lesson.lessonId) === index)
         .slice(0, 5);
-      const account = bundles[0]?.account;
-      if (!account) throw new Error("NO_ACCOUNT_EVIDENCE");
-      const openPositions = [...new Map(bundles.flatMap((bundle) => bundle.account.positions).map((position) => [`${position.symbol}:${position.positionSide}`, position])).values()];
+      const account = bundles[0]?.account ?? await client.getDashboardPortfolio();
+      const openPositions = [...new Map((bundles.flatMap((bundle) => bundle.account.positions).length ? bundles.flatMap((bundle) => bundle.account.positions) : account.positions).map((position) => [`${position.symbol}:${position.positionSide}`, position])).values()];
+      const discovery: CycleDiscovery = { scannedUniverseCount: scan.length, selectedEntryCandidateSymbols, managedExistingPositionSymbols: openPositions.filter((position) => Number(position.quantity) > 0).map((position) => position.symbol).sort(), financialWritesPerformed: 0 };
+      journal.discovery = discovery;
       journal.positionDiscrepancies = this.recordPositionDiscrepancies(experiences, openPositions, cycleId);
       recordLessonRetrieval(this, lessons.map((lesson) => lesson.lessonId), cycleId, startedAt);
       const drawdown = evaluateDrawdown(config.ownerPolicy, loadDailyDrawdownState(this), account.portfolioEquity, new Date());
@@ -476,76 +491,37 @@ export class TraderAgent extends Agent<Env, AgentState> {
         this.setState({ ...this.state, runtimeStatus: "COOLDOWN", currentStage: "COOLDOWN" });
         this.recordEvent("COOLDOWN_STARTED", cycleId, { code: drawdown.code });
       }
-      const backtest = drawdown.blocked ? await runCooldownBacktest(config, { symbol: candidateSymbols[0] ?? supportedUniverse[0] ?? "", bars: await client.getHistoricalBars(candidateSymbols[0] ?? supportedUniverse[0] ?? ""), experiences: experiences.filter((experience) => experience.outcomeStatus !== "EXECUTION_FAILURE"), trigger: drawdown.code }) : undefined;
+      const backtestSymbol = selectedEntryCandidateSymbols[0] ?? openPositionSymbols[0] ?? supportedUniverse[0] ?? "";
+      const backtest = drawdown.blocked ? await runCooldownBacktest(config, { symbol: backtestSymbol, bars: await client.getHistoricalBars(backtestSymbol), experiences: experiences.filter((experience) => experience.outcomeStatus !== "EXECUTION_FAILURE"), trigger: drawdown.code }) : undefined;
       if (backtest) { saveBacktest(this, backtest); journal.backtest = backtest; this.recordEvent("BACKTEST_COMPLETED", cycleId); }
       const openExperiences = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
-      const context = { bundles, supportedUniverse, experiences, openExperiences, lessons, openPositions, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE };
+      const context = { bundles, supportedUniverse, openPositionSymbols, entryCandidateSymbols: selectedEntryCandidateSymbols, experiences, openExperiences, lessons, openPositions, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE };
       const decisionSet = await decide(config, context, cycleId);
-      const decision = decisionSet.decision;
       if (decisionSet.ignoredLessonIds.length) this.recordEvent("LESSON_REFERENCE_IGNORED", cycleId, { count: String(decisionSet.ignoredLessonIds.length), ids: decisionSet.ignoredLessonIds.slice(0, 8).join(",") });
-      const legacyExit = decision.action === "REDUCE" || decision.action === "CLOSE" ? [decision] : [];
-      const proposedExits = [...legacyExit, ...decisionSet.exitDecisions.filter((exitDecision) => !legacyExit.some((legacy) => legacy.symbol === exitDecision.symbol && legacy.positionSide === exitDecision.positionSide))];
-      const exitDecisions = boundExitDecisions(proposedExits, openPositions);
-      for (const exitDecision of proposedExits.filter((candidate) => !exitDecisions.some((accepted) => accepted.decisionId === candidate.decisionId))) {
-        this.recordEvent("EXIT_SKIPPED", cycleId, { code: "POSITION_NOT_OPEN", symbol: exitDecision.symbol, positionSide: exitDecision.positionSide ?? "UNKNOWN" });
-      }
-      const bundle = bundles.find((candidate) => candidate.instrument.symbol === decision.symbol) ?? bundles[0];
-      if (!bundle) throw new Error("NO_EVIDENCE");
-      this.setState({ ...this.state, runtimeStatus: "RISK_CHECK", currentStage: "RISK_CHECK" });
       journal.marketContext = { scan, deep: bundles.map((candidate) => ({ market: candidate.market, regime: candidate.marketRegime })) };
       journal.portfolio = account;
       journal.evidence = bundles.flatMap((candidate) => candidate.evidence);
       journal.retrievedLessons = lessons.map((lesson) => lesson.lessonId);
-      journal.decision = decision;
-      journal.exitDecisions = exitDecisions;
-      if ((decision.action === "REDUCE" || decision.action === "CLOSE") && !exitDecisions.some((exitDecision) => exitDecision.decisionId === decision.decisionId)) {
-        journal.riskGateResult = { status: "BLOCK", codes: ["INSUFFICIENT_POSITION"], checkedAt: new Date().toISOString() };
-        this.recordEvent("DECISION_CREATED", cycleId, { action: decision.action, symbol: decision.symbol, decisionType: "EXIT" });
-        this.recordEvent("RISK_GATE_BLOCK", cycleId, { codes: "INSUFFICIENT_POSITION", decisionType: "EXIT", symbol: decision.symbol });
-      }
-      const exitRecords: DecisionExecutionRecord[] = [];
-      let exitWriteBlocked = false;
-      for (const exitDecision of exitDecisions) {
-        if (exitWriteBlocked) break;
-        const exitBundle = (await client.collectEvidence([exitDecision.symbol]))[0];
-        if (!exitBundle) {
-          this.recordEvent("EXECUTION_UNRESOLVED", cycleId, { decisionType: "EXIT", symbol: exitDecision.symbol, codes: "EVIDENCE_READBACK_UNAVAILABLE" });
-          exitWriteBlocked = true;
-          break;
-        }
-        const exitRecord = await this.executeDecision(client, config, exitDecision, exitBundle, cycleId, supportedUniverse, drawdown.blocked, startedAt, "EXIT");
-        exitRecords.push(exitRecord);
-        await this.persistDecisionOutcome(config, exitRecord, exitBundle, experiences, lessons, cycleId, startedAt, journal, false);
-        if (exitRecord.decision.decisionId === decision.decisionId) {
-          journal.riskGateResult = exitRecord.riskGateResult;
-          if (exitRecord.executionRequest) journal.executionRequest = exitRecord.executionRequest;
-          if (exitRecord.executionResult) journal.executionResult = exitRecord.executionResult;
-          if (exitRecord.reconciliationResult) journal.reconciliationResult = exitRecord.reconciliationResult;
-          if (exitRecord.positionBefore) journal.positionBefore = exitRecord.positionBefore;
-          if (exitRecord.positionAfter) journal.positionAfter = exitRecord.positionAfter;
-          if (exitRecord.accountAfter) journal.portfolio = exitRecord.accountAfter;
-        }
-        if (exitRecord.reconciliationResult && exitRecord.reconciliationResult.status !== "MATCHED") exitWriteBlocked = true;
-      }
-      journal.exitExecutions = exitRecords;
-      const refreshedBundles = exitDecisions.length && !exitWriteBlocked ? await client.collectEvidence([...new Set([...candidateSymbols, decision.symbol])]) : bundles;
-      const refreshedBundle = refreshedBundles.find((candidate) => candidate.instrument.symbol === decision.symbol) ?? refreshedBundles[0];
-      if (!refreshedBundle) throw new Error("NO_EVIDENCE");
-      journal.portfolio = refreshedBundle.account;
-      if (!exitWriteBlocked && decision.action !== "REDUCE" && decision.action !== "CLOSE") {
-        const entryRecord = await this.executeDecision(client, config, decision, refreshedBundle, cycleId, supportedUniverse, drawdown.blocked, startedAt, "ENTRY");
-        journal.riskGateResult = entryRecord.riskGateResult;
-        if (entryRecord.executionRequest) journal.executionRequest = entryRecord.executionRequest;
-        if (entryRecord.executionResult) journal.executionResult = entryRecord.executionResult;
-        if (entryRecord.reconciliationResult) journal.reconciliationResult = entryRecord.reconciliationResult;
-        if (entryRecord.positionBefore) journal.positionBefore = entryRecord.positionBefore;
-        if (entryRecord.positionAfter) journal.positionAfter = entryRecord.positionAfter;
-        if (entryRecord.accountAfter) journal.portfolio = entryRecord.accountAfter;
-        await this.persistDecisionOutcome(config, entryRecord, refreshedBundle, experiences, lessons, cycleId, startedAt, journal, true);
-      } else if (exitWriteBlocked && (decision.action === "OPEN_LONG" || decision.action === "OPEN_SHORT")) {
-        this.recordEvent("ENTRY_SKIPPED", cycleId, { code: "EXIT_UNRESOLVED" });
-        journal.riskGateResult = { status: "BLOCK", codes: ["EXIT_UNRESOLVED"], checkedAt: new Date().toISOString() };
-      }
+      const plan: CycleDecisionPlan = decisionSet.plan;
+      journal.cyclePlan = plan;
+      const execution = await executeCyclePlan(plan, {
+        refreshEvidence: async (symbol) => (await client.collectEvidence([symbol]))[0],
+        execute: async (action, actionBundle, decisionType) => {
+          this.setState({ ...this.state, runtimeStatus: "RISK_CHECK", currentStage: "RISK_CHECK" });
+          return this.executeDecision(client, config, action, actionBundle, cycleId, supportedUniverse, drawdown.blocked, startedAt, decisionType);
+        },
+        persist: async (record, actionBundle) => {
+          await this.persistDecisionOutcome(config, record, actionBundle, experiences, lessons, cycleId, startedAt, journal, record.decision.action !== "HOLD");
+        },
+        refreshPortfolio: async () => client.getDashboardPortfolio(),
+        onAmbiguousWrite: (record) => {
+          this.recordEvent("FINANCIAL_WRITES_STOPPED", cycleId, { code: "EXECUTION_UNRESOLVED", symbol: record.decision.symbol, action: record.decision.action });
+          this.recordEvent("PLAN_REMAINING_ACTIONS_SKIPPED", cycleId, { code: "EXECUTION_UNRESOLVED" });
+        },
+      });
+      journal.executionRecords = execution.records;
+      journal.discovery = { ...discovery, financialWritesPerformed: execution.records.filter((record) => Boolean(record.executionResult)).length };
+      if (execution.finalPortfolio) journal.portfolio = execution.finalPortfolio;
       this.setState({ ...this.state, runtimeStatus: "REFLECTING", currentStage: "REFLECTING" });
       const backtestLesson = backtest ? createBacktestLesson(backtest) : undefined;
       journal.createdLessons = [...journal.createdLessons, ...(backtestLesson ? [backtestLesson.lessonId] : [])];
@@ -595,7 +571,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     supportedUniverse: readonly string[],
     dailyDrawdownBlocked: boolean,
     startedAt: string,
-    decisionType: "ENTRY" | "EXIT",
+    decisionType: "POSITION_MANAGEMENT" | "NEW_ENTRY",
   ): Promise<DecisionExecutionRecord> {
     const riskGateResult = evaluateRiskGate(config, { decision, instrument: bundle.instrument, account: bundle.account, evidenceObservedAt: bundle.market.observedAt, openOrderSymbols: bundle.account.openOrderSymbols, supportedUniverse, emergencyStop: this.state.emergencyStop || config.ownerPolicy.emergencyStop, dailyDrawdownBlocked });
     this.recordEvent("DECISION_CREATED", cycleId, { action: decision.action, symbol: decision.symbol, decisionType });

@@ -1,21 +1,31 @@
 # Verification
 
-## Verified implementation facts
+## Evidence levels
 
-- strict TypeScript and scenario-based tests cover the current Worker path;
-- Wrangler dry-run/build includes the Worker, Durable Object binding, and static assets;
-- authenticated Qwen calls work through the configured Bitget AI proxy with `qwen3.8-max`;
-- Bitget Demo/PAPER execution works through the official SDK path;
-- the manual `NVDAUSDT` execution-path harness verified `OPEN_LONG` → provider readback → `CLOSE` → reconciliation `MATCHED`, with realized PnL `-0.0456`, final positions `0`, and final open orders `0`;
-- hedge-mode close uses `posSide` without `reduceOnly`; one-way close uses `reduceOnly`;
-- provider parsing supports `orderStatus` and `cumExecQty`;
-- the frontend contains Dashboard, Agent Journal, Trade History, Open Position, Learning, and Policy pages;
-- Open Position is read-only, uses `PROVIDER_LIVE` from `/api/live/portfolio` on current readback, supports multiple positions, and refreshes through the approximately 10-second provider polling; `/api/snapshot` is refreshed approximately every 60 seconds;
-- If the account or position provider read fails, the UI shows provider state as unavailable and does not show journal portfolio fallback;
-- signed provider PnL/rate parsing, deterministic reconciliation, runtime Git SHA injection, Demo-universe filtering, sequential exits, and ambiguous-write fail-closed behavior are covered by the implementation/tests.
-- `darwin-mandate-v4` requires evidence-backed decision rationale, supporting factors, risk/invalidation factors, and explicit evidence limitations; the dashboard renders `evidenceUsed` with the other explanation fields.
+### CODE VERIFIED
 
-The manual NVDA lifecycle is execution-path verification only. It is not autonomous Worker history and must not be presented as a competition log.
+The repository is intended to verify the following through typecheck, unit tests, integration boundaries, and the credential-free demo:
+
+- `CycleDecisionPlan` separates `positionActions[]` and `entryActions[]`;
+- every open provider position must receive exactly one management action;
+- management actions may target existing positions outside `supportedUniverse`;
+- new entries require supported-universe membership and current deep evidence;
+- `MAX_TOTAL_ACTIONS_PER_CYCLE=5` rejects over-cap intent without truncation;
+- `CLOSE → REDUCE → OPEN` ordering is deterministic and financial writes are sequential;
+- provider evidence and portfolio state refresh between matched writes;
+- ambiguous/unresolved writes stop remaining writes without blind retry;
+- idempotency remains per action;
+- old journals normalize through `src/storage/journal-normalizer.ts` without destructive migration;
+- paper-log effective execution/reconciliation fallback marks legacy matched primary executions verified;
+- paper-log action category, cycle discovery, and lifecycle metrics do not count HOLD or unresolved writes as verified trades;
+- dashboard and Judge Demo render grouped cycle plans and discovery evidence;
+- frontend has no provider credentials or manual financial controls.
+
+The prompt contracts are code-checked as `darwin-mandate-v5` and `darwin-decision-v3`. Reflection/backtest prompt versions remain unchanged.
+
+### PRODUCTION VERIFIED
+
+Only runtime observations after deployment belong here. A source test, Docker replay, or HOLD/no-entry cycle does not prove multi-write production execution. Production verification requires the exact deployed commit, `PROVIDER_LIVE` account/position reads, a healthy scheduler, and provider readback plus `MATCHED` reconciliation for any financial write. No multi-action financial execution is marked production-verified by this source change alone.
 
 ## Paper log evidence
 
@@ -26,11 +36,12 @@ GET /api/export/paper-log?format=json
 GET /api/export/paper-log?format=csv
 ```
 
-The export is read-only, includes HOLD cycles, excludes manual harness records, and preserves sanitized provider diagnostics. It does not expose credentials, auth headers, passphrases, or model chain-of-thought. The final competition export is still `PENDING FINAL COMPETITION EXPORT`.
+The export is read-only, includes HOLD cycles, exports every action separately with its action category and cycle-level discovery fields, excludes manual harness and Docker records, and preserves sanitized provider diagnostics. It does not expose credentials, auth headers, passphrases, or model chain-of-thought. The final competition export is still `PENDING FINAL COMPETITION EXPORT`.
 
 ## Not claimed
 
-- No guaranteed profitability.
+- No guaranteed profitability or meaningful Sharpe ratio when sample size is insufficient.
 - A Judge Demo replay is not a live provider session.
 - EVA evaluation is not part of the zero-credential demo.
 - Final competition-period metrics are not frozen.
+- A HOLD + no-entry cycle verifies scheduling/schema behavior only, not a multi-write path.
