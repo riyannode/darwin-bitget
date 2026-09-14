@@ -23,7 +23,7 @@ export default {
         return Response.json({ source: "PROVIDER_LIVE", portfolio, observedAt: portfolio.observedAt, ...(portfolio.openOrdersReadFailure ? { degraded: true, errors: { openOrders: portfolio.openOrdersReadFailure } } : {}) }, { headers: { "Cache-Control": "no-store" } });
       } catch (error) {
         const code = error instanceof Error && /^[A-Za-z0-9_-]{1,120}$/.test(error.message) ? error.message : "PROVIDER_READ_FAILED";
-        const readFailure = error instanceof BitgetReadError ? { operation: error.operation, symbol: error.symbol, ...(error.details.code ? { code: error.details.code } : {}), ...(error.details.message ? { message: error.details.message } : {}) } : undefined;
+        const readFailure = error instanceof BitgetReadError ? { operation: error.operation, symbol: error.symbol, ...(error.details.classification ? { classification: error.details.classification } : {}), ...(error.details.code ? { code: error.details.code } : {}), ...(error.details.message ? { message: error.details.message } : {}) } : undefined;
         return Response.json({ source: "PROVIDER_LIVE", error: code, ...(readFailure ? { provider: readFailure } : {}) }, { status: 503, headers: { "Cache-Control": "no-store" } });
       }
     }

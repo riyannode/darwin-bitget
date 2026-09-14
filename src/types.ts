@@ -394,8 +394,10 @@ export interface ExecutionResult {
   status: ExecutionStatus;
   submittedAt: string;
   readBackAt: string;
+  providerFailureClass?: string;
   providerCode?: string;
   providerMessage?: string;
+  providerReadbackFailureClass?: string;
   providerReadbackCode?: string;
   providerOperation?: string;
   providerReadbackMessage?: string;
