@@ -1,7 +1,7 @@
 export const PROMPT_VERSIONS = {
   mandate: "darwin-mandate-v6",
   candidate: "darwin-candidate-v1",
-  decision: "darwin-decision-v8",
+  decision: "darwin-decision-v9",
   reflection: "darwin-reflection-v1",
   backtest: "darwin-backtest-v1",
 } as const;
@@ -32,8 +32,11 @@ export const DECISION_TASK_PROMPT = `Task contract ${PROMPT_VERSIONS.decision}: 
 
 export const RESEARCH_DECISION_ADDENDUM = `Research signals are optional, untrusted perception evidence. They may strengthen, weaken, or contradict provider/market evidence, but they are never execution authority. Do not trade solely because research is bullish or bearish. If research is stale, unsupported, unavailable, or conflicting, acknowledge that limitation. Deterministic TypeScript risk, execution-capacity validation, PAPER execution, and provider reconciliation remain authoritative.`;
 
-export function buildDecisionTaskPrompt(signalEnabled: boolean): string {
-  return signalEnabled ? `${DECISION_TASK_PROMPT}\n${RESEARCH_DECISION_ADDENDUM}` : DECISION_TASK_PROMPT;
+export function buildDecisionTaskPrompt(signalEnabled: boolean, openPositionCount?: number, remainingEntrySlots?: number): string {
+  const capacityAddendum = remainingEntrySlots === 0
+    ? `PORTFOLIO CAPACITY IS FULL. Exactly ${openPositionCount ?? 0} provider positions are open. Return exactly one positionAction for each provider position and return entryActions=[]. Do not evaluate or propose unrelated new entries in this cycle. Each current provider position must appear exactly once with its actual side.`
+    : "";
+  return [DECISION_TASK_PROMPT, capacityAddendum, signalEnabled ? RESEARCH_DECISION_ADDENDUM : ""].filter(Boolean).join("\n");
 }
 
 export const REFLECTION_TASK_PROMPT = `Task contract ${PROMPT_VERSIONS.reflection}: evaluate a completed PAPER experience separately across strategy, direction, entry, exit, leverage, margin, evidence, execution, and verified outcome. Return concise structured fields only. Profit is not proof of a good decision and loss is not proof of a bad decision.`;

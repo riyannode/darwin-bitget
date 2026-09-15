@@ -4,7 +4,7 @@ import type { CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, De
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
-import { assertOpenPositionCountWithinPlanLimit, decide, rankMarketCandidates, selectCandidates } from "./decision.js";
+import { assertOpenPositionCountWithinPlanLimit, buildEvidenceSymbols, calculateActionCapacity, decide, rankMarketCandidates, selectEntryCandidates } from "./decision.js";
 import { reconcileTradingSchedule, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES, type SchedulerReconciliationResult } from "./scheduler.js";
 import { authorizeOwner } from "./owner-auth.js";
 import { retrieveLessons } from "../learning/lesson-retrieval.js";
@@ -678,9 +678,10 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const rankedScan = rankMarketCandidates(scan);
       this.recordEvent("MARKET_SCAN", cycleId, { symbols: String(scan.length), preRanked: String(rankedScan.length) });
       this.setState({ ...this.state, runtimeStatus: "ANALYZING", currentStage: "ANALYZING" });
-      const selectedEntryCandidateSymbols = rankedScan.length ? await selectCandidates(config, supportedUniverse, rankedScan) : [];
-      const evidenceSymbols = [...new Set([...openPositionSymbols, ...selectedEntryCandidateSymbols])];
-      this.recordEvent("CANDIDATE_SELECTED", cycleId, { symbols: selectedEntryCandidateSymbols.join(",") });
+      const selectedEntryCandidateSymbols = await selectEntryCandidates(config, supportedUniverse, rankedScan, openPositionSymbols.length);
+      const evidenceSymbols = buildEvidenceSymbols(openPositionSymbols, selectedEntryCandidateSymbols);
+      if (calculateActionCapacity(openPositionSymbols.length).remainingEntrySlots === 0) this.recordEvent("CANDIDATE_SELECTION_SKIPPED", cycleId, { code: "CAPACITY_SATURATED", openPositionCount: String(openPositionSymbols.length) });
+      else this.recordEvent("CANDIDATE_SELECTED", cycleId, { symbols: selectedEntryCandidateSymbols.join(",") });
       const bundles = await client.collectEvidence(evidenceSymbols);
       const lessons = bundles.flatMap((bundle) => retrieveLessons(allLessons, { symbol: bundle.instrument.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN" }, 3))
         .filter((lesson, index, list) => list.findIndex((candidate) => candidate.lessonId === lesson.lessonId) === index)

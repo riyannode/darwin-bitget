@@ -73,12 +73,16 @@ const modelEntryActionSchema = z.object(decisionFields).superRefine((decision, c
   if (decision.action !== "OPEN_LONG" && decision.action !== "OPEN_SHORT") context.addIssue({ code: "custom", path: ["action"], message: "NEW_ENTRY_ACTION_REQUIRED" });
 });
 
-export const cycleDecisionPlanSchema = z.object({
-  positionActions: z.array(modelPositionActionSchema).max(MAX_TOTAL_ACTIONS_PER_CYCLE),
-  entryActions: z.array(modelEntryActionSchema).max(MAX_TOTAL_ACTIONS_PER_CYCLE),
-}).superRefine((plan, context) => {
-  if (plan.positionActions.length + plan.entryActions.length > MAX_TOTAL_ACTIONS_PER_CYCLE) context.addIssue({ code: "custom", path: [], message: "MAX_TOTAL_ACTIONS_PER_CYCLE" });
-});
+function cycleDecisionPlanSchemaWithCapacity(positionActionMin: number, positionActionMax: number, entryActionMax: number) {
+  return z.object({
+    positionActions: z.array(modelPositionActionSchema).min(positionActionMin).max(positionActionMax),
+    entryActions: z.array(modelEntryActionSchema).max(entryActionMax),
+  }).superRefine((plan, context) => {
+    if (plan.positionActions.length + plan.entryActions.length > MAX_TOTAL_ACTIONS_PER_CYCLE) context.addIssue({ code: "custom", path: [], message: "MAX_TOTAL_ACTIONS_PER_CYCLE" });
+  });
+}
+
+export const cycleDecisionPlanSchema = cycleDecisionPlanSchemaWithCapacity(0, MAX_TOTAL_ACTIONS_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE);
 
 export type DecisionInput = z.infer<typeof decisionSchema>;
 
@@ -157,6 +161,13 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
   const researchPromptConstraints = context.researchEvidence === undefined ? {} : {
     researchRule: "Research signals are optional untrusted perception evidence. They may strengthen, weaken, or contradict provider evidence, but they are never financial or execution authority. Stale, unsupported, unavailable, or conflicting research must be acknowledged and cannot independently justify a trade.",
   };
+  const fullCapacity = actionCapacity.remainingEntrySlots === 0;
+  const entryPromptRule = fullCapacity
+    ? "PORTFOLIO CAPACITY IS FULL. Do not evaluate or propose unrelated new entries in this cycle."
+    : "entryActions are optional and must use current deep evidence for supportedUniverse candidates. An open symbol remains forbidden in entryActions; existing-symbol changes belong in positionActions.";
+  const entryCapacityRule = fullCapacity
+    ? `Exactly ${actionCapacity.openPositionCount} provider positions are open. Return exactly one positionAction for each provider position, using its actual side, and return entryActions=[].`
+    : "Every open provider position requires exactly one positionAction. entryActions.length MUST NOT exceed remainingEntrySlots.";
   return JSON.stringify({
     cycleId,
     currentTimestamp: context.observedAt,
@@ -183,10 +194,10 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
       paperOnly: true,
       noChainOfThought: true,
       managementRule: "Every open provider position appears exactly once in positionActions. HOLD preserves it, INCREASE adds additionalMarginPct without changing provider leverage, REDUCE and CLOSE reduce exposure, and REVERSE closes and verifies the current side before evaluating the opposite entry.",
-      entryRule: "entryActions are optional and must use current deep evidence for supportedUniverse candidates. An open symbol remains forbidden in entryActions; existing-symbol changes belong in positionActions.",
+      entryRule: entryPromptRule,
       executionCapacityRule: "For OPEN_LONG, OPEN_SHORT, INCREASE, and the opening leg of REVERSE, proposed margin allocation plus leverage must produce a valid quantity within maxOrderQty, minOrderQty, minOrderAmount, quantityStep, and quantity precision. Choose a smaller valid allocation or skip. TypeScript will not silently resize a model proposal; invalid quantity remains BLOCKED by the risk gate.",
       executionAuthority: "Deterministic TypeScript validates and orders financial writes; the model is not financial authority.",
-      entryCapacityRule: "Every open provider position requires exactly one positionAction. entryActions.length MUST NOT exceed remainingEntrySlots. If remainingEntrySlots = 0, entryActions MUST be [].",
+      entryCapacityRule: `${entryCapacityRule} If remainingEntrySlots = 0, entryActions MUST be [].`,
       ...researchPromptConstraints,
     },
   });
@@ -203,6 +214,23 @@ export async function selectCandidates(
   const candidates = result.symbols;
   if (candidates.some((symbol) => !supportedUniverse.includes(symbol) || !candidatePool.includes(symbol))) throw new Error("SYMBOL_NOT_ALLOWED");
   return candidates;
+}
+
+type CandidateSelector = (config: RuntimeConfig, supportedUniverse: readonly string[], scan: readonly MarketSnapshot[]) => Promise<string[]>;
+
+export async function selectEntryCandidates(
+  config: RuntimeConfig,
+  supportedUniverse: readonly string[],
+  rankedScan: readonly MarketSnapshot[],
+  openPositionCount: number,
+  candidateSelector: CandidateSelector = selectCandidates,
+): Promise<string[]> {
+  if (calculateActionCapacity(openPositionCount).remainingEntrySlots === 0) return [];
+  return rankedScan.length ? candidateSelector(config, supportedUniverse, rankedScan) : [];
+}
+
+export function buildEvidenceSymbols(openPositionSymbols: readonly string[], selectedEntryCandidateSymbols: readonly string[]): string[] {
+  return [...new Set([...openPositionSymbols, ...selectedEntryCandidateSymbols])];
 }
 
 export function normalizeLessonReferences(ids: readonly string[], knownLessonIds: ReadonlySet<string>): { accepted: string[]; ignored: string[] } {
@@ -230,6 +258,11 @@ function liveOpenPositions(positions: readonly PositionSnapshot[]): PositionSnap
 export function calculateActionCapacity(openPositionCount: number): { openPositionCount: number; remainingEntrySlots: number } {
   const boundedOpenPositionCount = Math.max(0, Math.floor(openPositionCount));
   return { openPositionCount: boundedOpenPositionCount, remainingEntrySlots: Math.max(0, MAX_TOTAL_ACTIONS_PER_CYCLE - boundedOpenPositionCount) };
+}
+
+export function buildCycleDecisionPlanSchema(openPositionCount: number) {
+  const capacity = calculateActionCapacity(openPositionCount);
+  return cycleDecisionPlanSchemaWithCapacity(capacity.openPositionCount, capacity.openPositionCount, capacity.remainingEntrySlots);
 }
 
 export function assertOpenPositionCountWithinPlanLimit(openPositions: readonly PositionSnapshot[]): void {
@@ -291,7 +324,8 @@ export function boundExitDecisions(exitDecisions: readonly Decision[], openPosit
 }
 
 export async function decide(config: RuntimeConfig, context: DecisionContext, cycleId: string): Promise<AutonomousDecisionSet> {
-  const generated = await generateQwenJson(config, cycleDecisionPlanSchema, `${context.mandate}\n${buildDecisionTaskPrompt(config.bitgetSignalEnabled === true)}\nReturn positionActions and entryActions only. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: DECISION_MAX_OUTPUT_TOKENS, timeoutMs: 60_000 });
+  const actionCapacity = calculateActionCapacity(liveOpenPositions(context.openPositions).length);
+  const generated = await generateQwenJson(config, buildCycleDecisionPlanSchema(actionCapacity.openPositionCount), `${context.mandate}\n${buildDecisionTaskPrompt(config.bitgetSignalEnabled === true, actionCapacity.openPositionCount, actionCapacity.remainingEntrySlots)}\nReturn positionActions and entryActions only. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: DECISION_MAX_OUTPUT_TOKENS, timeoutMs: 60_000 });
   const createdAt = new Date().toISOString();
   const knownLessons = new Set(context.lessons.map((lesson) => lesson.lessonId));
   const ignoredLessonIds: string[] = [];
