@@ -708,8 +708,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (backtest) { saveBacktest(this, backtest); journal.backtest = backtest; this.recordEvent("BACKTEST_COMPLETED", cycleId); }
       const openExperiences = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
       const executionCapacityHints = buildExecutionCapacityHints(bundles, config.ownerPolicy.maxLeverage);
-      const researchEvidence = await this.collectResearchEvidence(config, bundles, openPositionSymbols, selectedEntryCandidateSymbols);
-      const context = { bundles, supportedUniverse, openPositionSymbols, entryCandidateSymbols: selectedEntryCandidateSymbols, experiences, openExperiences, lessons, openPositions, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE, researchEvidence, executionCapacityHints };
+      const researchEvidence = config.bitgetSignalEnabled ? await this.collectResearchEvidence(config, bundles, openPositionSymbols, selectedEntryCandidateSymbols) : undefined;
+      const context = { bundles, supportedUniverse, openPositionSymbols, entryCandidateSymbols: selectedEntryCandidateSymbols, experiences, openExperiences, lessons, openPositions, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE, ...(researchEvidence === undefined ? {} : { researchEvidence }), executionCapacityHints };
       const decisionSet = await decide(config, context, cycleId);
       if (decisionSet.ignoredLessonIds.length) this.recordEvent("LESSON_REFERENCE_IGNORED", cycleId, { count: String(decisionSet.ignoredLessonIds.length), ids: decisionSet.ignoredLessonIds.slice(0, 8).join(",") });
       journal.marketContext = { scan, deep: bundles.map((candidate) => ({ market: candidate.market, regime: candidate.marketRegime })) };

@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+vi.mock("agents", () => ({ Agent: class {}, routeAgentRequest: vi.fn() }));
+import { TraderAgent } from "../src/agent/agent.js";
 import { availableResearchCapabilities } from "../src/research/capabilities.js";
 import { ResearchExecutor, normalizeResearchEvidence } from "../src/research/executor.js";
 import { MAX_MCP_TOOL_CALLS_PER_CYCLE, MAX_RESEARCH_REQUESTS_PER_CYCLE, RESEARCH_CONCURRENCY, buildResearchRouterPrompt, researchPlanSchema, validateResearchPlan, type ResearchRouterInput } from "../src/research/router.js";
@@ -57,6 +59,22 @@ describe("Bitget Signal research router", () => {
     const result = validateResearchPlan(plan, expensiveInput);
     expect(result.accepted).toHaveLength(1);
     expect(result.rejected[0]?.reason).toBe("MAX_MCP_TOOL_CALLS_PER_CYCLE");
+  });
+
+  it("does not invoke the research router or MCP executor when Signal is disabled", async () => {
+    let routerCalls = 0;
+    let executorCalls = 0;
+    const collectResearchEvidence = (TraderAgent.prototype as unknown as {
+      collectResearchEvidence: (this: unknown, config: { bitgetSignalEnabled?: boolean }, bundles: readonly [], openPositionSymbols: readonly string[], entryCandidateSymbols: readonly string[]) => Promise<unknown[]>;
+    }).collectResearchEvidence;
+    const fakeAgent = {
+      researchRouter: { plan: async () => { routerCalls += 1; return { requests: [] }; } },
+      researchExecutor: { execute: async () => { executorCalls += 1; return []; } },
+    };
+    const result = await collectResearchEvidence.call(fakeAgent, { bitgetSignalEnabled: false }, [], [], []);
+    expect(result).toEqual([]);
+    expect(routerCalls).toBe(0);
+    expect(executorCalls).toBe(0);
   });
 });
 
