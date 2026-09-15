@@ -61,6 +61,14 @@ describe("Bitget Signal research router", () => {
     expect(result.rejected[0]?.reason).toBe("MAX_MCP_TOOL_CALLS_PER_CYCLE");
   });
 
+  it("restricts full-capacity research to currently open symbols", () => {
+    const saturatedInput: ResearchRouterInput = { ...input, entryCandidateSymbols: [] };
+    const plan = researchPlanSchema.parse({ requests: [request("COINUSDT"), request("CRCLUSDT")] });
+    const result = validateResearchPlan(plan, saturatedInput);
+    expect(result.accepted).toEqual([request("COINUSDT")]);
+    expect(result.rejected[0]?.reason).toBe("SYMBOL_NOT_OPEN_OR_CANDIDATE");
+  });
+
   it("does not invoke the research router or MCP executor when Signal is disabled", async () => {
     let routerCalls = 0;
     let executorCalls = 0;

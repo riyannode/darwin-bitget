@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertOpenPositionCountWithinPlanLimit, calculateActionCapacity, cycleDecisionPlanSchema, buildDecisionPrompt, MAX_FINANCIAL_WRITES_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
+import { assertOpenPositionCountWithinPlanLimit, buildCycleDecisionPlanSchema, buildDecisionPrompt, calculateActionCapacity, cycleDecisionPlanSchema, buildEvidenceSymbols, MAX_FINANCIAL_WRITES_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, selectEntryCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
 import type { AccountSnapshot, CycleDecisionPlan, Decision, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot, PositionSnapshot } from "../src/types.js";
 import { buildDecisionTaskPrompt, DECISION_TASK_PROMPT, PROMPT_VERSIONS } from "../src/agent/mandate.js";
 
@@ -154,6 +154,45 @@ describe("cycle decision plan contract", () => {
     expect(MAX_TOTAL_ACTIONS_PER_CYCLE).toBe(5);
   });
 
+  it("skips candidate selection and unrelated evidence at saturated capacity", async () => {
+    let candidateSelectorCalls = 0;
+    const selected = await selectEntryCandidates({} as never, ["NVDAUSDT"], [snapshot("NVDAUSDT")], 5, async () => {
+      candidateSelectorCalls += 1;
+      return ["NVDAUSDT"];
+    });
+    expect(candidateSelectorCalls).toBe(0);
+    expect(selected).toEqual([]);
+    expect(buildEvidenceSymbols(["CRCLUSDT", "SKHYUSDT", "HOODUSDT", "MSTRUSDT", "COINUSDT"], selected)).toEqual(["CRCLUSDT", "SKHYUSDT", "HOODUSDT", "MSTRUSDT", "COINUSDT"]);
+  });
+
+  it("preserves candidate selection below saturated capacity", async () => {
+    let candidateSelectorCalls = 0;
+    const selected = await selectEntryCandidates({} as never, ["NVDAUSDT"], [snapshot("NVDAUSDT")], 4, async () => {
+      candidateSelectorCalls += 1;
+      return ["NVDAUSDT"];
+    });
+    expect(candidateSelectorCalls).toBe(1);
+    expect(selected).toEqual(["NVDAUSDT"]);
+  });
+
+  it("enforces capacity in the generated model schema before semantic execution", () => {
+    const positions = ["CRCLUSDT", "SKHYUSDT", "HOODUSDT", "MSTRUSDT", "COINUSDT"];
+    const valid = { positionActions: positions.map((symbol) => decision("HOLD", symbol, "LONG")), entryActions: [] };
+    expect(() => buildCycleDecisionPlanSchema(5).parse(valid)).not.toThrow();
+    expect(() => buildCycleDecisionPlanSchema(5).parse({ positionActions: valid.positionActions.slice(0, 4), entryActions: [] })).toThrow();
+    expect(() => buildCycleDecisionPlanSchema(5).parse({ positionActions: valid.positionActions, entryActions: [decision("OPEN_LONG", "NVDAUSDT", "LONG")] })).toThrow();
+    expect(() => validateCycleDecisionPlan(plan(valid.positionActions), context(positions.map((symbol) => position(symbol)), []))).not.toThrow();
+  });
+
+  it("allows only one entry for four positions and two for three positions", () => {
+    const four = buildCycleDecisionPlanSchema(4);
+    const three = buildCycleDecisionPlanSchema(3);
+    const positionActions = (count: number) => Array.from({ length: count }, (_, index) => decision("HOLD", `OPEN${index}USDT`, "LONG"));
+    expect(() => four.parse({ positionActions: positionActions(4), entryActions: [decision("OPEN_LONG", "NVDAUSDT", "LONG")] })).not.toThrow();
+    expect(() => four.parse({ positionActions: positionActions(4), entryActions: [decision("OPEN_LONG", "NVDAUSDT", "LONG"), decision("OPEN_LONG", "COINUSDT", "LONG")] })).toThrow();
+    expect(() => three.parse({ positionActions: positionActions(3), entryActions: [decision("OPEN_LONG", "NVDAUSDT", "LONG"), decision("OPEN_LONG", "COINUSDT", "LONG")] })).not.toThrow();
+  });
+
   it("accepts exactly five total actions and rejects six", () => {
     const positions = [position("CRCLUSDT"), position("MSTRUSDT"), position("TSLAUSDT", "SHORT")];
     const five = plan([decision("HOLD", "CRCLUSDT", "LONG"), decision("HOLD", "MSTRUSDT", "LONG"), decision("HOLD", "TSLAUSDT", "SHORT")], [decision("OPEN_LONG", "NVDAUSDT", "LONG"), decision("OPEN_SHORT", "COINUSDT", "SHORT")]);
@@ -204,7 +243,7 @@ describe("cycle decision plan contract", () => {
     expect(prompt).toContain('"openPositionCount":1');
     expect(prompt).toContain('"remainingEntrySlots":4');
     expect(prompt).toContain("entryActions.length MUST NOT exceed remainingEntrySlots");
-    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v8");
+    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v9");
     expect(DECISION_TASK_PROMPT).toContain('HOLD: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('INCREASE: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('REDUCE: positionSide = actual provider side, marginAllocationPct = "0"');
@@ -227,6 +266,8 @@ describe("cycle decision plan contract", () => {
     expect(prompt).toContain('"openPositionCount":5');
     expect(prompt).toContain('"remainingEntrySlots":0');
     expect(prompt).toContain("If remainingEntrySlots = 0, entryActions MUST be []");
+    expect(prompt).toContain("PORTFOLIO CAPACITY IS FULL");
+    expect(buildDecisionTaskPrompt(false, 5, 0)).toContain("Do not evaluate or propose unrelated new entries in this cycle");
   });
 
   it("allows one entry slot when four positions require management", () => {
