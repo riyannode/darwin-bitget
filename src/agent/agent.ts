@@ -1,6 +1,6 @@
 import { Agent } from "agents";
 import { ZodError } from "zod";
-import type { CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionSnapshot, ReflectionResult, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
+import type { BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionSnapshot, ReflectionResult, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
@@ -9,7 +9,7 @@ import { reconcileTradingSchedule, temporaryScanIntervalActive, TEMPORARY_SCAN_I
 import { authorizeOwner } from "./owner-auth.js";
 import { retrieveLessons } from "../learning/lesson-retrieval.js";
 import { reflect, reflectWithQwen } from "../learning/reflection.js";
-import { createBacktestLesson, runCooldownBacktest } from "../learning/backtest.js";
+import { backtestFailureMetadata, createBacktestLesson, runCooldownBacktestSafely } from "../learning/backtest.js";
 import { ensureStorage } from "../storage/schema.js";
 import {
   loadLatestBacktest,
@@ -705,7 +705,15 @@ export class TraderAgent extends Agent<Env, AgentState> {
         this.recordEvent("COOLDOWN_STARTED", cycleId, { code: drawdown.code });
       }
       const backtestSymbol = selectedEntryCandidateSymbols[0] ?? openPositionSymbols[0] ?? supportedUniverse[0] ?? "";
-      const backtest = drawdown.blocked ? await runCooldownBacktest(config, { symbol: backtestSymbol, bars: await client.getHistoricalBars(backtestSymbol), experiences: experiences.filter((experience) => experience.outcomeStatus !== "EXECUTION_FAILURE"), trigger: drawdown.code }) : undefined;
+      let backtest: BacktestReplay | undefined;
+      if (drawdown.blocked) {
+        try {
+          const bars = await client.getHistoricalBars(backtestSymbol);
+          backtest = await runCooldownBacktestSafely(config, { symbol: backtestSymbol, bars, experiences: experiences.filter((experience) => experience.outcomeStatus !== "EXECUTION_FAILURE"), trigger: drawdown.code }, (metadata) => this.recordEvent("BACKTEST_FAILED", cycleId, metadata));
+        } catch (error) {
+          this.recordEvent("BACKTEST_FAILED", cycleId, backtestFailureMetadata(error));
+        }
+      }
       if (backtest) { saveBacktest(this, backtest); journal.backtest = backtest; this.recordEvent("BACKTEST_COMPLETED", cycleId); }
       const openExperiences = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
       const executionCapacityHints = buildExecutionCapacityHints(bundles, config.ownerPolicy.maxLeverage);
