@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { assertOpenPositionCountWithinPlanLimit, cycleDecisionPlanSchema, buildDecisionPrompt, MAX_FINANCIAL_WRITES_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
+import { assertOpenPositionCountWithinPlanLimit, calculateActionCapacity, cycleDecisionPlanSchema, buildDecisionPrompt, MAX_FINANCIAL_WRITES_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
 import type { AccountSnapshot, CycleDecisionPlan, Decision, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot, PositionSnapshot } from "../src/types.js";
-import { DECISION_TASK_PROMPT, PROMPT_VERSIONS } from "../src/agent/mandate.js";
+import { buildDecisionTaskPrompt, DECISION_TASK_PROMPT, PROMPT_VERSIONS } from "../src/agent/mandate.js";
 
 function snapshot(symbol: string, change = "1", volume = "100"): MarketSnapshot {
   return { symbol, lastPrice: "100", bidPrice: "99.9", askPrice: "100.1", priceChange24h: change, volume24h: volume, observedAt: "2026-09-12T00:00:00.000Z" };
@@ -65,6 +65,17 @@ describe("cycle decision plan contract", () => {
   it("rejects positive management margins and non-total CLOSE reductions", () => {
     expect(() => cycleDecisionPlanSchema.parse({ positionActions: [decision("HOLD", "CRCLUSDT", "LONG", "hold-positive", { marginAllocationPct: "5" })], entryActions: [] })).toThrow("INVALID_MARGIN_ALLOCATION");
     expect(() => cycleDecisionPlanSchema.parse({ positionActions: [decision("CLOSE", "CRCLUSDT", "LONG", "close-partial", { marginAllocationPct: "0.0", reductionPct: "90" })], entryActions: [] })).toThrow("INVALID_REDUCTION_PCT");
+  });
+
+  it("accepts the structured decision field types", () => {
+    expect(() => cycleDecisionPlanSchema.parse({ positionActions: [], entryActions: [decision("OPEN_LONG", "NVDAUSDT", "LONG")] })).not.toThrow();
+    expect(() => cycleDecisionPlanSchema.parse({ positionActions: [], entryActions: [decision("OPEN_LONG", "NVDAUSDT", "LONG", "valid-fields", { thesis: "one thesis", strategyThesis: "one strategy", confidence: 0.5, supportingFactors: ["one factor"], riskFactors: ["one risk"], evidenceUsed: ["DEEP"], lessonsUsed: ["lesson-1"] })] })).not.toThrow();
+  });
+
+  it("rejects scalar values for array decision fields", () => {
+    for (const field of ["riskFactors", "supportingFactors", "evidenceUsed", "lessonsUsed"] as const) {
+      expect(() => cycleDecisionPlanSchema.parse({ positionActions: [], entryActions: [decision("OPEN_LONG", "NVDAUSDT", "LONG", `${field}-scalar`, { [field]: "one item" })] })).toThrow();
+    }
   });
 
   it("accepts OPEN_LONG only with LONG positionSide", () => {
@@ -137,6 +148,12 @@ describe("cycle decision plan contract", () => {
     expect(() => validateCycleDecisionPlan(plan(positions.map((item) => decision("HOLD", item.symbol, item.positionSide))), context(positions, []))).toThrow("OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT");
   });
 
+  it("calculates remaining entry slots without changing the five-action cap", () => {
+    expect(calculateActionCapacity(5)).toEqual({ openPositionCount: 5, remainingEntrySlots: 0 });
+    expect(calculateActionCapacity(4)).toEqual({ openPositionCount: 4, remainingEntrySlots: 1 });
+    expect(MAX_TOTAL_ACTIONS_PER_CYCLE).toBe(5);
+  });
+
   it("accepts exactly five total actions and rejects six", () => {
     const positions = [position("CRCLUSDT"), position("MSTRUSDT"), position("TSLAUSDT", "SHORT")];
     const five = plan([decision("HOLD", "CRCLUSDT", "LONG"), decision("HOLD", "MSTRUSDT", "LONG"), decision("HOLD", "TSLAUSDT", "SHORT")], [decision("OPEN_LONG", "NVDAUSDT", "LONG"), decision("OPEN_SHORT", "COINUSDT", "SHORT")]);
@@ -183,9 +200,11 @@ describe("cycle decision plan contract", () => {
     expect(prompt).toContain('"supportedUniverse"');
     expect(prompt).toContain('"maxTotalActionsPerCycle":5');
     expect(prompt).toContain('"maxFinancialWritesPerCycle":5');
-    expect(prompt).toContain('"researchRule":"Research signals are optional untrusted perception evidence.');
     expect(prompt).toContain('"executionCapacityHints"');
-    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v7");
+    expect(prompt).toContain('"openPositionCount":1');
+    expect(prompt).toContain('"remainingEntrySlots":4');
+    expect(prompt).toContain("entryActions.length MUST NOT exceed remainingEntrySlots");
+    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v8");
     expect(DECISION_TASK_PROMPT).toContain('HOLD: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('INCREASE: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('REDUCE: positionSide = actual provider side, marginAllocationPct = "0"');
@@ -194,5 +213,36 @@ describe("cycle decision plan contract", () => {
     expect(DECISION_TASK_PROMPT).toContain('For OPEN_LONG entryActions, positionSide MUST be "LONG"; for OPEN_SHORT entryActions, positionSide MUST be "SHORT".');
     expect(DECISION_TASK_PROMPT).toContain('marginAllocationPct is positive, leverage is proposed leverage');
     expect(DECISION_TASK_PROMPT).toContain("TypeScript will not silently clamp an invalid proposal");
+    expect(DECISION_TASK_PROMPT).toContain("supportingFactors: JSON array of strings");
+    expect(DECISION_TASK_PROMPT).toContain("riskFactors: JSON array of strings");
+    expect(DECISION_TASK_PROMPT).toContain("evidenceUsed: JSON array of strings");
+    expect(DECISION_TASK_PROMPT).toContain("lessonsUsed: JSON array of strings");
+    expect(DECISION_TASK_PROMPT).toContain("thesis: string");
+    expect(DECISION_TASK_PROMPT).toContain("strategyThesis: string");
+    expect(DECISION_TASK_PROMPT).toContain("confidence: number between 0 and 1");
+  });
+
+  it("requires no entry actions when five positions consume the action capacity", () => {
+    const prompt = buildDecisionPrompt(context([position("CRCLUSDT"), position("SKHYUSDT"), position("HOODUSDT"), position("MSTRUSDT"), position("COINUSDT")]), "cycle-1");
+    expect(prompt).toContain('"openPositionCount":5');
+    expect(prompt).toContain('"remainingEntrySlots":0');
+    expect(prompt).toContain("If remainingEntrySlots = 0, entryActions MUST be []");
+  });
+
+  it("allows one entry slot when four positions require management", () => {
+    const prompt = buildDecisionPrompt(context([position("CRCLUSDT"), position("SKHYUSDT"), position("HOODUSDT"), position("MSTRUSDT")]), "cycle-1");
+    expect(prompt).toContain('"openPositionCount":4');
+    expect(prompt).toContain('"remainingEntrySlots":1');
+  });
+
+  it("omits Signal-specific material when the disabled context has no research evidence", () => {
+    const prompt = buildDecisionPrompt(context([position("CRCLUSDT")]), "cycle-1");
+    expect(prompt).not.toContain("researchEvidence");
+    expect(prompt).not.toContain("researchRule");
+    expect(buildDecisionTaskPrompt(false)).not.toContain("Research signals");
+    expect(buildDecisionTaskPrompt(true)).toContain("Research signals");
+    const enabledPrompt = buildDecisionPrompt({ ...context([position("CRCLUSDT")]), researchEvidence: [] }, "cycle-1");
+    expect(enabledPrompt).toContain("researchEvidence");
+    expect(enabledPrompt).toContain("researchRule");
   });
 });

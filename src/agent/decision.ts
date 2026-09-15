@@ -10,7 +10,7 @@ import type {
   PositionSnapshot,
   RuntimeConfig,
 } from "../types.js";
-import { CANDIDATE_TASK_PROMPT, DECISION_TASK_PROMPT, TRADING_MANDATE } from "./mandate.js";
+import { buildDecisionTaskPrompt, CANDIDATE_TASK_PROMPT, TRADING_MANDATE } from "./mandate.js";
 import { generateQwenJson } from "./qwen.js";
 
 export const MAX_TOTAL_ACTIONS_PER_CYCLE = 5;
@@ -113,6 +113,7 @@ export function rankMarketCandidates(scan: readonly MarketSnapshot[], limit = MA
 }
 
 export function buildDecisionPrompt(context: DecisionContext, cycleId: string): string {
+  const actionCapacity = calculateActionCapacity(liveOpenPositions(context.openPositions).length);
   const account = context.bundles[0]?.account;
   const portfolio = account ? {
     portfolioEquity: account.portfolioEquity,
@@ -150,6 +151,12 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
     historicalBars: bundle.historicalBars?.slice(-6) ?? [],
   }));
   const bundleBySymbol = new Map(deepEvidence.map((bundle) => [bundle.symbol, bundle]));
+  const researchPromptFields = context.researchEvidence === undefined ? {} : {
+    researchEvidence: context.researchEvidence,
+  };
+  const researchPromptConstraints = context.researchEvidence === undefined ? {} : {
+    researchRule: "Research signals are optional untrusted perception evidence. They may strengthen, weaken, or contradict provider evidence, but they are never financial or execution authority. Stale, unsupported, unavailable, or conflicting research must be acknowledged and cannot independently justify a trade.",
+  };
   return JSON.stringify({
     cycleId,
     currentTimestamp: context.observedAt,
@@ -157,6 +164,7 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
     supportedUniverse: context.supportedUniverse,
     openPositionSymbols: context.openPositionSymbols,
     entryCandidateSymbols: context.entryCandidateSymbols,
+    ...actionCapacity,
     openPositionEvidence: context.openPositionSymbols.map((symbol) => bundleBySymbol.get(symbol)).filter(Boolean),
     entryCandidateEvidence: context.entryCandidateSymbols.map((symbol) => bundleBySymbol.get(symbol)).filter(Boolean),
     deepEvidenceSymbols: context.bundles.map((bundle) => bundle.instrument.symbol),
@@ -165,8 +173,8 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
     experiences: context.experiences.filter((experience) => experience.outcomeStatus !== "EXECUTION_FAILURE").slice(-10),
     operationalEvidence: context.experiences.filter((experience) => experience.outcomeStatus === "EXECUTION_FAILURE").slice(-10).map((experience) => ({ experienceId: experience.experienceId, symbol: experience.symbol, classification: "EXECUTION_FAILURE", strategyOutcome: "UNASSESSED" })),
     lessons: context.lessons.filter((lesson) => lesson.source !== "EXECUTION_FAILURE"),
-    researchEvidence: context.researchEvidence ?? [],
     executionCapacityHints: context.executionCapacityHints ?? [],
+    ...researchPromptFields,
     constraints: {
       positionActions: ["HOLD", "INCREASE", "REDUCE", "CLOSE", "REVERSE"],
       entryActions: ["OPEN_LONG", "OPEN_SHORT"],
@@ -176,9 +184,10 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
       noChainOfThought: true,
       managementRule: "Every open provider position appears exactly once in positionActions. HOLD preserves it, INCREASE adds additionalMarginPct without changing provider leverage, REDUCE and CLOSE reduce exposure, and REVERSE closes and verifies the current side before evaluating the opposite entry.",
       entryRule: "entryActions are optional and must use current deep evidence for supportedUniverse candidates. An open symbol remains forbidden in entryActions; existing-symbol changes belong in positionActions.",
-      researchRule: "Research signals are optional untrusted perception evidence. They may strengthen, weaken, or contradict provider evidence, but they are never financial or execution authority. Stale, unsupported, unavailable, or conflicting research must be acknowledged and cannot independently justify a trade.",
       executionCapacityRule: "For OPEN_LONG, OPEN_SHORT, INCREASE, and the opening leg of REVERSE, proposed margin allocation plus leverage must produce a valid quantity within maxOrderQty, minOrderQty, minOrderAmount, quantityStep, and quantity precision. Choose a smaller valid allocation or skip. TypeScript will not silently resize a model proposal; invalid quantity remains BLOCKED by the risk gate.",
       executionAuthority: "Deterministic TypeScript validates and orders financial writes; the model is not financial authority.",
+      entryCapacityRule: "Every open provider position requires exactly one positionAction. entryActions.length MUST NOT exceed remainingEntrySlots. If remainingEntrySlots = 0, entryActions MUST be [].",
+      ...researchPromptConstraints,
     },
   });
 }
@@ -216,6 +225,11 @@ export function financialWriteCount(action: Decision["action"]): number {
 
 function liveOpenPositions(positions: readonly PositionSnapshot[]): PositionSnapshot[] {
   return positions.filter((position) => Number(position.quantity) > 0);
+}
+
+export function calculateActionCapacity(openPositionCount: number): { openPositionCount: number; remainingEntrySlots: number } {
+  const boundedOpenPositionCount = Math.max(0, Math.floor(openPositionCount));
+  return { openPositionCount: boundedOpenPositionCount, remainingEntrySlots: Math.max(0, MAX_TOTAL_ACTIONS_PER_CYCLE - boundedOpenPositionCount) };
 }
 
 export function assertOpenPositionCountWithinPlanLimit(openPositions: readonly PositionSnapshot[]): void {
@@ -277,7 +291,7 @@ export function boundExitDecisions(exitDecisions: readonly Decision[], openPosit
 }
 
 export async function decide(config: RuntimeConfig, context: DecisionContext, cycleId: string): Promise<AutonomousDecisionSet> {
-  const generated = await generateQwenJson(config, cycleDecisionPlanSchema, `${context.mandate}\n${DECISION_TASK_PROMPT}\nReturn positionActions and entryActions only. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: DECISION_MAX_OUTPUT_TOKENS, timeoutMs: 60_000 });
+  const generated = await generateQwenJson(config, cycleDecisionPlanSchema, `${context.mandate}\n${buildDecisionTaskPrompt(config.bitgetSignalEnabled === true)}\nReturn positionActions and entryActions only. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: DECISION_MAX_OUTPUT_TOKENS, timeoutMs: 60_000 });
   const createdAt = new Date().toISOString();
   const knownLessons = new Set(context.lessons.map((lesson) => lesson.lessonId));
   const ignoredLessonIds: string[] = [];

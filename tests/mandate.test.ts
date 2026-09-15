@@ -6,7 +6,7 @@ describe("judge-facing mandate contract", () => {
   it("uses the v6 mandate and requires independent management and entry reasoning", () => {
     expect(PROMPT_VERSIONS.mandate).toBe("darwin-mandate-v6");
     expect(MANDATE_VERSION).toBe("darwin-mandate-v6");
-    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v7");
+    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v8");
     expect(TRADING_MANDATE).not.toContain("You are not required to trade.");
     expect(TRADING_MANDATE).toContain("Do not force a trade.");
     expect(TRADING_MANDATE).toContain("HOLD is a valid autonomous decision when current evidence does not justify changing a position.");
