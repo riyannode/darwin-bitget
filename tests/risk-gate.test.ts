@@ -35,6 +35,12 @@ describe("futures risk gate", () => {
     expect(result.codes).toEqual(expect.arrayContaining(["MAX_SINGLE_POSITION_MARGIN_PCT", "INSUFFICIENT_MARGIN"]));
   });
 
+  it("keeps financial actions blocked during daily drawdown cooldown", () => {
+    const result = evaluateRiskGate(config, { ...context(decision("OPEN_LONG")), dailyDrawdownBlocked: true });
+    expect(result.status).toBe("BLOCK");
+    expect(result.codes).toContain("DAILY_DRAWDOWN");
+  });
+
   it("does not impose a fixed profit or loss exit rule", () => {
     const result = evaluateRiskGate(config, context(decision("HOLD", "0", "1")));
     expect(result.status).toBe("PASS");
