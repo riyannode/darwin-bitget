@@ -204,7 +204,7 @@ describe("cycle decision plan contract", () => {
     expect(prompt).toContain('"openPositionCount":1');
     expect(prompt).toContain('"remainingEntrySlots":4');
     expect(prompt).toContain("entryActions.length MUST NOT exceed remainingEntrySlots");
-    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v7");
+    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v8");
     expect(DECISION_TASK_PROMPT).toContain('HOLD: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('INCREASE: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('REDUCE: positionSide = actual provider side, marginAllocationPct = "0"');

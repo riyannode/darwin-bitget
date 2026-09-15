@@ -1,7 +1,7 @@
 export const PROMPT_VERSIONS = {
   mandate: "darwin-mandate-v6",
   candidate: "darwin-candidate-v1",
-  decision: "darwin-decision-v7",
+  decision: "darwin-decision-v8",
   reflection: "darwin-reflection-v1",
   backtest: "darwin-backtest-v1",
 } as const;
