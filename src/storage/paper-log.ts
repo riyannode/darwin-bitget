@@ -428,9 +428,8 @@ function deriveExecutionOutcome(cycleId: string, events: readonly ActivityEvent[
 }
 
 function deriveFailureStage(lastSuccessfulEvent: string | null, executionOutcome: string | null): string | null {
-  if (executionOutcome === "VERIFIED_WRITE_BEFORE_CYCLE_FAILURE") return "post_write_portfolio_refresh";
-  if (executionOutcome === "SUBMITTED_BEFORE_CYCLE_FAILURE") return "post_write_portfolio_refresh";
-  if (!lastSuccessfulEvent) return null;
+  if (executionOutcome === "VERIFIED_WRITE_BEFORE_CYCLE_FAILURE" && lastSuccessfulEvent === "EXECUTION_VERIFIED") return "post_write_portfolio_refresh";
+  if (!lastSuccessfulEvent) return "unknown";
   const stageMap: Record<string, string> = {
     CYCLE_STARTED: "startup",
     MARKET_SCAN: "market_scan",

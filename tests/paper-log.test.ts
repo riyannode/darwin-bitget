@@ -257,4 +257,99 @@ describe("paper log export", () => {
     expect(() => parsePaperLogPeriod("invalid", null)).toThrow("INVALID_EXPORT_PERIOD");
     expect(() => parsePaperLogPeriod("2026-09-12T01:00:00Z", "2026-09-12T00:00:00Z")).toThrow("INVALID_EXPORT_PERIOD");
   });
+
+  it("classifies post_write_portfolio_refresh only when EXECUTION_VERIFIED is the last event before failure with verified-write outcome", () => {
+    const close = decision("cycle-fail", "CLOSE", "decision-close", "2026-09-12T00:01:00.000Z");
+    const execution = matchedExecution("CLOSE");
+    const record: DecisionExecutionRecord = { decision: close, riskGateResult: { status: "PASS", codes: [], checkedAt: close.createdAt }, executionResult: execution, reconciliationResult: matchedReconciliation(execution) };
+    const current: TradingJournal = { cycleId: "cycle-fail", agentVersion: "0.3.0", model: "qwen3.8-max", mode: "AUTONOMOUS", startedAt: close.createdAt, completedAt: close.createdAt, retrievedLessons: [], createdLessons: [], cyclePlan: { positionActions: [close as NonNullable<TradingJournal["cyclePlan"]>["positionActions"][number]], entryActions: [] }, executionRecords: [record] };
+    const events: ActivityEvent[] = [
+      { eventId: "ev-1", type: "CYCLE_STARTED", cycleId: "cycle-fail", createdAt: close.createdAt },
+      { eventId: "ev-2", type: "PAPER_ORDER_SUBMITTED", cycleId: "cycle-fail", createdAt: close.createdAt },
+      { eventId: "ev-3", type: "EXECUTION_VERIFIED", cycleId: "cycle-fail", createdAt: close.createdAt },
+      { eventId: "ev-4", type: "CYCLE_FAILED", cycleId: "cycle-fail", createdAt: close.createdAt, metadata: { category: "RUNTIME_ERROR", code: "RUNTIME_ERROR" } },
+    ];
+    const exported = buildPaperLogExport({ generatedAt: "2026-09-12T00:03:00.000Z", period: { start: null, end: null }, environment: "test", model: "qwen3.8-max", version: "0.3.0", commit: "abc123", cycles: [{ cycleId: "cycle-fail", status: "FAILED", startedAt: current.startedAt, completedAt: current.completedAt ?? null }], journals: [current], experiences: [], events });
+    expect(exported.cycles[0]?.failure?.executionOutcome).toBe("VERIFIED_WRITE_BEFORE_CYCLE_FAILURE");
+    expect(exported.cycles[0]?.failure?.lastSuccessfulEvent).toBe("EXECUTION_VERIFIED");
+    expect(exported.cycles[0]?.failure?.stage).toBe("post_write_portfolio_refresh");
+    expect(exported.failureBreakdown.byStage.post_write_portfolio_refresh).toBe(1);
+  });
+
+  it("does NOT classify as post_write_portfolio_refresh when last event is PAPER_ORDER_SUBMITTED with submitted-before-failure outcome", () => {
+    const close = decision("cycle-submit-fail", "CLOSE", "decision-submit", "2026-09-12T00:01:00.000Z");
+    const execution = matchedExecution("CLOSE");
+    const record: DecisionExecutionRecord = { decision: close, riskGateResult: { status: "PASS", codes: [], checkedAt: close.createdAt }, executionResult: execution, reconciliationResult: matchedReconciliation(execution) };
+    const current: TradingJournal = { cycleId: "cycle-submit-fail", agentVersion: "0.3.0", model: "qwen3.8-max", mode: "AUTONOMOUS", startedAt: close.createdAt, completedAt: close.createdAt, retrievedLessons: [], createdLessons: [], cyclePlan: { positionActions: [close as NonNullable<TradingJournal["cyclePlan"]>["positionActions"][number]], entryActions: [] }, executionRecords: [record] };
+    const events: ActivityEvent[] = [
+      { eventId: "ev-1", type: "CYCLE_STARTED", cycleId: "cycle-submit-fail", createdAt: close.createdAt },
+      { eventId: "ev-2", type: "PAPER_ORDER_SUBMITTED", cycleId: "cycle-submit-fail", createdAt: close.createdAt },
+      { eventId: "ev-3", type: "CYCLE_FAILED", cycleId: "cycle-submit-fail", createdAt: close.createdAt, metadata: { category: "RUNTIME_ERROR", code: "RUNTIME_ERROR" } },
+    ];
+    const exported = buildPaperLogExport({ generatedAt: "2026-09-12T00:03:00.000Z", period: { start: null, end: null }, environment: "test", model: "qwen3.8-max", version: "0.3.0", commit: "abc123", cycles: [{ cycleId: "cycle-submit-fail", status: "FAILED", startedAt: current.startedAt, completedAt: current.completedAt ?? null }], journals: [current], experiences: [], events });
+    expect(exported.cycles[0]?.failure?.executionOutcome).toBe("SUBMITTED_BEFORE_CYCLE_FAILURE");
+    expect(exported.cycles[0]?.failure?.lastSuccessfulEvent).toBe("PAPER_ORDER_SUBMITTED");
+    expect(exported.cycles[0]?.failure?.stage).toBe("execution");
+    expect(exported.failureBreakdown.byStage.execution).toBe(1);
+    expect(exported.failureBreakdown.byStage.post_write_portfolio_refresh).toBeUndefined();
+  });
+
+  it("classifies reflection when a later successful event exists after EXECUTION_VERIFIED before CYCLE_FAILED", () => {
+    const close = decision("cycle-reflect-fail", "CLOSE", "decision-reflect", "2026-09-12T00:01:00.000Z");
+    const execution = matchedExecution("CLOSE");
+    const record: DecisionExecutionRecord = { decision: close, riskGateResult: { status: "PASS", codes: [], checkedAt: close.createdAt }, executionResult: execution, reconciliationResult: matchedReconciliation(execution) };
+    const current: TradingJournal = { cycleId: "cycle-reflect-fail", agentVersion: "0.3.0", model: "qwen3.8-max", mode: "AUTONOMOUS", startedAt: close.createdAt, completedAt: close.createdAt, retrievedLessons: [], createdLessons: [], cyclePlan: { positionActions: [close as NonNullable<TradingJournal["cyclePlan"]>["positionActions"][number]], entryActions: [] }, executionRecords: [record] };
+    const events: ActivityEvent[] = [
+      { eventId: "ev-1", type: "CYCLE_STARTED", cycleId: "cycle-reflect-fail", createdAt: close.createdAt },
+      { eventId: "ev-2", type: "EXECUTION_VERIFIED", cycleId: "cycle-reflect-fail", createdAt: close.createdAt },
+      { eventId: "ev-3", type: "REFLECTION_COMPLETED", cycleId: "cycle-reflect-fail", createdAt: close.createdAt },
+      { eventId: "ev-4", type: "CYCLE_FAILED", cycleId: "cycle-reflect-fail", createdAt: close.createdAt, metadata: { category: "RUNTIME_ERROR", code: "RUNTIME_ERROR" } },
+    ];
+    const exported = buildPaperLogExport({ generatedAt: "2026-09-12T00:03:00.000Z", period: { start: null, end: null }, environment: "test", model: "qwen3.8-max", version: "0.3.0", commit: "abc123", cycles: [{ cycleId: "cycle-reflect-fail", status: "FAILED", startedAt: current.startedAt, completedAt: current.completedAt ?? null }], journals: [current], experiences: [], events });
+    expect(exported.cycles[0]?.failure?.executionOutcome).toBe("VERIFIED_WRITE_BEFORE_CYCLE_FAILURE");
+    expect(exported.cycles[0]?.failure?.lastSuccessfulEvent).toBe("REFLECTION_COMPLETED");
+    expect(exported.cycles[0]?.failure?.stage).toBe("reflection");
+    expect(exported.failureBreakdown.byStage.reflection).toBe(1);
+    expect(exported.failureBreakdown.byStage.post_write_portfolio_refresh).toBeUndefined();
+  });
+
+  it("returns unknown when there is no useful prior event before failure", () => {
+    const close = decision("cycle-empty-fail", "CLOSE", "decision-empty", "2026-09-12T00:01:00.000Z");
+    const current: TradingJournal = { cycleId: "cycle-empty-fail", agentVersion: "0.3.0", model: "qwen3.8-max", mode: "AUTONOMOUS", startedAt: close.createdAt, completedAt: close.createdAt, retrievedLessons: [], createdLessons: [], cyclePlan: { positionActions: [close as NonNullable<TradingJournal["cyclePlan"]>["positionActions"][number]], entryActions: [] } };
+    const events: ActivityEvent[] = [
+      { eventId: "ev-1", type: "CYCLE_FAILED", cycleId: "cycle-empty-fail", createdAt: close.createdAt, metadata: { category: "RUNTIME_ERROR", code: "RUNTIME_ERROR" } },
+    ];
+    const exported = buildPaperLogExport({ generatedAt: "2026-09-12T00:03:00.000Z", period: { start: null, end: null }, environment: "test", model: "qwen3.8-max", version: "0.3.0", commit: "abc123", cycles: [{ cycleId: "cycle-empty-fail", status: "FAILED", startedAt: current.startedAt, completedAt: current.completedAt ?? null }], journals: [current], experiences: [], events });
+    expect(exported.cycles[0]?.failure?.executionOutcome).toBeNull();
+    expect(exported.cycles[0]?.failure?.lastSuccessfulEvent).toBeNull();
+    expect(exported.cycles[0]?.failure?.stage).toBe("unknown");
+    expect(exported.failureBreakdown.byStage.unknown).toBe(1);
+  });
+
+  it("CSV escaping: comma, quote, and newline all produce valid quoted CSV", () => {
+    const close = decision("cycle-csv", "CLOSE", "decision-csv", "2026-09-12T00:01:00.000Z");
+    const current: TradingJournal = { cycleId: "cycle-csv", agentVersion: "0.3.0", model: "qwen3.8-max", mode: "AUTONOMOUS", startedAt: close.createdAt, completedAt: close.createdAt, retrievedLessons: [], createdLessons: [], cyclePlan: { positionActions: [{ ...close, strategyThesis: 'thesis, with "quotes" and\nnewline' } as NonNullable<TradingJournal["cyclePlan"]>["positionActions"][number]], entryActions: [] } };
+    const exported = buildPaperLogExport({ generatedAt: "2026-09-12T00:03:00.000Z", period: { start: null, end: null }, environment: "test", model: "qwen3.8-max", version: "0.3.0", commit: "abc123", cycles: [{ cycleId: "cycle-csv", status: "COMPLETED", startedAt: current.startedAt, completedAt: current.completedAt ?? null }], journals: [current], experiences: [], events: [] });
+    const csv = paperLogToCsv(exported);
+    const lines = csv.split("\r\n");
+    expect(lines.length).toBeGreaterThanOrEqual(2);
+    // The header row should have a fixed number of columns
+    const headerCols = lines[0]!.split(",").length;
+    // Data row should have the same number of columns when parsed correctly
+    const dataRow = lines[1];
+    // Manually parse: the strategyThesis field contains commas and quotes so it must be quoted
+    expect(dataRow).toContain('"thesis, with ""quotes"" and\nnewline"');
+    // Verify every data line has the same column count as header
+    for (const line of lines.slice(1)) {
+      if (line.trim() === "") continue;
+      // Simple CSV parse respecting quotes: split on commas not inside quotes
+      let colCount = 1;
+      let inQuotes = false;
+      for (const ch of line) {
+        if (ch === '"') inQuotes = !inQuotes;
+        else if (ch === ',' && !inQuotes) colCount++;
+      }
+      expect(colCount).toBe(headerCols);
+    }
+  });
 });
