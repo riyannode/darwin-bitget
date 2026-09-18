@@ -253,13 +253,11 @@ export class ResearchExecutor {
     const boundedRequests = requests.slice(0, Math.min(MAX_RESEARCH_REQUESTS_PER_CYCLE, MAX_MCP_TOOL_CALLS_PER_CYCLE));
     const results: Array<ResearchEvidence | undefined> = Array.from({ length: boundedRequests.length });
     const pending: Array<{ index: number; request: ResearchRequest; key: string }> = [];
-    let cacheHits = 0;
     for (const [index, request] of boundedRequests.entries()) {
       const key = `${request.skill}:${request.symbol ?? "GLOBAL"}:${BITGET_SIGNAL_RECIPE_VERSION}`;
       const cached = this.cache.get(key);
       if (cached && now.getTime() - cached.cachedAt <= RESEARCH_CACHE_TTL_MS) {
         results[index] = cached.evidence;
-        cacheHits += 1;
         this.safeEmit({ type: "CACHE_HIT", skill: request.skill, symbol: request.symbol ?? "GLOBAL" });
       }
       else pending.push({ index, request, key });
