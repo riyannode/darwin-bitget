@@ -302,26 +302,30 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   private emitResearchSummary(summary: ResearchCycleSummary): void {
-    const bounded: Record<string, unknown> = {
-      cycleId: summary.cycleId,
-      signalEnabled: summary.signalEnabled,
-      availableSkillCount: summary.availableSkillCount,
-      routerAttempted: summary.routerAttempted,
-      planRequests: summary.routerPlanRequestCount,
-      acceptedRequests: summary.acceptedRequestCount,
-      rejectedRequests: summary.rejectedRequestCount,
-      requestedSkills: summary.requestedSkills.slice(0, 3),
-      requestedSymbols: summary.requestedSymbols.slice(0, 3),
-      cacheHits: summary.cacheHits,
-      mcpConnectAttempts: summary.mcpConnectAttempts,
-      mcpConnectSuccesses: summary.mcpConnectSuccesses,
-      mcpToolCalls: summary.mcpToolCalls,
-      availableResults: summary.availableResults,
-      unavailableResults: summary.unavailableResults,
-      durationMs: summary.researchDurationMs,
-      finalStatus: summary.finalStatus,
-    };
-    console.log("DARWIN_RESEARCH_TELEMETRY", JSON.stringify(bounded));
+    try {
+      const bounded: Record<string, unknown> = {
+        cycleId: summary.cycleId,
+        signalEnabled: summary.signalEnabled,
+        availableSkillCount: summary.availableSkillCount,
+        routerAttempted: summary.routerAttempted,
+        planRequests: summary.routerPlanRequestCount,
+        acceptedRequests: summary.acceptedRequestCount,
+        rejectedRequests: summary.rejectedRequestCount,
+        requestedSkills: summary.requestedSkills.slice(0, 3),
+        requestedSymbols: summary.requestedSymbols.slice(0, 3),
+        cacheHits: summary.cacheHits,
+        mcpConnectAttempts: summary.mcpConnectAttempts,
+        mcpConnectSuccesses: summary.mcpConnectSuccesses,
+        mcpToolCalls: summary.mcpToolCalls,
+        availableResults: summary.availableResults,
+        unavailableResults: summary.unavailableResults,
+        durationMs: summary.researchDurationMs,
+        finalStatus: summary.finalStatus,
+      };
+      console.log("DARWIN_RESEARCH_TELEMETRY", JSON.stringify(bounded));
+    } catch {
+      // Telemetry must never affect research or trading runtime
+    }
   }
 
   override initialState: AgentState = {

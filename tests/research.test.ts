@@ -4,7 +4,7 @@ import { TraderAgent } from "../src/agent/agent.js";
 import { availableResearchCapabilities } from "../src/research/capabilities.js";
 import { ResearchExecutor, normalizeResearchEvidence } from "../src/research/executor.js";
 import { MAX_MCP_TOOL_CALLS_PER_CYCLE, MAX_RESEARCH_REQUESTS_PER_CYCLE, RESEARCH_CONCURRENCY, buildResearchRouterPrompt, researchPlanSchema, validateResearchPlan, type ResearchRouterInput } from "../src/research/router.js";
-import type { ResearchRequest } from "../src/types.js";
+import type { ResearchCycleSummary, ResearchRequest } from "../src/types.js";
 
 const input: ResearchRouterInput = {
   availableResearchSkills: availableResearchCapabilities(),
@@ -136,6 +136,48 @@ describe("Bitget Signal research router", () => {
     expect(summaries).toHaveLength(1);
     expect(summaries[0]?.signalEnabled).toBe(false);
     expect(summaries[0]?.finalStatus).toBe("SIGNAL_DISABLED");
+  });
+
+  it("telemetry emission failure does not break research (Signal=false path)", async () => {
+    const collectResearchEvidence = (TraderAgent.prototype as unknown as {
+      collectResearchEvidence: (this: unknown, config: { bitgetSignalEnabled?: boolean }, bundles: readonly [], openPositionSymbols: readonly string[], entryCandidateSymbols: readonly string[], cycleId: string) => Promise<unknown>;
+    }).collectResearchEvidence;
+    const fakeAgent = {
+      researchRouter: { plan: async () => ({ requests: [] }) },
+      researchExecutor: { execute: async () => [], executeWithTelemetry: async () => [] },
+      setupResearchTelemetry: () => ({ telemetry: undefined, summary: { finalStatus: "", cycleId: "c1" } }),
+      emitResearchSummary: (TraderAgent.prototype as unknown as { emitResearchSummary: (s: ResearchCycleSummary) => void }).emitResearchSummary,
+    };
+    const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      if (args[0] === "DARWIN_RESEARCH_TELEMETRY") throw new Error("CONSOLE_EMISSION_FAILED");
+    });
+    try {
+      const result = await collectResearchEvidence.call(fakeAgent, { bitgetSignalEnabled: false }, [], [], [], "c1");
+      expect(result).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("telemetry emission failure does not break research (Signal=true empty-plan path)", async () => {
+    const collectResearchEvidence = (TraderAgent.prototype as unknown as {
+      collectResearchEvidence: (this: unknown, config: { bitgetSignalEnabled?: boolean }, bundles: readonly [], openPositionSymbols: readonly string[], entryCandidateSymbols: readonly string[], cycleId: string) => Promise<unknown>;
+    }).collectResearchEvidence;
+    const fakeAgent = {
+      researchRouter: { plan: async () => ({ requests: [] }) },
+      researchExecutor: { execute: async () => [], executeWithTelemetry: async () => [] },
+      setupResearchTelemetry: () => ({ telemetry: undefined, summary: { finalStatus: "", cycleId: "c1" } }),
+      emitResearchSummary: (TraderAgent.prototype as unknown as { emitResearchSummary: (s: ResearchCycleSummary) => void }).emitResearchSummary,
+    };
+    const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      if (args[0] === "DARWIN_RESEARCH_TELEMETRY") throw new Error("CONSOLE_EMISSION_FAILED");
+    });
+    try {
+      const result = await collectResearchEvidence.call(fakeAgent, { bitgetSignalEnabled: true }, [], [], [], "c1");
+      expect(result).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

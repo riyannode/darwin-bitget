@@ -1,6 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { ResearchEvidence, ResearchPlan, ResearchRequest, ResearchCycleSummary } from "../types.js";
+import type { ResearchEvidence, ResearchRequest } from "../types.js";
 import { BITGET_SIGNAL_MCP_ENDPOINT, BITGET_SIGNAL_RECIPE_VERSION } from "./capabilities.js";
 import {
   MAX_MCP_TOOL_CALLS_PER_CYCLE,
