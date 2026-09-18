@@ -9,8 +9,16 @@
   </head>
   <body>
     <div class="app-shell">
+
+      <!-- =============================================================
+           SIDEBAR
+           ============================================================= -->
       <aside class="sidebar">
-        <div class="brand"><span class="brand-mark">↗</span><span>DARWIN</span></div>
+        <div class="brand">
+          <span class="brand-mark">↗</span>
+          <span>DARWIN</span>
+        </div>
+
         <nav class="nav" aria-label="Primary navigation">
           <button class="nav-item active" data-page="dashboard">Dashboard</button>
           <button class="nav-item" data-page="journal">Agent Journal</button>
@@ -19,30 +27,345 @@
           <button class="nav-item" data-page="learning-page">Learning</button>
           <button class="nav-item" data-page="policy-page">Policy</button>
         </nav>
-        <div class="sidebar-footer"><div class="identity"><span class="avatar">A</span><span><strong>Autonomous Agent</strong><small id="sidebar-model">Qwen</small></span></div><span class="pill pill-paper">PAPER</span></div>
+
+        <div class="sidebar-footer">
+          <div class="identity">
+            <span class="avatar">A</span>
+            <span>
+              <strong>Autonomous Agent</strong>
+              <small id="sidebar-model">Qwen</small>
+            </span>
+          </div>
+          <span class="pill pill-paper">PAPER</span>
+        </div>
       </aside>
+
+      <!-- =============================================================
+           MAIN CONTENT
+           ============================================================= -->
       <main class="main-content">
-        <header class="topbar"><div><p class="eyebrow">BITGET / PERPETUAL FUTURES</p><h1 id="page-title">Dashboard</h1><p class="subtle">Overview of autonomous trading performance.</p></div><div class="actions"><span id="top-status" class="status-dot"><i></i> ONLINE</span><button data-action="START" class="button button-primary">Start</button><button data-action="PAUSE" class="button">Pause</button><button data-action="RESUME" class="button">Resume</button><button data-action="EMERGENCY_STOP" class="button button-danger">Stop</button></div></header>
-        <section id="judge-demo-banner" class="judge-demo-banner" hidden><strong>JUDGE DEMO</strong><span>RECORDED / DETERMINISTIC REPLAY</span><span>NO LIVE ORDERS</span><span id="judge-demo-result"></span></section>
-        <p id="error" class="banner banner-error" hidden></p>
-        <section id="page-dashboard" class="page">
-          <section class="agent-card panel"><div><span class="label">AGENT STATUS</span><strong id="agent-status">ONLINE</strong><span id="agent-stage" class="subtle">Stage —</span></div><div class="agent-facts"><span><small>MODE</small><b id="agent-mode">AUTONOMOUS / PAPER</b></span><span><small>MODEL</small><b id="agent-model">—</b></span><span><small>LAST SCAN</small><b id="last-scan">—</b></span><span><small>NEXT SCAN</small><b id="next-scan">—</b></span></div></section>
-          <section id="cooldown-notice" class="cooldown-notice" hidden></section>
-          <section id="performance" class="summary-grid" aria-label="Performance summary"></section>
-          <section class="portfolio-panel panel" aria-label="Portfolio"><div class="panel-heading"><h2>Portfolio</h2><span id="portfolio-freshness" class="label">—</span></div><div id="portfolio" class="portfolio-rail"></div></section>
-          <div class="dashboard-grid top-grid"><section class="panel performance-panel"><div class="panel-heading"><h2>Monthly Performance</h2><span id="calendar-month" class="label">—</span></div><div id="calendar" class="calendar"></div></section><section class="panel recent-panel"><div class="panel-heading"><h2>Recent Trades</h2><button class="text-link" data-page-link="trade-history">View all</button></div><div id="recent-trades" class="recent-trades empty">No recent trades</div></section></div>
-          <section class="panel journal-decision" data-legacy-decision-panel><div class="panel-heading"><h2>Latest Decision</h2><span id="dashboard-decision-action" class="pill">—</span></div><div id="dashboard-decision-summary" class="detail-grid empty">No Qwen decision recorded yet.</div><details id="dashboard-decision-details" class="disclosure"><summary>Read full decision</summary><div id="dashboard-decision" class="detail-grid"></div></details></section>
-          <section class="panel"><div class="panel-heading"><h2>CYCLE PLAN</h2><span class="label">SEPARATED RESPONSIBILITIES</span></div><div id="dashboard-cycle-status" class="cycle-status" aria-live="polite"></div><div id="dashboard-cycle-plan" class="stack empty">No valid cycle plan recorded yet.</div></section>
-          <section class="panel"><div class="panel-heading"><h2>MARKET DISCOVERY</h2><span class="label">READ-ONLY EVIDENCE</span></div><div id="dashboard-market-discovery" class="detail-grid empty">No discovery evidence recorded yet.</div></section>
-          <section class="panel"><div class="panel-heading"><h2>Recent Activity</h2><span class="label">LIVE READBACK</span></div><div id="activity" class="activity empty">No events recorded yet.</div></section>
+
+        <!-- Topbar -->
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">BITGET / PERPETUAL FUTURES</p>
+            <h1 id="page-title">Dashboard</h1>
+            <p class="subtle">Overview of autonomous trading performance.</p>
+          </div>
+          <div class="actions">
+            <span id="top-status" class="status-dot"><i></i> ONLINE</span>
+            <button data-action="START" class="button button-primary">Start</button>
+            <button data-action="PAUSE" class="button">Pause</button>
+            <button data-action="RESUME" class="button">Resume</button>
+            <button data-action="EMERGENCY_STOP" class="button button-danger">Stop</button>
+          </div>
+        </header>
+
+        <!-- Judge demo banner -->
+        <section id="judge-demo-banner" class="judge-demo-banner" hidden>
+          <strong>JUDGE DEMO</strong>
+          <span>RECORDED / DETERMINISTIC REPLAY</span>
+          <span>NO LIVE ORDERS</span>
+          <span id="judge-demo-result"></span>
         </section>
-        <section id="page-open-position" class="page" hidden><div class="page-heading"><div><h2>Open Position</h2><p class="subtle">Live provider positions and unrealized performance.</p></div><span id="open-position-freshness" class="label">—</span></div><section class="panel"><div id="open-positions" class="position-cards empty">No open provider positions.</div></section></section>
-        <section id="page-journal" class="page" hidden><div class="page-heading"><div><h2>Agent Journal</h2><p class="subtle">Autonomous cycle plans and reasoning history.</p></div><span class="label">25 MOST RECENT</span></div><section class="panel journal-decision" data-legacy-decision-panel><div class="panel-heading"><h2>Latest Decision</h2><span id="decision-action" class="pill">—</span></div><div id="decision-summary" class="detail-grid empty">No Qwen decision recorded yet.</div><details id="decision-details" class="disclosure"><summary>Read full decision</summary><div id="decision" class="detail-grid"></div></details></section><section class="panel"><div class="panel-heading"><h2>CYCLE PLAN</h2><span class="label">POSITION + ENTRY</span></div><div id="journal-cycle-status" class="cycle-status" aria-live="polite"></div><div id="cycle-plan" class="stack empty">No valid cycle plan recorded yet.</div></section><section class="panel"><div class="panel-heading"><h2>MARKET DISCOVERY</h2><span class="label">READ-ONLY EVIDENCE</span></div><div id="market-discovery" class="detail-grid empty">No discovery evidence recorded yet.</div></section><section class="panel"><div class="panel-heading"><h2>Decision History</h2><span class="label">GROUPED BY CYCLE</span></div><div id="decision-history" class="decision-history empty">No decisions recorded yet.</div></section></section>
-        <section id="page-trade-history" class="page" hidden><div class="page-heading"><div><h2>Trade History</h2><p class="subtle">Verified PAPER history and blocked proposals.</p></div><div class="actions"><button class="button" data-export="json">Download JSON</button><button class="button" data-export="csv">Download CSV</button><span class="label">25 MOST RECENT</span></div></div><section class="panel latest-trade-panel"><div class="panel-heading"><h2>Latest Trade</h2><span id="latest-trade-status" class="pill">—</span></div><div id="latest-trade-summary" class="detail-grid empty">No verified PAPER trade recorded yet.</div><details id="latest-trade-details" class="disclosure"><summary>Read full trade</summary><div id="latest-trade" class="detail-grid"></div></details></section><section class="panel"><div class="panel-heading"><div><h2>Trade History</h2><p class="subtle">Verified PAPER history and blocked proposals.</p></div><div id="trade-filters" class="filter-row"><button class="filter active" data-filter="ALL">All</button><button class="filter" data-filter="OPEN">Open</button><button class="filter" data-filter="CLOSED">Closed</button><button class="filter" data-filter="WIN">Win</button><button class="filter" data-filter="LOSS">Loss</button></div></div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Margin</th><th>Lev.</th><th>Notional</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Status</th></tr></thead><tbody id="trade-table"></tbody></table></div></section></section>
-        <section id="page-learning-page" class="page" hidden><section class="panel journal-decision"><div class="panel-heading"><h2>Recent Reflection</h2></div><div id="learning" class="stack empty">No reflection recorded yet.</div></section><div class="page-heading"><div><h2>Learning</h2><p class="subtle">Persisted reflections and bounded replay evidence.</p></div></div><section class="panel"><div class="table-wrap"><table><thead><tr><th>Lesson</th><th>Source</th><th>Scope</th><th>Confidence</th><th>Retrieved</th><th>Applied</th><th>Success</th><th>Failed</th><th>Status</th><th>Created</th></tr></thead><tbody id="lesson-table"></tbody></table></div></section><section id="replay-card" class="panel replay-panel" hidden></section></section>
-        <section id="page-policy-page" class="page" hidden><div class="page-heading"><div><h2>Policy</h2><p class="subtle">Owner boundaries with authenticated runtime controls.</p></div></div><section class="panel"><div id="policy" class="policy-grid large-policy"></div><div id="policy-editor" class="policy-editor"></div><p id="policy-status" class="subtle" role="status"></p></section></section>
+
+        <!-- Error banner -->
+        <p id="error" class="banner" hidden></p>
+
+        <!-- =============================================================
+             PAGE: DASHBOARD
+             ============================================================= -->
+        <section id="page-dashboard" class="page">
+
+          <!-- Agent status card -->
+          <section class="agent-card panel">
+            <div>
+              <span class="label">AGENT STATUS</span>
+              <strong id="agent-status">ONLINE</strong>
+              <span id="agent-stage" class="subtle">Stage —</span>
+            </div>
+            <div class="agent-facts">
+              <span><small>MODE</small><b id="agent-mode">AUTONOMOUS / PAPER</b></span>
+              <span><small>MODEL</small><b id="agent-model">—</b></span>
+              <span><small>LAST SCAN</small><b id="last-scan">—</b></span>
+              <span><small>NEXT SCAN</small><b id="next-scan">—</b></span>
+            </div>
+          </section>
+
+          <!-- Cooldown notice -->
+          <section id="cooldown-notice" class="cooldown-notice" hidden></section>
+
+          <!-- Performance summary grid -->
+          <section id="performance" class="summary-grid" aria-label="Performance summary"></section>
+
+          <!-- Portfolio -->
+          <section class="portfolio-panel panel" aria-label="Portfolio">
+            <div class="panel-heading">
+              <h2>Portfolio</h2>
+              <span id="portfolio-freshness" class="label">—</span>
+            </div>
+            <div id="portfolio" class="portfolio-rail"></div>
+          </section>
+
+          <!-- Dashboard grid: calendar + recent trades -->
+          <div class="dashboard-grid top-grid">
+            <section class="panel performance-panel">
+              <div class="panel-heading">
+                <h2>Monthly Performance</h2>
+                <span id="calendar-month" class="label">—</span>
+              </div>
+              <div id="calendar" class="calendar"></div>
+            </section>
+            <section class="panel recent-panel">
+              <div class="panel-heading">
+                <h2>Recent Trades</h2>
+                <button class="text-link" data-page-link="trade-history">View all</button>
+              </div>
+              <div id="recent-trades" class="recent-trades empty">No recent trades</div>
+            </section>
+          </div>
+
+          <!-- Latest Decision -->
+          <section class="panel journal-decision" data-legacy-decision-panel>
+            <div class="panel-heading">
+              <h2>Latest Decision</h2>
+              <span id="dashboard-decision-action" class="pill">—</span>
+            </div>
+            <div id="dashboard-decision-summary" class="detail-grid empty">No Qwen decision recorded yet.</div>
+            <details id="dashboard-decision-details" class="disclosure">
+              <summary>Read full decision</summary>
+              <div id="dashboard-decision" class="detail-grid"></div>
+            </details>
+          </section>
+
+          <!-- Cycle Plan -->
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>CYCLE PLAN</h2>
+              <span class="label">SEPARATED RESPONSIBILITIES</span>
+            </div>
+            <div id="dashboard-cycle-status" class="cycle-status" aria-live="polite"></div>
+            <div id="dashboard-cycle-plan" class="stack empty">No valid cycle plan recorded yet.</div>
+          </section>
+
+          <!-- Market Discovery -->
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>MARKET DISCOVERY</h2>
+              <span class="label">READ-ONLY EVIDENCE</span>
+            </div>
+            <div id="dashboard-market-discovery" class="detail-grid empty">No discovery evidence recorded yet.</div>
+          </section>
+
+          <!-- Recent Activity -->
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>Recent Activity</h2>
+              <span class="label">LIVE READBACK</span>
+            </div>
+            <div id="activity" class="activity empty">No events recorded yet.</div>
+          </section>
+
+        </section>
+
+        <!-- =============================================================
+             PAGE: OPEN POSITION
+             ============================================================= -->
+        <section id="page-open-position" class="page" hidden>
+          <div class="page-heading">
+            <div>
+              <h2>Open Position</h2>
+              <p class="subtle">Live provider positions and unrealized performance.</p>
+            </div>
+            <span id="open-position-freshness" class="label">—</span>
+          </div>
+          <section class="panel">
+            <div id="open-positions" class="position-cards empty">No open provider positions.</div>
+          </section>
+        </section>
+
+        <!-- =============================================================
+             PAGE: AGENT JOURNAL
+             ============================================================= -->
+        <section id="page-journal" class="page" hidden>
+          <div class="page-heading">
+            <div>
+              <h2>Agent Journal</h2>
+              <p class="subtle">Autonomous cycle plans and reasoning history.</p>
+            </div>
+            <span class="label">25 MOST RECENT</span>
+          </div>
+
+          <section class="panel journal-decision" data-legacy-decision-panel>
+            <div class="panel-heading">
+              <h2>Latest Decision</h2>
+              <span id="decision-action" class="pill">—</span>
+            </div>
+            <div id="decision-summary" class="detail-grid empty">No Qwen decision recorded yet.</div>
+            <details id="decision-details" class="disclosure">
+              <summary>Read full decision</summary>
+              <div id="decision" class="detail-grid"></div>
+            </details>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>CYCLE PLAN</h2>
+              <span class="label">POSITION + ENTRY</span>
+            </div>
+            <div id="journal-cycle-status" class="cycle-status" aria-live="polite"></div>
+            <div id="cycle-plan" class="stack empty">No valid cycle plan recorded yet.</div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>MARKET DISCOVERY</h2>
+              <span class="label">READ-ONLY EVIDENCE</span>
+            </div>
+            <div id="market-discovery" class="detail-grid empty">No discovery evidence recorded yet.</div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>Decision History</h2>
+              <span class="label">GROUPED BY CYCLE</span>
+            </div>
+            <div id="decision-history" class="decision-history empty">No decisions recorded yet.</div>
+          </section>
+        </section>
+
+        <!-- =============================================================
+             PAGE: TRADE HISTORY
+             ============================================================= -->
+        <section id="page-trade-history" class="page" hidden>
+          <div class="page-heading">
+            <div>
+              <h2>Trade History</h2>
+              <p class="subtle">Verified PAPER history and blocked proposals.</p>
+            </div>
+            <div class="actions">
+              <button class="button" data-export="json">Download JSON</button>
+              <button class="button" data-export="csv">Download CSV</button>
+              <span class="label">25 MOST RECENT</span>
+            </div>
+          </div>
+
+          <section class="panel latest-trade-panel">
+            <div class="panel-heading">
+              <h2>Latest Trade</h2>
+              <span id="latest-trade-status" class="pill">—</span>
+            </div>
+            <div id="latest-trade-summary" class="detail-grid empty">No verified PAPER trade recorded yet.</div>
+            <details id="latest-trade-details" class="disclosure">
+              <summary>Read full trade</summary>
+              <div id="latest-trade" class="detail-grid"></div>
+            </details>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Trade History</h2>
+                <p class="subtle">Verified PAPER history and blocked proposals.</p>
+              </div>
+              <div id="trade-filters" class="filter-row">
+                <button class="filter active" data-filter="ALL">All</button>
+                <button class="filter" data-filter="OPEN">Open</button>
+                <button class="filter" data-filter="CLOSED">Closed</button>
+                <button class="filter" data-filter="WIN">Win</button>
+                <button class="filter" data-filter="LOSS">Loss</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Symbol</th>
+                    <th>Action</th>
+                    <th>Margin</th>
+                    <th>Lev.</th>
+                    <th>Notional</th>
+                    <th>Entry</th>
+                    <th>Exit</th>
+                    <th>PnL</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="trade-table"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <!-- =============================================================
+             PAGE: LEARNING
+             ============================================================= -->
+        <section id="page-learning-page" class="page" hidden>
+          <div class="page-heading">
+            <div>
+              <h2>Learning</h2>
+              <p class="subtle">Persisted reflections and bounded replay evidence.</p>
+            </div>
+          </div>
+
+          <section class="panel journal-decision">
+            <div class="panel-heading">
+              <h2>Recent Reflection</h2>
+            </div>
+            <div id="learning" class="stack empty">No reflection recorded yet.</div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>Lessons</h2>
+              <span class="label">PERSISTED KNOWLEDGE</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Lesson</th>
+                    <th>Source</th>
+                    <th>Scope</th>
+                    <th>Confidence</th>
+                    <th>Retrieved</th>
+                    <th>Applied</th>
+                    <th>Success</th>
+                    <th>Failed</th>
+                    <th>Status</th>
+                    <th>Created</th>
+                  </tr>
+                </thead>
+                <tbody id="lesson-table"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="replay-card" class="panel replay-panel" hidden></section>
+        </section>
+
+        <!-- =============================================================
+             PAGE: POLICY
+             ============================================================= -->
+        <section id="page-policy-page" class="page" hidden>
+          <div class="page-heading">
+            <div>
+              <h2>Policy</h2>
+              <p class="subtle">Owner boundaries with authenticated runtime controls.</p>
+            </div>
+          </div>
+
+          <section class="panel">
+            <div id="policy" class="policy-grid large-policy"></div>
+            <div id="policy-editor" class="policy-editor"></div>
+            <p id="policy-status" class="subtle" role="status"></p>
+          </section>
+        </section>
+
       </main>
     </div>
+
     <script type="module" src="/dashboard.js"></script>
   </body>
 </html>
