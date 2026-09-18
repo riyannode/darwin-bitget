@@ -1,6 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { ResearchEvidence, ResearchRequest } from "../types.js";
+import type { ResearchEvidence, ResearchPlan, ResearchRequest, ResearchCycleSummary } from "../types.js";
 import { BITGET_SIGNAL_MCP_ENDPOINT, BITGET_SIGNAL_RECIPE_VERSION } from "./capabilities.js";
 import {
   MAX_MCP_TOOL_CALLS_PER_CYCLE,
@@ -200,10 +200,33 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, code: stri
   ]);
 }
 
-export class ResearchExecutor {
-  private readonly cache = new Map<string, CachedEvidence>();
+export type ResearchExecutionTelemetryEvent =
+  | { type: "CACHE_HIT"; skill: string; symbol: string }
+  | { type: "MCP_CONNECT_ATTEMPT" }
+  | { type: "MCP_CONNECT_SUCCESS" }
+  | { type: "MCP_CONNECT_FAILED"; code: string }
+  | { type: "MCP_TOOL_ATTEMPT"; skill: string; symbol: string; tool: string }
+  | { type: "MCP_TOOL_RESULT"; skill: string; symbol: string; status: string }
+  | { type: "MCP_TOOL_FAILED"; skill: string; symbol: string; code: string };
 
-  public constructor(private readonly factory: McpResearchClientFactory = defaultMcpResearchClientFactory) {}
+export type ResearchExecutionTelemetryCallback = (event: ResearchExecutionTelemetryEvent) => void;
+
+export interface ResearchExecutorOptions {
+  telemetry?: ResearchExecutionTelemetryCallback;
+  cache?: Map<string, CachedEvidence>;
+}
+
+export class ResearchExecutor {
+  private readonly cache: Map<string, CachedEvidence>;
+  private readonly options: ResearchExecutorOptions;
+
+  public constructor(
+    private readonly factory: McpResearchClientFactory = defaultMcpResearchClientFactory,
+    options: ResearchExecutorOptions = {},
+  ) {
+    this.cache = options.cache ?? new Map<string, CachedEvidence>();
+    this.options = options;
+  }
 
   public cacheSize(): number { return this.cache.size; }
 
@@ -230,10 +253,15 @@ export class ResearchExecutor {
     const boundedRequests = requests.slice(0, Math.min(MAX_RESEARCH_REQUESTS_PER_CYCLE, MAX_MCP_TOOL_CALLS_PER_CYCLE));
     const results: Array<ResearchEvidence | undefined> = Array.from({ length: boundedRequests.length });
     const pending: Array<{ index: number; request: ResearchRequest; key: string }> = [];
+    let cacheHits = 0;
     for (const [index, request] of boundedRequests.entries()) {
       const key = `${request.skill}:${request.symbol ?? "GLOBAL"}:${BITGET_SIGNAL_RECIPE_VERSION}`;
       const cached = this.cache.get(key);
-      if (cached && now.getTime() - cached.cachedAt <= RESEARCH_CACHE_TTL_MS) results[index] = cached.evidence;
+      if (cached && now.getTime() - cached.cachedAt <= RESEARCH_CACHE_TTL_MS) {
+        results[index] = cached.evidence;
+        cacheHits += 1;
+        this.safeEmit({ type: "CACHE_HIT", skill: request.skill, symbol: request.symbol ?? "GLOBAL" });
+      }
       else pending.push({ index, request, key });
     }
     if (pending.length === 0) return enforceCycleBudget(results.filter((item): item is ResearchEvidence => Boolean(item)));
@@ -241,7 +269,14 @@ export class ResearchExecutor {
     let client: McpResearchClient | undefined;
     try {
       const remainingForConnection = Math.max(1, RESEARCH_PHASE_TIMEOUT_MS - (Date.now() - phaseStartedAt));
-      client = await withTimeout(this.factory.connect(), Math.min(RESEARCH_TOOL_TIMEOUT_MS, remainingForConnection), "RESEARCH_CONNECTION_TIMEOUT");
+      this.safeEmit({ type: "MCP_CONNECT_ATTEMPT" });
+      try {
+        client = await withTimeout(this.factory.connect(), Math.min(RESEARCH_TOOL_TIMEOUT_MS, remainingForConnection), "RESEARCH_CONNECTION_TIMEOUT");
+        this.safeEmit({ type: "MCP_CONNECT_SUCCESS" });
+      } catch (connectError) {
+        this.safeEmit({ type: "MCP_CONNECT_FAILED", code: connectError instanceof Error ? connectError.message.split(":")[0] ?? "CONNECT_ERROR" : "CONNECT_ERROR" });
+        throw connectError;
+      }
       let next = 0;
       let toolCallCount = 0;
       const worker = async (): Promise<void> => {
@@ -253,15 +288,19 @@ export class ResearchExecutor {
             const prepared = recipe(current.request);
             if (toolCallCount >= MAX_MCP_TOOL_CALLS_PER_CYCLE) throw new Error("MAX_MCP_TOOL_CALLS_PER_CYCLE");
             toolCallCount += 1;
+            this.safeEmit({ type: "MCP_TOOL_ATTEMPT", skill: current.request.skill, symbol: current.request.symbol ?? "GLOBAL", tool: prepared.tool });
             const remainingMs = Math.max(1, RESEARCH_PHASE_TIMEOUT_MS - (Date.now() - phaseStartedAt));
             const raw = await Promise.race([
               client!.callTool(prepared.tool, prepared.argumentsValue),
               new Promise<never>((_, reject) => setTimeout(() => reject(new Error("RESEARCH_PHASE_TIMEOUT")), Math.min(RESEARCH_TOOL_TIMEOUT_MS, remainingMs))),
             ]);
             const evidence = normalizeResearchEvidence(current.request.skill, current.request.symbol ?? "GLOBAL", raw, observedAt);
+            this.safeEmit({ type: "MCP_TOOL_RESULT", skill: current.request.skill, symbol: current.request.symbol ?? "GLOBAL", status: evidence.status });
             results[current.index] = evidence;
             this.cacheEvidence(current.key, evidence, now.getTime());
           } catch (error) {
+            const code = error instanceof Error ? error.message.split(":")[0] ?? "TOOL_ERROR" : "TOOL_ERROR";
+            this.safeEmit({ type: "MCP_TOOL_FAILED", skill: current.request.skill, symbol: current.request.symbol ?? "GLOBAL", code });
             const evidence = unavailableResearchEvidence(current.request, "UNAVAILABLE", error instanceof Error ? error.message : "Research tool unavailable.", observedAt);
             results[current.index] = evidence;
             this.cacheEvidence(current.key, evidence, now.getTime());
@@ -278,5 +317,24 @@ export class ResearchExecutor {
       if (client?.close) await withTimeout(client.close(), 250, "RESEARCH_CLOSE_TIMEOUT").catch(() => undefined);
     }
     return enforceCycleBudget(results.map((item, index) => item ?? unavailableResearchEvidence(boundedRequests[index]!, "UNAVAILABLE", "Research result unavailable.", new Date().toISOString())));
+  }
+
+  public async executeWithTelemetry(
+    requests: readonly ResearchRequest[],
+    telemetry: ResearchExecutionTelemetryCallback | undefined,
+    now = new Date(),
+  ): Promise<ResearchEvidence[]> {
+    if (!telemetry) return this.execute(requests, now);
+    const executor = new ResearchExecutor(this.factory, { telemetry, cache: this.cache });
+    return executor.execute(requests, now);
+  }
+
+  private safeEmit(event: ResearchExecutionTelemetryEvent): void {
+    if (!this.options.telemetry) return;
+    try {
+      this.options.telemetry(event);
+    } catch {
+      // Telemetry callback failure must never break research execution
+    }
   }
 }

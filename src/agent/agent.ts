@@ -1,6 +1,6 @@
 import { Agent } from "agents";
 import { ZodError } from "zod";
-import type { BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionSnapshot, ReflectionResult, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
+import type { BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionSnapshot, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
@@ -64,7 +64,7 @@ import { bootstrapPositionContexts, decisionReasoning, upsertPositionContext } f
 import { EvaClient } from "../eva/client.js";
 import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
 import { availableResearchCapabilities } from "../research/capabilities.js";
-import { ResearchExecutor } from "../research/executor.js";
+import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../research/executor.js";
 import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
 
@@ -261,6 +261,68 @@ function latestValidCycleReadModel(readModel: LatestValidCyclePlan): NormalizedC
 export class TraderAgent extends Agent<Env, AgentState> {
   private readonly researchRouter = new ResearchRouter();
   private readonly researchExecutor = new ResearchExecutor();
+
+  private setupResearchTelemetry(cycleId: string): { telemetry: ResearchExecutionTelemetryCallback; summary: ResearchCycleSummary } {
+    const summary: ResearchCycleSummary = {
+      cycleId,
+      signalEnabled: false,
+      availableSkillCount: 0,
+      routerAttempted: false,
+      routerPlanRequestCount: 0,
+      acceptedRequestCount: 0,
+      rejectedRequestCount: 0,
+      requestedSkills: [],
+      requestedSymbols: [],
+      cacheHits: 0,
+      mcpConnectAttempts: 0,
+      mcpConnectSuccesses: 0,
+      mcpToolCalls: 0,
+      availableResults: 0,
+      unavailableResults: 0,
+      researchDurationMs: 0,
+      finalStatus: "NOT_STARTED",
+    };
+    const telemetry: ResearchExecutionTelemetryCallback = (event) => {
+      if (event.type === "CACHE_HIT") {
+        summary.cacheHits += 1;
+      } else if (event.type === "MCP_CONNECT_ATTEMPT") {
+        summary.mcpConnectAttempts += 1;
+      } else if (event.type === "MCP_CONNECT_SUCCESS") {
+        summary.mcpConnectSuccesses += 1;
+      } else if (event.type === "MCP_TOOL_ATTEMPT") {
+        summary.mcpToolCalls += 1;
+      } else if (event.type === "MCP_TOOL_RESULT") {
+        if (event.status === "AVAILABLE") summary.availableResults += 1;
+        else summary.unavailableResults += 1;
+      } else if (event.type === "MCP_TOOL_FAILED") {
+        summary.unavailableResults += 1;
+      }
+    };
+    return { telemetry, summary };
+  }
+
+  private emitResearchSummary(summary: ResearchCycleSummary): void {
+    const bounded: Record<string, unknown> = {
+      cycleId: summary.cycleId,
+      signalEnabled: summary.signalEnabled,
+      availableSkillCount: summary.availableSkillCount,
+      routerAttempted: summary.routerAttempted,
+      planRequests: summary.routerPlanRequestCount,
+      acceptedRequests: summary.acceptedRequestCount,
+      rejectedRequests: summary.rejectedRequestCount,
+      requestedSkills: summary.requestedSkills.slice(0, 3),
+      requestedSymbols: summary.requestedSymbols.slice(0, 3),
+      cacheHits: summary.cacheHits,
+      mcpConnectAttempts: summary.mcpConnectAttempts,
+      mcpConnectSuccesses: summary.mcpConnectSuccesses,
+      mcpToolCalls: summary.mcpToolCalls,
+      availableResults: summary.availableResults,
+      unavailableResults: summary.unavailableResults,
+      durationMs: summary.researchDurationMs,
+      finalStatus: summary.finalStatus,
+    };
+    console.log("DARWIN_RESEARCH_TELEMETRY", JSON.stringify(bounded));
+  }
 
   override initialState: AgentState = {
     emergencyStop: false,
@@ -717,7 +779,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (backtest) { saveBacktest(this, backtest); journal.backtest = backtest; this.recordEvent("BACKTEST_COMPLETED", cycleId); }
       const openExperiences = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
       const executionCapacityHints = buildExecutionCapacityHints(bundles, config.ownerPolicy.maxLeverage);
-      const researchEvidence = config.bitgetSignalEnabled ? await this.collectResearchEvidence(config, bundles, openPositionSymbols, selectedEntryCandidateSymbols) : undefined;
+      const researchEvidence = await this.collectResearchEvidence(
+        config,
+        bundles,
+        openPositionSymbols,
+        selectedEntryCandidateSymbols,
+        cycleId,
+      );
       const context = { bundles, supportedUniverse, openPositionSymbols, entryCandidateSymbols: selectedEntryCandidateSymbols, experiences, openExperiences, lessons, openPositions, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE, ...(researchEvidence === undefined ? {} : { researchEvidence }), executionCapacityHints };
       const decisionSet = await decide(config, context, cycleId);
       if (decisionSet.ignoredLessonIds.length) this.recordEvent("LESSON_REFERENCE_IGNORED", cycleId, { count: String(decisionSet.ignoredLessonIds.length), ids: decisionSet.ignoredLessonIds.slice(0, 8).join(",") });
@@ -777,28 +845,67 @@ export class TraderAgent extends Agent<Env, AgentState> {
     bundles: readonly EvidenceBundle[],
     openPositionSymbols: readonly string[],
     entryCandidateSymbols: readonly string[],
-  ) {
-    if (!config.bitgetSignalEnabled) return [];
-    const availableResearchSkills = availableResearchCapabilities();
-    if (availableResearchSkills.length === 0) return [];
-    const routerInput: ResearchRouterInput = {
-      availableResearchSkills,
-      openPositionSymbols: [...openPositionSymbols],
-      entryCandidateSymbols: [...entryCandidateSymbols],
-      marketEvidence: bundles.map((bundle) => ({
-        symbol: bundle.instrument.symbol,
-        lastPrice: bundle.market.lastPrice,
-        priceChange24h: bundle.market.priceChange24h,
-        volume24h: bundle.market.volume24h,
-        marketRegime: bundle.marketRegime ?? "UNKNOWN",
-      })),
-      researchBudget: { maxResearchRequests: 3, maxMcpToolCalls: 4, concurrency: 2 },
-    };
+    cycleId: string,
+  ): Promise<ResearchEvidence[] | undefined> {
+    const { telemetry, summary } = this.setupResearchTelemetry(cycleId);
+    const phaseStartedAt = Date.now();
+    summary.signalEnabled = config.bitgetSignalEnabled ?? false;
+
     try {
-      const plan = await this.researchRouter.plan(config, routerInput);
+      if (!config.bitgetSignalEnabled) {
+        summary.finalStatus = "SIGNAL_DISABLED";
+        summary.researchDurationMs = Date.now() - phaseStartedAt;
+        this.emitResearchSummary(summary);
+        return undefined;
+      }
+      const availableResearchSkills = availableResearchCapabilities();
+      summary.availableSkillCount = availableResearchSkills.length;
+      if (availableResearchSkills.length === 0) {
+        summary.finalStatus = "NO_AVAILABLE_CAPABILITY";
+        summary.researchDurationMs = Date.now() - phaseStartedAt;
+        this.emitResearchSummary(summary);
+        return [];
+      }
+      summary.routerAttempted = true;
+      const routerInput: ResearchRouterInput = {
+        availableResearchSkills,
+        openPositionSymbols: [...openPositionSymbols],
+        entryCandidateSymbols: [...entryCandidateSymbols],
+        marketEvidence: bundles.map((bundle) => ({
+          symbol: bundle.instrument.symbol,
+          lastPrice: bundle.market.lastPrice,
+          priceChange24h: bundle.market.priceChange24h,
+          volume24h: bundle.market.volume24h,
+          marketRegime: bundle.marketRegime ?? "UNKNOWN",
+        })),
+        researchBudget: { maxResearchRequests: 3, maxMcpToolCalls: 4, concurrency: 2 },
+      };
+      let plan: ResearchPlan;
+      try {
+        plan = await this.researchRouter.plan(config, routerInput);
+      } catch (routerError) {
+        summary.finalStatus = "ROUTER_FAILED";
+        summary.researchDurationMs = Date.now() - phaseStartedAt;
+        this.emitResearchSummary(summary);
+        return [];
+      }
+      summary.routerPlanRequestCount = plan.requests.length;
+      for (const req of plan.requests) {
+        if (summary.requestedSkills.length < 3) summary.requestedSkills.push(req.skill);
+        if (summary.requestedSymbols.length < 3) summary.requestedSymbols.push(req.symbol ?? "GLOBAL");
+      }
       const validation = validateResearchPlan(plan, routerInput);
-      return await this.researchExecutor.execute(validation.accepted);
-    } catch {
+      summary.acceptedRequestCount = validation.accepted.length;
+      summary.rejectedRequestCount = validation.rejected.length;
+      const evidence = await this.researchExecutor.executeWithTelemetry(validation.accepted, telemetry);
+      summary.researchDurationMs = Date.now() - phaseStartedAt;
+      summary.finalStatus = evidence.length === 0 ? "NO_RESULTS" : "COMPLETED";
+      this.emitResearchSummary(summary);
+      return evidence;
+    } catch (error) {
+      summary.researchDurationMs = Date.now() - phaseStartedAt;
+      summary.finalStatus = "ERROR";
+      this.emitResearchSummary(summary);
       return [];
     }
   }

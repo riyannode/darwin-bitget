@@ -285,6 +285,26 @@ export interface ResearchPlan {
   requests: ResearchRequest[];
 }
 
+export interface ResearchCycleSummary {
+  cycleId: string;
+  signalEnabled: boolean;
+  availableSkillCount: number;
+  routerAttempted: boolean;
+  routerPlanRequestCount: number;
+  acceptedRequestCount: number;
+  rejectedRequestCount: number;
+  requestedSkills: string[];
+  requestedSymbols: string[];
+  cacheHits: number;
+  mcpConnectAttempts: number;
+  mcpConnectSuccesses: number;
+  mcpToolCalls: number;
+  availableResults: number;
+  unavailableResults: number;
+  researchDurationMs: number;
+  finalStatus: string;
+}
+
 export interface ResearchEvidence {
   skill: ResearchSkill;
   scope: string;

@@ -73,16 +73,69 @@ describe("Bitget Signal research router", () => {
     let routerCalls = 0;
     let executorCalls = 0;
     const collectResearchEvidence = (TraderAgent.prototype as unknown as {
-      collectResearchEvidence: (this: unknown, config: { bitgetSignalEnabled?: boolean }, bundles: readonly [], openPositionSymbols: readonly string[], entryCandidateSymbols: readonly string[]) => Promise<unknown[]>;
+      collectResearchEvidence: (this: unknown, config: { bitgetSignalEnabled?: boolean }, bundles: readonly [], openPositionSymbols: readonly string[], entryCandidateSymbols: readonly string[], cycleId: string) => Promise<unknown>;
     }).collectResearchEvidence;
     const fakeAgent = {
       researchRouter: { plan: async () => { routerCalls += 1; return { requests: [] }; } },
-      researchExecutor: { execute: async () => { executorCalls += 1; return []; } },
+      researchExecutor: { execute: async () => { executorCalls += 1; return []; }, executeWithTelemetry: async () => { executorCalls += 1; return []; } },
+      setupResearchTelemetry: () => { return { telemetry: undefined, summary: { finalStatus: "", cycleId: "test-cycle" } }; },
+      emitResearchSummary: () => {},
     };
-    const result = await collectResearchEvidence.call(fakeAgent, { bitgetSignalEnabled: false }, [], [], []);
-    expect(result).toEqual([]);
+    const result = await collectResearchEvidence.call(fakeAgent, { bitgetSignalEnabled: false }, [], [], [], "test-cycle");
+    expect(result).toBeUndefined();
     expect(routerCalls).toBe(0);
     expect(executorCalls).toBe(0);
+  });
+
+  it("returns undefined for Signal=false so researchEvidence stays absent from decision context", async () => {
+    const collectResearchEvidence = (TraderAgent.prototype as unknown as {
+      collectResearchEvidence: (this: unknown, config: { bitgetSignalEnabled?: boolean }, bundles: readonly [], openPositionSymbols: readonly string[], entryCandidateSymbols: readonly string[], cycleId: string) => Promise<unknown>;
+    }).collectResearchEvidence;
+    const fakeAgent = {
+      researchRouter: { plan: async () => ({ requests: [] }) },
+      researchExecutor: { execute: async () => [], executeWithTelemetry: async () => [] },
+      setupResearchTelemetry: () => ({ telemetry: undefined, summary: { finalStatus: "", cycleId: "c1" } }),
+      emitResearchSummary: () => {},
+    };
+    const result = await collectResearchEvidence.call(fakeAgent, { bitgetSignalEnabled: false }, [], [], [], "c1");
+    expect(result).toBeUndefined();
+    // When undefined, the spread ...(researchEvidence === undefined ? {} : { researchEvidence }) omits the key
+    const context = { a: 1, ...(result === undefined ? {} : { researchEvidence: result }) };
+    expect(context).not.toHaveProperty("researchEvidence");
+    expect(context).toEqual({ a: 1 });
+  });
+
+  it("passes explicit cycleId to telemetry (not derived from state)", async () => {
+    let capturedCycleId = "";
+    const collectResearchEvidence = (TraderAgent.prototype as unknown as {
+      collectResearchEvidence: (this: unknown, config: { bitgetSignalEnabled?: boolean }, bundles: readonly [], openPositionSymbols: readonly string[], entryCandidateSymbols: readonly string[], cycleId: string) => Promise<unknown>;
+    }).collectResearchEvidence;
+    const fakeAgent = {
+      state: { lastCycleId: "WRONG_CYCLE_ID" },
+      researchRouter: { plan: async () => ({ requests: [] }) },
+      researchExecutor: { execute: async () => [], executeWithTelemetry: async () => [] },
+      setupResearchTelemetry: (cid: string) => { capturedCycleId = cid; return { telemetry: undefined, summary: { finalStatus: "", cycleId: cid } }; },
+      emitResearchSummary: () => {},
+    };
+    await collectResearchEvidence.call(fakeAgent, { bitgetSignalEnabled: false }, [], [], [], "EXPLICIT_CYCLE_ID");
+    expect(capturedCycleId).toBe("EXPLICIT_CYCLE_ID");
+  });
+
+  it("Signal=false emits exactly one telemetry summary with SIGNAL_DISABLED", async () => {
+    const summaries: Array<Record<string, unknown>> = [];
+    const collectResearchEvidence = (TraderAgent.prototype as unknown as {
+      collectResearchEvidence: (this: unknown, config: { bitgetSignalEnabled?: boolean }, bundles: readonly [], openPositionSymbols: readonly string[], entryCandidateSymbols: readonly string[], cycleId: string) => Promise<unknown>;
+    }).collectResearchEvidence;
+    const fakeAgent = {
+      researchRouter: { plan: async () => ({ requests: [] }) },
+      researchExecutor: { execute: async () => [], executeWithTelemetry: async () => [] },
+      setupResearchTelemetry: () => ({ telemetry: undefined, summary: { finalStatus: "", cycleId: "c1" } }),
+      emitResearchSummary: (s: Record<string, unknown>) => { summaries.push(s); },
+    };
+    await collectResearchEvidence.call(fakeAgent, { bitgetSignalEnabled: false }, [], [], [], "c1");
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]?.signalEnabled).toBe(false);
+    expect(summaries[0]?.finalStatus).toBe("SIGNAL_DISABLED");
   });
 });
 
