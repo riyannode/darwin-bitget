@@ -9,14 +9,22 @@ export interface PaperLogPeriod {
 }
 
 export interface PaperLogExport {
-  exportGeneratedAt: string;
-  period: PaperLogPeriod;
-  environment: string;
-  paperMode: true;
-  model: string;
-  version: string;
-  commit: string;
+  schemaVersion: string;
+  export: {
+    generatedAt: string;
+    period: PaperLogPeriod;
+    environment: string;
+    paperMode: true;
+    model: string;
+    version: string;
+    commit: string | null;
+    commitStatus: "AVAILABLE" | "UNAVAILABLE";
+  };
   summary: PaperLogSummary;
+  recentWindow: PaperLogRecentWindow;
+  closedTrades: PaperLogClosedTrade[];
+  verifiedExecutions: PaperLogVerifiedExecution[];
+  failureBreakdown: PaperLogFailureBreakdown;
   cycles: PaperLogCycle[];
   decisions: PaperLogDecision[];
   experiences: PaperLogExperience[];
@@ -24,19 +32,72 @@ export interface PaperLogExport {
 }
 
 export interface PaperLogSummary {
-  totalCycles: number;
-  completedCycles: number;
-  failedCycles: number;
+  cycles: {
+    total: number;
+    completed: number;
+    failed: number;
+    completionRatePct: string;
+  };
   decisions: Record<Decision["action"], number>;
+  executions: {
+    verified: number;
+    unresolved: number;
+  };
+  closedTrades: {
+    total: number;
+    wins: number;
+    losses: number;
+    breakeven: number;
+    realizedPnl: string;
+  };
+  risk: {
+    currentDrawdownPct: string | null;
+    maxDrawdownPct: string | null;
+  };
+}
+
+export interface PaperLogRecentWindow {
+  size: number;
+  completed: number;
+  failed: number;
   verifiedExecutions: number;
-  unresolvedExecutions: number;
-  closedTrades: number;
-  wins: number;
-  losses: number;
-  breakeven: number;
-  realizedPnl: string;
-  currentDrawdownPct: string | null;
-  maxDrawdownPct: string | null;
+  financialWrites: number;
+  start: string | null;
+  end: string | null;
+}
+
+export interface PaperLogClosedTrade {
+  symbol: string;
+  positionSide: TradeExperience["positionSide"];
+  entryPrice: string;
+  exitPrice: string;
+  openedAt: string;
+  closedAt: string;
+  realizedPnl: string | null;
+  realizedPnlPct: string | null;
+  outcomeStatus: TradeExperience["outcomeStatus"];
+  experienceId: string;
+  closeCycleId: string | null;
+  verified: boolean;
+}
+
+export interface PaperLogVerifiedExecution {
+  cycleId: string;
+  timestamp: string;
+  symbol: string;
+  action: Decision["action"];
+  decisionId: string;
+  clientOrderId: string | null;
+  providerOrderId: string | null;
+  fillPrice: string | null;
+  quantity: string | null;
+  reconciliationStatus: string;
+  realizedPnl: string | null;
+}
+
+export interface PaperLogFailureBreakdown {
+  byCode: Record<string, number>;
+  byStage: Record<string, number>;
 }
 
 export interface PaperLogCycle {
@@ -45,13 +106,25 @@ export interface PaperLogCycle {
   startedAt: string;
   completedAt: string | null;
   durationMs: number | null;
-  decisionIds: string[];
+  planning: {
+    scannedUniverseCount: number | null;
+    selectedEntryCandidates: string[];
+    managedExistingPositions: string[];
+    totalProposedActions: number;
+  };
+  execution: {
+    financialWritesPerformed: number;
+    verifiedExecutions: number;
+    unresolvedExecutions: number;
+  };
+  failure: {
+    code: string | null;
+    stage: string | null;
+    lastSuccessfulEvent: string | null;
+    executionOutcome: string | null;
+  } | null;
   eventTypes: string[];
-  scannedUniverseCount: number | null;
-  selectedEntryCandidates: string[];
-  managedExistingPositions: string[];
-  totalProposedActions: number;
-  financialWritesPerformed: number;
+  decisionIds: string[];
 }
 
 export interface PaperLogDecision {
@@ -156,6 +229,9 @@ export interface PaperLogExperience {
   funding: string | null;
   lessonsUsed: string[];
 }
+
+export const PAPER_LOG_SCHEMA_VERSION = "2.0.0";
+const RECENT_WINDOW_SIZE = 25;
 
 export function parsePaperLogPeriod(from: string | null, to: string | null): PaperLogPeriod {
   const start = normalizeTimestamp(from);
@@ -330,6 +406,50 @@ function summarizeDrawdown(journals: readonly TradingJournal[]): { current: stri
   return calculatePeakDrawdown(journals.flatMap((journal) => journal.portfolio?.portfolioEquity ? [journal.portfolio.portfolioEquity] : []));
 }
 
+function lastSuccessfulEventForFailedCycle(cycleId: string, events: readonly ActivityEvent[]): string | null {
+  const cycleEvents = events
+    .filter((event) => event.cycleId === cycleId)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const failedIndex = cycleEvents.findIndex((event) => event.type === "CYCLE_FAILED");
+  if (failedIndex <= 0) return null;
+  return cycleEvents[failedIndex - 1]?.type ?? null;
+}
+
+function deriveExecutionOutcome(cycleId: string, events: readonly ActivityEvent[]): string | null {
+  const cycleEvents = events.filter((event) => event.cycleId === cycleId);
+  const hasVerified = cycleEvents.some((event) => event.type === "EXECUTION_VERIFIED");
+  const hasSubmitted = cycleEvents.some((event) => event.type === "PAPER_ORDER_SUBMITTED");
+  const hasFailed = cycleEvents.some((event) => event.type === "CYCLE_FAILED");
+  if (hasVerified && hasFailed) return "VERIFIED_WRITE_BEFORE_CYCLE_FAILURE";
+  if (hasSubmitted && hasFailed) return "SUBMITTED_BEFORE_CYCLE_FAILURE";
+  if (hasVerified) return "VERIFIED";
+  if (hasSubmitted) return "SUBMITTED";
+  return null;
+}
+
+function deriveFailureStage(lastSuccessfulEvent: string | null, executionOutcome: string | null): string | null {
+  if (executionOutcome === "VERIFIED_WRITE_BEFORE_CYCLE_FAILURE") return "post_write_portfolio_refresh";
+  if (executionOutcome === "SUBMITTED_BEFORE_CYCLE_FAILURE") return "post_write_portfolio_refresh";
+  if (!lastSuccessfulEvent) return null;
+  const stageMap: Record<string, string> = {
+    CYCLE_STARTED: "startup",
+    MARKET_SCAN: "market_scan",
+    CANDIDATE_SELECTION_SKIPPED: "candidate_selection",
+    CANDIDATE_SELECTED: "candidate_selection",
+    LESSON_REFERENCE_IGNORED: "lesson_retrieval",
+    RISK_GATE_PASS: "risk_gate",
+    RISK_GATE_BLOCK: "risk_gate",
+    DECISION_CREATED: "decision",
+    PAPER_ORDER_SUBMITTED: "execution",
+    EXECUTION_VERIFIED: "execution",
+    EXECUTION_UNRESOLVED: "execution",
+    REFLECTION_COMPLETED: "reflection",
+    LESSON_CREATED: "lesson_save",
+    CYCLE_COMPLETED: "finalization",
+  };
+  return stageMap[lastSuccessfulEvent] ?? "unknown";
+}
+
 export function buildPaperLogExport(input: {
   generatedAt: string;
   period: PaperLogPeriod;
@@ -346,57 +466,173 @@ export function buildPaperLogExport(input: {
   const journalByCycle = new Map(journals.map((journal) => [journal.cycleId, journal]));
   const cycleIds = new Set(journals.map((journal) => journal.cycleId));
   const events = input.events.filter((event) => cycleIds.has(event.cycleId));
-  const cycles = input.cycles.filter((cycle) => cycleIds.has(cycle.cycleId)).map((cycle) => {
-    const journal = journalByCycle.get(cycle.cycleId);
-    const cycleEvents = events.filter((event) => event.cycleId === cycle.cycleId);
-    return {
-      cycleId: cycle.cycleId,
-      status: cycle.status,
-      startedAt: cycle.startedAt,
-      completedAt: cycle.completedAt,
-      durationMs: journal?.durationMs ?? null,
-      decisionIds: journal ? cycleDecisions(journal).map((decision) => decision.decisionId) : [],
-      eventTypes: cycleEvents.map((event) => event.type),
-      scannedUniverseCount: journal?.discovery?.scannedUniverseCount ?? null,
-      selectedEntryCandidates: journal?.discovery?.selectedEntryCandidateSymbols ?? [],
-      managedExistingPositions: journal?.discovery?.managedExistingPositionSymbols ?? [],
-      totalProposedActions: journal ? cycleDecisions(journal).length : 0,
-      financialWritesPerformed: journal?.discovery?.financialWritesPerformed ?? (journal ? normalizeCycleDecisions(journal).records.filter((record) => Boolean(record.executionResult)).length : 0),
-    };
-  });
+
+  const cycles = input.cycles
+    .filter((cycle) => cycleIds.has(cycle.cycleId))
+    .map((cycle) => {
+      const journal = journalByCycle.get(cycle.cycleId);
+      const cycleEvents = events.filter((event) => event.cycleId === cycle.cycleId);
+      const eventTypes = cycleEvents.map((event) => event.type);
+      const decisions = journal ? cycleDecisions(journal) : [];
+      const physicalWrites = decisions.flatMap((decision) => decision.physicalWrites);
+      const verifiedExecutions = decisions.filter((decision) => decision.action !== "REVERSE" && decision.providerVerified).length + physicalWrites.filter((write) => write.providerVerified).length;
+      const unresolvedExecutions = decisions.filter((decision) => decision.action !== "REVERSE" && decision.executionResult && !decision.providerVerified).length + physicalWrites.filter((write) => write.executionStatus !== null && !write.providerVerified).length;
+      const financialWritesPerformed = journal?.discovery?.financialWritesPerformed ?? (journal ? normalizeCycleDecisions(journal).records.filter((record) => Boolean(record.executionResult)).length : 0);
+      const failureEvent = cycleEvents.find((event) => event.type === "CYCLE_FAILED");
+      const failureCode = failureEvent?.metadata?.category ?? failureEvent?.metadata?.code ?? null;
+      const lastSuccessfulEvent = cycle.status === "FAILED" ? lastSuccessfulEventForFailedCycle(cycle.cycleId, events) : null;
+      const executionOutcome = cycle.status === "FAILED" ? deriveExecutionOutcome(cycle.cycleId, events) : null;
+      return {
+        cycleId: cycle.cycleId,
+        status: cycle.status,
+        startedAt: cycle.startedAt,
+        completedAt: cycle.completedAt,
+        durationMs: journal?.durationMs ?? null,
+        planning: {
+          scannedUniverseCount: journal?.discovery?.scannedUniverseCount ?? null,
+          selectedEntryCandidates: journal?.discovery?.selectedEntryCandidateSymbols ?? [],
+          managedExistingPositions: journal?.discovery?.managedExistingPositionSymbols ?? [],
+          totalProposedActions: decisions.length,
+        },
+        execution: {
+          financialWritesPerformed,
+          verifiedExecutions,
+          unresolvedExecutions,
+        },
+        failure: cycle.status === "FAILED" ? {
+          code: failureCode,
+          stage: deriveFailureStage(lastSuccessfulEvent, executionOutcome),
+          lastSuccessfulEvent,
+          executionOutcome,
+        } : null,
+        eventTypes,
+        decisionIds: decisions.map((decision) => decision.decisionId),
+      } as PaperLogCycle;
+    })
+    .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+
   const decisions = journals.flatMap(cycleDecisions);
   const experienceIds = new Set(journals.flatMap((journal) => journal.experienceIds ?? []));
   const experiences = input.experiences.filter((experience) => experienceIds.has(experience.experienceId)).map(exportExperience);
+
   const decisionCounts: Record<Decision["action"], number> = { HOLD: 0, OPEN_LONG: 0, OPEN_SHORT: 0, INCREASE: 0, REDUCE: 0, CLOSE: 0, REVERSE: 0 };
   for (const decision of decisions) decisionCounts[decision.action] += 1;
+
   const physicalWrites = decisions.flatMap((decision) => decision.physicalWrites);
   const verifiedExecutions = decisions.filter((decision) => decision.action !== "REVERSE" && decision.providerVerified).length + physicalWrites.filter((write) => write.providerVerified).length;
   const unresolvedExecutions = decisions.filter((decision) => decision.action !== "REVERSE" && decision.executionResult && !decision.providerVerified).length + physicalWrites.filter((write) => write.executionStatus !== null && !write.providerVerified).length;
+
   const closed = experiences.filter((experience) => ["PROFITABLE", "LOSING", "BREAK_EVEN", "CLOSED_UNCLASSIFIED"].includes(experience.outcomeStatus));
   const realizedPnl = experiences.filter((experience) => experience.realizedPnlVerified && typeof experience.realizedPnl === "string" && isDecimal(experience.realizedPnl)).reduce((total, experience) => addDecimal(total, experience.realizedPnl ?? "0"), "0");
   const drawdown = summarizeDrawdown(journals);
+
+  const totalCycles = cycles.length;
+  const completedCycles = cycles.filter((cycle) => cycle.status === "COMPLETED").length;
+  const failedCycles = cycles.filter((cycle) => cycle.status === "FAILED").length;
+  const completionRatePct = totalCycles > 0 ? ((completedCycles / totalCycles) * 100).toFixed(2) : "0.00";
+
+  const recentCycles = cycles.slice(0, RECENT_WINDOW_SIZE);
+  const recentVerifiedExecutions = recentCycles.reduce((sum, cycle) => sum + cycle.execution.verifiedExecutions, 0);
+  const recentFinancialWrites = recentCycles.reduce((sum, cycle) => sum + cycle.execution.financialWritesPerformed, 0);
+
+  const closedTrades: PaperLogClosedTrade[] = closed
+    .filter((experience) => experience.realizedPnlVerified)
+    .map((experience) => ({
+      symbol: experience.symbol,
+      positionSide: experience.positionSide,
+      entryPrice: experience.entryPrice,
+      exitPrice: experience.exitPrice,
+      openedAt: experience.entryTime,
+      closedAt: experience.exitTime,
+      realizedPnl: experience.realizedPnl,
+      realizedPnlPct: experience.realizedPnlPct,
+      outcomeStatus: experience.outcomeStatus,
+      experienceId: experience.experienceId,
+      closeCycleId: null,
+      verified: experience.realizedPnlVerified === true,
+    }));
+
+  const verifiedExecutionsList: PaperLogVerifiedExecution[] = decisions
+    .filter((decision) => decision.providerVerified)
+    .map((decision) => ({
+      cycleId: decision.cycleId,
+      timestamp: decision.timestamp,
+      symbol: decision.symbol,
+      action: decision.action,
+      decisionId: decision.decisionId,
+      clientOrderId: decision.executionRequest?.clientOrderId ?? null,
+      providerOrderId: decision.executionResult?.providerOrderId ?? null,
+      fillPrice: decision.executionResult?.averageFillPrice ?? null,
+      quantity: decision.executionResult?.executedQuantity ?? null,
+      reconciliationStatus: decision.reconciliation?.status ?? "MATCHED",
+      realizedPnl: decision.realizedPnl,
+    }));
+
+  const failureEvents = events.filter((event) => event.type === "CYCLE_FAILED");
+  const byCode: Record<string, number> = {};
+  const byStage: Record<string, number> = {};
+  for (const event of failureEvents) {
+    const code = event.metadata?.category ?? event.metadata?.code ?? "UNKNOWN";
+    byCode[code] = (byCode[code] ?? 0) + 1;
+    const lastEvent = lastSuccessfulEventForFailedCycle(event.cycleId, events);
+    const outcome = deriveExecutionOutcome(event.cycleId, events);
+    const stage = deriveFailureStage(lastEvent, outcome) ?? "unknown";
+    byStage[stage] = (byStage[stage] ?? 0) + 1;
+  }
+
+  const commitValue = input.commit?.trim();
+  const commitStatus: "AVAILABLE" | "UNAVAILABLE" = commitValue && commitValue !== "unknown" && commitValue !== "local" ? "AVAILABLE" : "UNAVAILABLE";
+
   return {
-    exportGeneratedAt: input.generatedAt,
-    period: input.period,
-    environment: input.environment,
-    paperMode: true,
-    model: input.model,
-    version: input.version,
-    commit: input.commit,
+    schemaVersion: PAPER_LOG_SCHEMA_VERSION,
+    export: {
+      generatedAt: input.generatedAt,
+      period: input.period,
+      environment: input.environment,
+      paperMode: true,
+      model: input.model,
+      version: input.version,
+      commit: commitValue && commitValue !== "unknown" && commitValue !== "local" ? commitValue : null,
+      commitStatus,
+    },
     summary: {
-      totalCycles: cycles.length,
-      completedCycles: cycles.filter((cycle) => cycle.status === "COMPLETED").length,
-      failedCycles: cycles.filter((cycle) => cycle.status === "FAILED").length,
+      cycles: {
+        total: totalCycles,
+        completed: completedCycles,
+        failed: failedCycles,
+        completionRatePct,
+      },
       decisions: decisionCounts,
-      verifiedExecutions,
-      unresolvedExecutions,
-      closedTrades: closed.length,
-      wins: closed.filter((experience) => experience.outcomeStatus === "PROFITABLE").length,
-      losses: closed.filter((experience) => experience.outcomeStatus === "LOSING").length,
-      breakeven: closed.filter((experience) => experience.outcomeStatus === "BREAK_EVEN").length,
-      realizedPnl,
-      currentDrawdownPct: drawdown.current,
-      maxDrawdownPct: drawdown.maximum,
+      executions: {
+        verified: verifiedExecutions,
+        unresolved: unresolvedExecutions,
+      },
+      closedTrades: {
+        total: closed.length,
+        wins: closed.filter((experience) => experience.outcomeStatus === "PROFITABLE").length,
+        losses: closed.filter((experience) => experience.outcomeStatus === "LOSING").length,
+        breakeven: closed.filter((experience) => experience.outcomeStatus === "BREAK_EVEN").length,
+        realizedPnl,
+      },
+      risk: {
+        currentDrawdownPct: drawdown.current,
+        maxDrawdownPct: drawdown.maximum,
+      },
+    },
+    recentWindow: {
+      size: RECENT_WINDOW_SIZE,
+      completed: recentCycles.filter((cycle) => cycle.status === "COMPLETED").length,
+      failed: recentCycles.filter((cycle) => cycle.status === "FAILED").length,
+      verifiedExecutions: recentVerifiedExecutions,
+      financialWrites: recentFinancialWrites,
+      start: recentCycles.length > 0 ? recentCycles[recentCycles.length - 1]?.startedAt ?? null : null,
+      end: recentCycles.length > 0 ? recentCycles[0]?.startedAt ?? null : null,
+    },
+    closedTrades,
+    verifiedExecutions: verifiedExecutionsList,
+    failureBreakdown: {
+      byCode,
+      byStage,
     },
     cycles,
     decisions,
@@ -414,7 +650,7 @@ export function paperLogToCsv(exported: PaperLogExport): string {
   const header = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "scannedUniverseCount", "selectedEntryCandidates", "managedExistingPositions", "totalProposedActions", "financialWritesPerformed", "decisionId", "decisionTimestamp", "actionCategory", "action", "symbol", "positionSide", "marginAllocationPct", "additionalMarginPct", "targetPositionSide", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "providerOperation", "providerCode", "providerMessage", "providerReadbackCode", "providerReadbackMessage", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "physicalWrites", "reflectionIds", "createdLessonIds"];
   const rows = exported.cycles.flatMap((cycle) => {
     const decisions = exported.decisions.filter((decision) => decision.cycleId === cycle.cycleId);
-    const cycleValues = [cycle.cycleId, cycle.status, cycle.startedAt, cycle.completedAt, cycle.eventTypes, cycle.scannedUniverseCount, cycle.selectedEntryCandidates, cycle.managedExistingPositions, cycle.totalProposedActions, cycle.financialWritesPerformed];
+    const cycleValues = [cycle.cycleId, cycle.status, cycle.startedAt, cycle.completedAt, cycle.eventTypes, cycle.planning.scannedUniverseCount, cycle.planning.selectedEntryCandidates, cycle.planning.managedExistingPositions, cycle.planning.totalProposedActions, cycle.execution.financialWritesPerformed];
     if (!decisions.length) return [[...cycleValues, ...Array(header.length - cycleValues.length).fill("")]];
     return decisions.map((decision) => [...cycleValues, decision.decisionId, decision.timestamp, decision.actionCategory, decision.action, decision.symbol, decision.positionSide, decision.marginAllocationPct, decision.additionalMarginPct, decision.targetPositionSide, decision.leverage, decision.reductionPct, decision.confidence, decision.strategyThesis, decision.supportingFactors, decision.riskFactors, decision.evidenceUsed, decision.lessonsUsed, decision.riskGate?.status, decision.riskGate?.codes, decision.executionRequest?.tradeSide, decision.executionRequest?.positionNotional, decision.executionRequest?.clientOrderId, decision.executionResult?.providerOrderId, decision.executionResult?.status, decision.executionResult?.requestedQuantity, decision.executionResult?.executedQuantity, decision.executionResult?.providerOperation, decision.executionResult?.providerCode, decision.executionResult?.providerMessage, decision.executionResult?.providerReadbackCode, decision.executionResult?.providerReadbackMessage, decision.reconciliation?.status, decision.reconciliation?.codes, decision.providerVerified, decision.realizedPnl, decision.physicalWrites, decision.reflectionIds, decision.createdLessonIds]);
   });
