@@ -164,9 +164,9 @@ describe("telemetry result accounting from final evidence", () => {
     };
   }
 
-  function deriveFinalStatus(evidence: readonly { status: string }[]): string {
+  function deriveFinalStatus(evidence: ReadonlyArray<{ status: string }>): string {
     if (evidence.length === 0) return "NO_RESULTS";
-    const availableCount = evidence.filter((e) => e.status === "AVAILABLE").length;
+    const availableCount = evidence.filter((e) => (e.status as string) === "AVAILABLE").length;
     if (availableCount === evidence.length) return "COMPLETED";
     if (availableCount > 0) return "PARTIAL";
     return "UNAVAILABLE";
@@ -236,9 +236,9 @@ describe("telemetry result accounting from final evidence", () => {
     // The executor does not cache UNAVAILABLE evidence (cacheEvidence only caches AVAILABLE/STALE),
     // but the final-status derivation must correctly map any non-AVAILABLE evidence array to UNAVAILABLE.
     // This test verifies the derivation logic directly against a non-AVAILABLE evidence array.
-    const evidence = [
+    const evidence: Array<{ skill: string; scope: string; observedAt: string; status: "AVAILABLE" | "UNAVAILABLE" | "UNSUPPORTED" | "STALE"; facts: string[]; limitations: string[] }> = [
       { skill: "technical-analysis", scope: "CRCLUSDT", observedAt: "2026-09-18T00:00:00.000Z", status: "UNAVAILABLE", facts: [], limitations: ["MCP connection unavailable."] },
-    ] as const;
+    ];
 
     const availableResults = evidence.filter((e) => e.status === "AVAILABLE").length;
     const unavailableResults = evidence.length - availableResults;
