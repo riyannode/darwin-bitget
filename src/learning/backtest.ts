@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { ZodError, z } from "zod";
 import type { BacktestReplay, HistoricalBar, Lesson, RuntimeConfig, TradeExperience } from "../types.js";
 import { generateQwenJson } from "../agent/qwen.js";
 import { BACKTEST_TASK_PROMPT } from "../agent/mandate.js";
@@ -70,7 +70,8 @@ export async function runCooldownBacktest(
     })).min(1).max(3),
     selectedLesson: z.string().min(1).max(500),
   });
-  const parsed = await generateQwenJson(config, schema, BACKTEST_TASK_PROMPT, JSON.stringify({ symbol: input.symbol, bars, experiences: input.experiences.slice(0, 20), baseline: "NO_TRADE_BASELINE" }));
+  const generated = await generateQwenJson(config, schema, BACKTEST_TASK_PROMPT, JSON.stringify({ symbol: input.symbol, bars, experiences: input.experiences.slice(0, 20), baseline: "NO_TRADE_BASELINE" }));
+  const parsed = schema.parse(generated);
   const metrics = [
     { hypothesis: "NO_TRADE_BASELINE", returnPct: "0.000000", maxDrawdownPct: "0.000000", trades: 0, wins: 0, losses: 0 },
     ...parsed.traces.map((trace) => metric(trace.hypothesis, trace.actions, bars)),
@@ -88,6 +89,35 @@ export async function runCooldownBacktest(
     selectedLesson: parsed.selectedLesson,
     createdAt: now,
   };
+}
+
+export function backtestFailureMetadata(error: unknown): Record<string, string> {
+  if (error instanceof ZodError) {
+    const first = error.issues[0];
+    return {
+      category: "COOLDOWN_BACKTEST",
+      code: "ZOD_VALIDATION_FAILED",
+      ...(first?.path.length ? { firstIssuePath: first.path.map(String).join(".").slice(0, 120) } : {}),
+      ...(first?.code ? { firstIssueCode: first.code.slice(0, 80) } : {}),
+    };
+  }
+  const rawMessage = error instanceof Error ? error.message : "BACKTEST_FAILED";
+  const candidateCode = rawMessage.split(":", 1)[0]?.trim() ?? "";
+  const code = /^[A-Z][A-Z0-9_]{1,79}$/.test(candidateCode) ? candidateCode : "BACKTEST_FAILED";
+  return { category: "COOLDOWN_BACKTEST", code };
+}
+
+export async function runCooldownBacktestSafely(
+  config: RuntimeConfig,
+  input: CooldownBacktestInput,
+  onFailure: (metadata: Record<string, string>) => void,
+): Promise<BacktestReplay | undefined> {
+  try {
+    return await runCooldownBacktest(config, input);
+  } catch (error) {
+    onFailure(backtestFailureMetadata(error));
+    return undefined;
+  }
 }
 
 export function createBacktestLesson(replay: BacktestReplay): Lesson {

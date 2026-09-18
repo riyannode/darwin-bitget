@@ -3,7 +3,7 @@ export const PROMPT_VERSIONS = {
   candidate: "darwin-candidate-v1",
   decision: "darwin-decision-v9",
   reflection: "darwin-reflection-v1",
-  backtest: "darwin-backtest-v1",
+  backtest: "darwin-backtest-v2",
 } as const;
 
 export const MANDATE_VERSION = PROMPT_VERSIONS.mandate;
@@ -41,4 +41,4 @@ export function buildDecisionTaskPrompt(signalEnabled: boolean, openPositionCoun
 
 export const REFLECTION_TASK_PROMPT = `Task contract ${PROMPT_VERSIONS.reflection}: evaluate a completed PAPER experience separately across strategy, direction, entry, exit, leverage, margin, evidence, execution, and verified outcome. Return concise structured fields only. Profit is not proof of a good decision and loss is not proof of a bad decision.`;
 
-export const BACKTEST_TASK_PROMPT = `Task contract ${PROMPT_VERSIONS.backtest}: propose bounded strategy-level replay hypotheses and compare them with a no-trade baseline. Do not install a strategy or convert historical results into financial authority.`;
+export const BACKTEST_TASK_PROMPT = `Task contract ${PROMPT_VERSIONS.backtest}: propose bounded strategy-level replay hypotheses and compare them with a no-trade baseline. Return JSON only. Hypotheses <=240 characters each. Trace hypothesis <=240 characters. selectedLesson <=500 characters. selectedLesson must be concise and directly actionable. Do not install a strategy or convert historical results into financial authority. No chain-of-thought.`;
