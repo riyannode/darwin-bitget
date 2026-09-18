@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../src/research/executor.js";
+import type { ResearchRequest } from "../src/types.js";
 
 describe("collectResearchEvidence telemetry", () => {
   // These are integration-level tests that verify the telemetry structure
@@ -6,7 +8,6 @@ describe("collectResearchEvidence telemetry", () => {
   // setup and emit functions directly since the agent requires a DO context.
 
   it("telemetry shape for requests=[] Case A", () => {
-    // Simulated summary for Case A: router attempted, empty plan, no MCP
     const summary: Record<string, unknown> = {
       cycleId: "test-cycle",
       signalEnabled: true,
@@ -34,7 +35,6 @@ describe("collectResearchEvidence telemetry", () => {
   });
 
   it("telemetry shape for MCP execution Case B", () => {
-    // Simulated summary for Case B: router planned, MCP executed
     const summary: Record<string, unknown> = {
       cycleId: "test-cycle",
       signalEnabled: true,
@@ -113,5 +113,191 @@ describe("collectResearchEvidence telemetry", () => {
     const bounded = requestedSymbols.slice(0, 3);
     expect(bounded.length).toBe(3);
     expect(bounded).toEqual(["CRCLUSDT", "COINUSDT", "HOODUSDT"]);
+  });
+});
+
+describe("telemetry result accounting from final evidence", () => {
+  function makeRequest(symbol = "CRCLUSDT"): ResearchRequest {
+    return { skill: "technical-analysis", symbol, purpose: "test" };
+  }
+
+  function makeFactory(behavior: "success" | "connect-fail" | "tool-fail" | "mixed") {
+    if (behavior === "connect-fail") {
+      return {
+        connect: async () => { throw new Error("CONNECT_ERROR: simulated failure"); },
+      };
+    }
+    let callCount = 0;
+    return {
+      connect: async () => ({
+        callTool: async () => {
+          callCount++;
+          if (behavior === "tool-fail") {
+            throw new Error("TOOL_ERROR: simulated failure");
+          }
+          if (behavior === "mixed") {
+            return callCount === 1
+              ? { content: [{ type: "text", text: JSON.stringify({ verdict: "bullish", rsi: { rsi: 60, signal: "bullish" } }) }] }
+              : { isError: true, content: [{ type: "text", text: "MCP error" }] };
+          }
+          return { content: [{ type: "text", text: JSON.stringify({ verdict: "neutral", rsi: { rsi: 50, signal: "neutral" } }) }] };
+        },
+        close: async () => {},
+      }),
+    };
+  }
+
+  function trackTelemetry() {
+    let cacheHits = 0;
+    let mcpConnectAttempts = 0;
+    let mcpConnectSuccesses = 0;
+    let mcpToolCalls = 0;
+    const telemetry: ResearchExecutionTelemetryCallback = (event) => {
+      if (event.type === "CACHE_HIT") cacheHits++;
+      else if (event.type === "MCP_CONNECT_ATTEMPT") mcpConnectAttempts++;
+      else if (event.type === "MCP_CONNECT_SUCCESS") mcpConnectSuccesses++;
+      else if (event.type === "MCP_TOOL_ATTEMPT") mcpToolCalls++;
+    };
+    return {
+      telemetry,
+      getCounters: () => ({ cacheHits, mcpConnectAttempts, mcpConnectSuccesses, mcpToolCalls }),
+    };
+  }
+
+  function deriveFinalStatus(evidence: readonly { status: string }[]): string {
+    if (evidence.length === 0) return "NO_RESULTS";
+    const availableCount = evidence.filter((e) => e.status === "AVAILABLE").length;
+    if (availableCount === evidence.length) return "COMPLETED";
+    if (availableCount > 0) return "PARTIAL";
+    return "UNAVAILABLE";
+  }
+
+  it("MCP connection failure: connect counted, results derived as UNAVAILABLE", async () => {
+    const executor = new ResearchExecutor(makeFactory("connect-fail") as never);
+    const { telemetry, getCounters } = trackTelemetry();
+
+    const evidence = await executor.executeWithTelemetry([makeRequest()], telemetry);
+    const counters = getCounters();
+
+    const availableResults = evidence.filter((e) => e.status === "AVAILABLE").length;
+    const unavailableResults = evidence.length - availableResults;
+    const finalStatus = deriveFinalStatus(evidence);
+
+    expect(counters.mcpConnectAttempts).toBe(1);
+    expect(counters.mcpConnectSuccesses).toBe(0);
+    expect(availableResults).toBe(0);
+    expect(unavailableResults).toBeGreaterThanOrEqual(1);
+    expect(finalStatus).toBe("UNAVAILABLE");
+  });
+
+  it("MCP tool failure: tool call counted, results derived as UNAVAILABLE", async () => {
+    const executor = new ResearchExecutor(makeFactory("tool-fail") as never);
+    const { telemetry, getCounters } = trackTelemetry();
+
+    const evidence = await executor.executeWithTelemetry([makeRequest()], telemetry);
+    const counters = getCounters();
+
+    const availableResults = evidence.filter((e) => e.status === "AVAILABLE").length;
+    const unavailableResults = evidence.length - availableResults;
+    const finalStatus = deriveFinalStatus(evidence);
+
+    expect(counters.mcpToolCalls).toBe(1);
+    expect(availableResults).toBe(0);
+    expect(unavailableResults).toBeGreaterThanOrEqual(1);
+    expect(finalStatus).toBe("UNAVAILABLE");
+  });
+
+  it("AVAILABLE cache hit: cacheHits=1, no MCP calls, finalStatus=COMPLETED", async () => {
+    const executor = new ResearchExecutor(makeFactory("success") as never);
+    const { telemetry, getCounters } = trackTelemetry();
+
+    // First call populates cache
+    await executor.executeWithTelemetry([makeRequest()], telemetry);
+    const countersAfterFirst = getCounters();
+    expect(countersAfterFirst.mcpToolCalls).toBe(1);
+
+    // Second call should hit cache
+    const evidence = await executor.executeWithTelemetry([makeRequest()], telemetry);
+    const counters = getCounters();
+
+    const availableResults = evidence.filter((e) => e.status === "AVAILABLE").length;
+    const unavailableResults = evidence.length - availableResults;
+    const finalStatus = deriveFinalStatus(evidence);
+
+    expect(counters.cacheHits).toBe(1);
+    expect(counters.mcpConnectAttempts).toBe(1); // only first call
+    expect(counters.mcpToolCalls).toBe(1); // only first call
+    expect(availableResults).toBe(1);
+    expect(unavailableResults).toBe(0);
+    expect(finalStatus).toBe("COMPLETED");
+  });
+
+  it("non-AVAILABLE evidence (e.g. STALE or UNAVAILABLE): results derived as UNAVAILABLE", async () => {
+    // The executor does not cache UNAVAILABLE evidence (cacheEvidence only caches AVAILABLE/STALE),
+    // but the final-status derivation must correctly map any non-AVAILABLE evidence array to UNAVAILABLE.
+    // This test verifies the derivation logic directly against a non-AVAILABLE evidence array.
+    const evidence = [
+      { skill: "technical-analysis", scope: "CRCLUSDT", observedAt: "2026-09-18T00:00:00.000Z", status: "UNAVAILABLE", facts: [], limitations: ["MCP connection unavailable."] },
+    ] as const;
+
+    const availableResults = evidence.filter((e) => e.status === "AVAILABLE").length;
+    const unavailableResults = evidence.length - availableResults;
+    const finalStatus = deriveFinalStatus(evidence);
+
+    expect(availableResults).toBe(0);
+    expect(unavailableResults).toBe(1);
+    expect(finalStatus).toBe("UNAVAILABLE");
+  });
+
+  it("mixed AVAILABLE + UNAVAILABLE: finalStatus=PARTIAL", async () => {
+    const executor = new ResearchExecutor(makeFactory("mixed") as never);
+    const { telemetry, getCounters } = trackTelemetry();
+
+    const evidence = await executor.executeWithTelemetry([makeRequest("A"), makeRequest("B")], telemetry);
+
+    const availableResults = evidence.filter((e) => e.status === "AVAILABLE").length;
+    const unavailableResults = evidence.length - availableResults;
+    const finalStatus = deriveFinalStatus(evidence);
+
+    expect(availableResults).toBeGreaterThan(0);
+    expect(unavailableResults).toBeGreaterThan(0);
+    expect(finalStatus).toBe("PARTIAL");
+  });
+
+  it("empty request list: finalStatus=NO_RESULTS", async () => {
+    const executor = new ResearchExecutor(makeFactory("success") as never);
+    const { telemetry, getCounters } = trackTelemetry();
+
+    const evidence = await executor.executeWithTelemetry([], telemetry);
+    const counters = getCounters();
+
+    const finalStatus = deriveFinalStatus(evidence);
+
+    expect(evidence.length).toBe(0);
+    expect(counters.mcpConnectAttempts).toBe(0);
+    expect(counters.mcpToolCalls).toBe(0);
+    expect(finalStatus).toBe("NO_RESULTS");
+  });
+
+  it("telemetry callback failure does not affect research result counts", async () => {
+    const executor = new ResearchExecutor(makeFactory("success") as never);
+
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {
+      throw new Error("TELEMETRY_EMISSION_BROKEN");
+    });
+
+    try {
+      const evidence = await executor.executeWithTelemetry([makeRequest()], () => {
+        throw new Error("CALLBACK_BROKEN");
+      });
+
+      const availableResults = evidence.filter((e) => e.status === "AVAILABLE").length;
+      const finalStatus = deriveFinalStatus(evidence);
+
+      expect(availableResults).toBe(1);
+      expect(finalStatus).toBe("COMPLETED");
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

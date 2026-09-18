@@ -291,11 +291,6 @@ export class TraderAgent extends Agent<Env, AgentState> {
         summary.mcpConnectSuccesses += 1;
       } else if (event.type === "MCP_TOOL_ATTEMPT") {
         summary.mcpToolCalls += 1;
-      } else if (event.type === "MCP_TOOL_RESULT") {
-        if (event.status === "AVAILABLE") summary.availableResults += 1;
-        else summary.unavailableResults += 1;
-      } else if (event.type === "MCP_TOOL_FAILED") {
-        summary.unavailableResults += 1;
       }
     };
     return { telemetry, summary };
@@ -903,7 +898,19 @@ export class TraderAgent extends Agent<Env, AgentState> {
       summary.rejectedRequestCount = validation.rejected.length;
       const evidence = await this.researchExecutor.executeWithTelemetry(validation.accepted, telemetry);
       summary.researchDurationMs = Date.now() - phaseStartedAt;
-      summary.finalStatus = evidence.length === 0 ? "NO_RESULTS" : "COMPLETED";
+      const availableCount = evidence.filter((e) => e.status === "AVAILABLE").length;
+      const unavailableCount = evidence.length - availableCount;
+      summary.availableResults = availableCount;
+      summary.unavailableResults = unavailableCount;
+      if (evidence.length === 0) {
+        summary.finalStatus = "NO_RESULTS";
+      } else if (availableCount === evidence.length) {
+        summary.finalStatus = "COMPLETED";
+      } else if (availableCount > 0) {
+        summary.finalStatus = "PARTIAL";
+      } else {
+        summary.finalStatus = "UNAVAILABLE";
+      }
       this.emitResearchSummary(summary);
       return evidence;
     } catch (error) {
