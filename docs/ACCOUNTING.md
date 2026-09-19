@@ -19,6 +19,12 @@ Persisted ledger values are durable read-model state:
 - verified lifecycle counts and verified realized PnL;
 - peak equity and incremental high-water drawdown state.
 
+`performance-v2` is a targeted rebuild of the prior performance row. It scans the
+canonical autonomous journals and experiences once, preserves the Durable Object,
+and rebuilds closed episodes, partial reductions, win/loss classification, and the
+earliest trustworthy provider baseline. A partial REDUCE contributes to
+`partialRealizedPnl` but never to closed-trade win rate.
+
 The competition baseline is immutable after initialization. An existing baseline is
 preserved during restart, UI reads, failed cycles, and new positions.
 
@@ -85,6 +91,14 @@ values `CURRENT DRAWDOWN` and `MAX DRAWDOWN`.
 used as currency amounts. `imr` is only used as `INITIAL MARGIN` because the UTA
 account endpoint documents that exact field as an initial-margin amount; it is not
 used as a generic `MARGIN USED` fallback.
+
+Export semantics are explicit:
+
+```text
+summary.closedTrades.realizedPnl = fully closed episode PnL only
+summary.closedTrades.partialRealizedPnl = verified REDUCE PnL
+summary.closedTrades.verifiedRealizedPnl = closed + partial PnL
+```
 
 ## Screenshot reconciliation example
 

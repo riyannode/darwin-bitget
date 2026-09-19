@@ -59,7 +59,7 @@ import { buildExecutionRequest, executePaperOrder } from "../trading/execution.j
 import { executeCyclePlan } from "../trading/execution-planner.js";
 import { reconcileExecution } from "../trading/reconcile.js";
 import { addDecimal, isDecimal, isPositiveDecimal } from "../trading/decimal.js";
-import { bootstrapPerformance, buildPerformanceAccounting, currentMonthDailyPnl, emptyPerformance, isPerformanceAggregate, POSITION_CONTEXT_READ_MODEL_VERSION, recordVerifiedClose, recordVerifiedOpen, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate, type PerformanceObservation } from "../trading/performance.js";
+import { bootstrapPerformance, buildPerformanceAccounting, currentMonthDailyPnl, emptyPerformance, isPerformanceAggregate, POSITION_CONTEXT_READ_MODEL_VERSION, recordVerifiedClose, recordVerifiedOpen, recordVerifiedPartial, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate, type PerformanceObservation } from "../trading/performance.js";
 import { bootstrapPositionContexts, decisionReasoning, upsertPositionContext } from "./position-context.js";
 import { EvaClient } from "../eva/client.js";
 import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
@@ -221,7 +221,7 @@ function executionEvidence(journal: TradingJournal | null): DashboardSnapshot["e
 }
 
 function unavailablePerformance(): DashboardSnapshot["performance"] {
-  return { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, openTrades: null, closedTrades: null, wins: null, losses: null, breakeven: null, verifiedRealizedPnl: "", competitionBaselineEquity: null, latestEquity: null, performanceBaselineAt: null, dailyPnl: {} };
+  return { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, openTrades: null, closedTrades: null, wins: null, losses: null, breakeven: null, closedTradeRealizedPnl: "UNAVAILABLE", partialRealizedPnl: "UNAVAILABLE", verifiedRealizedPnl: "UNAVAILABLE", competitionBaselineEquity: null, latestEquity: null, performanceBaselineAt: null, dailyPnl: {} };
 }
 
 function json(value: unknown, status = 200): Response {
@@ -531,7 +531,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     }
     if (isPerformanceAggregate(performance) && positionContextBootstrapped?.version === POSITION_CONTEXT_READ_MODEL_VERSION) return;
     const history = this.readBootstrapHistory();
-    if (!isPerformanceAggregate(performance)) savePerformanceAggregate(this, bootstrapPerformance(history.journals, history.experiences, initializedAt), initializedAt);
+    if (!isPerformanceAggregate(performance)) savePerformanceAggregate(this, bootstrapPerformance(loadAllAutonomousJournals(this), loadAllExperiences(this), initializedAt), initializedAt);
     if (positionContextBootstrapped?.version !== POSITION_CONTEXT_READ_MODEL_VERSION) {
       for (const context of bootstrapPositionContexts(history.journals, history.experiences, initializedAt)) savePositionContext(this, context);
       savePositionContextBootstrap(this, POSITION_CONTEXT_READ_MODEL_VERSION, initializedAt);
@@ -554,6 +554,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     let performance = this.performanceWithEquity(equity, observedAt);
     if (record.decision.action === "OPEN_LONG" || record.decision.action === "OPEN_SHORT") performance = recordVerifiedOpen(performance, equity, observedAt);
     if (record.decision.action === "CLOSE") performance = recordVerifiedClose(performance, record.executionResult.realizedPnl, equity, observedAt);
+    if (record.decision.action === "REDUCE") performance = recordVerifiedPartial(performance, record.executionResult.realizedPnl ?? "", equity, observedAt);
     savePerformanceAggregate(this, performance, observedAt);
   }
 
@@ -616,6 +617,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
       wins: persistedPerformance.wins,
       losses: persistedPerformance.losses,
       breakeven: persistedPerformance.breakeven,
+      closedTradeRealizedPnl: persistedPerformance.closedTradeRealizedPnl,
+      partialRealizedPnl: persistedPerformance.partialRealizedPnl,
       verifiedRealizedPnl: accounting.verifiedRealizedPnl,
       competitionBaselineEquity: accounting.baselineEquity,
       latestEquity: accounting.currentEquity,

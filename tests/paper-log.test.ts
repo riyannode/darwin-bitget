@@ -30,6 +30,23 @@ function matchedReconciliation(execution: ExecutionResult): ReconciliationResult
 }
 
 describe("paper log export", () => {
+  it("separates closed episode PnL from verified partial reductions", () => {
+    const closes = ["-64.857", "-18.173", "73.6127", "-21.1194"];
+    const closedExperiences = closes.map((pnl, index) => ({ ...experience(), experienceId: `closed-${index}`, realizedPnl: pnl, outcomeStatus: pnl === "73.6127" ? "PROFITABLE" as const : "LOSING" as const, entryDecisionId: `entry-${index}`, exitDecisionId: `exit-${index}` }));
+    const partial = { ...experience(), experienceId: "partial-coin", symbol: "COINUSDT", realizedPnl: "3.1374", outcomeStatus: "OPEN" as const, entryDecisionId: "partial-entry", exitDecisionId: "", exitTime: "" };
+    const allExperiences = [...closedExperiences, partial];
+    const reduceDecision = { ...decision("partial-cycle", "REDUCE", "partial-reduce", "2026-09-19T19:00:00.000Z"), symbol: "COINUSDT", positionSide: "LONG" as const };
+    const reduceExecution = { ...matchedExecution("CLOSE"), action: "REDUCE" as const, tradeSide: "close" as const, symbol: "COINUSDT", positionSide: "LONG" as const, realizedPnl: "3.1374" };
+    const reduceJournal = { ...journal(99, "REDUCE"), cycleId: "partial-cycle", decision: reduceDecision, executionResult: reduceExecution, reconciliationResult: matchedReconciliation(reduceExecution), experienceIds: [partial.experienceId] };
+    const journals = allExperiences.slice(0, -1).map((item, index) => ({ ...journal(index, "OPEN_LONG"), experienceIds: [item.experienceId] })).concat(reduceJournal);
+    const exported = buildPaperLogExport({ generatedAt: "2026-09-19T20:00:00.000Z", period: { start: null, end: null }, environment: "test", model: "qwen3.8-max", version: "0.3.0", commit: "abc123", cycles: journals.map((entry) => ({ cycleId: entry.cycleId, status: "COMPLETED", startedAt: entry.startedAt, completedAt: entry.completedAt ?? null })), journals, experiences: allExperiences, events: [] });
+    expect(exported.summary.closedTrades).toMatchObject({ total: 4, wins: 1, losses: 3, breakeven: 0, realizedPnl: "-30.5367", partialRealizedPnl: "3.1374", verifiedRealizedPnl: "-27.3993" });
+    expect(exported.closedTrades).toHaveLength(4);
+    const csv = paperLogToCsv(exported);
+    expect(csv).toContain("closedTradeRealizedPnl,partialRealizedPnl,verifiedRealizedPnl");
+    expect(csv).toContain("-30.5367");
+  });
+
   it("calculates peak-to-trough drawdown after a new peak", () => {
     expect(calculatePeakDrawdown(["10000", "10500", "10100"])).toEqual({ current: "-3.80952381", maximum: "-3.80952381" });
   });

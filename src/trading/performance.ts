@@ -2,7 +2,7 @@ import type { AccountSnapshot, TradeExperience, TradingJournal } from "../types.
 import { cyclePlanDecisions, effectiveExecutionResult, effectiveReconciliationResult, normalizeCycleDecisions } from "../storage/journal-normalizer.js";
 import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal, isZeroDecimal, subtractDecimal } from "./decimal.js";
 
-export const PERFORMANCE_READ_MODEL_VERSION = "performance-v1";
+export const PERFORMANCE_READ_MODEL_VERSION = "performance-v2";
 export const POSITION_CONTEXT_READ_MODEL_VERSION = "position-context-v2";
 export const MAX_PERSISTED_PERFORMANCE_DAYS = 62;
 export const ZERO_EXTERNAL_FLOW_INVARIANT = "UNVERIFIED_ZERO_FLOW_INVARIANT";
@@ -29,6 +29,8 @@ export interface PerformanceAggregate {
   losses: number;
   breakeven: number;
   winRate: string;
+  closedTradeRealizedPnl: string;
+  partialRealizedPnl: string;
   verifiedRealizedPnl: string;
   dailyPnl: Record<string, PerformanceDay>;
   netExternalInflows?: string;
@@ -67,6 +69,8 @@ export interface PerformanceAccounting {
   netExternalInflows: string;
   externalFlowStatus: "VERIFIED" | typeof ZERO_EXTERNAL_FLOW_INVARIANT;
   netPnlSinceBaseline: string;
+  closedTradeRealizedPnl: string;
+  partialRealizedPnl: string;
   verifiedRealizedPnl: string;
   unrealizedPnl: string;
   unrealizedPnlSource: "ACCOUNT" | "POSITIONS" | "UNAVAILABLE";
@@ -98,6 +102,8 @@ export function isPerformanceAggregate(value: unknown): value is PerformanceAggr
     && typeof candidate.losses === "number"
     && typeof candidate.breakeven === "number"
     && typeof candidate.winRate === "string"
+    && typeof candidate.closedTradeRealizedPnl === "string"
+    && typeof candidate.partialRealizedPnl === "string"
     && typeof candidate.verifiedRealizedPnl === "string"
     && Boolean(candidate.dailyPnl && typeof candidate.dailyPnl === "object");
 }
@@ -117,6 +123,8 @@ export function emptyPerformance(initializedAt: string): PerformanceAggregate {
     losses: 0,
     breakeven: 0,
     winRate: "UNAVAILABLE",
+    closedTradeRealizedPnl: "0",
+    partialRealizedPnl: "0",
     verifiedRealizedPnl: "",
     dailyPnl: {},
     netExternalInflows: "0",
@@ -137,6 +145,8 @@ export function normalizePerformanceAggregate(performance: PerformanceAggregate)
   const peak = performance.peakEquity ?? baseline ?? latest;
   return {
     ...performance,
+    closedTradeRealizedPnl: performance.closedTradeRealizedPnl ?? "0",
+    partialRealizedPnl: performance.partialRealizedPnl ?? "0",
     netExternalInflows: performance.netExternalInflows ?? "0",
     externalFlowStatus: performance.externalFlowStatus ?? ZERO_EXTERNAL_FLOW_INVARIANT,
     baselineSource: performance.baselineSource ?? (baseline ? "PERSISTED_PERFORMANCE_AGGREGATE" : "UNAVAILABLE"),
@@ -208,6 +218,17 @@ export function recordVerifiedClose(performance: PerformanceAggregate, realizedP
     losses,
     breakeven,
     winRate: classifiedWinRate(wins, losses, breakeven),
+    closedTradeRealizedPnl: updated.closedTradeRealizedPnl ? addDecimal(updated.closedTradeRealizedPnl, realizedPnl) : realizedPnl,
+    verifiedRealizedPnl: updated.verifiedRealizedPnl ? addDecimal(updated.verifiedRealizedPnl, realizedPnl) : realizedPnl,
+  };
+}
+
+export function recordVerifiedPartial(performance: PerformanceAggregate, realizedPnl: string, equity: string, observedAt: string): PerformanceAggregate {
+  if (!isDecimal(realizedPnl)) return updateEquity(performance, equity, observedAt);
+  const updated = updateEquity(performance, equity, observedAt);
+  return {
+    ...updated,
+    partialRealizedPnl: updated.partialRealizedPnl ? addDecimal(updated.partialRealizedPnl, realizedPnl) : realizedPnl,
     verifiedRealizedPnl: updated.verifiedRealizedPnl ? addDecimal(updated.verifiedRealizedPnl, realizedPnl) : realizedPnl,
   };
 }
@@ -243,6 +264,8 @@ export function buildPerformanceAccounting(performance: PerformanceAggregate, ob
     netExternalInflows,
     externalFlowStatus: normalized.externalFlowStatus ?? ZERO_EXTERNAL_FLOW_INVARIANT,
     netPnlSinceBaseline,
+    closedTradeRealizedPnl: normalized.closedTradeRealizedPnl,
+    partialRealizedPnl: normalized.partialRealizedPnl,
     verifiedRealizedPnl: normalized.verifiedRealizedPnl || "UNAVAILABLE",
     unrealizedPnl: effectiveObservation?.unrealizedPnl ?? "UNAVAILABLE",
     unrealizedPnlSource: effectiveObservation?.unrealizedPnlSource ?? "UNAVAILABLE",
@@ -273,29 +296,25 @@ export function currentMonthDailyPnl(performance: PerformanceAggregate, now = ne
 
 export function bootstrapPerformance(journals: readonly TradingJournal[], experiences: readonly TradeExperience[], initializedAt: string): PerformanceAggregate {
   const performance = emptyPerformance(initializedAt);
-  const facts = verifiedLifecycleFacts(journals);
-  let result = { ...performance, totalTrades: facts.verifiedOpenIds.size };
-  const closedExperiences = experiences.filter((experience) => {
-    const closed = experience.outcomeStatus === "PROFITABLE" || experience.outcomeStatus === "LOSING" || experience.outcomeStatus === "BREAK_EVEN" || experience.outcomeStatus === "CLOSED_UNCLASSIFIED";
-    if (closed && facts.verifiedOpenIds.has(experience.entryDecisionId) && facts.verifiedCloseIds.has(experience.exitDecisionId)) {
-      facts.verifiedClosedIds.add(experience.experienceId);
-      if (experience.realizedPnlVerified === true && isDecimal(experience.realizedPnl)) facts.realizedPnlByClosedId.set(experience.experienceId, experience.realizedPnl);
-      return true;
-    }
-    return false;
-  });
-  result = { ...result, closedTrades: closedExperiences.length, openTrades: Math.max(0, result.totalTrades - closedExperiences.length) };
-  for (const experience of closedExperiences) {
-    const pnl = facts.realizedPnlByClosedId.get(experience.experienceId);
-    if (!isDecimal(pnl)) continue;
-    result = {
-      ...result,
-      wins: result.wins + (isPositiveDecimal(pnl) ? 1 : 0),
-      losses: result.losses + (compareDecimal(pnl, "0") < 0 ? 1 : 0),
-      breakeven: result.breakeven + (isZeroDecimal(pnl) ? 1 : 0),
-      verifiedRealizedPnl: result.verifiedRealizedPnl ? addDecimal(result.verifiedRealizedPnl, pnl) : pnl,
-    };
-  }
+  const closedStatuses = new Set(["PROFITABLE", "LOSING", "BREAK_EVEN", "CLOSED_UNCLASSIFIED"]);
+  const closedExperiences = experiences.filter((experience) => closedStatuses.has(experience.outcomeStatus) && Boolean(experience.exitDecisionId && experience.exitTime));
+  const openExperiences = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
+  const closedPnl = sumDecimalValues(closedExperiences.filter((experience) => experience.realizedPnlVerified === true && isDecimal(experience.realizedPnl)).map((experience) => experience.realizedPnl));
+  const partialFromRecords = verifiedPartialRealizedPnl(journals);
+  const partialFromOpenEpisodes = sumDecimalValues(openExperiences.filter((experience) => experience.realizedPnlVerified === true && isDecimal(experience.realizedPnl)).map((experience) => experience.realizedPnl));
+  const partialPnl = isZeroDecimal(partialFromRecords) ? partialFromOpenEpisodes : partialFromRecords;
+  let result = {
+    ...performance,
+    totalTrades: closedExperiences.length + openExperiences.length,
+    closedTrades: closedExperiences.length,
+    openTrades: openExperiences.length,
+    wins: closedExperiences.filter((experience) => experience.outcomeStatus === "PROFITABLE" && experience.realizedPnlVerified === true && isDecimal(experience.realizedPnl)).length,
+    losses: closedExperiences.filter((experience) => experience.outcomeStatus === "LOSING" && experience.realizedPnlVerified === true && isDecimal(experience.realizedPnl)).length,
+    breakeven: closedExperiences.filter((experience) => experience.outcomeStatus === "BREAK_EVEN" && experience.realizedPnlVerified === true && isDecimal(experience.realizedPnl)).length,
+    closedTradeRealizedPnl: closedPnl,
+    partialRealizedPnl: partialPnl,
+    verifiedRealizedPnl: addDecimal(closedPnl, partialPnl),
+  };
   result = { ...result, winRate: classifiedWinRate(result.wins, result.losses, result.breakeven) };
   const baselinePortfolio = journals
     .map((journal) => journal.portfolio)
@@ -316,6 +335,27 @@ export function bootstrapPerformance(journals: readonly TradingJournal[], experi
     result = updateEquity(result, baselinePortfolio.portfolioEquity, baselinePortfolio.observedAt);
   }
   return result;
+}
+
+function verifiedPartialRealizedPnl(journals: readonly TradingJournal[]): string {
+  const seen = new Set<string>();
+  let total = "0";
+  for (const journal of journals) {
+    if (journal.mode !== "AUTONOMOUS") continue;
+    const normalized = normalizeCycleDecisions(journal);
+    for (const record of normalized.records) {
+      if (record.decision.action !== "REDUCE" || seen.has(record.decision.decisionId)) continue;
+      seen.add(record.decision.decisionId);
+      const execution = effectiveExecutionResult(journal, record.decision, record);
+      const reconciliation = effectiveReconciliationResult(journal, record.decision, record);
+      if (execution?.status === "filled" && reconciliation?.status === "MATCHED" && isDecimal(execution.realizedPnl)) total = addDecimal(total, execution.realizedPnl);
+    }
+  }
+  return total;
+}
+
+function sumDecimalValues(values: readonly (string | undefined)[]): string {
+  return values.filter(isDecimal).reduce((total, value) => addDecimal(total, value), "0");
 }
 
 export function verifiedLifecycleFacts(journals: readonly TradingJournal[]): VerifiedLifecycleFacts {

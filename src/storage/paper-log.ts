@@ -49,6 +49,8 @@ export interface PaperLogSummary {
     losses: number;
     breakeven: number;
     realizedPnl: string;
+    partialRealizedPnl: string;
+    verifiedRealizedPnl: string;
   };
   risk: {
     currentDrawdownPct: string | null;
@@ -230,7 +232,7 @@ export interface PaperLogExperience {
   lessonsUsed: string[];
 }
 
-export const PAPER_LOG_SCHEMA_VERSION = "2.0.0";
+export const PAPER_LOG_SCHEMA_VERSION = "2.1.0";
 const RECENT_WINDOW_SIZE = 25;
 
 export function parsePaperLogPeriod(from: string | null, to: string | null): PaperLogPeriod {
@@ -522,7 +524,9 @@ export function buildPaperLogExport(input: {
   const unresolvedExecutions = decisions.filter((decision) => decision.action !== "REVERSE" && decision.executionResult && !decision.providerVerified).length + physicalWrites.filter((write) => write.executionStatus !== null && !write.providerVerified).length;
 
   const closed = experiences.filter((experience) => ["PROFITABLE", "LOSING", "BREAK_EVEN", "CLOSED_UNCLASSIFIED"].includes(experience.outcomeStatus));
-  const realizedPnl = experiences.filter((experience) => experience.realizedPnlVerified && typeof experience.realizedPnl === "string" && isDecimal(experience.realizedPnl)).reduce((total, experience) => addDecimal(total, experience.realizedPnl ?? "0"), "0");
+  const closedTradeRealizedPnl = closed.filter((experience) => experience.realizedPnlVerified && typeof experience.realizedPnl === "string" && isDecimal(experience.realizedPnl)).reduce((total, experience) => addDecimal(total, experience.realizedPnl ?? "0"), "0");
+  const partialRealizedPnl = decisions.filter((decision) => decision.action === "REDUCE" && decision.providerVerified && decision.realizedPnl !== null && isDecimal(decision.realizedPnl)).reduce((total, decision) => addDecimal(total, decision.realizedPnl ?? "0"), "0");
+  const verifiedRealizedPnl = addDecimal(closedTradeRealizedPnl, partialRealizedPnl);
   const drawdown = summarizeDrawdown(journals);
 
   const totalCycles = cycles.length;
@@ -611,7 +615,9 @@ export function buildPaperLogExport(input: {
         wins: closed.filter((experience) => experience.outcomeStatus === "PROFITABLE").length,
         losses: closed.filter((experience) => experience.outcomeStatus === "LOSING").length,
         breakeven: closed.filter((experience) => experience.outcomeStatus === "BREAK_EVEN").length,
-        realizedPnl,
+        realizedPnl: closedTradeRealizedPnl,
+        partialRealizedPnl,
+        verifiedRealizedPnl,
       },
       risk: {
         currentDrawdownPct: drawdown.current,
@@ -646,12 +652,13 @@ function csvValue(value: unknown): string {
 }
 
 export function paperLogToCsv(exported: PaperLogExport): string {
-  const header = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "scannedUniverseCount", "selectedEntryCandidates", "managedExistingPositions", "totalProposedActions", "financialWritesPerformed", "decisionId", "decisionTimestamp", "actionCategory", "action", "symbol", "positionSide", "marginAllocationPct", "additionalMarginPct", "targetPositionSide", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "providerOperation", "providerCode", "providerMessage", "providerReadbackCode", "providerReadbackMessage", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "physicalWrites", "reflectionIds", "createdLessonIds"];
+  const header = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "scannedUniverseCount", "selectedEntryCandidates", "managedExistingPositions", "totalProposedActions", "financialWritesPerformed", "decisionId", "decisionTimestamp", "actionCategory", "action", "symbol", "positionSide", "marginAllocationPct", "additionalMarginPct", "targetPositionSide", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "providerOperation", "providerCode", "providerMessage", "providerReadbackCode", "providerReadbackMessage", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "physicalWrites", "reflectionIds", "createdLessonIds", "closedTradeRealizedPnl", "partialRealizedPnl", "verifiedRealizedPnl", "closedTrades", "wins", "losses", "breakeven", "winRatePct"];
+  const summaryValues = [exported.summary.closedTrades.realizedPnl, exported.summary.closedTrades.partialRealizedPnl, exported.summary.closedTrades.verifiedRealizedPnl, exported.summary.closedTrades.total, exported.summary.closedTrades.wins, exported.summary.closedTrades.losses, exported.summary.closedTrades.breakeven, exported.summary.closedTrades.total > 0 ? (exported.summary.closedTrades.wins * 100 / exported.summary.closedTrades.total).toString() : "UNAVAILABLE"];
   const rows = exported.cycles.flatMap((cycle) => {
     const decisions = exported.decisions.filter((decision) => decision.cycleId === cycle.cycleId);
     const cycleValues = [cycle.cycleId, cycle.status, cycle.startedAt, cycle.completedAt, cycle.eventTypes, cycle.planning.scannedUniverseCount, cycle.planning.selectedEntryCandidates, cycle.planning.managedExistingPositions, cycle.planning.totalProposedActions, cycle.execution.financialWritesPerformed];
-    if (!decisions.length) return [[...cycleValues, ...Array(header.length - cycleValues.length).fill("")]];
-    return decisions.map((decision) => [...cycleValues, decision.decisionId, decision.timestamp, decision.actionCategory, decision.action, decision.symbol, decision.positionSide, decision.marginAllocationPct, decision.additionalMarginPct, decision.targetPositionSide, decision.leverage, decision.reductionPct, decision.confidence, decision.strategyThesis, decision.supportingFactors, decision.riskFactors, decision.evidenceUsed, decision.lessonsUsed, decision.riskGate?.status, decision.riskGate?.codes, decision.executionRequest?.tradeSide, decision.executionRequest?.positionNotional, decision.executionRequest?.clientOrderId, decision.executionResult?.providerOrderId, decision.executionResult?.status, decision.executionResult?.requestedQuantity, decision.executionResult?.executedQuantity, decision.executionResult?.providerOperation, decision.executionResult?.providerCode, decision.executionResult?.providerMessage, decision.executionResult?.providerReadbackCode, decision.executionResult?.providerReadbackMessage, decision.reconciliation?.status, decision.reconciliation?.codes, decision.providerVerified, decision.realizedPnl, decision.physicalWrites, decision.reflectionIds, decision.createdLessonIds]);
+    if (!decisions.length) return [[...cycleValues, ...Array(header.length - cycleValues.length - summaryValues.length).fill(""), ...summaryValues]];
+    return decisions.map((decision) => [...cycleValues, decision.decisionId, decision.timestamp, decision.actionCategory, decision.action, decision.symbol, decision.positionSide, decision.marginAllocationPct, decision.additionalMarginPct, decision.targetPositionSide, decision.leverage, decision.reductionPct, decision.confidence, decision.strategyThesis, decision.supportingFactors, decision.riskFactors, decision.evidenceUsed, decision.lessonsUsed, decision.riskGate?.status, decision.riskGate?.codes, decision.executionRequest?.tradeSide, decision.executionRequest?.positionNotional, decision.executionRequest?.clientOrderId, decision.executionResult?.providerOrderId, decision.executionResult?.status, decision.executionResult?.requestedQuantity, decision.executionResult?.executedQuantity, decision.executionResult?.providerOperation, decision.executionResult?.providerCode, decision.executionResult?.providerMessage, decision.executionResult?.providerReadbackCode, decision.executionResult?.providerReadbackMessage, decision.reconciliation?.status, decision.reconciliation?.codes, decision.providerVerified, decision.realizedPnl, decision.physicalWrites, decision.reflectionIds, decision.createdLessonIds, ...summaryValues]);
   });
   return [header, ...rows].map((row) => row.map(csvValue).join(",")).join("\r\n") + "\r\n";
 }

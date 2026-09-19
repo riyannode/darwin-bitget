@@ -135,4 +135,22 @@ describe("persisted performance aggregate", () => {
     expect(value.openTrades).toBe(1);
     expect(value.closedTrades).toBe(0);
   });
+
+  it("rebuilds canonical closed and partial lifecycle accounting", () => {
+    const pnls = ["-64.857", "-18.173", "73.6127", "-21.1194"];
+    const closed = pnls.map((pnl, index) => experience(`closed-${index}`, pnl === "73.6127" ? "PROFITABLE" : "LOSING", pnl));
+    const partial = { ...experience("partial", "OPEN", "3.1374"), realizedPnlVerified: true };
+    const reduce = decision("REDUCE", "partial-reduce");
+    const reduceExecution = { ...execution("CLOSE", "partial-reduce", "3.1374"), action: "REDUCE" as const };
+    const partialJournal: TradingJournal = { cycleId: "partial-cycle", agentVersion: "1", model: "qwen", mode: "AUTONOMOUS", startedAt: at, completedAt: at, retrievedLessons: [], createdLessons: [], decision: reduce, executionResult: reduceExecution, reconciliationResult: { status: "MATCHED", codes: [], execution: reduceExecution } };
+    const value = bootstrapPerformance([partialJournal], [...closed, partial], at);
+    expect(value).toMatchObject({ closedTrades: 4, wins: 1, losses: 3, breakeven: 0, winRate: "25", closedTradeRealizedPnl: "-30.5367", partialRealizedPnl: "3.1374", verifiedRealizedPnl: "-27.3993" });
+  });
+
+  it("chooses the earliest trustworthy provider portfolio as the migration baseline", () => {
+    const older: TradingJournal = { cycleId: "older", agentVersion: "1", model: "qwen", mode: "AUTONOMOUS", startedAt: "2026-09-12T00:00:00.000Z", completedAt: "2026-09-12T00:01:00.000Z", portfolio: { ...account, portfolioEquity: "50000", observedAt: "2026-09-12T00:00:30.000Z" }, retrievedLessons: [], createdLessons: [] };
+    const newer: TradingJournal = { ...older, cycleId: "newer", startedAt: "2026-09-14T09:58:00.000Z", completedAt: "2026-09-14T09:59:00.000Z", portfolio: { ...account, portfolioEquity: "50033.99009667", observedAt: "2026-09-14T09:58:49.197Z" } };
+    const value = bootstrapPerformance([newer, older], [], at);
+    expect(value).toMatchObject({ competitionBaselineEquity: "50000", performanceBaselineAt: "2026-09-12T00:00:30.000Z", baselineInitializationReason: "FIRST_TRUSTWORTHY_PROVIDER_OBSERVATION" });
+  });
 });
