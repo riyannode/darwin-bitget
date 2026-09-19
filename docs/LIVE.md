@@ -27,7 +27,7 @@ The dashboard Cycle Plan groups actions into `POSITION MANAGEMENT` and `NEW ENTR
 - `/api/live/portfolio` bypasses Durable Object hot-path reads. Private authenticated Bitget operations use the narrow gateway over Cloudflare Tunnel to the stable-egress gateway; public market operations may remain direct.
 - If an account or position provider read fails, the UI shows provider state as unavailable. It does not display journal portfolio fallback.
 - Financial writes are PAPER-only, bounded to five semantic actions and five physical writes per cycle, serialized `CLOSE/REVERSE-close → REDUCE → INCREASE → OPEN → REVERSE-open`, refreshed between matched writes, and stopped after ambiguity. INCREASE shows additional margin and existing leverage; REVERSE shows close verification separately from opposite-entry result.
-- Provider realized PnL prefers an account-level signed field and falls back to signed position-level aggregation only when account-level data is absent. Missing values remain unavailable. Funding and fees remain separate fields.
+- Provider account-level unrealized PnL is preferred; current-position realized PnL is exposed separately and is not treated as all-time realized PnL. Missing account-level realized values remain unavailable. Funding, fees, and cash dividends remain separate fields.
 
 ## Provider-live semantics
 

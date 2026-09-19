@@ -42,11 +42,36 @@ describe("Bitget provider readback", () => {
     expect(portfolio.realizedPnl).toBe("7.5");
   });
 
-  it("falls back to signed position realized PnL without fabricating zero", () => {
+  it("does not present current-position realized PnL as account-level realized PnL", () => {
     const portfolio = parseDashboardPortfolio({ usdtEquity: "1000" }, [{ symbol: "CRCLUSDT", posSide: "long", total: "1", positionValue: "100", realizedPnl: "-2.0595" }, { symbol: "KORUUSDT", posSide: "short", total: "1", positionValue: "100", achievedProfits: "1.2500" }], { list: [] }, "2026-09-12T17:00:00.000Z");
-    expect(portfolio.realizedPnl).toBe("-0.8095");
+    expect(portfolio.realizedPnl).toBe("");
+    expect(portfolio.positionRealizedPnl).toBe("-0.8095");
     const unavailable = parseDashboardPortfolio({ usdtEquity: "1000" }, [{ symbol: "CRCLUSDT", posSide: "long", total: "1", positionValue: "100" }], { list: [] }, "2026-09-12T17:00:00.000Z");
     expect(unavailable.realizedPnl).toBe("");
+  });
+
+  it("keeps account initial margin, position margin, and unavailable account margin used distinct", () => {
+    const portfolio = parseDashboardPortfolio({ usdtEquity: "50405.78465224", effEquity: "50386.75811093", imr: "3776.78" }, [
+      { symbol: "AUSDT", posSide: "long", total: "1", positionValue: "100", marginSize: "60", unrealisedPnl: "1" },
+      { symbol: "BUSDT", posSide: "long", total: "1", positionValue: "100", marginSize: "40", unrealisedPnl: "2" },
+    ], { list: [] }, "2026-09-12T17:00:00.000Z");
+    expect(portfolio).toMatchObject({ availableMargin: "50386.75811093", marginUsage: "", initialMargin: "3776.78", positionMargin: "100", unrealizedPnl: "3", unrealizedPnlSource: "POSITIONS" });
+  });
+
+  it("prefers explicit account margin used and never promotes margin ratios to currency", () => {
+    const portfolio = parseDashboardPortfolio({ usdtEquity: "1000", effEquity: "900", marginUsed: "12.5", imr: "25", mgnRatio: "0.015", positionMgnRatio: "0.02" }, [], { list: [] }, "2026-09-12T17:00:00.000Z");
+    expect(portfolio).toMatchObject({ marginUsage: "12.5", accountMarginUsed: "12.5", initialMargin: "25" });
+    const rateOnly = parseDashboardPortfolio({ usdtEquity: "1000", effEquity: "900", mgnRatio: "0.015", positionMgnRatio: "0.02" }, [], { list: [] }, "2026-09-12T17:00:00.000Z");
+    expect(rateOnly.marginUsage).toBe("");
+    expect(rateOnly.initialMargin).toBeUndefined();
+  });
+
+  it("prefers authoritative account unrealized PnL over a position sum", () => {
+    const portfolio = parseDashboardPortfolio({ usdtEquity: "1000", usdtUnrealisedPnl: "453.3867" }, [
+      { symbol: "AUSDT", posSide: "long", total: "1", positionValue: "100", unrealisedPnl: "1" },
+      { symbol: "BUSDT", posSide: "long", total: "1", positionValue: "100", unrealisedPnl: "2" },
+    ], { list: [] }, "2026-09-12T17:00:00.000Z");
+    expect(portfolio).toMatchObject({ unrealizedPnl: "453.3867", unrealizedPnlSource: "ACCOUNT" });
   });
 
   it("normalizes negative provider ROI ratios to percentage points", () => {
@@ -77,6 +102,14 @@ describe("Bitget provider readback", () => {
     expect(normalizeProviderProfitRate(undefined)).toBeUndefined();
   });
 
+  it("preserves provider position timestamps without presenting them as the snapshot time", () => {
+    const observedAt = "2026-09-12T17:00:00.000Z";
+    const portfolio = parseDashboardPortfolio({ usdtEquity: "1000" }, [{ symbol: "CRCLUSDT", posSide: "long", total: "1", positionValue: "100", createdTime: "1729928018076", updatedTime: "1729929656321" }], { list: [] }, observedAt);
+    expect(portfolio.observedAt).toBe(observedAt);
+    expect(portfolio.positions[0]).toMatchObject({ openedAt: "1729928018076", updatedAt: "1729929656321" });
+    expect(portfolio.positions[0]?.updatedAt).not.toBe(portfolio.observedAt);
+  });
+
   it("fails closed when the account response has no equity field", () => {
     const instrument = { symbol: "NVDAUSDT", category: "USDT-FUTURES", baseCoin: "NVDA", quoteCoin: "USDT", marginCoin: "USDT", symbolType: "stock", isRwa: "YES", status: "online", minOrderQty: "0.01", maxOrderQty: "100", minOrderAmount: "5", pricePrecision: 2, quantityPrecision: 2, quantityStep: "0.01", leverageMin: "1", leverageMax: "5" } satisfies Instrument;
     const market = { symbol: "NVDAUSDT", lastPrice: "100", bidPrice: "99.9", askPrice: "100.1", priceChange24h: "0", volume24h: "100", observedAt: "2026-09-12T00:00:00.000Z" } satisfies MarketSnapshot;
@@ -90,7 +123,7 @@ describe("Bitget provider readback", () => {
   });
 
   it("reads historical position PnL, funding, and fees", () => {
-    const result = parsePositionHistorySummary({ list: [{ closeAvgPrice: "101", pnl: "2.5", totalFunding: "-0.1", openFee: "-0.2", closeFee: "-0.3" }] });
-    expect(result).toEqual({ averageClosePrice: "101", realizedPnl: "2.5", fees: "-0.5", funding: "-0.1" });
+    const result = parsePositionHistorySummary({ list: [{ closeAvgPrice: "101", cumRealisedPnl: "3.1", netProfit: "2.5", totalFunding: "-0.1", openFeeTotal: "-0.2", closeFeeTotal: "-0.3", cashDividend: "0.05" }] });
+    expect(result).toEqual({ averageClosePrice: "101", realizedPnl: "2.5", realizedPnlSource: "POSITION_HISTORY_NET_PROFIT", realizedPnlIncludesCosts: true, fees: "-0.5", funding: "-0.1", cashDividend: "0.05" });
   });
 });

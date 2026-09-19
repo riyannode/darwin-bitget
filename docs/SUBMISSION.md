@@ -83,7 +83,7 @@ The current prompt contracts are `darwin-mandate-v6`, `darwin-candidate-v1`, `da
 - **Decision explainability:** management and entry actions each retain evidence-attributed rationale, risk, confidence, and execution/reconciliation state.
 - **Agent architecture:** portfolio management cannot suppress unrelated opportunity discovery; an existing HOLD, INCREASE, REDUCE, CLOSE, or REVERSE and a new entry can coexist when deterministic rules allow it.
 - **Risk control:** deterministic five-action cap, current-position validation, refreshed portfolio risk checks, serialized writes, idempotency, and stop-on-ambiguity.
-- **Performance integrity:** total trades require verified autonomous opens, win rate uses verified closed outcomes only, total PnL is persisted equity delta from a one-time baseline, and daily summaries use trustworthy UTC equity observations only.
+- **Performance integrity:** trade episodes require verified autonomous opens, win rate uses verified classified closed outcomes only, NET PNL SINCE BASELINE is provider equity delta adjusted by the explicit external-flow status from a one-time immutable baseline, and daily summaries use trustworthy UTC equity observations only.
 - **Explainability:** Open Position preserves original verified entry reasoning separately from the latest HOLD/INCREASE/REDUCE/CLOSE/REVERSE management reasoning; Trade History exposes structured entry, exit, and lifecycle evidence.
 - **Operational integrity:** no forced trades, HOLD remains valid, unresolved writes are not verified trades, and the Docker replay is not production history. No better returns are promised.
 

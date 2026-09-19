@@ -128,15 +128,22 @@ export interface AccountSnapshot {
   availableBalance: string;
   availableMargin: string;
   marginUsage: string;
+  accountMarginUsed?: string;
+  initialMargin?: string;
+  positionMargin?: string;
   positionNotional: string;
   totalPositionNotional: string;
   positionQuantity: string;
   portfolioEquity: string;
   positions: PositionSnapshot[];
   realizedPnl: string;
+  positionRealizedPnl?: string;
+  realizedPnlSource?: "ACCOUNT" | "POSITIONS";
   unrealizedPnl: string;
+  unrealizedPnlSource?: "ACCOUNT" | "POSITIONS";
   funding?: string;
   fees?: string;
+  cashDividend?: string;
   openOrders: number | null;
   openOrderSymbols: string[];
   openOrdersReadFailure?: {
@@ -159,10 +166,13 @@ export interface PositionSnapshot {
   unrealizedPnl: string;
   unrealizedPnlPct?: string;
   realizedPnl: string;
+  realizedPnlSource?: "CURRENT_POSITION" | "ACCOUNT";
   openedAt?: string;
+  updatedAt?: string;
   liquidationPrice?: string;
   funding?: string;
   fees?: string;
+  cashDividend?: string;
 }
 
 export interface Evidence {
@@ -461,7 +471,10 @@ export interface ExecutionResult {
   fees?: string;
   funding?: string;
   realizedPnl?: string;
+  realizedPnlSource?: "FILL" | "POSITION_HISTORY_NET_PROFIT" | "POSITION_HISTORY_PNL";
+  realizedPnlIncludesCosts?: boolean;
   realizedPnlPct?: string;
+  cashDividend?: string;
   liquidationDistance?: string;
 }
 
@@ -581,6 +594,7 @@ export interface DashboardSnapshot {
     performanceBaselineAt: string | null;
     dailyPnl: Record<string, { pnl: string; trades: number; dailyReturnPct?: string }>;
   };
+  performanceAccounting: PerformanceAccountingReadModel;
   trades: TradeLogEntry[];
   latestDecision: Decision | null;
   decisions: Decision[];
@@ -639,6 +653,32 @@ export interface DashboardSnapshot {
   riskControls: OwnerPolicy & { drawdownBlocked: boolean; drawdownCode: string; cooldownUntil: string | null; temporaryScanIntervalExpiresAt: string | null };
   activity: ActivityEvent[];
   lastPolicyUpdate: ActivityEvent | null;
+}
+
+export interface PerformanceAccountingReadModel {
+  baselineEquity: string | null;
+  baselineObservedAt: string | null;
+  baselineSource: string;
+  initializationReason: string;
+  currentEquity: string | null;
+  currentEquityObservedAt: string | null;
+  equityDeltaSinceBaseline: string;
+  netExternalInflows: string;
+  externalFlowStatus: "VERIFIED" | "UNVERIFIED_ZERO_FLOW_INVARIANT";
+  netPnlSinceBaseline: string;
+  verifiedRealizedPnl: string;
+  unrealizedPnl: string;
+  unrealizedPnlSource: "ACCOUNT" | "POSITIONS" | "UNAVAILABLE";
+  wins: number;
+  losses: number;
+  breakeven: number;
+  classifiedClosedTrades: number;
+  winRatePct: string;
+  peakEquity: string | null;
+  peakEquityObservedAt: string | null;
+  currentDrawdownPct: string;
+  maxDrawdownPct: string;
+  source: "PROVIDER_LIVE" | "PERSISTED_LEDGER" | "UNAVAILABLE";
 }
 
 export interface TradeLogEntry {

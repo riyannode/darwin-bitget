@@ -1,10 +1,11 @@
-import type { TradeExperience, TradingJournal } from "../types.js";
+import type { AccountSnapshot, TradeExperience, TradingJournal } from "../types.js";
 import { cyclePlanDecisions, effectiveExecutionResult, effectiveReconciliationResult, normalizeCycleDecisions } from "../storage/journal-normalizer.js";
-import { addDecimal, isDecimal, subtractDecimal } from "./decimal.js";
+import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal, isZeroDecimal, subtractDecimal } from "./decimal.js";
 
 export const PERFORMANCE_READ_MODEL_VERSION = "performance-v1";
 export const POSITION_CONTEXT_READ_MODEL_VERSION = "position-context-v2";
 export const MAX_PERSISTED_PERFORMANCE_DAYS = 62;
+export const ZERO_EXTERNAL_FLOW_INVARIANT = "UNVERIFIED_ZERO_FLOW_INVARIANT";
 
 export interface PerformanceDay {
   openingEquity: string;
@@ -30,6 +31,15 @@ export interface PerformanceAggregate {
   winRate: string;
   verifiedRealizedPnl: string;
   dailyPnl: Record<string, PerformanceDay>;
+  netExternalInflows?: string;
+  externalFlowStatus?: "VERIFIED" | typeof ZERO_EXTERNAL_FLOW_INVARIANT;
+  baselineSource?: string;
+  baselineInitializationReason?: string;
+  latestEquityObservedAt?: string | null;
+  peakEquity?: string | null;
+  peakEquityObservedAt?: string | null;
+  currentDrawdownPct?: string;
+  maxDrawdownPct?: string;
 }
 
 export interface VerifiedLifecycleFacts {
@@ -37,6 +47,39 @@ export interface VerifiedLifecycleFacts {
   verifiedCloseIds: Set<string>;
   verifiedClosedIds: Set<string>;
   realizedPnlByClosedId: Map<string, string>;
+}
+
+export interface PerformanceObservation {
+  portfolioEquity: string;
+  observedAt: string;
+  unrealizedPnl?: string;
+  unrealizedPnlSource?: "ACCOUNT" | "POSITIONS";
+}
+
+export interface PerformanceAccounting {
+  baselineEquity: string | null;
+  baselineObservedAt: string | null;
+  baselineSource: string;
+  initializationReason: string;
+  currentEquity: string | null;
+  currentEquityObservedAt: string | null;
+  equityDeltaSinceBaseline: string;
+  netExternalInflows: string;
+  externalFlowStatus: "VERIFIED" | typeof ZERO_EXTERNAL_FLOW_INVARIANT;
+  netPnlSinceBaseline: string;
+  verifiedRealizedPnl: string;
+  unrealizedPnl: string;
+  unrealizedPnlSource: "ACCOUNT" | "POSITIONS" | "UNAVAILABLE";
+  wins: number;
+  losses: number;
+  breakeven: number;
+  classifiedClosedTrades: number;
+  winRatePct: string;
+  peakEquity: string | null;
+  peakEquityObservedAt: string | null;
+  currentDrawdownPct: string;
+  maxDrawdownPct: string;
+  source: "PROVIDER_LIVE" | "PERSISTED_LEDGER" | "UNAVAILABLE";
 }
 
 export function isPerformanceAggregate(value: unknown): value is PerformanceAggregate {
@@ -76,11 +119,38 @@ export function emptyPerformance(initializedAt: string): PerformanceAggregate {
     winRate: "UNAVAILABLE",
     verifiedRealizedPnl: "",
     dailyPnl: {},
+    netExternalInflows: "0",
+    externalFlowStatus: ZERO_EXTERNAL_FLOW_INVARIANT,
+    baselineSource: "UNAVAILABLE",
+    baselineInitializationReason: "UNINITIALIZED",
+    latestEquityObservedAt: null,
+    peakEquity: null,
+    peakEquityObservedAt: null,
+    currentDrawdownPct: "0",
+    maxDrawdownPct: "0",
+  };
+}
+
+export function normalizePerformanceAggregate(performance: PerformanceAggregate): PerformanceAggregate {
+  const baseline = performance.competitionBaselineEquity;
+  const latest = performance.latestEquity;
+  const peak = performance.peakEquity ?? baseline ?? latest;
+  return {
+    ...performance,
+    netExternalInflows: performance.netExternalInflows ?? "0",
+    externalFlowStatus: performance.externalFlowStatus ?? ZERO_EXTERNAL_FLOW_INVARIANT,
+    baselineSource: performance.baselineSource ?? (baseline ? "PERSISTED_PERFORMANCE_AGGREGATE" : "UNAVAILABLE"),
+    baselineInitializationReason: performance.baselineInitializationReason ?? (baseline ? "PRESERVED_EXISTING_BASELINE" : "UNINITIALIZED"),
+    latestEquityObservedAt: performance.latestEquityObservedAt ?? performance.performanceBaselineAt,
+    peakEquity: peak,
+    peakEquityObservedAt: performance.peakEquityObservedAt ?? performance.performanceBaselineAt,
+    currentDrawdownPct: performance.currentDrawdownPct ?? (peak && latest ? drawdownPercentage(peak, latest) : "0"),
+    maxDrawdownPct: performance.maxDrawdownPct ?? (peak && latest ? drawdownPercentage(peak, latest) : "0"),
   };
 }
 
 export function updateEquity(performance: PerformanceAggregate, equity: string, observedAt: string): PerformanceAggregate {
-  if (!isDecimal(equity) || Number(equity) <= 0) return performance;
+  if (!isPositiveDecimal(equity)) return performance;
   const date = observedAt.slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return performance;
   const currentDay = performance.dailyPnl[date];
@@ -91,11 +161,22 @@ export function updateEquity(performance: PerformanceAggregate, equity: string, 
   day.dailyReturnPct = percentage(day.pnl, day.openingEquity);
   const dailyPnl = Object.fromEntries(Object.entries({ ...performance.dailyPnl, [date]: day }).sort(([left], [right]) => left.localeCompare(right)).slice(-MAX_PERSISTED_PERFORMANCE_DAYS));
   const totalPnl = performance.competitionBaselineEquity ? subtractDecimal(equity, performance.competitionBaselineEquity) : "UNAVAILABLE";
+  const normalized = normalizePerformanceAggregate(performance);
+  const previousPeak = normalized.peakEquity;
+  const isNewPeak = !previousPeak || compareDecimal(equity, previousPeak) > 0;
+  const peakEquity = isNewPeak ? equity : previousPeak;
+  const currentDrawdownPct = peakEquity ? drawdownPercentage(peakEquity, equity) : "0";
+  const maxDrawdownPct = maximumPercentage(normalized.maxDrawdownPct ?? "0", currentDrawdownPct);
   return {
-    ...performance,
+    ...normalized,
     latestEquity: equity,
+    latestEquityObservedAt: observedAt,
     totalPnl,
     dailyPnl,
+    peakEquity,
+    peakEquityObservedAt: isNewPeak ? observedAt : normalized.peakEquityObservedAt ?? null,
+    currentDrawdownPct,
+    maxDrawdownPct,
   };
 }
 
@@ -115,10 +196,9 @@ export function recordVerifiedClose(performance: PerformanceAggregate, realizedP
   const updated = updateEquity(performance, equity, observedAt);
   const closed = updated.closedTrades + 1;
   if (!isDecimal(realizedPnl)) return { ...updated, openTrades: Math.max(0, updated.openTrades - 1), closedTrades: closed, winRate: classifiedWinRate(updated.wins, updated.losses, updated.breakeven) };
-  const pnl = Number(realizedPnl);
-  const wins = updated.wins + (pnl > 0 ? 1 : 0);
-  const losses = updated.losses + (pnl < 0 ? 1 : 0);
-  const breakeven = updated.breakeven + (pnl === 0 ? 1 : 0);
+  const wins = updated.wins + (isPositiveDecimal(realizedPnl) ? 1 : 0);
+  const losses = updated.losses + (compareDecimal(realizedPnl, "0") < 0 ? 1 : 0);
+  const breakeven = updated.breakeven + (isZeroDecimal(realizedPnl) ? 1 : 0);
   return {
     ...updated,
     openTrades: Math.max(0, updated.openTrades - 1),
@@ -134,6 +214,47 @@ export function recordVerifiedClose(performance: PerformanceAggregate, realizedP
 export function performanceTotalPnl(performance: PerformanceAggregate): string {
   if (!performance.competitionBaselineEquity || !performance.latestEquity) return "UNAVAILABLE";
   return subtractDecimal(performance.latestEquity, performance.competitionBaselineEquity);
+}
+
+export function buildPerformanceAccounting(performance: PerformanceAggregate, observation?: PerformanceObservation): PerformanceAccounting {
+  const normalized = normalizePerformanceAggregate(performance);
+  const currentEquity = observation?.portfolioEquity ?? normalized.latestEquity;
+  const currentEquityObservedAt = observation?.observedAt ?? normalized.latestEquityObservedAt ?? normalized.performanceBaselineAt;
+  const source = observation ? "PROVIDER_LIVE" : currentEquity ? "PERSISTED_LEDGER" : "UNAVAILABLE";
+  const baselineEquity = normalized.competitionBaselineEquity;
+  const equityDeltaSinceBaseline = baselineEquity && currentEquity ? subtractDecimal(currentEquity, baselineEquity) : "UNAVAILABLE";
+  const netExternalInflows = normalized.netExternalInflows ?? "0";
+  const netPnlSinceBaseline = baselineEquity && currentEquity && isDecimal(netExternalInflows)
+    ? subtractDecimal(equityDeltaSinceBaseline, netExternalInflows)
+    : "UNAVAILABLE";
+  const peakEquity = normalized.peakEquity && currentEquity && compareDecimal(currentEquity, normalized.peakEquity) > 0 ? currentEquity : normalized.peakEquity;
+  const currentDrawdownPct = peakEquity && currentEquity ? drawdownPercentage(peakEquity, currentEquity) : "UNAVAILABLE";
+  const maxDrawdownPct = currentDrawdownPct === "UNAVAILABLE" ? normalized.maxDrawdownPct ?? "UNAVAILABLE" : maximumPercentage(normalized.maxDrawdownPct ?? "0", currentDrawdownPct);
+  return {
+    baselineEquity,
+    baselineObservedAt: normalized.performanceBaselineAt,
+    baselineSource: normalized.baselineSource ?? "UNAVAILABLE",
+    initializationReason: normalized.baselineInitializationReason ?? "UNAVAILABLE",
+    currentEquity,
+    currentEquityObservedAt,
+    equityDeltaSinceBaseline,
+    netExternalInflows,
+    externalFlowStatus: normalized.externalFlowStatus ?? ZERO_EXTERNAL_FLOW_INVARIANT,
+    netPnlSinceBaseline,
+    verifiedRealizedPnl: normalized.verifiedRealizedPnl || "UNAVAILABLE",
+    unrealizedPnl: observation?.unrealizedPnl ?? "UNAVAILABLE",
+    unrealizedPnlSource: observation?.unrealizedPnlSource ?? "UNAVAILABLE",
+    wins: normalized.wins,
+    losses: normalized.losses,
+    breakeven: normalized.breakeven,
+    classifiedClosedTrades: normalized.wins + normalized.losses + normalized.breakeven,
+    winRatePct: classifiedWinRate(normalized.wins, normalized.losses, normalized.breakeven),
+    peakEquity: peakEquity ?? null,
+    peakEquityObservedAt: normalized.peakEquityObservedAt ?? normalized.performanceBaselineAt ?? null,
+    currentDrawdownPct,
+    maxDrawdownPct,
+    source,
+  };
 }
 
 export function currentMonthDailyPnl(performance: PerformanceAggregate, now = new Date()): Record<string, { pnl: string; trades: number; dailyReturnPct: string }> {
@@ -156,27 +277,34 @@ export function bootstrapPerformance(journals: readonly TradingJournal[], experi
   });
   result = { ...result, closedTrades: closedExperiences.length, openTrades: Math.max(0, result.totalTrades - closedExperiences.length) };
   for (const experience of closedExperiences) {
-    const pnl = facts.realizedPnlByClosedId.get(experience.experienceId) ?? experience.realizedPnl;
+    const pnl = facts.realizedPnlByClosedId.get(experience.experienceId);
     if (!isDecimal(pnl)) continue;
-    const value = Number(pnl);
     result = {
       ...result,
-      wins: result.wins + (value > 0 ? 1 : 0),
-      losses: result.losses + (value < 0 ? 1 : 0),
-      breakeven: result.breakeven + (value === 0 ? 1 : 0),
+      wins: result.wins + (isPositiveDecimal(pnl) ? 1 : 0),
+      losses: result.losses + (compareDecimal(pnl, "0") < 0 ? 1 : 0),
+      breakeven: result.breakeven + (isZeroDecimal(pnl) ? 1 : 0),
       verifiedRealizedPnl: result.verifiedRealizedPnl ? addDecimal(result.verifiedRealizedPnl, pnl) : pnl,
     };
   }
   result = { ...result, winRate: classifiedWinRate(result.wins, result.losses, result.breakeven) };
-  const latestPortfolio = journals.find((journal) => journal.portfolio?.portfolioEquity);
-  if (latestPortfolio?.portfolio && isDecimal(latestPortfolio.portfolio.portfolioEquity) && Number(latestPortfolio.portfolio.portfolioEquity) > 0) {
+  const baselinePortfolio = journals
+    .map((journal) => journal.portfolio)
+    .filter((portfolio): portfolio is AccountSnapshot => Boolean(portfolio && isPositiveDecimal(portfolio.portfolioEquity)))
+    .sort((left, right) => left.observedAt.localeCompare(right.observedAt))[0];
+  if (baselinePortfolio) {
     result = {
       ...result,
-      performanceBaselineAt: latestPortfolio.portfolio.observedAt,
-      competitionBaselineEquity: latestPortfolio.portfolio.portfolioEquity,
-      latestEquity: latestPortfolio.portfolio.portfolioEquity,
+      performanceBaselineAt: baselinePortfolio.observedAt,
+      competitionBaselineEquity: baselinePortfolio.portfolioEquity,
+      latestEquity: baselinePortfolio.portfolioEquity,
+      latestEquityObservedAt: baselinePortfolio.observedAt,
+      peakEquity: baselinePortfolio.portfolioEquity,
+      peakEquityObservedAt: baselinePortfolio.observedAt,
+      baselineSource: "PROVIDER_LIVE",
+      baselineInitializationReason: "FIRST_TRUSTWORTHY_PROVIDER_OBSERVATION",
     };
-    result = updateEquity(result, latestPortfolio.portfolio.portfolioEquity, latestPortfolio.portfolio.observedAt);
+    result = updateEquity(result, baselinePortfolio.portfolioEquity, baselinePortfolio.observedAt);
   }
   return result;
 }
@@ -202,12 +330,24 @@ export function verifiedLifecycleFacts(journals: readonly TradingJournal[]): Ver
 }
 
 function percentage(value: string, denominator: string): string {
-  if (!isDecimal(denominator) || Number(denominator) <= 0) return "0";
+  if (!isDecimal(value) || !isPositiveDecimal(denominator)) return "0";
   const valueParts = decimalParts(value);
   const denominatorParts = decimalParts(denominator);
-  const numerator = valueParts.integer * 100n * 10n ** BigInt(8 + denominatorParts.scale);
-  const quotient = numerator / (denominatorParts.integer * 10n ** BigInt(valueParts.scale));
-  return decimalText(quotient, 8);
+  const scale = Math.max(valueParts.scale, denominatorParts.scale);
+  const numerator = valueParts.integer * 10n ** BigInt(scale - valueParts.scale) * 100n * 10n ** 8n;
+  const divisor = denominatorParts.integer * 10n ** BigInt(scale - denominatorParts.scale);
+  return decimalText(numerator / divisor, 8);
+}
+
+function drawdownPercentage(peak: string, current: string): string {
+  if (!isPositiveDecimal(peak) || !isDecimal(current) || compareDecimal(current, peak) >= 0) return "0";
+  return percentage(subtractDecimal(peak, current), peak);
+}
+
+function maximumPercentage(left: string, right: string): string {
+  if (left === "UNAVAILABLE") return right;
+  if (right === "UNAVAILABLE") return left;
+  return compareDecimal(left, right) >= 0 ? left : right;
 }
 
 function ratioPercent(numerator: number, denominator: number): string {
@@ -220,9 +360,9 @@ function classifiedWinRate(wins: number, losses: number, breakeven: number): str
 }
 
 function decimalParts(value: string): { integer: bigint; scale: number } {
-  const match = /^-?(\d+)(?:\.(\d+))?$/.exec(value.trim());
-  if (!match?.[1]) throw new Error("INVALID_DECIMAL");
-  return { integer: BigInt(`${match[0].startsWith("-") ? "-" : ""}${match[1]}${match[2] ?? ""}`), scale: match[2]?.length ?? 0 };
+  const match = /^([+-]?)(\d+)(?:\.(\d+))?$/.exec(value.trim());
+  if (!match?.[2]) throw new Error("INVALID_DECIMAL");
+  return { integer: BigInt(`${match[1] === "-" ? "-" : ""}${match[2]}${match[3] ?? ""}`), scale: match[3]?.length ?? 0 };
 }
 
 function decimalText(value: bigint, scale: number): string {

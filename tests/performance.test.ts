@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AccountSnapshot, Decision, DecisionExecutionRecord, ExecutionResult, ReconciliationResult, TradeExperience, TradingJournal } from "../src/types.js";
-import { bootstrapPerformance, emptyPerformance, performanceTotalPnl, recordVerifiedClose, recordVerifiedOpen, updateEquity } from "../src/trading/performance.js";
+import { bootstrapPerformance, buildPerformanceAccounting, emptyPerformance, performanceTotalPnl, recordVerifiedClose, recordVerifiedOpen, updateEquity } from "../src/trading/performance.js";
 
 const at = "2026-09-14T10:00:00.000Z";
 const account: AccountSnapshot = {
@@ -58,6 +58,57 @@ describe("persisted performance aggregate", () => {
     expect(value.competitionBaselineEquity).toBe("1000");
     expect(performanceTotalPnl(value)).toBe("12.42");
     expect(value.dailyPnl["2026-09-14"]).toMatchObject({ openingEquity: "1000", latestEquity: "1012.42", pnl: "12.42", dailyReturnPct: "1.242", trades: 0 });
+  });
+
+  it("adjusts net PnL for explicit external inflows without changing the baseline", () => {
+    let value = emptyPerformance(at);
+    value = { ...value, competitionBaselineEquity: "1000", performanceBaselineAt: at, netExternalInflows: "25", externalFlowStatus: "VERIFIED" };
+    value = updateEquity(value, "1100.125", "2026-09-14T12:00:00.000Z");
+    const accounting = buildPerformanceAccounting(value, { portfolioEquity: "1100.125", observedAt: "2026-09-14T12:00:00.000Z" });
+    expect(value.competitionBaselineEquity).toBe("1000");
+    expect(accounting.equityDeltaSinceBaseline).toBe("100.125");
+    expect(accounting.netPnlSinceBaseline).toBe("75.125");
+    expect(accounting.netExternalInflows).toBe("25");
+  });
+
+  it("keeps negative equity-delta PnL exact", () => {
+    let value = emptyPerformance(at);
+    value = { ...value, competitionBaselineEquity: "50000.00000000", performanceBaselineAt: at };
+    value = updateEquity(value, "49999.87543210", "2026-09-14T12:00:00.000Z");
+    expect(performanceTotalPnl(value)).toBe("-0.1245679");
+  });
+
+  it("tracks a persisted high-water mark and peak-to-trough drawdown", () => {
+    let value = emptyPerformance(at);
+    value = { ...value, competitionBaselineEquity: "50000", performanceBaselineAt: at };
+    for (const [equity, observedAt] of [["50000", at], ["51000", "2026-09-14T11:00:00.000Z"], ["50500", "2026-09-14T12:00:00.000Z"], ["49500", "2026-09-14T13:00:00.000Z"]] as const) value = updateEquity(value, equity, observedAt);
+    expect(value.peakEquity).toBe("51000");
+    expect(value.currentDrawdownPct).toBe("2.94117647");
+    expect(value.maxDrawdownPct).toBe("2.94117647");
+  });
+
+  it("does not classify a partial reduce as a closed trade", () => {
+    let value = recordVerifiedOpen(emptyPerformance(at), "1000", at);
+    const before = { ...value };
+    value = updateEquity(value, "1001", "2026-09-14T11:00:00.000Z");
+    expect(value).toMatchObject({ totalTrades: before.totalTrades, openTrades: 1, closedTrades: 0, wins: 0, losses: 0, breakeven: 0, winRate: "UNAVAILABLE" });
+  });
+
+  it("closes the old episode and opens a new episode for reverse lifecycle accounting", () => {
+    let value = recordVerifiedOpen(emptyPerformance(at), "1000", at);
+    value = recordVerifiedClose(value, "-2", "998", "2026-09-14T11:00:00.000Z");
+    value = recordVerifiedOpen(value, "998", "2026-09-14T11:01:00.000Z");
+    expect(value).toMatchObject({ totalTrades: 2, openTrades: 1, closedTrades: 1, wins: 0, losses: 1, breakeven: 0, winRate: "0", verifiedRealizedPnl: "-2" });
+  });
+
+  it("uses classified closed trades as the win-rate denominator and leaves zero unavailable", () => {
+    const open = emptyPerformance(at);
+    expect(buildPerformanceAccounting(open, { portfolioEquity: "1000", observedAt: at }).winRatePct).toBe("UNAVAILABLE");
+    let value = recordVerifiedOpen(open, "1000", at);
+    value = recordVerifiedClose(value, "2", "1002", at);
+    value = recordVerifiedOpen(value, "1002", at);
+    value = recordVerifiedClose(value, "-1", "1001", at);
+    expect(buildPerformanceAccounting(value, { portfolioEquity: "1001", observedAt: at })).toMatchObject({ wins: 1, losses: 1, classifiedClosedTrades: 2, winRatePct: "50" });
   });
 
   it("starts daily history at the first trustworthy observation", () => {

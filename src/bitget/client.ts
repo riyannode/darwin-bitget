@@ -353,7 +353,7 @@ export class BitgetClient {
       ...(this.text(response.avgPrice, this.text(response.priceAvg, this.text(response.fillPrice))) ? { averageFillPrice: this.text(response.avgPrice, this.text(response.priceAvg, this.text(response.fillPrice))) } : {}),
       ...(this.text(response.fee, this.text(response.feeAmount)) ? { fees: this.text(response.fee, this.text(response.feeAmount)) } : {}),
       ...(this.text(response.fundingFee, this.text(response.funding)) ? { funding: this.text(response.fundingFee, this.text(response.funding)) } : {}),
-      ...(this.text(response.realizedPnl, this.text(response.realizedProfit, this.text(response.totalProfits))) ? { realizedPnl: this.text(response.realizedPnl, this.text(response.realizedProfit, this.text(response.totalProfits))) } : {}),
+      ...(this.text(response.realizedPnl, this.text(response.realizedProfit, this.text(response.totalProfits))) ? { realizedPnl: this.text(response.realizedPnl, this.text(response.realizedProfit, this.text(response.totalProfits))), realizedPnlSource: "FILL" as const, realizedPnlIncludesCosts: false } : {}),
       ...(this.text(response.realizedPnlPct, this.text(response.profitRate)) ? { realizedPnlPct: this.text(response.realizedPnlPct, this.text(response.profitRate)) } : {}),
       ...(this.text(response.liquidationPrice) ? { liquidationDistance: this.text(response.liquidationPrice) } : {}),
     };
@@ -367,22 +367,23 @@ export class BitgetClient {
           ...enriched,
           ...(!enriched.averageFillPrice && summary.averageFillPrice ? { averageFillPrice: summary.averageFillPrice } : {}),
           ...(summary.executedQuantity ? { executedQuantity: summary.executedQuantity } : {}),
-          ...(!enriched.realizedPnl && summary.realizedPnl ? { realizedPnl: summary.realizedPnl } : {}),
+          ...(!enriched.realizedPnl && summary.realizedPnl ? { realizedPnl: summary.realizedPnl, ...(summary.realizedPnlSource ? { realizedPnlSource: summary.realizedPnlSource } : {}), ...(summary.realizedPnlIncludesCosts !== undefined ? { realizedPnlIncludesCosts: summary.realizedPnlIncludesCosts } : {}) } : {}),
           ...(!enriched.fees && summary.fees ? { fees: summary.fees } : {}),
         };
       } catch {
         readbackFailure = true;
       }
-      if (request.tradeSide === "close" && !enriched.realizedPnl) {
+      if (request.tradeSide === "close") {
         try {
           const history = await this.callOperation<unknown>("getPositionsHistory", { category: this.category, symbol: request.symbol, limit: "20" });
           const summary = parsePositionHistorySummary(history.data);
           enriched = {
             ...enriched,
             ...(!enriched.averageFillPrice && summary.averageClosePrice ? { averageFillPrice: summary.averageClosePrice } : {}),
-            ...(!enriched.realizedPnl && summary.realizedPnl ? { realizedPnl: summary.realizedPnl } : {}),
+            ...(summary.realizedPnl ? { realizedPnl: summary.realizedPnl, ...(summary.realizedPnlSource ? { realizedPnlSource: summary.realizedPnlSource } : {}), ...(summary.realizedPnlIncludesCosts !== undefined ? { realizedPnlIncludesCosts: summary.realizedPnlIncludesCosts } : {}) } : {}),
             ...(!enriched.fees && summary.fees ? { fees: summary.fees } : {}),
             ...(!enriched.funding && summary.funding ? { funding: summary.funding } : {}),
+            ...(summary.cashDividend ? { cashDividend: summary.cashDividend } : {}),
           };
         } catch {
           readbackFailure = true;

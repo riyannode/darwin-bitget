@@ -27,7 +27,9 @@ The repository is intended to verify the following through typecheck, unit tests
 - new cycle-plan journals hide the legacy single-action headline; legacy journals retain the fallback Latest Decision view;
 - frontend has no provider credentials or manual financial controls.
 - `/api/live/portfolio` remains provider-only with zero Durable Object reads;
-- account-level realized PnL is preferred, signed position-level realized PnL is the fallback, and missing realized data remains unavailable;
+- `/api/snapshot` composes provider equity/available margin/positions/unrealized PnL with the persisted accounting ledger using one observation timestamp;
+- account initial margin, position margin, and generic account margin used remain distinct; rate fields are not treated as currency;
+- account-level unrealized PnL is preferred, current-position realized PnL is not treated as all-time realized PnL, and missing realized data remains unavailable;
 - the compact performance aggregate is read O(1) from Durable Object state and is updated incrementally rather than reconstructed during `/api/snapshot`;
 - provider-verified closes increment `closedTrades` without requiring realized-PnL enrichment, while win rate uses only classified outcomes;
 - one-time bootstrap targets current OPEN experiences and their entry decision IDs beyond the recent-journal window;

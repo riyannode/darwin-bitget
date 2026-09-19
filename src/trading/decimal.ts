@@ -36,3 +36,20 @@ export function subtractDecimal(left: string, right: string): string {
 export function isDecimal(value: string | undefined): value is string {
   return typeof value === "string" && /^[+-]?\d+(?:\.\d+)?$/.test(value.trim());
 }
+
+export function compareDecimal(left: string, right: string): -1 | 0 | 1 {
+  const leftValue = parseDecimal(left);
+  const rightValue = parseDecimal(right);
+  const scale = Math.max(leftValue.scale, rightValue.scale);
+  const leftInteger = leftValue.integer * 10n ** BigInt(scale - leftValue.scale);
+  const rightInteger = rightValue.integer * 10n ** BigInt(scale - rightValue.scale);
+  return leftInteger < rightInteger ? -1 : leftInteger > rightInteger ? 1 : 0;
+}
+
+export function isPositiveDecimal(value: string | undefined): value is string {
+  return isDecimal(value) && compareDecimal(value, "0") > 0;
+}
+
+export function isZeroDecimal(value: string | undefined): value is string {
+  return isDecimal(value) && compareDecimal(value, "0") === 0;
+}

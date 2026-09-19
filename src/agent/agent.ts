@@ -59,7 +59,7 @@ import { buildExecutionRequest, executePaperOrder } from "../trading/execution.j
 import { executeCyclePlan } from "../trading/execution-planner.js";
 import { reconcileExecution } from "../trading/reconcile.js";
 import { addDecimal, isDecimal } from "../trading/decimal.js";
-import { bootstrapPerformance, currentMonthDailyPnl, emptyPerformance, isPerformanceAggregate, performanceTotalPnl, POSITION_CONTEXT_READ_MODEL_VERSION, recordVerifiedClose, recordVerifiedOpen, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate } from "../trading/performance.js";
+import { bootstrapPerformance, buildPerformanceAccounting, currentMonthDailyPnl, emptyPerformance, isPerformanceAggregate, POSITION_CONTEXT_READ_MODEL_VERSION, recordVerifiedClose, recordVerifiedOpen, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate, type PerformanceObservation } from "../trading/performance.js";
 import { bootstrapPositionContexts, decisionReasoning, upsertPositionContext } from "./position-context.js";
 import { EvaClient } from "../eva/client.js";
 import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
@@ -358,6 +358,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
   public override async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/snapshot" && request.method === "GET") return json(await this.getDashboardSnapshot());
+    if (url.pathname === "/snapshot" && request.method === "POST") {
+      if (request.headers.get("x-darwin-internal") !== "worker") return json({ error: "METHOD_NOT_ALLOWED" }, 405);
+      const body = await request.json().catch(() => null) as { portfolio?: DashboardSnapshot["portfolio"] } | null;
+      return json(await this.getDashboardSnapshot(body?.portfolio ?? undefined));
+    }
     if (url.pathname === "/position-context" && request.method === "GET") return this.getPositionContext(url);
     if (url.pathname === "/agent-journal" && request.method === "GET") return this.getAgentJournal(url);
     if (url.pathname === "/trade-history" && request.method === "GET") return this.getTradeHistory(url);
@@ -572,7 +577,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (next) savePositionContext(this, next);
   }
 
-  public async getDashboardSnapshot(): Promise<DashboardSnapshot> {
+  public async getDashboardSnapshot(livePortfolio?: DashboardSnapshot["portfolio"]): Promise<DashboardSnapshot> {
+    if (livePortfolio) this.persistPerformanceEquity(livePortfolio.portfolioEquity, livePortfolio.observedAt);
     const config = loadConfig(this.env, this.ensureActivePolicy());
     const journal = loadLatestJournal(this);
     const recentJournals = loadRecentJournals(this, 25);
@@ -592,9 +598,12 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const configuredIntervalMinutes = temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes;
     const scheduler = await this.getSchedulerDiagnostics(configuredIntervalMinutes);
     const persistedPerformance = loadPerformanceAggregate<PerformanceAggregate>(this);
+    const accounting = isPerformanceAggregate(persistedPerformance)
+      ? buildPerformanceAccounting(persistedPerformance, livePortfolio ? { portfolioEquity: livePortfolio.portfolioEquity, observedAt: livePortfolio.observedAt, unrealizedPnl: livePortfolio.unrealizedPnl, ...(livePortfolio.unrealizedPnlSource ? { unrealizedPnlSource: livePortfolio.unrealizedPnlSource } : {}) } satisfies PerformanceObservation : undefined)
+      : buildPerformanceAccounting(emptyPerformance(new Date().toISOString()), livePortfolio ? { portfolioEquity: livePortfolio.portfolioEquity, observedAt: livePortfolio.observedAt, unrealizedPnl: livePortfolio.unrealizedPnl, ...(livePortfolio.unrealizedPnlSource ? { unrealizedPnlSource: livePortfolio.unrealizedPnlSource } : {}) } satisfies PerformanceObservation : undefined);
     const performance = isPerformanceAggregate(persistedPerformance) ? {
-      totalPnl: performanceTotalPnl(persistedPerformance),
-      winRate: persistedPerformance.winRate,
+      totalPnl: accounting.netPnlSinceBaseline,
+      winRate: accounting.winRatePct,
       dailyDrawdown: drawdownPct,
       totalTrades: persistedPerformance.totalTrades,
       openTrades: persistedPerformance.openTrades,
@@ -602,10 +611,10 @@ export class TraderAgent extends Agent<Env, AgentState> {
       wins: persistedPerformance.wins,
       losses: persistedPerformance.losses,
       breakeven: persistedPerformance.breakeven,
-      verifiedRealizedPnl: persistedPerformance.verifiedRealizedPnl,
-      competitionBaselineEquity: persistedPerformance.competitionBaselineEquity,
-      latestEquity: persistedPerformance.latestEquity,
-      performanceBaselineAt: persistedPerformance.performanceBaselineAt,
+      verifiedRealizedPnl: accounting.verifiedRealizedPnl,
+      competitionBaselineEquity: accounting.baselineEquity,
+      latestEquity: accounting.currentEquity,
+      performanceBaselineAt: accounting.baselineObservedAt,
       dailyPnl: currentMonthDailyPnl(persistedPerformance),
     } : { ...unavailablePerformance(), dailyDrawdown: drawdownPct };
     return {
@@ -621,9 +630,10 @@ export class TraderAgent extends Agent<Env, AgentState> {
         model: this.state.model || config.qwenModel,
         paperMode: true,
       },
-      portfolio: null,
-      portfolioFreshness: { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" },
+      portfolio: livePortfolio ?? null,
+      portfolioFreshness: livePortfolio ? { source: "PROVIDER_LIVE", observedAt: livePortfolio.observedAt, stale: false } : { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" },
       performance,
+      performanceAccounting: accounting,
       trades: [],
       latestDecision: latestValidCycle?.plan.entryActions[0] ?? latestValidCycle?.plan.positionActions[0] ?? null,
       decisions: recentJournals.flatMap((entry) => cyclePlanDecisions(entry)),

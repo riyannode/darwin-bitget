@@ -10,7 +10,8 @@ let snapshot = {
   agent: { status: "UNAVAILABLE", runtimeMode: "AUTONOMOUS", currentStage: "STATE_READ_FAILED", lastScan: null, nextScan: null, model: "—", paperMode: true },
   portfolio: null,
   portfolioFreshness: { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" },
-  performance: { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, wins: null, losses: null, breakeven: null, dailyPnl: {} },
+  performance: { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, openTrades: null, closedTrades: null, wins: null, losses: null, breakeven: null, dailyPnl: {} },
+  performanceAccounting: { baselineEquity: null, baselineObservedAt: null, currentEquity: null, currentEquityObservedAt: null, netExternalInflows: "UNAVAILABLE", netPnlSinceBaseline: "UNAVAILABLE", verifiedRealizedPnl: "UNAVAILABLE", unrealizedPnl: "UNAVAILABLE", wins: 0, losses: 0, breakeven: 0, classifiedClosedTrades: 0, winRatePct: "UNAVAILABLE", peakEquity: null, peakEquityObservedAt: null, currentDrawdownPct: "UNAVAILABLE", maxDrawdownPct: "UNAVAILABLE", source: "UNAVAILABLE", externalFlowStatus: "UNVERIFIED_ZERO_FLOW_INVARIANT", baselineSource: "UNAVAILABLE", initializationReason: "UNAVAILABLE", unrealizedPnlSource: "UNAVAILABLE" },
   trades: [],
   latestDecision: null,
   decisions: [],
@@ -71,9 +72,11 @@ function renderAgent() {
 
 function renderPerformance() {
   const performance = snapshot.performance;
-  const values = [["TOTAL PNL", money(performance.totalPnl)], ["WIN RATE", performance.winRate === "UNAVAILABLE" ? "—" : `${performance.winRate}%`], ["DRAWDOWN", `${performance.dailyDrawdown}%`], ["TOTAL TRADES", performance.totalTrades ?? "—"], ["OPEN POSITIONS", (judgeDemo ? snapshot.portfolio : livePortfolio)?.positions?.length ?? 0]];
+  const accounting = snapshot.performanceAccounting ?? {};
+  const values = [["NET PNL SINCE BASELINE", money(accounting.netPnlSinceBaseline ?? performance.totalPnl)], ["WIN RATE (CLOSED)", accounting.winRatePct && accounting.winRatePct !== "UNAVAILABLE" ? `${accounting.winRatePct}%` : "—"], ["DAILY RISK DRAWDOWN", percent(performance.dailyDrawdown)], ["CURRENT DRAWDOWN", percent(accounting.currentDrawdownPct)], ["CLOSED TRADES", accounting.classifiedClosedTrades ?? performance.closedTrades ?? "—"], ["OPEN TRADES", performance.openTrades ?? "—"], ["OPEN POSITIONS", (judgeDemo ? snapshot.portfolio : livePortfolio)?.positions?.length ?? 0]];
   const node = $("performance"); node.replaceChildren();
   values.forEach(([label, value]) => { const card = document.createElement("div"); card.className = "summary-card"; const title = document.createElement("small"); title.textContent = label; const content = document.createElement("strong"); content.textContent = text(value); card.append(title, content); node.append(card); });
+  const audit = document.createElement("small"); audit.className = "subtle"; audit.textContent = `${text(accounting.source)} · ${when(accounting.currentEquityObservedAt)} · baseline ${money(accounting.baselineEquity)} · external flows ${text(accounting.externalFlowStatus)}`; node.append(audit);
 }
 
 function renderCalendar() {
@@ -86,7 +89,7 @@ function renderCalendar() {
 function renderPortfolio() {
   const portfolio = judgeDemo ? snapshot.portfolio : livePortfolio;
   const freshness = judgeDemo ? { source: "RECORDED_PROVIDER_REPLAY", observedAt: snapshot.portfolioFreshness.observedAt, stale: true } : liveFreshness; const freshnessNode = $("portfolio-freshness"); freshnessNode.textContent = freshness ? `${freshness.source}${freshness.stale ? " · STALE" : ""} · ${when(freshness.observedAt)}` : "—"; freshnessNode.style.color = freshness?.stale ? "var(--warning)" : "var(--accent)";
-  const node = $("portfolio"); node.replaceChildren(); [["ACCOUNT EQUITY", money(portfolio?.portfolioEquity)], ["AVAILABLE MARGIN", money(portfolio?.availableMargin)], ["MARGIN USED", money(portfolio?.marginUsage)], ["UNREALIZED PNL", signedMoney(portfolio?.unrealizedPnl)], ["REALIZED PNL", signedMoney(portfolio?.realizedPnl)], ["FUNDING", signedMoney(portfolio?.funding)], ["FEES", signedMoney(portfolio?.fees)], ["OPEN POSITIONS", portfolio?.positions?.length ?? 0]].forEach(([label, value]) => { const item = document.createElement("div"); const title = document.createElement("span"); title.className = "label"; title.textContent = label; const content = document.createElement("strong"); content.textContent = text(value); if (label.includes("PNL") || label === "FUNDING" || label === "FEES") content.className = pnlClass(value); item.append(title, content); node.append(item); });
+  const node = $("portfolio"); node.replaceChildren(); [["ACCOUNT EQUITY", money(portfolio?.portfolioEquity)], ["AVAILABLE MARGIN", money(portfolio?.availableMargin)], ["MARGIN USED", money(portfolio?.accountMarginUsed)], ["INITIAL MARGIN", money(portfolio?.initialMargin)], ["POSITION MARGIN", money(portfolio?.positionMargin)], ["UNREALIZED PNL", signedMoney(portfolio?.unrealizedPnl)], ["POSITION REALIZED PNL", signedMoney(portfolio?.positionRealizedPnl)], ["FUNDING", signedMoney(portfolio?.funding)], ["FEES", signedMoney(portfolio?.fees)], ["CASH DIVIDEND", signedMoney(portfolio?.cashDividend)], ["OPEN POSITIONS", portfolio?.positions?.length ?? 0]].forEach(([label, value]) => { const item = document.createElement("div"); const title = document.createElement("span"); title.className = "label"; title.textContent = label; const content = document.createElement("strong"); content.textContent = text(value); if (label.includes("PNL") || label === "FUNDING" || label === "FEES" || label === "CASH DIVIDEND") content.className = pnlClass(value); item.append(title, content); node.append(item); });
 }
 
 function renderOpenPositions() {
@@ -124,7 +127,7 @@ function renderOpenPositions() {
     summary.append(identity, metrics);
     const content = document.createElement("div");
     content.className = "detail-grid position-details";
-    [["SYMBOL", position.symbol], ["SIDE", position.positionSide], ["ENTRY", money(position.entryPrice)], ["MARK", money(position.markPrice)], ["QTY", position.quantity], ["MARGIN", money(position.marginAllocated)], ["LEVERAGE", `${position.leverage}x`], ["NOTIONAL", money(position.notional)], ["UNREALIZED PNL", signedMoney(position.unrealizedPnl)], ["REALIZED PNL", signedMoney(position.realizedPnl)], ["FUNDING", signedMoney(position.funding)], ["FEES", signedMoney(position.fees)], ["UNREALIZED PNL %", percent(position.unrealizedPnlPct)], ["LIQUIDATION PRICE", money(position.liquidationPrice)], ["OPENED AT", when(position.openedAt)]].forEach(([label, value]) => { const item = detail(label, value); if (label.startsWith("UNREALIZED")) item.querySelector(".value").className = `value ${pnlClass(value)}`; content.append(item); });
+    [["SYMBOL", position.symbol], ["SIDE", position.positionSide], ["ENTRY", money(position.entryPrice)], ["MARK", money(position.markPrice)], ["QTY", position.quantity], ["MARGIN", money(position.marginAllocated)], ["LEVERAGE", `${position.leverage}x`], ["NOTIONAL", money(position.notional)], ["UNREALIZED PNL", signedMoney(position.unrealizedPnl)], ["REALIZED PNL", signedMoney(position.realizedPnl)], ["FUNDING", signedMoney(position.funding)], ["FEES", signedMoney(position.fees)], ["UNREALIZED PNL %", percent(position.unrealizedPnlPct)], ["LIQUIDATION PRICE", money(position.liquidationPrice)], ["OPENED AT", when(position.openedAt)], ["UPDATED AT", when(position.updatedAt)]].forEach(([label, value]) => { const item = detail(label, value); if (label.startsWith("UNREALIZED")) item.querySelector(".value").className = `value ${pnlClass(value)}`; content.append(item); });
     const context = positionContexts[`${position.symbol}:${position.positionSide}`];
     const reasoning = document.createElement("div"); reasoning.className = "position-reasoning";
     reasoning.append(reasoningSection("WHY THIS POSITION WAS OPENED", context?.entryReasoning, "Provider position present; verified DARWIN entry context unavailable."), reasoningSection("CURRENT MANAGEMENT", context?.latestManagement, "No persisted DARWIN management decision available."));
@@ -318,32 +321,15 @@ async function refreshSnapshot() {
       learning: loadedPages.has("learning-page") ? snapshot.learning : data.learning,
       riskControls: loadedPages.has("policy-page") ? snapshot.riskControls : data.riskControls,
     };
-    snapshot = { ...snapshot, ...data, ...retained, portfolio: judgeDemo ? data.portfolio : livePortfolio, portfolioFreshness: judgeDemo ? data.portfolioFreshness : liveFreshness };
+    livePortfolio = data.portfolio ?? null;
+    liveFreshness = data.portfolioFreshness ?? { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" };
+    snapshot = { ...snapshot, ...data, ...retained, portfolio: data.portfolio, portfolioFreshness: data.portfolioFreshness };
     if (!liveFreshness.stale) $("error").hidden = true;
     render();
   } catch (error) {
     snapshot.agent = { ...snapshot.agent, status: "UNAVAILABLE", currentStage: "STATE_READ_FAILED" };
     const banner = $("error"); banner.textContent = `Agent runtime: STATE_READ_FAILED${error instanceof Error ? ` (${error.message})` : ""}. Provider data is independent.`; banner.hidden = false; render();
   }
-}
-async function refreshLivePortfolio() {
-  if (judgeDemo) return;
-  try {
-    const data = await requestJson("/api/live/portfolio");
-    livePortfolio = data.portfolio;
-    liveFreshness = { source: "PROVIDER_LIVE", observedAt: data.observedAt ?? data.portfolio?.observedAt ?? new Date().toISOString(), stale: false, ...(data.degraded ? { errorCode: data.errors?.openOrders?.code ?? "OPEN_ORDERS_READ_FAILED" } : {}) };
-    if (data.degraded) {
-      const banner = $("error"); banner.textContent = `Provider live read partially degraded: ${liveFreshness.errorCode}. Account and positions remain live; open orders are unavailable.`; banner.hidden = false;
-    }
-  } catch (error) {
-    livePortfolio = null;
-    liveFreshness = { source: "PROVIDER_LIVE", observedAt: liveFreshness.observedAt ?? new Date().toISOString(), stale: true, errorCode: error instanceof Error && /^HTTP_\d+$/.test(error.message) ? error.message : "PROVIDER_READ_FAILED" };
-    const banner = $("error"); banner.textContent = `Provider live read failed: ${liveFreshness.errorCode}. Current provider state is unavailable; no journal fallback is shown.`; banner.hidden = false;
-  }
-  snapshot.portfolio = livePortfolio;
-  snapshot.portfolioFreshness = liveFreshness;
-  renderPerformance(); renderPortfolio(); renderOpenPositions();
-  if (currentPage === "open-position") void loadPositionContexts();
 }
 async function loadPositionContexts() {
   if (judgeDemo || Date.now() - positionContextsLoadedAt < 60000) return;
@@ -384,4 +370,4 @@ document.querySelectorAll("[data-page]").forEach((button) => button.addEventList
 document.querySelectorAll("[data-page-link]").forEach((button) => button.addEventListener("click", () => selectPage(button.dataset.pageLink)));
 document.querySelectorAll("[data-export]").forEach((button) => button.addEventListener("click", () => downloadPaperLog(button.dataset.export)));
 document.querySelectorAll("[data-filter]").forEach((button) => button.addEventListener("click", () => { tradeFilter = button.dataset.filter; document.querySelectorAll(".filter").forEach((item) => item.classList.toggle("active", item.dataset.filter === tradeFilter)); renderTradeTable(); }));
-selectPage("dashboard"); void refreshSnapshot(); void refreshLivePortfolio(); if (!judgeDemo) { window.setInterval(() => { void refreshLivePortfolio(); }, 10000); window.setInterval(() => { void refreshSnapshot(); }, 60000); }
+selectPage("dashboard"); void refreshSnapshot(); if (!judgeDemo) window.setInterval(() => { void refreshSnapshot(); }, 10000);
