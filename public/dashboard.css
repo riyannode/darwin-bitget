@@ -586,6 +586,27 @@ p {
 /* ---------------------------------------------------------------------------
    PORTFOLIO RAIL
    --------------------------------------------------------------------------- */
+.accounting-details {
+  grid-column: 1 / -1;
+  border: 1px solid var(--line-subtle);
+  border-radius: var(--radius-lg);
+  padding: var(--space-3) var(--space-4);
+  background: var(--panel);
+}
+
+.accounting-details summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.accounting-details .detail-grid {
+  margin-top: var(--space-3);
+}
+
 .portfolio-panel {
   margin-bottom: var(--space-4);
   padding-bottom: 0;
