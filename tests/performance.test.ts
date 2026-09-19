@@ -124,6 +124,23 @@ describe("persisted performance aggregate", () => {
     value = recordVerifiedClose(value, "6", "1006", "2026-09-14T11:01:00.000Z", "10", "POSITION_HISTORY_NET_PROFIT");
     expect(value).toMatchObject({ closedEpisodeRealizedPnl: "6", openEpisodePartialRealizedPnl: "0", verifiedRealizedPnl: "6", wins: 1, losses: 0, winRate: "100" });
   });
+  it("subtracts the closed episode partial from a signed global partial total", () => {
+    let value = emptyPerformance(at);
+    value = recordVerifiedOpen(value, "1000", at);
+    value = recordVerifiedPartial(value, "10", "1010", "2026-09-14T11:00:00.000Z");
+    value = recordVerifiedOpen(value, "1010", "2026-09-14T11:01:00.000Z");
+    value = recordVerifiedPartial(value, "-20", "990", "2026-09-14T11:02:00.000Z");
+    value = recordVerifiedClose(value, "0", "990", "2026-09-14T11:03:00.000Z", "10", "FILL");
+    expect(value.openEpisodePartialRealizedPnl).toBe("-20");
+    let opposite = emptyPerformance(at);
+    opposite = recordVerifiedOpen(opposite, "1000", at);
+    opposite = recordVerifiedPartial(opposite, "-10", "990", "2026-09-14T11:00:00.000Z");
+    opposite = recordVerifiedOpen(opposite, "990", "2026-09-14T11:01:00.000Z");
+    opposite = recordVerifiedPartial(opposite, "20", "1010", "2026-09-14T11:02:00.000Z");
+    opposite = recordVerifiedClose(opposite, "0", "1010", "2026-09-14T11:03:00.000Z", "-10", "FILL");
+    expect(opposite.openEpisodePartialRealizedPnl).toBe("20");
+  });
+
   it("uses classified closed trades as the win-rate denominator and leaves zero unavailable", () => {
     const open = emptyPerformance(at);
     expect(buildPerformanceAccounting(open, { portfolioEquity: "1000", observedAt: at }).winRatePct).toBe("UNAVAILABLE");

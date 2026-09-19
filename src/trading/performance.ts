@@ -219,7 +219,7 @@ export function recordVerifiedClose(
   const updated = updateEquity(performance, equity, observedAt);
   const closed = updated.closedTrades + 1;
   const prior = isDecimal(priorEpisodeRealizedPnl) ? priorEpisodeRealizedPnl : "0";
-  const remainingOpenPartial = compareDecimal(updated.openEpisodePartialRealizedPnl, prior) < 0 ? "0" : subtractDecimal(updated.openEpisodePartialRealizedPnl, prior);
+  const remainingOpenPartial = subtractDecimal(updated.openEpisodePartialRealizedPnl, prior);
   const base = { ...updated, openTrades: Math.max(0, updated.openTrades - 1), closedTrades: closed, openEpisodePartialRealizedPnl: remainingOpenPartial };
   if (!isDecimal(realizedPnl)) return { ...base, verifiedRealizedPnl: base.verifiedRealizedPnl || (base.closedEpisodeRealizedPnl === "0" && remainingOpenPartial === "0" ? "" : addDecimal(base.closedEpisodeRealizedPnl, remainingOpenPartial)), winRate: classifiedWinRate(base.wins, base.losses, base.breakeven) };
   const episodePnl = realizedPnlSource === "POSITION_HISTORY_NET_PROFIT" || realizedPnlSource === "POSITION_HISTORY_PNL" ? realizedPnl : addDecimal(prior, realizedPnl);

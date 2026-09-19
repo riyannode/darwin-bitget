@@ -23,7 +23,7 @@ Persisted ledger values are durable read-model state:
 canonical autonomous journals and experiences once, preserves the Durable Object,
 and rebuilds closed episodes, partial reductions, win/loss classification, and the
 earliest trustworthy provider baseline. A partial REDUCE contributes to
-`partialRealizedPnl` but never to closed-trade win rate.
+`openEpisodePartialRealizedPnl` but never to closed-trade win rate.
 
 The competition baseline is immutable after initialization. An existing baseline is
 preserved during restart, UI reads, failed cycles, and new positions.
@@ -95,9 +95,10 @@ used as a generic `MARGIN USED` fallback.
 Export semantics are explicit:
 
 ```text
-summary.closedTrades.realizedPnl = fully closed episode PnL only
-summary.closedTrades.partialRealizedPnl = verified REDUCE PnL
-summary.closedTrades.verifiedRealizedPnl = closed + partial PnL
+summary.closedTrades.closedEpisodeRealizedPnl = fully closed episode PnL only
+summary.closedTrades.openEpisodePartialRealizedPnl = verified REDUCE PnL from OPEN episodes
+summary.closedTrades.verifiedRealizedPnl = closed + open partial PnL
+summary.closedTrades.winRatePct = wins / (wins + losses + breakeven)
 ```
 
 ## Screenshot reconciliation example

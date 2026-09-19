@@ -47,6 +47,14 @@ describe("paper log export", () => {
     expect(csv).toContain("-30.5367");
   });
 
+  it("uses classified closed episodes rather than total closed rows for CSV win rate", () => {
+    const win = { ...experience(), experienceId: "win", outcomeStatus: "PROFITABLE" as const, realizedPnl: "1" };
+    const unclassified = { ...experience(), experienceId: "unclassified", outcomeStatus: "CLOSED_UNCLASSIFIED" as const, realizedPnl: "0", realizedPnlVerified: false };
+    const journals = [win, unclassified].map((item, index) => ({ ...journal(index, "OPEN_LONG"), experienceIds: [item.experienceId] }));
+    const exported = buildPaperLogExport({ generatedAt: "2026-09-19T20:00:00.000Z", period: { start: null, end: null }, environment: "test", model: "qwen", version: "1", commit: "abc", cycles: journals.map((entry) => ({ cycleId: entry.cycleId, status: "COMPLETED", startedAt: entry.startedAt, completedAt: entry.completedAt ?? null })), journals, experiences: [win, unclassified], events: [] });
+    expect(exported.summary.closedTrades).toMatchObject({ total: 2, classifiedClosedTrades: 1, winRatePct: "100" });
+    expect(paperLogToCsv(exported)).toContain(",1,100\r\n");
+  });
   it("calculates peak-to-trough drawdown after a new peak", () => {
     expect(calculatePeakDrawdown(["10000", "10500", "10100"])).toEqual({ current: "-3.80952381", maximum: "-3.80952381" });
   });

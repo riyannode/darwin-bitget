@@ -52,6 +52,8 @@ export interface PaperLogSummary {
     closedEpisodeRealizedPnl: string;
     openEpisodePartialRealizedPnl: string;
     verifiedRealizedPnl: string;
+    classifiedClosedTrades: number;
+    winRatePct: string;
   };
   risk: {
     currentDrawdownPct: string | null;
@@ -528,6 +530,11 @@ export function buildPaperLogExport(input: {
   const closedEpisodeRealizedPnl = closed.filter((experience) => experience.realizedPnlVerified && typeof experience.realizedPnl === "string" && isDecimal(experience.realizedPnl)).reduce((total, experience) => addDecimal(total, experience.realizedPnl ?? "0"), "0");
   const openEpisodePartialRealizedPnl = experiences.filter((experience) => experience.outcomeStatus === "OPEN" && experience.realizedPnlVerified === true && experience.realizedPnl !== null && isDecimal(experience.realizedPnl)).reduce((total, experience) => addDecimal(total, experience.realizedPnl ?? "0"), "0");
   const verifiedRealizedPnl = addDecimal(closedEpisodeRealizedPnl, openEpisodePartialRealizedPnl);
+  const closedWins = closed.filter((experience) => experience.outcomeStatus === "PROFITABLE").length;
+  const closedLosses = closed.filter((experience) => experience.outcomeStatus === "LOSING").length;
+  const closedBreakeven = closed.filter((experience) => experience.outcomeStatus === "BREAK_EVEN").length;
+  const classifiedClosedTrades = closedWins + closedLosses + closedBreakeven;
+  const winRatePct = classifiedClosedTrades > 0 ? (closedWins * 100 / classifiedClosedTrades).toString() : "UNAVAILABLE";
   const drawdown = summarizeDrawdown(journals);
 
   const totalCycles = cycles.length;
@@ -613,13 +620,15 @@ export function buildPaperLogExport(input: {
       },
       closedTrades: {
         total: closed.length,
-        wins: closed.filter((experience) => experience.outcomeStatus === "PROFITABLE").length,
-        losses: closed.filter((experience) => experience.outcomeStatus === "LOSING").length,
-        breakeven: closed.filter((experience) => experience.outcomeStatus === "BREAK_EVEN").length,
+        wins: closedWins,
+        losses: closedLosses,
+        breakeven: closedBreakeven,
         realizedPnl: closedEpisodeRealizedPnl,
         closedEpisodeRealizedPnl,
         openEpisodePartialRealizedPnl,
         verifiedRealizedPnl,
+        classifiedClosedTrades,
+        winRatePct,
       },
       risk: {
         currentDrawdownPct: drawdown.current,
@@ -654,8 +663,8 @@ function csvValue(value: unknown): string {
 }
 
 export function paperLogToCsv(exported: PaperLogExport): string {
-  const header = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "scannedUniverseCount", "selectedEntryCandidates", "managedExistingPositions", "totalProposedActions", "financialWritesPerformed", "decisionId", "decisionTimestamp", "actionCategory", "action", "symbol", "positionSide", "marginAllocationPct", "additionalMarginPct", "targetPositionSide", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "providerOperation", "providerCode", "providerMessage", "providerReadbackCode", "providerReadbackMessage", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "physicalWrites", "reflectionIds", "createdLessonIds", "closedEpisodeRealizedPnl", "openEpisodePartialRealizedPnl", "verifiedRealizedPnl", "closedTrades", "wins", "losses", "breakeven", "winRatePct"];
-  const summaryValues = [exported.summary.closedTrades.closedEpisodeRealizedPnl, exported.summary.closedTrades.openEpisodePartialRealizedPnl, exported.summary.closedTrades.verifiedRealizedPnl, exported.summary.closedTrades.total, exported.summary.closedTrades.wins, exported.summary.closedTrades.losses, exported.summary.closedTrades.breakeven, exported.summary.closedTrades.total > 0 ? (exported.summary.closedTrades.wins * 100 / exported.summary.closedTrades.total).toString() : "UNAVAILABLE"];
+  const header = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "scannedUniverseCount", "selectedEntryCandidates", "managedExistingPositions", "totalProposedActions", "financialWritesPerformed", "decisionId", "decisionTimestamp", "actionCategory", "action", "symbol", "positionSide", "marginAllocationPct", "additionalMarginPct", "targetPositionSide", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "providerOperation", "providerCode", "providerMessage", "providerReadbackCode", "providerReadbackMessage", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "physicalWrites", "reflectionIds", "createdLessonIds", "closedEpisodeRealizedPnl", "openEpisodePartialRealizedPnl", "verifiedRealizedPnl", "closedTrades", "wins", "losses", "breakeven", "classifiedClosedTrades", "winRatePct"];
+  const summaryValues = [exported.summary.closedTrades.closedEpisodeRealizedPnl, exported.summary.closedTrades.openEpisodePartialRealizedPnl, exported.summary.closedTrades.verifiedRealizedPnl, exported.summary.closedTrades.total, exported.summary.closedTrades.wins, exported.summary.closedTrades.losses, exported.summary.closedTrades.breakeven, exported.summary.closedTrades.classifiedClosedTrades, exported.summary.closedTrades.winRatePct];
   const rows = exported.cycles.flatMap((cycle) => {
     const decisions = exported.decisions.filter((decision) => decision.cycleId === cycle.cycleId);
     const cycleValues = [cycle.cycleId, cycle.status, cycle.startedAt, cycle.completedAt, cycle.eventTypes, cycle.planning.scannedUniverseCount, cycle.planning.selectedEntryCandidates, cycle.planning.managedExistingPositions, cycle.planning.totalProposedActions, cycle.execution.financialWritesPerformed];
