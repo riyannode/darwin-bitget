@@ -48,7 +48,7 @@ Public market operations may remain direct because they do not require private B
 
 Because every open provider position requires one management action, a live account with more than five open positions cannot be represented by this bounded contract. DARWIN fails before model financial planning with `OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT`, records a visible `PLAN_REJECTED` event, performs no financial write, and does not omit positions or raise the cap. The symbols may still be scanned and used for management evidence before the guard is evaluated.
 
-The new mandate/decision contracts are `darwin-mandate-v6` and `darwin-decision-v4`. Reflection and backtest prompt versions remain unchanged.
+The current prompt contracts are `darwin-mandate-v6`, `darwin-candidate-v1`, `darwin-decision-v9`, `darwin-reflection-v1`, and `darwin-backtest-v2`.
 
 ## Data boundaries and read models
 

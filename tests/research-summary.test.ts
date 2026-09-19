@@ -251,7 +251,7 @@ describe("telemetry result accounting from final evidence", () => {
 
   it("mixed AVAILABLE + UNAVAILABLE: finalStatus=PARTIAL", async () => {
     const executor = new ResearchExecutor(makeFactory("mixed") as never);
-    const { telemetry, getCounters } = trackTelemetry();
+    const { telemetry } = trackTelemetry();
 
     const evidence = await executor.executeWithTelemetry([makeRequest("A"), makeRequest("B")], telemetry);
 

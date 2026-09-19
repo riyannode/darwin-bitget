@@ -1,0 +1,12 @@
+.git
+.env
+node_modules
+coverage
+.temp
+.local
+*.log
+playwright-report
+test-results
+*.har
+*.trace.zip
+.token_value

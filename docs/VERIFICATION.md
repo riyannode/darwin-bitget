@@ -35,7 +35,7 @@ The repository is intended to verify the following through typecheck, unit tests
 - same-side re-entry resets management history and excludes decisions created before the current entry boundary;
 - Open Position and Trade History distinguish provider-live facts from persisted DARWIN decision evidence.
 
-The prompt contracts are code-checked as `darwin-mandate-v6` and `darwin-decision-v4`. Reflection/backtest prompt versions remain unchanged.
+The current prompt contracts are `darwin-mandate-v6`, `darwin-candidate-v1`, `darwin-decision-v9`, `darwin-reflection-v1`, and `darwin-backtest-v2`.
 
 ### PRODUCTION VERIFIED
 

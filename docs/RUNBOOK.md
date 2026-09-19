@@ -28,7 +28,7 @@ The demo requires no `.env`, credentials, or external network at runtime. It nev
 
 The Worker requires `TRADING_MODE=PAPER`, `PAPER_ONLY=true`, and `AGENT_MODE=AUTONOMOUS` or `EVA_EVALUATION`. The Worker stores only backend-only gateway, Qwen, owner-control, and optional EVA secrets. Bitget API credentials belong only in the stable-egress gateway, never in Worker secrets, source, fixtures, `wrangler.jsonc`, Vercel public variables, or browser storage. On startup, the Durable Object creates the compact performance and symbol+side position-context read models; their one-time bounded bootstrap must not be moved into `/api/snapshot`.
 
-The owner policy defaults to 30% maximum single-position margin allocation, 5x maximum leverage, 10% daily drawdown, 60-minute cooldown, 15-minute scan cadence, and emergency stop disabled. Runtime policy/control mutations require `OWNER_CONTROL_TOKEN` and persist in the Durable Object.
+The owner policy defaults to 30% maximum single-position margin allocation, 5x maximum leverage, 10% daily drawdown, 60-minute cooldown, 5-minute scan cadence, and emergency stop disabled. Runtime policy/control mutations require `OWNER_CONTROL_TOKEN` and persist in the Durable Object.
 
 ## Safe first start
 
