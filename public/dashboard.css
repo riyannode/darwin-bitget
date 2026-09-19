@@ -21,8 +21,8 @@
 
   /* Typography */
   --text: #e8eae9;
-  --text-secondary: #a0a6a8;
-  --text-muted: #6b7275;
+  --text-secondary: #BAE6FD;
+  --text-muted: #7DD3FC;
 
   /* Accent — kept for runtime compat; refined usage */
   --accent: #1fcc93;
