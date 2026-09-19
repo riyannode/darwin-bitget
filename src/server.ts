@@ -1,7 +1,6 @@
 import { routeAgentRequest } from "agents";
 import { TraderAgent } from "./agent/agent.js";
 import type { Env } from "./types.js";
-import type { AccountSnapshot } from "./types.js";
 import { BitgetClient, BitgetReadError } from "./bitget/client.js";
 import { loadConfig } from "./config.js";
 
@@ -34,15 +33,7 @@ export default {
       const path = url.pathname === "/api/snapshot" ? "/snapshot" : url.pathname === "/api/position-context" ? "/position-context" : url.pathname === "/api/agent-journal" ? "/agent-journal" : url.pathname === "/api/trade-history" ? "/trade-history" : url.pathname === "/api/learning" ? "/learning" : url.pathname === "/api/policy" ? "/policy" : url.pathname === "/api/export/paper-log" ? "/export/paper-log" : url.pathname === "/api/eva/connection-test" ? "/eva/connection-test" : "/control";
       const agentUrl = new URL(request.url);
       agentUrl.pathname = path;
-      if (url.pathname === "/api/snapshot" && request.method === "GET") {
-        let portfolio: AccountSnapshot | undefined;
-        try {
-          portfolio = await new BitgetClient(loadConfig(env)).getDashboardPortfolio();
-        } catch {
-          portfolio = undefined;
-        }
-        if (portfolio) return stub.fetch(new Request(agentUrl, { method: "POST", headers: { "content-type": "application/json", "x-darwin-internal": "worker" }, body: JSON.stringify({ portfolio }) }));
-      }
+      if (url.pathname === "/api/snapshot" && request.method === "GET") agentUrl.searchParams.set("includeLive", "true");
       return stub.fetch(new Request(agentUrl, request));
     }
     if (env.ASSETS) {

@@ -357,11 +357,16 @@ export class TraderAgent extends Agent<Env, AgentState> {
 
   public override async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/snapshot" && request.method === "GET") return json(await this.getDashboardSnapshot());
-    if (url.pathname === "/snapshot" && request.method === "POST") {
-      if (request.headers.get("x-darwin-internal") !== "worker") return json({ error: "METHOD_NOT_ALLOWED" }, 405);
-      const body = await request.json().catch(() => null) as { portfolio?: DashboardSnapshot["portfolio"] } | null;
-      return json(await this.getDashboardSnapshot(body?.portfolio ?? undefined));
+    if (url.pathname === "/snapshot" && request.method === "GET") {
+      let livePortfolio: DashboardSnapshot["portfolio"] | undefined;
+      if (url.searchParams.get("includeLive") === "true") {
+        try {
+          livePortfolio = await new BitgetClient(loadConfig(this.env, this.ensureActivePolicy())).getDashboardPortfolio();
+        } catch {
+          livePortfolio = undefined;
+        }
+      }
+      return json(await this.getDashboardSnapshot(livePortfolio));
     }
     if (url.pathname === "/position-context" && request.method === "GET") return this.getPositionContext(url);
     if (url.pathname === "/agent-journal" && request.method === "GET") return this.getAgentJournal(url);
