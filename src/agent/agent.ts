@@ -479,8 +479,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
         experiences: loadAllExperiences(this),
         events: loadAllEvents(this),
       });
-      if (format === "csv") return new Response(paperLogToCsv(exported), { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": "attachment; filename=darwin-paper-log.csv", "cache-control": "no-store" } });
-      return new Response(JSON.stringify(exported), { headers: { "content-type": "application/json; charset=utf-8", "content-disposition": "attachment; filename=darwin-paper-log.json", "cache-control": "no-store" } });
+      if (format === "csv") return new Response(paperLogToCsv(exported), { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": "attachment; filename=darwin-paper-log-full.csv", "cache-control": "no-store" } });
+      return new Response(JSON.stringify(exported, null, 2), { headers: { "content-type": "application/json; charset=utf-8", "content-disposition": "attachment; filename=darwin-paper-log-full.json", "cache-control": "no-store" } });
     } catch (error) {
       return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "PAPER_LOG_EXPORT_FAILED" : "PAPER_LOG_EXPORT_FAILED" }, 400);
     }
