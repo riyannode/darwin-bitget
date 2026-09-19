@@ -588,8 +588,8 @@ export interface DashboardSnapshot {
     wins: number | null;
     losses: number | null;
     breakeven: number | null;
-    closedTradeRealizedPnl: string;
-    partialRealizedPnl: string;
+    closedEpisodeRealizedPnl: string;
+    openEpisodePartialRealizedPnl: string;
     verifiedRealizedPnl: string;
     competitionBaselineEquity: string | null;
     latestEquity: string | null;
@@ -662,14 +662,15 @@ export interface PerformanceAccountingReadModel {
   baselineObservedAt: string | null;
   baselineSource: string;
   initializationReason: string;
+  competitionStartVerified: boolean;
   currentEquity: string | null;
   currentEquityObservedAt: string | null;
   equityDeltaSinceBaseline: string;
   netExternalInflows: string;
   externalFlowStatus: "VERIFIED" | "UNVERIFIED_ZERO_FLOW_INVARIANT";
   netPnlSinceBaseline: string;
-  closedTradeRealizedPnl: string;
-  partialRealizedPnl: string;
+  closedEpisodeRealizedPnl: string;
+  openEpisodePartialRealizedPnl: string;
   verifiedRealizedPnl: string;
   unrealizedPnl: string;
   unrealizedPnlSource: "ACCOUNT" | "POSITIONS" | "UNAVAILABLE";

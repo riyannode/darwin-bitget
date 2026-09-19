@@ -29,14 +29,15 @@ export interface PerformanceAggregate {
   losses: number;
   breakeven: number;
   winRate: string;
-  closedTradeRealizedPnl: string;
-  partialRealizedPnl: string;
+  closedEpisodeRealizedPnl: string;
+  openEpisodePartialRealizedPnl: string;
   verifiedRealizedPnl: string;
   dailyPnl: Record<string, PerformanceDay>;
   netExternalInflows?: string;
   externalFlowStatus?: "VERIFIED" | typeof ZERO_EXTERNAL_FLOW_INVARIANT;
   baselineSource?: string;
   baselineInitializationReason?: string;
+  competitionStartVerified?: boolean;
   latestEquityObservedAt?: string | null;
   peakEquity?: string | null;
   peakEquityObservedAt?: string | null;
@@ -63,14 +64,15 @@ export interface PerformanceAccounting {
   baselineObservedAt: string | null;
   baselineSource: string;
   initializationReason: string;
+  competitionStartVerified: boolean;
   currentEquity: string | null;
   currentEquityObservedAt: string | null;
   equityDeltaSinceBaseline: string;
   netExternalInflows: string;
   externalFlowStatus: "VERIFIED" | typeof ZERO_EXTERNAL_FLOW_INVARIANT;
   netPnlSinceBaseline: string;
-  closedTradeRealizedPnl: string;
-  partialRealizedPnl: string;
+  closedEpisodeRealizedPnl: string;
+  openEpisodePartialRealizedPnl: string;
   verifiedRealizedPnl: string;
   unrealizedPnl: string;
   unrealizedPnlSource: "ACCOUNT" | "POSITIONS" | "UNAVAILABLE";
@@ -102,9 +104,10 @@ export function isPerformanceAggregate(value: unknown): value is PerformanceAggr
     && typeof candidate.losses === "number"
     && typeof candidate.breakeven === "number"
     && typeof candidate.winRate === "string"
-    && typeof candidate.closedTradeRealizedPnl === "string"
-    && typeof candidate.partialRealizedPnl === "string"
+    && typeof candidate.closedEpisodeRealizedPnl === "string"
+    && typeof candidate.openEpisodePartialRealizedPnl === "string"
     && typeof candidate.verifiedRealizedPnl === "string"
+    && typeof candidate.competitionStartVerified === "boolean"
     && Boolean(candidate.dailyPnl && typeof candidate.dailyPnl === "object");
 }
 
@@ -123,14 +126,15 @@ export function emptyPerformance(initializedAt: string): PerformanceAggregate {
     losses: 0,
     breakeven: 0,
     winRate: "UNAVAILABLE",
-    closedTradeRealizedPnl: "0",
-    partialRealizedPnl: "0",
+    closedEpisodeRealizedPnl: "0",
+    openEpisodePartialRealizedPnl: "0",
     verifiedRealizedPnl: "",
     dailyPnl: {},
     netExternalInflows: "0",
     externalFlowStatus: ZERO_EXTERNAL_FLOW_INVARIANT,
     baselineSource: "UNAVAILABLE",
     baselineInitializationReason: "UNINITIALIZED",
+    competitionStartVerified: false,
     latestEquityObservedAt: null,
     peakEquity: null,
     peakEquityObservedAt: null,
@@ -145,12 +149,13 @@ export function normalizePerformanceAggregate(performance: PerformanceAggregate)
   const peak = performance.peakEquity ?? baseline ?? latest;
   return {
     ...performance,
-    closedTradeRealizedPnl: performance.closedTradeRealizedPnl ?? "0",
-    partialRealizedPnl: performance.partialRealizedPnl ?? "0",
+    closedEpisodeRealizedPnl: performance.closedEpisodeRealizedPnl ?? "0",
+    openEpisodePartialRealizedPnl: performance.openEpisodePartialRealizedPnl ?? "0",
     netExternalInflows: performance.netExternalInflows ?? "0",
     externalFlowStatus: performance.externalFlowStatus ?? ZERO_EXTERNAL_FLOW_INVARIANT,
     baselineSource: performance.baselineSource ?? (baseline ? "PERSISTED_PERFORMANCE_AGGREGATE" : "UNAVAILABLE"),
     baselineInitializationReason: performance.baselineInitializationReason ?? (baseline ? "PRESERVED_EXISTING_BASELINE" : "UNINITIALIZED"),
+    competitionStartVerified: performance.competitionStartVerified ?? false,
     latestEquityObservedAt: performance.latestEquityObservedAt ?? performance.performanceBaselineAt,
     peakEquity: peak,
     peakEquityObservedAt: performance.peakEquityObservedAt ?? performance.performanceBaselineAt,
@@ -203,23 +208,33 @@ export function recordVerifiedOpen(performance: PerformanceAggregate, equity: st
   };
 }
 
-export function recordVerifiedClose(performance: PerformanceAggregate, realizedPnl: string | undefined, equity: string, observedAt: string): PerformanceAggregate {
+export function recordVerifiedClose(
+  performance: PerformanceAggregate,
+  realizedPnl: string | undefined,
+  equity: string,
+  observedAt: string,
+  priorEpisodeRealizedPnl = "0",
+  realizedPnlSource?: "FILL" | "POSITION_HISTORY_NET_PROFIT" | "POSITION_HISTORY_PNL",
+): PerformanceAggregate {
   const updated = updateEquity(performance, equity, observedAt);
   const closed = updated.closedTrades + 1;
-  if (!isDecimal(realizedPnl)) return { ...updated, openTrades: Math.max(0, updated.openTrades - 1), closedTrades: closed, winRate: classifiedWinRate(updated.wins, updated.losses, updated.breakeven) };
-  const wins = updated.wins + (isPositiveDecimal(realizedPnl) ? 1 : 0);
-  const losses = updated.losses + (compareDecimal(realizedPnl, "0") < 0 ? 1 : 0);
-  const breakeven = updated.breakeven + (isZeroDecimal(realizedPnl) ? 1 : 0);
+  const prior = isDecimal(priorEpisodeRealizedPnl) ? priorEpisodeRealizedPnl : "0";
+  const remainingOpenPartial = compareDecimal(updated.openEpisodePartialRealizedPnl, prior) < 0 ? "0" : subtractDecimal(updated.openEpisodePartialRealizedPnl, prior);
+  const base = { ...updated, openTrades: Math.max(0, updated.openTrades - 1), closedTrades: closed, openEpisodePartialRealizedPnl: remainingOpenPartial };
+  if (!isDecimal(realizedPnl)) return { ...base, verifiedRealizedPnl: base.verifiedRealizedPnl || (base.closedEpisodeRealizedPnl === "0" && remainingOpenPartial === "0" ? "" : addDecimal(base.closedEpisodeRealizedPnl, remainingOpenPartial)), winRate: classifiedWinRate(base.wins, base.losses, base.breakeven) };
+  const episodePnl = realizedPnlSource === "POSITION_HISTORY_NET_PROFIT" || realizedPnlSource === "POSITION_HISTORY_PNL" ? realizedPnl : addDecimal(prior, realizedPnl);
+  const wins = updated.wins + (isPositiveDecimal(episodePnl) ? 1 : 0);
+  const losses = updated.losses + (compareDecimal(episodePnl, "0") < 0 ? 1 : 0);
+  const breakeven = updated.breakeven + (isZeroDecimal(episodePnl) ? 1 : 0);
+  const closedEpisodeRealizedPnl = addDecimal(updated.closedEpisodeRealizedPnl, episodePnl);
   return {
-    ...updated,
-    openTrades: Math.max(0, updated.openTrades - 1),
-    closedTrades: closed,
+    ...base,
     wins,
     losses,
     breakeven,
     winRate: classifiedWinRate(wins, losses, breakeven),
-    closedTradeRealizedPnl: updated.closedTradeRealizedPnl ? addDecimal(updated.closedTradeRealizedPnl, realizedPnl) : realizedPnl,
-    verifiedRealizedPnl: updated.verifiedRealizedPnl ? addDecimal(updated.verifiedRealizedPnl, realizedPnl) : realizedPnl,
+    closedEpisodeRealizedPnl,
+    verifiedRealizedPnl: addDecimal(closedEpisodeRealizedPnl, remainingOpenPartial),
   };
 }
 
@@ -228,7 +243,7 @@ export function recordVerifiedPartial(performance: PerformanceAggregate, realize
   const updated = updateEquity(performance, equity, observedAt);
   return {
     ...updated,
-    partialRealizedPnl: updated.partialRealizedPnl ? addDecimal(updated.partialRealizedPnl, realizedPnl) : realizedPnl,
+    openEpisodePartialRealizedPnl: updated.openEpisodePartialRealizedPnl ? addDecimal(updated.openEpisodePartialRealizedPnl, realizedPnl) : realizedPnl,
     verifiedRealizedPnl: updated.verifiedRealizedPnl ? addDecimal(updated.verifiedRealizedPnl, realizedPnl) : realizedPnl,
   };
 }
@@ -258,14 +273,15 @@ export function buildPerformanceAccounting(performance: PerformanceAggregate, ob
     baselineObservedAt: normalized.performanceBaselineAt,
     baselineSource: normalized.baselineSource ?? "UNAVAILABLE",
     initializationReason: normalized.baselineInitializationReason ?? "UNAVAILABLE",
+    competitionStartVerified: normalized.competitionStartVerified ?? false,
     currentEquity,
     currentEquityObservedAt,
     equityDeltaSinceBaseline,
     netExternalInflows,
     externalFlowStatus: normalized.externalFlowStatus ?? ZERO_EXTERNAL_FLOW_INVARIANT,
     netPnlSinceBaseline,
-    closedTradeRealizedPnl: normalized.closedTradeRealizedPnl,
-    partialRealizedPnl: normalized.partialRealizedPnl,
+    closedEpisodeRealizedPnl: normalized.closedEpisodeRealizedPnl,
+    openEpisodePartialRealizedPnl: normalized.openEpisodePartialRealizedPnl,
     verifiedRealizedPnl: normalized.verifiedRealizedPnl || "UNAVAILABLE",
     unrealizedPnl: effectiveObservation?.unrealizedPnl ?? "UNAVAILABLE",
     unrealizedPnlSource: effectiveObservation?.unrealizedPnlSource ?? "UNAVAILABLE",
@@ -311,15 +327,17 @@ export function bootstrapPerformance(journals: readonly TradingJournal[], experi
     wins: closedExperiences.filter((experience) => experience.outcomeStatus === "PROFITABLE" && experience.realizedPnlVerified === true && isDecimal(experience.realizedPnl)).length,
     losses: closedExperiences.filter((experience) => experience.outcomeStatus === "LOSING" && experience.realizedPnlVerified === true && isDecimal(experience.realizedPnl)).length,
     breakeven: closedExperiences.filter((experience) => experience.outcomeStatus === "BREAK_EVEN" && experience.realizedPnlVerified === true && isDecimal(experience.realizedPnl)).length,
-    closedTradeRealizedPnl: closedPnl,
-    partialRealizedPnl: partialPnl,
+    closedEpisodeRealizedPnl: closedPnl,
+    openEpisodePartialRealizedPnl: partialPnl,
     verifiedRealizedPnl: addDecimal(closedPnl, partialPnl),
   };
   result = { ...result, winRate: classifiedWinRate(result.wins, result.losses, result.breakeven) };
-  const baselinePortfolio = journals
+  const portfolioObservations = [...new Map(journals
     .map((journal) => journal.portfolio)
-    .filter((portfolio): portfolio is AccountSnapshot => Boolean(portfolio && isPositiveDecimal(portfolio.portfolioEquity)))
-    .sort((left, right) => left.observedAt.localeCompare(right.observedAt))[0];
+    .filter((portfolio): portfolio is AccountSnapshot => Boolean(portfolio && isPositiveDecimal(portfolio.portfolioEquity) && /^\d{4}-\d{2}-\d{2}T/.test(portfolio.observedAt)))
+    .map((portfolio) => [`${portfolio.observedAt}|${portfolio.portfolioEquity}`, portfolio] as const)).values()]
+    .sort((left, right) => left.observedAt.localeCompare(right.observedAt));
+  const baselinePortfolio = portfolioObservations[0];
   if (baselinePortfolio) {
     result = {
       ...result,
@@ -330,9 +348,10 @@ export function bootstrapPerformance(journals: readonly TradingJournal[], experi
       peakEquity: baselinePortfolio.portfolioEquity,
       peakEquityObservedAt: baselinePortfolio.observedAt,
       baselineSource: "PROVIDER_LIVE",
-      baselineInitializationReason: "FIRST_TRUSTWORTHY_PROVIDER_OBSERVATION",
+      baselineInitializationReason: "EARLIEST_STORED_PROVIDER_OBSERVATION",
+      competitionStartVerified: false,
     };
-    result = updateEquity(result, baselinePortfolio.portfolioEquity, baselinePortfolio.observedAt);
+    for (const portfolio of portfolioObservations) result = updateEquity(result, portfolio.portfolioEquity, portfolio.observedAt);
   }
   return result;
 }

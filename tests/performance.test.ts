@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AccountSnapshot, Decision, DecisionExecutionRecord, ExecutionResult, ReconciliationResult, TradeExperience, TradingJournal } from "../src/types.js";
-import { bootstrapPerformance, buildPerformanceAccounting, emptyPerformance, performanceTotalPnl, recordVerifiedClose, recordVerifiedOpen, updateEquity } from "../src/trading/performance.js";
+import { bootstrapPerformance, buildPerformanceAccounting, emptyPerformance, performanceTotalPnl, recordVerifiedClose, recordVerifiedOpen, recordVerifiedPartial, updateEquity } from "../src/trading/performance.js";
 
 const at = "2026-09-14T10:00:00.000Z";
 const account: AccountSnapshot = {
@@ -110,6 +110,20 @@ describe("persisted performance aggregate", () => {
     expect(value).toMatchObject({ totalTrades: 2, openTrades: 1, closedTrades: 1, wins: 0, losses: 1, breakeven: 0, winRate: "0", verifiedRealizedPnl: "-2" });
   });
 
+  it("does not double-count partial reductions when the episode later closes", () => {
+    let value = recordVerifiedOpen(emptyPerformance(at), "1000", at);
+    value = recordVerifiedPartial(value, "10", "1010", "2026-09-14T11:00:00.000Z");
+    value = recordVerifiedPartial(value, "-2", "1008", "2026-09-14T11:01:00.000Z");
+    value = recordVerifiedClose(value, "-3", "1005", "2026-09-14T11:02:00.000Z", "8", "FILL");
+    expect(value).toMatchObject({ closedTrades: 1, wins: 1, losses: 0, closedEpisodeRealizedPnl: "5", openEpisodePartialRealizedPnl: "0", verifiedRealizedPnl: "5", winRate: "100" });
+  });
+
+  it("treats cumulative position-history PnL as the episode total, not another contribution", () => {
+    let value = recordVerifiedOpen(emptyPerformance(at), "1000", at);
+    value = recordVerifiedPartial(value, "10", "1010", "2026-09-14T11:00:00.000Z");
+    value = recordVerifiedClose(value, "6", "1006", "2026-09-14T11:01:00.000Z", "10", "POSITION_HISTORY_NET_PROFIT");
+    expect(value).toMatchObject({ closedEpisodeRealizedPnl: "6", openEpisodePartialRealizedPnl: "0", verifiedRealizedPnl: "6", wins: 1, losses: 0, winRate: "100" });
+  });
   it("uses classified closed trades as the win-rate denominator and leaves zero unavailable", () => {
     const open = emptyPerformance(at);
     expect(buildPerformanceAccounting(open, { portfolioEquity: "1000", observedAt: at }).winRatePct).toBe("UNAVAILABLE");
@@ -126,6 +140,12 @@ describe("persisted performance aggregate", () => {
     expect(value.dailyPnl["2026-09-12"]).toBeUndefined();
   });
 
+  it("replays every historical equity observation during migration", () => {
+    const equities = ["50000", "51000", "50500", "49500", "50400"];
+    const journals = equities.map((equity, index): TradingJournal => ({ cycleId: `equity-${index}`, agentVersion: "1", model: "qwen", mode: "AUTONOMOUS", startedAt: `2026-09-${String(12 + index).padStart(2, "0")}T00:00:00.000Z`, completedAt: `2026-09-${String(12 + index).padStart(2, "0")}T00:01:00.000Z`, portfolio: { ...account, portfolioEquity: equity, observedAt: `2026-09-${String(12 + index).padStart(2, "0")}T00:00:30.000Z` }, retrievedLessons: [], createdLessons: [] }));
+    const value = bootstrapPerformance(journals, [], at);
+    expect(value).toMatchObject({ competitionBaselineEquity: "50000", latestEquity: "50400", peakEquity: "51000", currentDrawdownPct: "1.17647058", maxDrawdownPct: "2.94117647" });
+  });
   it("bootstraps only provider-verified autonomous opens", () => {
     const open = decision("OPEN_LONG", "open-1");
     const verifiedJournal: TradingJournal = { cycleId: "cycle-1", agentVersion: "1", model: "qwen", mode: "AUTONOMOUS", startedAt: at, completedAt: at, portfolio: account, retrievedLessons: [], createdLessons: [], cyclePlan: { positionActions: [], entryActions: [open as never] }, executionRecords: [recordFor("OPEN_LONG", "open-1")] };
@@ -144,13 +164,13 @@ describe("persisted performance aggregate", () => {
     const reduceExecution = { ...execution("CLOSE", "partial-reduce", "3.1374"), action: "REDUCE" as const };
     const partialJournal: TradingJournal = { cycleId: "partial-cycle", agentVersion: "1", model: "qwen", mode: "AUTONOMOUS", startedAt: at, completedAt: at, retrievedLessons: [], createdLessons: [], decision: reduce, executionResult: reduceExecution, reconciliationResult: { status: "MATCHED", codes: [], execution: reduceExecution } };
     const value = bootstrapPerformance([partialJournal], [...closed, partial], at);
-    expect(value).toMatchObject({ closedTrades: 4, wins: 1, losses: 3, breakeven: 0, winRate: "25", closedTradeRealizedPnl: "-30.5367", partialRealizedPnl: "3.1374", verifiedRealizedPnl: "-27.3993" });
+    expect(value).toMatchObject({ closedTrades: 4, wins: 1, losses: 3, breakeven: 0, winRate: "25", closedEpisodeRealizedPnl: "-30.5367", openEpisodePartialRealizedPnl: "3.1374", verifiedRealizedPnl: "-27.3993" });
   });
 
   it("chooses the earliest trustworthy provider portfolio as the migration baseline", () => {
     const older: TradingJournal = { cycleId: "older", agentVersion: "1", model: "qwen", mode: "AUTONOMOUS", startedAt: "2026-09-12T00:00:00.000Z", completedAt: "2026-09-12T00:01:00.000Z", portfolio: { ...account, portfolioEquity: "50000", observedAt: "2026-09-12T00:00:30.000Z" }, retrievedLessons: [], createdLessons: [] };
     const newer: TradingJournal = { ...older, cycleId: "newer", startedAt: "2026-09-14T09:58:00.000Z", completedAt: "2026-09-14T09:59:00.000Z", portfolio: { ...account, portfolioEquity: "50033.99009667", observedAt: "2026-09-14T09:58:49.197Z" } };
     const value = bootstrapPerformance([newer, older], [], at);
-    expect(value).toMatchObject({ competitionBaselineEquity: "50000", performanceBaselineAt: "2026-09-12T00:00:30.000Z", baselineInitializationReason: "FIRST_TRUSTWORTHY_PROVIDER_OBSERVATION" });
+    expect(value).toMatchObject({ competitionBaselineEquity: "50000", performanceBaselineAt: "2026-09-12T00:00:30.000Z", baselineInitializationReason: "EARLIEST_STORED_PROVIDER_OBSERVATION", competitionStartVerified: false });
   });
 });

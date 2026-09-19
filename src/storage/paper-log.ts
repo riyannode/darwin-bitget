@@ -49,7 +49,8 @@ export interface PaperLogSummary {
     losses: number;
     breakeven: number;
     realizedPnl: string;
-    partialRealizedPnl: string;
+    closedEpisodeRealizedPnl: string;
+    openEpisodePartialRealizedPnl: string;
     verifiedRealizedPnl: string;
   };
   risk: {
@@ -524,9 +525,9 @@ export function buildPaperLogExport(input: {
   const unresolvedExecutions = decisions.filter((decision) => decision.action !== "REVERSE" && decision.executionResult && !decision.providerVerified).length + physicalWrites.filter((write) => write.executionStatus !== null && !write.providerVerified).length;
 
   const closed = experiences.filter((experience) => ["PROFITABLE", "LOSING", "BREAK_EVEN", "CLOSED_UNCLASSIFIED"].includes(experience.outcomeStatus));
-  const closedTradeRealizedPnl = closed.filter((experience) => experience.realizedPnlVerified && typeof experience.realizedPnl === "string" && isDecimal(experience.realizedPnl)).reduce((total, experience) => addDecimal(total, experience.realizedPnl ?? "0"), "0");
-  const partialRealizedPnl = decisions.filter((decision) => decision.action === "REDUCE" && decision.providerVerified && decision.realizedPnl !== null && isDecimal(decision.realizedPnl)).reduce((total, decision) => addDecimal(total, decision.realizedPnl ?? "0"), "0");
-  const verifiedRealizedPnl = addDecimal(closedTradeRealizedPnl, partialRealizedPnl);
+  const closedEpisodeRealizedPnl = closed.filter((experience) => experience.realizedPnlVerified && typeof experience.realizedPnl === "string" && isDecimal(experience.realizedPnl)).reduce((total, experience) => addDecimal(total, experience.realizedPnl ?? "0"), "0");
+  const openEpisodePartialRealizedPnl = experiences.filter((experience) => experience.outcomeStatus === "OPEN" && experience.realizedPnlVerified === true && experience.realizedPnl !== null && isDecimal(experience.realizedPnl)).reduce((total, experience) => addDecimal(total, experience.realizedPnl ?? "0"), "0");
+  const verifiedRealizedPnl = addDecimal(closedEpisodeRealizedPnl, openEpisodePartialRealizedPnl);
   const drawdown = summarizeDrawdown(journals);
 
   const totalCycles = cycles.length;
@@ -615,8 +616,9 @@ export function buildPaperLogExport(input: {
         wins: closed.filter((experience) => experience.outcomeStatus === "PROFITABLE").length,
         losses: closed.filter((experience) => experience.outcomeStatus === "LOSING").length,
         breakeven: closed.filter((experience) => experience.outcomeStatus === "BREAK_EVEN").length,
-        realizedPnl: closedTradeRealizedPnl,
-        partialRealizedPnl,
+        realizedPnl: closedEpisodeRealizedPnl,
+        closedEpisodeRealizedPnl,
+        openEpisodePartialRealizedPnl,
         verifiedRealizedPnl,
       },
       risk: {
@@ -652,8 +654,8 @@ function csvValue(value: unknown): string {
 }
 
 export function paperLogToCsv(exported: PaperLogExport): string {
-  const header = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "scannedUniverseCount", "selectedEntryCandidates", "managedExistingPositions", "totalProposedActions", "financialWritesPerformed", "decisionId", "decisionTimestamp", "actionCategory", "action", "symbol", "positionSide", "marginAllocationPct", "additionalMarginPct", "targetPositionSide", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "providerOperation", "providerCode", "providerMessage", "providerReadbackCode", "providerReadbackMessage", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "physicalWrites", "reflectionIds", "createdLessonIds", "closedTradeRealizedPnl", "partialRealizedPnl", "verifiedRealizedPnl", "closedTrades", "wins", "losses", "breakeven", "winRatePct"];
-  const summaryValues = [exported.summary.closedTrades.realizedPnl, exported.summary.closedTrades.partialRealizedPnl, exported.summary.closedTrades.verifiedRealizedPnl, exported.summary.closedTrades.total, exported.summary.closedTrades.wins, exported.summary.closedTrades.losses, exported.summary.closedTrades.breakeven, exported.summary.closedTrades.total > 0 ? (exported.summary.closedTrades.wins * 100 / exported.summary.closedTrades.total).toString() : "UNAVAILABLE"];
+  const header = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "scannedUniverseCount", "selectedEntryCandidates", "managedExistingPositions", "totalProposedActions", "financialWritesPerformed", "decisionId", "decisionTimestamp", "actionCategory", "action", "symbol", "positionSide", "marginAllocationPct", "additionalMarginPct", "targetPositionSide", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "providerOperation", "providerCode", "providerMessage", "providerReadbackCode", "providerReadbackMessage", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "physicalWrites", "reflectionIds", "createdLessonIds", "closedEpisodeRealizedPnl", "openEpisodePartialRealizedPnl", "verifiedRealizedPnl", "closedTrades", "wins", "losses", "breakeven", "winRatePct"];
+  const summaryValues = [exported.summary.closedTrades.closedEpisodeRealizedPnl, exported.summary.closedTrades.openEpisodePartialRealizedPnl, exported.summary.closedTrades.verifiedRealizedPnl, exported.summary.closedTrades.total, exported.summary.closedTrades.wins, exported.summary.closedTrades.losses, exported.summary.closedTrades.breakeven, exported.summary.closedTrades.total > 0 ? (exported.summary.closedTrades.wins * 100 / exported.summary.closedTrades.total).toString() : "UNAVAILABLE"];
   const rows = exported.cycles.flatMap((cycle) => {
     const decisions = exported.decisions.filter((decision) => decision.cycleId === cycle.cycleId);
     const cycleValues = [cycle.cycleId, cycle.status, cycle.startedAt, cycle.completedAt, cycle.eventTypes, cycle.planning.scannedUniverseCount, cycle.planning.selectedEntryCandidates, cycle.planning.managedExistingPositions, cycle.planning.totalProposedActions, cycle.execution.financialWritesPerformed];

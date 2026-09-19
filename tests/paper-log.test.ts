@@ -40,10 +40,10 @@ describe("paper log export", () => {
     const reduceJournal = { ...journal(99, "REDUCE"), cycleId: "partial-cycle", decision: reduceDecision, executionResult: reduceExecution, reconciliationResult: matchedReconciliation(reduceExecution), experienceIds: [partial.experienceId] };
     const journals = allExperiences.slice(0, -1).map((item, index) => ({ ...journal(index, "OPEN_LONG"), experienceIds: [item.experienceId] })).concat(reduceJournal);
     const exported = buildPaperLogExport({ generatedAt: "2026-09-19T20:00:00.000Z", period: { start: null, end: null }, environment: "test", model: "qwen3.8-max", version: "0.3.0", commit: "abc123", cycles: journals.map((entry) => ({ cycleId: entry.cycleId, status: "COMPLETED", startedAt: entry.startedAt, completedAt: entry.completedAt ?? null })), journals, experiences: allExperiences, events: [] });
-    expect(exported.summary.closedTrades).toMatchObject({ total: 4, wins: 1, losses: 3, breakeven: 0, realizedPnl: "-30.5367", partialRealizedPnl: "3.1374", verifiedRealizedPnl: "-27.3993" });
+    expect(exported.summary.closedTrades).toMatchObject({ total: 4, wins: 1, losses: 3, breakeven: 0, realizedPnl: "-30.5367", closedEpisodeRealizedPnl: "-30.5367", openEpisodePartialRealizedPnl: "3.1374", verifiedRealizedPnl: "-27.3993" });
     expect(exported.closedTrades).toHaveLength(4);
     const csv = paperLogToCsv(exported);
-    expect(csv).toContain("closedTradeRealizedPnl,partialRealizedPnl,verifiedRealizedPnl");
+    expect(csv).toContain("closedEpisodeRealizedPnl,openEpisodePartialRealizedPnl,verifiedRealizedPnl");
     expect(csv).toContain("-30.5367");
   });
 

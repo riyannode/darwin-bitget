@@ -221,7 +221,7 @@ function executionEvidence(journal: TradingJournal | null): DashboardSnapshot["e
 }
 
 function unavailablePerformance(): DashboardSnapshot["performance"] {
-  return { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, openTrades: null, closedTrades: null, wins: null, losses: null, breakeven: null, closedTradeRealizedPnl: "UNAVAILABLE", partialRealizedPnl: "UNAVAILABLE", verifiedRealizedPnl: "UNAVAILABLE", competitionBaselineEquity: null, latestEquity: null, performanceBaselineAt: null, dailyPnl: {} };
+  return { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, openTrades: null, closedTrades: null, wins: null, losses: null, breakeven: null, closedEpisodeRealizedPnl: "UNAVAILABLE", openEpisodePartialRealizedPnl: "UNAVAILABLE", verifiedRealizedPnl: "UNAVAILABLE", competitionBaselineEquity: null, latestEquity: null, performanceBaselineAt: null, dailyPnl: {} };
 }
 
 function json(value: unknown, status = 200): Response {
@@ -547,13 +547,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
     return { journals, experiences };
   }
 
-  private updatePerformanceReadModel(record: DecisionExecutionRecord, bundle: EvidenceBundle, verified: boolean): void {
+  private updatePerformanceReadModel(record: DecisionExecutionRecord, bundle: EvidenceBundle, verified: boolean, currentExperience?: TradeExperience): void {
     if (!verified || !record.executionResult) return;
     const observedAt = record.executionResult.readBackAt;
     const equity = record.accountAfter?.portfolioEquity ?? bundle.account.portfolioEquity;
     let performance = this.performanceWithEquity(equity, observedAt);
     if (record.decision.action === "OPEN_LONG" || record.decision.action === "OPEN_SHORT") performance = recordVerifiedOpen(performance, equity, observedAt);
-    if (record.decision.action === "CLOSE") performance = recordVerifiedClose(performance, record.executionResult.realizedPnl, equity, observedAt);
+    if (record.decision.action === "CLOSE") performance = recordVerifiedClose(performance, record.executionResult.realizedPnl, equity, observedAt, currentExperience?.realizedPnl, record.executionResult.realizedPnlSource);
     if (record.decision.action === "REDUCE") performance = recordVerifiedPartial(performance, record.executionResult.realizedPnl ?? "", equity, observedAt);
     savePerformanceAggregate(this, performance, observedAt);
   }
@@ -617,8 +617,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
       wins: persistedPerformance.wins,
       losses: persistedPerformance.losses,
       breakeven: persistedPerformance.breakeven,
-      closedTradeRealizedPnl: persistedPerformance.closedTradeRealizedPnl,
-      partialRealizedPnl: persistedPerformance.partialRealizedPnl,
+      closedEpisodeRealizedPnl: persistedPerformance.closedEpisodeRealizedPnl,
+      openEpisodePartialRealizedPnl: persistedPerformance.openEpisodePartialRealizedPnl,
       verifiedRealizedPnl: accounting.verifiedRealizedPnl,
       competitionBaselineEquity: accounting.baselineEquity,
       latestEquity: accounting.currentEquity,
@@ -1026,8 +1026,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const isEntryDecision = decision.action === "OPEN_LONG" || decision.action === "OPEN_SHORT";
     const isManagementDecision = managementDecision.action === "HOLD" || managementDecision.action === "INCREASE" || managementDecision.action === "REDUCE" || managementDecision.action === "CLOSE" || managementDecision.action === "REVERSE";
     if (isManagementDecision && (!isEntryDecision || verified)) this.updatePositionContext(record);
-    this.updatePerformanceReadModel(record, bundle, verified);
     const currentExperience = experiences.find((experience) => experience.outcomeStatus === "OPEN" && experience.symbol === decision.symbol && experience.positionSide === decision.positionSide);
+    this.updatePerformanceReadModel(record, bundle, verified, currentExperience);
     if (!currentExperience && allowFailureReflection && (record.riskGateResult.status === "BLOCK" || (executionResult && !verified))) {
       const failure = record.riskGateResult.codes.length ? record.riskGateResult.codes.join(",") : "EXECUTION_FAILURE";
       const failureResult = reflect({ decision, outcome: record.riskGateResult.status === "BLOCK" ? "RISK_BLOCKED" : "EXECUTION_FAILURE", failureCode: failure, symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", experienceStatus: record.riskGateResult.status === "BLOCK" ? "BLOCKED" : "EXECUTION_FAILURE", entryPrice: bundle.market.lastPrice, exitPrice: bundle.market.lastPrice, evidenceAtEntry: bundle.evidence.map((evidence) => evidence.type), evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: decision.lessonsUsed, marginAllocated: record.executionRequest?.marginAllocated ?? "0", positionNotional: record.executionRequest?.positionNotional ?? "0" });
@@ -1069,7 +1069,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
     }
     if (!currentExperience || !executionResult) return {};
     const realizedPnl = isDecimal(executionResult.realizedPnl) ? executionResult.realizedPnl : undefined;
-    const cumulativePnl = realizedPnl && isDecimal(currentExperience.realizedPnl) ? addDecimal(currentExperience.realizedPnl, realizedPnl) : currentExperience.realizedPnl;
+    const historyPnlIsCumulative = executionResult.realizedPnlSource === "POSITION_HISTORY_NET_PROFIT" || executionResult.realizedPnlSource === "POSITION_HISTORY_PNL";
+    const cumulativePnl = realizedPnl && historyPnlIsCumulative ? realizedPnl : realizedPnl && isDecimal(currentExperience.realizedPnl) ? addDecimal(currentExperience.realizedPnl, realizedPnl) : currentExperience.realizedPnl;
     const sharedInput = { decision, symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", entryPrice: currentExperience.entryPrice, exitPrice: executionResult.averageFillPrice ?? bundle.market.lastPrice, evidenceAtEntry: currentExperience.evidenceAtEntry, evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: [...new Set([...currentExperience.lessonsUsed, ...decision.lessonsUsed])], lessons: lessons.filter((lesson) => currentExperience.lessonsUsed.includes(lesson.lessonId) || decision.lessonsUsed.includes(lesson.lessonId)), marginAllocated: currentExperience.marginAllocated, positionNotional: record.positionAfter?.notional ?? currentExperience.positionNotional, realizedPnl: cumulativePnl, realizedPnlPct: executionResult.realizedPnlPct ?? currentExperience.realizedPnlPct, realizedPnlVerified: Boolean(realizedPnl), ...(executionResult.fees ? { fees: executionResult.fees } : {}), ...(executionResult.funding ? { funding: executionResult.funding } : {}) };
     if (decision.action === "CLOSE" && verified) {
       const closeInput = { ...sharedInput, outcome: realizedPnl ? "CLOSED" : "CLOSED_PNL_UNVERIFIED", failureCode: "", experienceStatus: realizedPnl ? outcomeFromPnl(cumulativePnl) : "CLOSED_UNCLASSIFIED" as const, existingExperience: currentExperience };
