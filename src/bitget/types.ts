@@ -320,11 +320,17 @@ export function parseFillSummary(value: unknown): FillSummary {
   };
 }
 
-export function parsePositionHistorySummary(value: unknown): PositionHistorySummary {
+export interface PositionHistoryQuery {
+  symbol: string;
+  positionSide: PositionSide;
+  submittedAt?: string;
+}
+
+export function parsePositionHistorySummary(value: unknown, query?: PositionHistoryQuery): PositionHistorySummary {
   const payload = record(value);
   const container = Array.isArray(payload.list) ? payload.list : [];
   const rows = records(container);
-  const row = rows[0];
+  const row = query ? rows.find((candidate) => positionHistoryMatches(candidate, query)) : rows[0];
   if (!row) return {};
   const fees = [text(row.openFeeTotal, text(row.openFee)), text(row.closeFeeTotal, text(row.closeFee))].filter(Boolean);
   const netProfit = text(row.netProfit);
@@ -336,6 +342,19 @@ export function parsePositionHistorySummary(value: unknown): PositionHistorySumm
     ...(text(row.totalFunding) ? { funding: text(row.totalFunding) } : {}),
     ...(text(row.cashDividend) ? { cashDividend: text(row.cashDividend) } : {}),
   };
+}
+
+function positionHistoryMatches(row: Record<string, unknown>, query: PositionHistoryQuery): boolean {
+  const symbol = text(row.symbol, text(row.instId));
+  if (symbol && symbol !== query.symbol) return false;
+  const side = text(row.posSide, text(row.holdSide));
+  if (side && side.toUpperCase() !== query.positionSide) return false;
+  if (!query.submittedAt) return true;
+  const updatedAt = text(row.updatedTime, text(row.uTime, text(row.utime)));
+  if (!updatedAt) return false;
+  const updatedMs = Number(updatedAt);
+  const submittedMs = Date.parse(query.submittedAt);
+  return Number.isFinite(updatedMs) && Number.isFinite(submittedMs) && updatedMs >= submittedMs;
 }
 
 function entryQuantity(entry: Record<string, unknown>): unknown {

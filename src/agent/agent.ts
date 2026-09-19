@@ -58,7 +58,7 @@ import { loadOwnerPolicy, updateOwnerPolicy } from "../trading/policy.js";
 import { buildExecutionRequest, executePaperOrder } from "../trading/execution.js";
 import { executeCyclePlan } from "../trading/execution-planner.js";
 import { reconcileExecution } from "../trading/reconcile.js";
-import { addDecimal, isDecimal } from "../trading/decimal.js";
+import { addDecimal, isDecimal, isPositiveDecimal } from "../trading/decimal.js";
 import { bootstrapPerformance, buildPerformanceAccounting, currentMonthDailyPnl, emptyPerformance, isPerformanceAggregate, POSITION_CONTEXT_READ_MODEL_VERSION, recordVerifiedClose, recordVerifiedOpen, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate, type PerformanceObservation } from "../trading/performance.js";
 import { bootstrapPositionContexts, decisionReasoning, upsertPositionContext } from "./position-context.js";
 import { EvaClient } from "../eva/client.js";
@@ -564,7 +564,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   private performanceWithEquity(equity: string, observedAt: string): PerformanceAggregate {
     let performance = loadPerformanceAggregate<PerformanceAggregate>(this);
     if (!isPerformanceAggregate(performance)) performance = emptyPerformance(observedAt);
-    if (!performance.competitionBaselineEquity && isDecimal(equity) && Number(equity) > 0) performance = { ...performance, competitionBaselineEquity: equity, latestEquity: equity, performanceBaselineAt: observedAt };
+    if (!performance.competitionBaselineEquity && isPositiveDecimal(equity)) performance = { ...performance, competitionBaselineEquity: equity, latestEquity: equity, performanceBaselineAt: observedAt };
     return updateEquity(performance, equity, observedAt);
   }
 

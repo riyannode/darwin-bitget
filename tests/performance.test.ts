@@ -87,6 +87,15 @@ describe("persisted performance aggregate", () => {
     expect(value.maxDrawdownPct).toBe("2.94117647");
   });
 
+  it("ignores provider observations older than the persisted ledger observation", () => {
+    let value = emptyPerformance(at);
+    value = { ...value, competitionBaselineEquity: "1000", performanceBaselineAt: at, latestEquity: "1000", latestEquityObservedAt: at };
+    value = updateEquity(value, "1010", "2026-09-14T11:00:00.000Z");
+    value = updateEquity(value, "9999", "2026-09-14T10:30:00.000Z");
+    expect(value.latestEquity).toBe("1010");
+    expect(value.latestEquityObservedAt).toBe("2026-09-14T11:00:00.000Z");
+  });
+
   it("does not classify a partial reduce as a closed trade", () => {
     let value = recordVerifiedOpen(emptyPerformance(at), "1000", at);
     const before = { ...value };

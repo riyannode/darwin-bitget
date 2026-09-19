@@ -373,10 +373,10 @@ export class BitgetClient {
       } catch {
         readbackFailure = true;
       }
-      if (request.tradeSide === "close") {
+      if (request.tradeSide === "close" && !enriched.realizedPnl) {
         try {
           const history = await this.callOperation<unknown>("getPositionsHistory", { category: this.category, symbol: request.symbol, limit: "20" });
-          const summary = parsePositionHistorySummary(history.data);
+          const summary = parsePositionHistorySummary(history.data, { symbol: request.symbol, positionSide: request.positionSide, submittedAt: reference.submittedAt });
           enriched = {
             ...enriched,
             ...(!enriched.averageFillPrice && summary.averageClosePrice ? { averageFillPrice: summary.averageClosePrice } : {}),

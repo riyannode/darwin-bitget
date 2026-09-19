@@ -126,4 +126,13 @@ describe("Bitget provider readback", () => {
     const result = parsePositionHistorySummary({ list: [{ closeAvgPrice: "101", cumRealisedPnl: "3.1", netProfit: "2.5", totalFunding: "-0.1", openFeeTotal: "-0.2", closeFeeTotal: "-0.3", cashDividend: "0.05" }] });
     expect(result).toEqual({ averageClosePrice: "101", realizedPnl: "2.5", realizedPnlSource: "POSITION_HISTORY_NET_PROFIT", realizedPnlIncludesCosts: true, fees: "-0.5", funding: "-0.1", cashDividend: "0.05" });
   });
+
+  it("correlates position history to symbol, side, and close observation", () => {
+    const result = parsePositionHistorySummary({ list: [
+      { symbol: "OTHERUSDT", posSide: "long", updatedTime: "1730000000000", netProfit: "99" },
+      { symbol: "CRCLUSDT", posSide: "long", updatedTime: "1730000001000", netProfit: "2.5" },
+    ] }, { symbol: "CRCLUSDT", positionSide: "LONG", submittedAt: "2024-10-27T00:00:00.000Z" });
+    expect(result.realizedPnl).toBe("2.5");
+    expect(parsePositionHistorySummary({ list: [{ symbol: "OTHERUSDT", posSide: "long", updatedTime: "1730000000000", netProfit: "99" }] }, { symbol: "CRCLUSDT", positionSide: "LONG", submittedAt: "2024-10-27T00:00:00.000Z" })).toEqual({});
+  });
 });

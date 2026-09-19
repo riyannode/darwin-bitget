@@ -151,6 +151,7 @@ export function normalizePerformanceAggregate(performance: PerformanceAggregate)
 
 export function updateEquity(performance: PerformanceAggregate, equity: string, observedAt: string): PerformanceAggregate {
   if (!isPositiveDecimal(equity)) return performance;
+  if (isOlderObservation(performance.latestEquityObservedAt, observedAt) || isOlderObservation(performance.performanceBaselineAt, observedAt)) return performance;
   const date = observedAt.slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return performance;
   const currentDay = performance.dailyPnl[date];
@@ -218,9 +219,10 @@ export function performanceTotalPnl(performance: PerformanceAggregate): string {
 
 export function buildPerformanceAccounting(performance: PerformanceAggregate, observation?: PerformanceObservation): PerformanceAccounting {
   const normalized = normalizePerformanceAggregate(performance);
-  const currentEquity = observation?.portfolioEquity ?? normalized.latestEquity;
-  const currentEquityObservedAt = observation?.observedAt ?? normalized.latestEquityObservedAt ?? normalized.performanceBaselineAt;
-  const source = observation ? "PROVIDER_LIVE" : currentEquity ? "PERSISTED_LEDGER" : "UNAVAILABLE";
+  const effectiveObservation = observation && !isOlderObservation(normalized.latestEquityObservedAt, observation.observedAt) && !isOlderObservation(normalized.performanceBaselineAt, observation.observedAt) ? observation : undefined;
+  const currentEquity = effectiveObservation?.portfolioEquity ?? normalized.latestEquity;
+  const currentEquityObservedAt = effectiveObservation?.observedAt ?? normalized.latestEquityObservedAt ?? normalized.performanceBaselineAt;
+  const source = effectiveObservation ? "PROVIDER_LIVE" : currentEquity ? "PERSISTED_LEDGER" : "UNAVAILABLE";
   const baselineEquity = normalized.competitionBaselineEquity;
   const equityDeltaSinceBaseline = baselineEquity && currentEquity ? subtractDecimal(currentEquity, baselineEquity) : "UNAVAILABLE";
   const netExternalInflows = normalized.netExternalInflows ?? "0";
@@ -242,19 +244,26 @@ export function buildPerformanceAccounting(performance: PerformanceAggregate, ob
     externalFlowStatus: normalized.externalFlowStatus ?? ZERO_EXTERNAL_FLOW_INVARIANT,
     netPnlSinceBaseline,
     verifiedRealizedPnl: normalized.verifiedRealizedPnl || "UNAVAILABLE",
-    unrealizedPnl: observation?.unrealizedPnl ?? "UNAVAILABLE",
-    unrealizedPnlSource: observation?.unrealizedPnlSource ?? "UNAVAILABLE",
+    unrealizedPnl: effectiveObservation?.unrealizedPnl ?? "UNAVAILABLE",
+    unrealizedPnlSource: effectiveObservation?.unrealizedPnlSource ?? "UNAVAILABLE",
     wins: normalized.wins,
     losses: normalized.losses,
     breakeven: normalized.breakeven,
     classifiedClosedTrades: normalized.wins + normalized.losses + normalized.breakeven,
     winRatePct: classifiedWinRate(normalized.wins, normalized.losses, normalized.breakeven),
     peakEquity: peakEquity ?? null,
-    peakEquityObservedAt: normalized.peakEquityObservedAt ?? normalized.performanceBaselineAt ?? null,
+    peakEquityObservedAt: peakEquity === currentEquity && currentEquityObservedAt ? currentEquityObservedAt : normalized.peakEquityObservedAt ?? normalized.performanceBaselineAt ?? null,
     currentDrawdownPct,
     maxDrawdownPct,
     source,
   };
+}
+
+function isOlderObservation(previous: string | null | undefined, next: string): boolean {
+  if (!previous) return false;
+  const previousMs = Date.parse(previous);
+  const nextMs = Date.parse(next);
+  return Number.isFinite(previousMs) && Number.isFinite(nextMs) && nextMs < previousMs;
 }
 
 export function currentMonthDailyPnl(performance: PerformanceAggregate, now = new Date()): Record<string, { pnl: string; trades: number; dailyReturnPct: string }> {
