@@ -1,6 +1,6 @@
 # DARWIN Bitget Signal Research Layer
 
-Status: implementation on `feat/bitget-signal-research`, based on `431b325acddec77e2cd3ce2d44383816d74c61cb`.
+Status: merged to main. Implementation lives in `src/research/` (router, executor, capabilities) and `src/agent/agent.ts` (`DARWIN_RESEARCH_TELEMETRY`).
 
 This layer is optional perception enrichment. It does not own trading, risk, sizing, execution, reconciliation, or provider state.
 
@@ -161,7 +161,7 @@ For the latest production no-write cycle, the observed evidence set was five sym
 = 20 existing external requests before enrichment
 ```
 
-The measured cold research overhead makes that observed no-write path approximately 27 external requests, leaving headroom under the 50-subrequest Worker limit. Existing financial write/readback behavior is unchanged; this PR adds no requests to that path. Research concurrency is at most two waiting MCP calls.
+The measured cold research overhead makes that observed no-write path approximately 27 external requests, leaving headroom under the 50-subrequest Worker limit. Research concurrency is at most two waiting MCP calls.
 
 The measured normalized MSTR smoke result was `AVAILABLE` with bounded facts covering `NEUTRAL` verdict, RSI `58.83`/`neutral`, MACD histogram `-0.677657`/`death_cross`, support/resistance levels, and one bullish signal. Raw MCP output was not printed or persisted.
 
@@ -203,4 +203,81 @@ The hint derives the same effective provider max semantics used by the risk gate
 
 ## Learning duplicate investigation
 
-The latest `/api/learning` readback contains two distinct `RISK_GATE` lesson rows for KORU, with different lesson IDs, actions, regimes, and creation times. They are distinct historical records, not identical persistence duplicates. This PR does not change the learning system or add deduplication.
+The latest `/api/learning` readback contains two distinct `RISK_GATE` lesson rows for KORU, with different lesson IDs, actions, regimes, and creation times. They are distinct historical records, not identical persistence duplicates.
+
+
+## Current runtime observability
+
+`collectResearchEvidence` in `src/agent/agent.ts` instruments every return path with a `ResearchCycleSummary` emitted as `DARWIN_RESEARCH_TELEMETRY`. The authoritative counter locations are:
+
+| Field | Meaning |
+|---|---|
+| `signalEnabled` | `config.bitgetSignalEnabled` |
+| `availableSkillCount` | `availableResearchCapabilities().length` |
+| `routerAttempted` | `true` after the router is invoked |
+| `planRequests` | `plan.requests.length` from the router |
+| `acceptedRequests` | count after `validateResearchPlan` |
+| `rejectedRequests` | count after `validateResearchPlan` |
+| `requestedSkills` | max 3 accepted skills |
+| `requestedSymbols` | max 3 accepted symbols |
+| `cacheHits` | cache lookup hits |
+| `mcpConnectAttempts` | `factory.connect()` attempts |
+| `mcpConnectSuccesses` | successful connections |
+| `mcpToolCalls` | `client.callTool(...)` attempts |
+| `availableResults` | `evidence.filter(e => e.status === "AVAILABLE").length` |
+| `unavailableResults` | remaining evidence count |
+| `researchDurationMs` | wall-clock duration |
+| `finalStatus` | one of the values below |
+
+### Final status semantics
+
+| Condition | `finalStatus` |
+|---|---|
+| Signal disabled | `SIGNAL_DISABLED` |
+| No capabilities | `NO_AVAILABLE_CAPABILITY` |
+| Router threw | `ROUTER_FAILED` |
+| Empty evidence | `NO_RESULTS` |
+| All AVAILABLE | `COMPLETED` |
+| Some AVAILABLE + some non-AVAILABLE | `PARTIAL` |
+| All non-AVAILABLE | `UNAVAILABLE` |
+| Uncaught exception | `ERROR` |
+
+Result counts are derived from the final returned `ResearchEvidence[]` array, not from `MCP_TOOL_RESULT` / `MCP_TOOL_FAILED` events. `emitResearchSummary` is wrapped in `try/catch` so telemetry emission cannot affect research or trading runtime.
+
+## Current runtime observability
+
+`collectResearchEvidence` in `src/agent/agent.ts` instruments every return path with a `ResearchCycleSummary` emitted as `DARWIN_RESEARCH_TELEMETRY`. The authoritative counter locations are:
+
+| Field | Meaning |
+|---|---|
+| `signalEnabled` | `config.bitgetSignalEnabled` |
+| `availableSkillCount` | `availableResearchCapabilities().length` |
+| `routerAttempted` | `true` after the router is invoked |
+| `planRequests` | `plan.requests.length` from the router |
+| `acceptedRequests` | count after `validateResearchPlan` |
+| `rejectedRequests` | count after `validateResearchPlan` |
+| `requestedSkills` | max 3 accepted skills |
+| `requestedSymbols` | max 3 accepted symbols |
+| `cacheHits` | cache lookup hits |
+| `mcpConnectAttempts` | `factory.connect()` attempts |
+| `mcpConnectSuccesses` | successful connections |
+| `mcpToolCalls` | `client.callTool(...)` attempts |
+| `availableResults` | `evidence.filter(e => e.status === "AVAILABLE").length` |
+| `unavailableResults` | remaining evidence count |
+| `researchDurationMs` | wall-clock duration |
+| `finalStatus` | one of the values below |
+
+### Final status semantics
+
+| Condition | `finalStatus` |
+|---|---|
+| Signal disabled | `SIGNAL_DISABLED` |
+| No capabilities | `NO_AVAILABLE_CAPABILITY` |
+| Router threw | `ROUTER_FAILED` |
+| Empty evidence | `NO_RESULTS` |
+| All AVAILABLE | `COMPLETED` |
+| Some AVAILABLE + some non-AVAILABLE | `PARTIAL` |
+| All non-AVAILABLE | `UNAVAILABLE` |
+| Uncaught exception | `ERROR` |
+
+Result counts are derived from the final returned `ResearchEvidence[]` array, not from `MCP_TOOL_RESULT` / `MCP_TOOL_FAILED` events. `emitResearchSummary` is wrapped in `try/catch` so telemetry emission cannot affect research or trading runtime.

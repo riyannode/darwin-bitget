@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_OWNER_POLICY, parseOwnerPolicy, updateOwnerPolicy } from "../src/trading/policy.js";
 
 describe("owner policy", () => {
+  it("defaults to the authoritative 5-minute scan cadence", () => {
+    expect(DEFAULT_OWNER_POLICY.scanIntervalMinutes).toBe(5);
+  });
+
   it("accepts an update inside hard bounds", () => {
     expect(updateOwnerPolicy(DEFAULT_OWNER_POLICY, { maxLeverage: "3", scanIntervalMinutes: 30 })).toMatchObject({ maxLeverage: "3", scanIntervalMinutes: 30 });
   });

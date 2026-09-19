@@ -7,7 +7,7 @@ export const DEFAULT_OWNER_POLICY: OwnerPolicy = {
   maxLeverage: "5",
   maxDailyDrawdownPct: "10",
   drawdownCooldownMinutes: 60,
-  scanIntervalMinutes: 15,
+  scanIntervalMinutes: 5,
   emergencyStop: false,
 };
 

@@ -486,7 +486,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     }
   }
 
-  private ensureTemporaryScanTest(): void {
+  private ensureTemporaryScanTest(policy: OwnerPolicy): void {
     const expiresAt = this.state.temporaryScanIntervalExpiresAt;
     if (this.state.temporaryScanIntervalDurationMs !== TEMPORARY_SCAN_INTERVAL_DURATION_MS) {
       const nextExpiresAt = new Date(Date.now() + TEMPORARY_SCAN_INTERVAL_DURATION_MS).toISOString();
@@ -498,7 +498,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (expiresAt) {
       if (new Date(expiresAt).getTime() > Date.now()) return;
       this.setState({ ...this.state, temporaryScanIntervalExpiresAt: null, temporaryScanIntervalCompleted: true });
-      this.recordEvent("TEMPORARY_SCAN_INTERVAL_EXPIRED", "CONTROL", { restoredIntervalMinutes: "15" });
+      this.recordEvent("TEMPORARY_SCAN_INTERVAL_EXPIRED", "CONTROL", { restoredIntervalMinutes: String(policy.scanIntervalMinutes) });
       return;
     }
     const nextExpiresAt = new Date(Date.now() + TEMPORARY_SCAN_INTERVAL_DURATION_MS).toISOString();
@@ -507,7 +507,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   private activeScanIntervalMinutes(policy: OwnerPolicy): number {
-    this.ensureTemporaryScanTest();
+    this.ensureTemporaryScanTest(policy);
     return temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : policy.scanIntervalMinutes;
   }
 

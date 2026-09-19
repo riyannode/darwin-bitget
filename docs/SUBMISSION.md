@@ -76,7 +76,7 @@ Qwen proposes strategy, thesis, symbol, direction, management intent, margin all
 
 ## Agent-quality evidence contract
 
-The current prompt contracts are `darwin-mandate-v6` and `darwin-decision-v4`. Each action must explain its decision rationale, supporting evidence, risk and invalidation conditions, evidence limitations, and lessons used. INCREASE carries additional margin and preserves provider leverage; REVERSE carries previous side, target side, and two-leg verification. The dashboard exposes those fields grouped by cycle so a judge can distinguish model reasoning from deterministic risk authority. This PR intentionally changes financial behavior architecture; it is not SAFE_CLEANUP.
+The current prompt contracts are `darwin-mandate-v6`, `darwin-candidate-v1`, `darwin-decision-v9`, `darwin-reflection-v1`, and `darwin-backtest-v2`. Each action must explain its decision rationale, supporting evidence, risk and invalidation conditions, evidence limitations, and lessons used. INCREASE carries additional margin and preserves provider leverage; REVERSE carries previous side, target side, and two-leg verification. The dashboard exposes those fields grouped by cycle so a judge can distinguish model reasoning from deterministic risk authority.
 
 ## Architectural differentiator for judging
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { evaluateRiskGate } from "../src/trading/risk-gate.js";
 import { providerQuantityCodes } from "../src/trading/order-quantity.js";
-import type { AccountSnapshot, Decision, EvidenceBundle, Instrument, RuntimeConfig } from "../src/types.js";
+import type { AccountSnapshot, Decision, Instrument, RuntimeConfig } from "../src/types.js";
 
 const config: RuntimeConfig = {
   tradingMode: "PAPER",
@@ -19,7 +19,6 @@ const account: AccountSnapshot = {
 };
 const market = { symbol: "KORUUSDT", lastPrice: "100", bidPrice: "99.9", askPrice: "100.1", priceChange24h: "0", volume24h: "1000", observedAt: account.observedAt } as const;
 const instrument: Instrument = { symbol: "KORUUSDT", category: "USDT-FUTURES", baseCoin: "KORU", quoteCoin: "USDT", marginCoin: "USDT", symbolType: "stock", isRwa: "YES", status: "online", minOrderQty: "0.01", maxOrderQty: "2", minOrderAmount: "5", pricePrecision: 2, quantityPrecision: 2, quantityStep: "0.01", leverageMin: "1", leverageMax: "5" };
-const bundle: EvidenceBundle = { market, account, instrument, evidence: [] };
 
 function decision(marginAllocationPct: string): Decision {
   return { decisionId: "decision-1", cycleId: "cycle-1", action: "OPEN_SHORT", positionSide: "SHORT", symbol: "KORUUSDT", marginAllocationPct, leverage: "2", reductionPct: null, confidence: 0.6, thesis: "test", strategyThesis: "test", supportingFactors: [], riskFactors: [], evidenceUsed: [], lessonsUsed: [], createdAt: account.observedAt };
