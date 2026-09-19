@@ -316,9 +316,7 @@ export function bootstrapPerformance(journals: readonly TradingJournal[], experi
   const closedExperiences = experiences.filter((experience) => closedStatuses.has(experience.outcomeStatus) && Boolean(experience.exitDecisionId && experience.exitTime));
   const openExperiences = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
   const closedPnl = sumDecimalValues(closedExperiences.filter((experience) => experience.realizedPnlVerified === true && isDecimal(experience.realizedPnl)).map((experience) => experience.realizedPnl));
-  const partialFromRecords = verifiedPartialRealizedPnl(journals);
-  const partialFromOpenEpisodes = sumDecimalValues(openExperiences.filter((experience) => experience.realizedPnlVerified === true && isDecimal(experience.realizedPnl)).map((experience) => experience.realizedPnl));
-  const partialPnl = isZeroDecimal(partialFromRecords) ? partialFromOpenEpisodes : partialFromRecords;
+  const partialPnl = sumDecimalValues(openExperiences.filter((experience) => experience.realizedPnlVerified === true && isDecimal(experience.realizedPnl)).map((experience) => experience.realizedPnl));
   let result = {
     ...performance,
     totalTrades: closedExperiences.length + openExperiences.length,
@@ -354,23 +352,6 @@ export function bootstrapPerformance(journals: readonly TradingJournal[], experi
     for (const portfolio of portfolioObservations) result = updateEquity(result, portfolio.portfolioEquity, portfolio.observedAt);
   }
   return result;
-}
-
-function verifiedPartialRealizedPnl(journals: readonly TradingJournal[]): string {
-  const seen = new Set<string>();
-  let total = "0";
-  for (const journal of journals) {
-    if (journal.mode !== "AUTONOMOUS") continue;
-    const normalized = normalizeCycleDecisions(journal);
-    for (const record of normalized.records) {
-      if (record.decision.action !== "REDUCE" || seen.has(record.decision.decisionId)) continue;
-      seen.add(record.decision.decisionId);
-      const execution = effectiveExecutionResult(journal, record.decision, record);
-      const reconciliation = effectiveReconciliationResult(journal, record.decision, record);
-      if (execution?.status === "filled" && reconciliation?.status === "MATCHED" && isDecimal(execution.realizedPnl)) total = addDecimal(total, execution.realizedPnl);
-    }
-  }
-  return total;
 }
 
 function sumDecimalValues(values: readonly (string | undefined)[]): string {
