@@ -90,12 +90,9 @@ export function parseAccount(value: unknown, instrument: Instrument, market: Mar
         entryPrice: text(entry.openPriceAvg, text(entry.averageOpenPrice, "0")),
         unrealizedPnl: text(entry.unrealizedPnl, text(entry.unrealizedPL, text(entry.upl, "0"))),
         realizedPnl: text(entry.realizedPnl, text(entry.realizedPL, text(entry.achievedProfits))),
-        ...(text(entry.realizedPnl, text(entry.realizedPL, text(entry.achievedProfits))) ? { realizedPnlSource: "CURRENT_POSITION" as const } : {}),
         ...(text(entry.funding, text(entry.fundingFee, text(entry.totalFunding))) ? { funding: text(entry.funding, text(entry.fundingFee, text(entry.totalFunding))) } : {}),
-        ...(providerFees(entry) ? { fees: providerFees(entry) } : {}),
-        ...(text(entry.cashDividend) ? { cashDividend: text(entry.cashDividend) } : {}),
+        ...(text(entry.fees, text(entry.fee, text(entry.feeAmount))) ? { fees: text(entry.fees, text(entry.fee, text(entry.feeAmount))) } : {}),
         ...(text(entry.ctime, text(entry.openTime)) ? { openedAt: text(entry.ctime, text(entry.openTime)) } : {}),
-        ...(text(entry.utime, text(entry.updatedTime)) ? { updatedAt: text(entry.utime, text(entry.updatedTime)) } : {}),
         ...(text(entry.liquidationPrice) ? { liquidationPrice: text(entry.liquidationPrice) } : {}),
       };
     });
@@ -104,39 +101,27 @@ export function parseAccount(value: unknown, instrument: Instrument, market: Mar
   const equity = accountEquity || sumAssetValues(assetRows, ["usdValue", "equity", "balance"]);
   const accountAvailable = Array.isArray(value) ? "" : firstDecimal(account, ["effEquity", "available", "availableMargin", "availableBalance"]);
   const availableMargin = accountAvailable || sumAssetValues(assetRows, ["available", "equity", "balance"]) || equity;
-  const accountMarginUsed = Array.isArray(value) ? "" : firstDecimal(account, ["marginUsed", "usedMargin", "occupiedMargin", "occupiedMarginAmount", "totalMargin"]);
-  const initialMargin = Array.isArray(value) ? "" : firstDecimal(account, ["imr"]);
   if (!equity || equity === "0") throw new Error(`INVALID_PORTFOLIO_EQUITY_${Object.keys(account).sort().join("_") || "EMPTY"}`);
   const openOrderPayload = overview.openOrders;
   const openOrders = Array.isArray(openOrderPayload) ? records(openOrderPayload) : openOrderPayload && typeof openOrderPayload === "object" && !Array.isArray(openOrderPayload) && Array.isArray((openOrderPayload as Record<string, unknown>).list) ? records((openOrderPayload as Record<string, unknown>).list) : [];
   const instrumentPosition = positions.find((position) => position.symbol === instrument.symbol);
   const accountRealizedPnl = firstSignedText(account, ["realizedPnl", "realizedPL"]);
   const positionRealizedPnl = positions.map((position) => position.realizedPnl).filter(isSignedDecimal);
-  const accountUnrealizedPnl = firstSignedText(account, ["usdtUnrealisedPnl", "unrealisedPnl", "unrealizedPnl", "unrealizedPL", "totalUnrealizedPL"]);
-  const positionMargin = positions.map((position) => position.marginAllocated).filter(isDecimalValue).reduce((total, margin) => addDecimal(total, margin), "0");
-  const positionFunding = positions.map((position) => position.funding).filter(isSignedDecimal);
-  const positionFees = positions.map((position) => position.fees).filter(isSignedDecimal);
-  const positionDividends = positions.map((position) => position.cashDividend).filter(isSignedDecimal);
+  const realizedPnl = accountRealizedPnl || (positionRealizedPnl.length ? sumSignedDecimals(positionRealizedPnl) : "");
   return {
     balance: text(account.balance, equity),
     availableBalance: availableMargin,
     availableMargin,
-    marginUsage: accountMarginUsed,
-    ...(accountMarginUsed ? { accountMarginUsed } : {}),
-    ...(initialMargin ? { initialMargin } : {}),
-    ...(positionMargin ? { positionMargin } : {}),
+    marginUsage: subtractDecimal(equity, availableMargin),
     positionNotional: instrumentPosition?.notional ?? "0",
     totalPositionNotional,
     positionQuantity: instrumentPosition?.quantity ?? "0",
     portfolioEquity: equity,
     positions,
-    ...(accountRealizedPnl ? { realizedPnl: accountRealizedPnl, realizedPnlSource: "ACCOUNT" as const } : { realizedPnl: "" }),
-    ...(positionRealizedPnl.length ? { positionRealizedPnl: sumSignedDecimals(positionRealizedPnl) } : {}),
-    unrealizedPnl: accountUnrealizedPnl || positions.reduce((total, position) => addDecimal(total, position.unrealizedPnl), "0"),
-    unrealizedPnlSource: accountUnrealizedPnl ? "ACCOUNT" : "POSITIONS",
-    ...(firstSignedText(account, ["funding", "fundingFee", "totalFunding"]) || positionFunding.length ? { funding: firstSignedText(account, ["funding", "fundingFee", "totalFunding"]) || sumSignedDecimals(positionFunding) } : {}),
-    ...(firstSignedText(account, ["fees", "fee", "feeAmount", "totalFee"]) || positionFees.length ? { fees: firstSignedText(account, ["fees", "fee", "feeAmount", "totalFee"]) || sumSignedDecimals(positionFees) } : {}),
-    ...(firstSignedText(account, ["cashDividend"]) || positionDividends.length ? { cashDividend: firstSignedText(account, ["cashDividend"]) || sumSignedDecimals(positionDividends) } : {}),
+    realizedPnl,
+    unrealizedPnl: positions.reduce((total, position) => addDecimal(total, position.unrealizedPnl), "0"),
+    ...(firstSignedText(account, ["funding", "fundingFee", "totalFunding"]) ? { funding: firstSignedText(account, ["funding", "fundingFee", "totalFunding"]) } : {}),
+    ...(firstSignedText(account, ["fees", "fee", "feeAmount", "totalFee"]) ? { fees: firstSignedText(account, ["fees", "fee", "feeAmount", "totalFee"]) } : {}),
     openOrders: openOrders.length,
     openOrderSymbols: openOrders.map((entry) => text(entry.symbol)).filter(Boolean),
     observedAt,
@@ -263,10 +248,6 @@ function firstSignedText(entry: Record<string, unknown>, keys: string[]): string
     if (isSignedDecimal(value)) return value;
   }
   return "";
-}
-
-function isDecimalValue(value: string): boolean {
-  return isSignedDecimal(value);
 }
 
 function providerFees(entry: Record<string, unknown>): string {
