@@ -448,7 +448,17 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (!effectivePaused) {
       const config = loadConfig(this.env, this.ensureActivePolicy());
       const intervalMinutes = this.activeScanIntervalMinutes(config.ownerPolicy);
-      await this.reconcileScheduler(intervalMinutes, { ensureSchedule: true });
+      const hasActiveCycleMetadata = this.state.lastStatus === "RUNNING" || Boolean(this.state.cycleStartedAt);
+      const staleCycleRecovered = hasActiveCycleMetadata && this.recoverStaleCycle();
+      await this.reconcileScheduler(intervalMinutes, {
+        ensureSchedule: true,
+        state: {
+          paused: nextState.paused,
+          emergencyStop: nextState.emergencyStop,
+          activeCycle: staleCycleRecovered ? false : this.state.lastStatus === "RUNNING" || Boolean(this.state.cycleStartedAt),
+          nextScanAt: this.state.nextScanAt,
+        },
+      });
     }
     return nextState;
   }
@@ -672,14 +682,18 @@ export class TraderAgent extends Agent<Env, AgentState> {
     }
   }
 
-  private async reconcileScheduler(intervalMinutes: number, options: { ensureSchedule?: boolean; now?: number } = {}): Promise<SchedulerReconciliationResult> {
-    const result = await reconcileTradingSchedule(this, intervalMinutes, {
+  private async reconcileScheduler(intervalMinutes: number, options: { ensureSchedule?: boolean; now?: number; state?: Parameters<typeof reconcileTradingSchedule>[2] } = {}): Promise<SchedulerReconciliationResult> {
+    const reconciliationState = options.state ?? {
       paused: this.state.paused,
       emergencyStop: this.state.emergencyStop,
       activeCycle: this.state.lastStatus === "RUNNING" || Boolean(this.state.cycleStartedAt),
       nextScanAt: this.state.nextScanAt,
-    }, options);
-    if (result.matchingSchedules.length === 1 && result.nextScanAt !== this.state.nextScanAt) this.setState({ ...this.state, nextScanAt: result.nextScanAt });
+    };
+    const { state: _state, ...schedulerOptions } = options;
+    const result = await reconcileTradingSchedule(this, intervalMinutes, reconciliationState, schedulerOptions);
+    if (result.matchingSchedules.length === 1 && result.nextScanAt !== reconciliationState.nextScanAt) {
+      this.setState({ ...this.state, paused: reconciliationState.paused, emergencyStop: reconciliationState.emergencyStop, nextScanAt: result.nextScanAt });
+    }
     return result;
   }
 
