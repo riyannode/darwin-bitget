@@ -1,44 +1,54 @@
 /* ==========================================================================
    DARWIN BITGET — REDESIGNED DASHBOARD UI
-   ReUI-inspired design system · Dark mode · Operator dashboard
+   ReUI-inspired design system · Light theme · Operator dashboard
    ========================================================================== */
 
 /* ---------------------------------------------------------------------------
    DESIGN TOKENS
    --------------------------------------------------------------------------- */
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 
-  /* Core palette — preserved for JS/runtime compat; refined for polish */
-  --bg: #0a0c0e;
-  --bg-elevated: #111416;
-  --sidebar: #070809;
-  --panel: #121517;
-  --panel-hover: #161a1c;
-  --raised: #1a1f22;
-  --line: #23282b;
-  --line-subtle: #1a1f22;
+  /* Core palette — preserved for JS/runtime compat; light operator theme */
+  --bg: #f4f7f4;
+  --bg-elevated: #edf4ef;
+  --sidebar: #1c4939;
+  --sidebar-end: #103126;
+  --panel: #ffffff;
+  --panel-hover: #f7fbf8;
+  --raised: #fbfdfc;
+  --line: #d8e4db;
+  --line-subtle: #e7eee9;
 
   /* Typography */
-  --text: #e8eae9;
-  --text-secondary: #BAE6FD;
-  --text-muted: #7DD3FC;
+  --text: #17352b;
+  --text-secondary: #53665c;
+  --text-muted: #77877e;
+  --sidebar-text: #c9dfd0;
+  --sidebar-text-muted: #a8c5b3;
+  --sidebar-text-strong: #f4fbf6;
+  --on-accent: #ffffff;
 
-  /* Accent — kept for runtime compat; refined usage */
-  --accent: #1fcc93;
-  --accent-dim: #0f2a22;
-  --accent-glow: rgba(31, 204, 147, 0.15);
-  --accent-border: rgba(31, 204, 147, 0.3);
+  /* Accent — kept for runtime compat; sage green usage */
+  --accent: #2e7651;
+  --accent-deep: #245d43;
+  --accent-hover: #276e4b;
+  --accent-light: #a8d8b5;
+  --accent-dim: #e5f2e9;
+  --accent-glow: rgba(46, 118, 81, 0.14);
+  --accent-border: rgba(46, 118, 81, 0.28);
 
   /* Semantic */
-  --warning: #d4b04a;
-  --warning-dim: #2a2410;
-  --danger: #e87676;
-  --danger-dim: #2a1618;
-  --info: #5aa9e6;
+  --warning: #946f1d;
+  --warning-dim: #fbf3dc;
+  --warning-border: rgba(148, 111, 29, 0.3);
+  --danger: #b55459;
+  --danger-dim: #fbeaec;
+  --danger-border: rgba(181, 84, 89, 0.3);
+  --info: #5b806d;
 
   /* Status */
-  --success: #1fcc93;
+  --success: #2e7651;
 
   /* Spacing scale (8px base) */
   --space-1: 4px;
@@ -56,10 +66,11 @@
   --radius-xl: 16px;
 
   /* Shadows */
-  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5);
-  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.6);
-  --shadow-glow: 0 0 20px rgba(31, 204, 147, 0.12);
+  --shadow-sm: 0 1px 3px rgba(23, 53, 43, 0.08);
+  --shadow-md: 0 4px 12px rgba(23, 53, 43, 0.12);
+  --shadow-lg: 0 8px 24px rgba(23, 53, 43, 0.16);
+  --shadow-glow: 0 4px 14px rgba(46, 118, 81, 0.14);
+  --empty-surface: #fafcfa;
 
   /* Transitions */
   --ease: cubic-bezier(0.4, 0, 0.2, 1);
@@ -113,7 +124,7 @@ button {
 /* Selection */
 ::selection {
   background: var(--accent);
-  color: var(--bg);
+  color: var(--on-accent);
 }
 
 /* Scrollbar styling */
@@ -150,7 +161,7 @@ button {
   flex-direction: column;
   min-height: 100vh;
   padding: var(--space-5) var(--space-3) var(--space-4);
-  background: var(--sidebar);
+  background: linear-gradient(180deg, var(--sidebar), var(--sidebar-end));
   border-right: 1px solid var(--line-subtle);
   position: sticky;
   top: 0;
@@ -174,8 +185,8 @@ button {
   width: 28px;
   height: 28px;
   border-radius: var(--radius-md);
-  color: var(--bg);
-  background: linear-gradient(135deg, var(--accent), #16a085);
+  color: var(--on-accent);
+  background: linear-gradient(135deg, var(--accent), var(--accent-deep));
   font-size: 16px;
   font-weight: 900;
   box-shadow: var(--shadow-glow);
@@ -192,7 +203,7 @@ button {
 .nav-item {
   border-radius: var(--radius-md);
   padding: var(--space-3) var(--space-3);
-  color: var(--text-secondary);
+  color: var(--sidebar-text);
   text-align: left;
   transition: all var(--dur-fast) var(--ease);
   position: relative;
@@ -202,15 +213,15 @@ button {
 }
 
 .nav-item:hover {
-  color: var(--text);
-  background: var(--panel-hover);
+  color: var(--sidebar-text-strong);
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .nav-item.active {
-  color: var(--accent);
-  background: var(--accent-dim);
+  color: var(--accent-light);
+  background: rgba(168, 216, 181, 0.16);
   font-weight: 600;
-  box-shadow: inset 2px 0 0 var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent-light);
 }
 
 /* Sidebar footer */
@@ -233,12 +244,12 @@ button {
   display: block;
   font-size: 12px;
   font-weight: 600;
-  color: var(--text);
+  color: var(--sidebar-text-strong);
 }
 
 .identity small {
   display: block;
-  color: var(--text-muted);
+  color: var(--sidebar-text-muted);
   font-size: 11px;
   margin-top: 2px;
   font-family: var(--font-mono);
@@ -250,8 +261,8 @@ button {
   width: 32px;
   height: 32px;
   border-radius: var(--radius-md);
-  color: var(--bg);
-  background: linear-gradient(135deg, var(--accent), #16a085);
+  color: var(--on-accent);
+  background: linear-gradient(135deg, var(--accent), var(--accent-deep));
   font-weight: 800;
   font-size: 14px;
   flex-shrink: 0;
@@ -277,6 +288,12 @@ button {
   border-color: var(--accent-border);
   color: var(--accent);
   background: var(--accent-dim);
+}
+
+.sidebar .pill-paper {
+  border-color: rgba(168, 216, 181, 0.32);
+  color: var(--accent-light);
+  background: rgba(168, 216, 181, 0.14);
 }
 
 /* ---------------------------------------------------------------------------
@@ -383,22 +400,22 @@ p {
 
 .button-primary {
   border-color: var(--accent);
-  color: var(--bg);
-  background: linear-gradient(135deg, var(--accent), #18b385);
+  color: var(--on-accent);
+  background: linear-gradient(135deg, var(--accent), var(--accent-deep));
   font-weight: 600;
   box-shadow: var(--shadow-glow);
 }
 
 .button-primary:hover {
-  background: linear-gradient(135deg, #22d9a0, #1cc08e);
+  background: linear-gradient(135deg, var(--accent-hover), var(--accent-deep));
   border-color: var(--accent);
-  color: var(--bg);
-  box-shadow: 0 0 24px rgba(31, 204, 147, 0.2);
+  color: var(--on-accent);
+  box-shadow: var(--shadow-glow);
 }
 
 .button-danger {
   color: var(--danger);
-  border-color: rgba(232, 118, 118, 0.3);
+  border-color: var(--danger-border);
 }
 
 .button-danger:hover {
@@ -862,7 +879,7 @@ p {
 }
 
 .disclosure > summary:hover {
-  color: #22d9a0;
+  color: var(--accent-hover);
 }
 
 .disclosure[open] > summary {
@@ -972,7 +989,7 @@ p {
   padding: var(--space-5);
   border: 1px dashed var(--line-subtle);
   border-radius: var(--radius-md);
-  background: rgba(255, 255, 255, 0.01);
+  background: var(--empty-surface);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1043,7 +1060,7 @@ p {
    COOLDOWN NOTICE
    --------------------------------------------------------------------------- */
 .cooldown-notice {
-  border: 1px solid rgba(212, 176, 74, 0.3);
+  border: 1px solid var(--warning-border);
   border-radius: var(--radius-md);
   color: var(--warning);
   background: var(--warning-dim);
@@ -1241,7 +1258,7 @@ td .table-action {
    BANNERS
    --------------------------------------------------------------------------- */
 .banner {
-  border: 1px solid rgba(232, 118, 118, 0.3);
+  border: 1px solid var(--danger-border);
   color: var(--danger);
   border-radius: var(--radius-md);
   padding: var(--space-3) var(--space-4);
