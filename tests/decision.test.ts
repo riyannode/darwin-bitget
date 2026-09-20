@@ -263,7 +263,7 @@ describe("cycle decision plan contract", () => {
   });
 
   it("includes deterministic position lifecycle state in the prompt", () => {
-    const prompt = buildDecisionPrompt(context([position("CRCLUSDT")], [], [{ symbol: "CRCLUSDT", positionSide: "LONG", entryPrice: "100", currentPrice: "106", currentReturnPct: 6, maximumFavorableReturnPct: 10, profitGivebackPct: 40, timeInTradeMinutes: 15, priorManagementActions: ["HOLD", "HOLD", "REDUCE", "HOLD"] }]), "cycle-1");
+    const prompt = buildDecisionPrompt(context([position("CRCLUSDT")], [], [{ symbol: "CRCLUSDT", positionSide: "LONG", entryPrice: "100", currentPrice: "106", currentReturnPct: 6, maximumFavorableReturnPct: 10, maximumFavorableReturnBasis: "SINCE_ENTRY", profitGivebackPct: 40, timeInTradeMinutes: 15, priorManagementActions: ["HOLD", "HOLD", "REDUCE", "HOLD"] }]), "cycle-1");
     expect(prompt).toContain('"currentReturnPct":6');
     expect(prompt).toContain('"maximumFavorableReturnPct":10');
     expect(prompt).toContain('"profitGivebackPct":40');

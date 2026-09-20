@@ -77,6 +77,7 @@ describe("lesson memory", () => {
     expect(result.lesson.status).toBe("CANDIDATE");
     expect(result.experience.outcomeStatus).toBe("OPEN");
     expect(result.experience.entryDecisionId).toBe(baseDecision.decisionId);
+    expect(result.experience.maximumFavorableExcursionBasis).toBe("SINCE_ENTRY");
   });
 
   it("closes the original experience instead of creating a second trade", () => {

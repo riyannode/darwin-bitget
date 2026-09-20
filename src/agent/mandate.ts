@@ -1,5 +1,5 @@
 export const PROMPT_VERSIONS = {
-  mandate: "darwin-mandate-v6",
+  mandate: "darwin-mandate-v7",
   candidate: "darwin-candidate-v1",
   decision: "darwin-decision-v9",
   reflection: "darwin-reflection-v1",

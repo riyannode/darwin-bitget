@@ -195,7 +195,7 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
       paperOnly: true,
       noChainOfThought: true,
       managementRule: "Every open provider position appears exactly once in positionActions. HOLD preserves it, INCREASE adds additionalMarginPct without changing provider leverage, REDUCE and CLOSE reduce exposure, and REVERSE closes and verifies the current side before evaluating the opposite entry.",
-      positionManagementStateRule: "positionManagementState contains deterministic TypeScript-computed lifecycle values for the matching open provider positions. Do not calculate, modify, or invent these values.",
+      positionManagementStateRule: "positionManagementState contains deterministic TypeScript-computed lifecycle values for the matching open provider positions. Do not calculate, modify, or invent these values. maximumFavorableReturnBasis=SINCE_FIRST_DETERMINISTIC_OBSERVATION means the legacy peak is not proven since entry.",
       entryRule: entryPromptRule,
       executionCapacityRule: "For OPEN_LONG, OPEN_SHORT, INCREASE, and the opening leg of REVERSE, proposed margin allocation plus leverage must produce a valid quantity within maxOrderQty, minOrderQty, minOrderAmount, quantityStep, and quantity precision. Choose a smaller valid allocation or skip. TypeScript will not silently resize a model proposal; invalid quantity remains BLOCKED by the risk gate.",
       executionAuthority: "Deterministic TypeScript validates and orders financial writes; the model is not financial authority.",

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildPositionManagementState } from "../src/trading/position-management.js";
+import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } from "../src/trading/position-management.js";
 import type { TradeExperience } from "../src/types.js";
 
 const entryTime = "2026-09-12T10:00:00.000Z";
@@ -57,6 +57,30 @@ describe("position management lifecycle state", () => {
     expect(later.state).toMatchObject({ currentReturnPct: 6, maximumFavorableReturnPct: 10, profitGivebackPct: 40 });
   });
 
+  it("marks a legacy OPEN experience as first-observation-scoped", () => {
+    const result = buildPositionManagementState(position(), experience({ maximumFavorableExcursion: "0" }), "110", "2026-09-12T10:05:00.000Z");
+
+    expect(result.state).toMatchObject({ maximumFavorableReturnPct: 10, maximumFavorableReturnBasis: "SINCE_FIRST_DETERMINISTIC_OBSERVATION" });
+    expect(result.experience).toMatchObject({ maximumFavorableExcursion: "10", maximumFavorableExcursionBasis: "SINCE_FIRST_DETERMINISTIC_OBSERVATION" });
+  });
+
+  it("reconstructs a legacy peak only from persisted provider-backed observations", () => {
+    const peak = reconstructMaximumFavorableReturnPct(position(), experience({ maximumFavorableExcursion: "0" }), [{
+      cycleId: "cycle-1",
+      agentVersion: "1",
+      model: "qwen",
+      mode: "AUTONOMOUS",
+      startedAt: "2026-09-12T10:10:00.000Z",
+      completedAt: "2026-09-12T10:10:01.000Z",
+      portfolio: { positions: [{ symbol: "TESTUSDT", positionSide: "LONG", quantity: "1" }], observedAt: "2026-09-12T10:10:00.500Z" } as never,
+      marketContext: { deep: [{ market: { symbol: "TESTUSDT", lastPrice: "108", observedAt: "2026-09-12T10:10:00.000Z" } }] },
+      retrievedLessons: [],
+      createdLessons: [],
+    }]);
+
+    expect(peak).toBe(8);
+  });
+
   it("never decreases the favorable peak", () => {
     let current = experience();
     for (const price of ["110", "108", "105"]) current = buildPositionManagementState(position(), current, price, "2026-09-12T10:05:00.000Z").experience;
@@ -95,5 +119,14 @@ describe("position management lifecycle state", () => {
     });
 
     expect(result.state.priorManagementActions).toEqual(["HOLD", "REDUCE", "HOLD", "CLOSE", "HOLD"]);
+  });
+
+  it("does not mutate a CLOSED experience during lifecycle refresh", () => {
+    const closed = experience({ outcomeStatus: "PROFITABLE", exitTime: "2026-09-12T10:04:00.000Z" });
+    const result = buildPositionManagementState(position(), closed, "110", "2026-09-12T10:05:00.000Z");
+
+    expect(result.experience).toBe(closed);
+    expect(result.experience.maximumFavorableExcursion).toBe("0");
+    expect(result.experience.maximumFavorableExcursionBasis).toBeUndefined();
   });
 });

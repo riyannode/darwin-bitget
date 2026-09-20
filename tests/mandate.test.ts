@@ -3,9 +3,9 @@ import { describe, expect, it } from "vitest";
 import { DECISION_TASK_PROMPT, MANDATE_VERSION, PROMPT_VERSIONS, TRADING_MANDATE } from "../src/agent/mandate.js";
 
 describe("judge-facing mandate contract", () => {
-  it("uses the v6 mandate and requires independent management and entry reasoning", () => {
-    expect(PROMPT_VERSIONS.mandate).toBe("darwin-mandate-v6");
-    expect(MANDATE_VERSION).toBe("darwin-mandate-v6");
+  it("uses the v7 mandate and requires independent management and entry reasoning", () => {
+    expect(PROMPT_VERSIONS.mandate).toBe("darwin-mandate-v7");
+    expect(MANDATE_VERSION).toBe("darwin-mandate-v7");
     expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v9");
     expect(TRADING_MANDATE).not.toContain("You are not required to trade.");
     expect(TRADING_MANDATE).toContain("Do not force a trade.");

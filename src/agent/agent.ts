@@ -67,7 +67,7 @@ import { availableResearchCapabilities } from "../research/capabilities.js";
 import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../research/executor.js";
 import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
-import { buildPositionManagementState } from "../trading/position-management.js";
+import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } from "../trading/position-management.js";
 
 
 interface AgentState {
@@ -604,6 +604,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     positions: readonly PositionSnapshot[],
     bundles: readonly EvidenceBundle[],
     observedAt: string,
+    lifecycleHistory: readonly TradingJournal[] = [],
   ): PositionManagementState[] {
     const states: PositionManagementState[] = [];
     for (const position of positions.filter((candidate) => Number(candidate.quantity) > 0)) {
@@ -615,7 +616,12 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const currentPrice = bundle?.market.lastPrice ?? position.markPrice;
       if (!currentPrice) continue;
       const positionContext = loadPositionContext(this, position.symbol, position.positionSide);
-      const result = buildPositionManagementState(position, experience, currentPrice, bundle?.market.observedAt ?? observedAt, positionContext);
+      let experienceForRefresh = experience;
+      if (!experience.maximumFavorableExcursionBasis) {
+        const historicalPeak = reconstructMaximumFavorableReturnPct(position, experience, lifecycleHistory);
+        if (historicalPeak !== null) experienceForRefresh = { ...experience, maximumFavorableExcursion: String(Math.max(Number(experience.maximumFavorableExcursion) || 0, historicalPeak)), maximumFavorableExcursionBasis: "SINCE_ENTRY" };
+      }
+      const result = buildPositionManagementState(position, experienceForRefresh, currentPrice, bundle?.market.observedAt ?? observedAt, positionContext);
       if (result.experience !== experience) {
         experiences[experienceIndex] = result.experience;
         saveExperience(this, result.experience, observedAt);
@@ -840,7 +846,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
         }
       }
       if (backtest) { saveBacktest(this, backtest); journal.backtest = backtest; this.recordEvent("BACKTEST_COMPLETED", cycleId); }
-      const positionManagementState = this.refreshPositionManagementState(experiences, openPositions, bundles, new Date().toISOString());
+      const lifecycleHistory = experiences.some((experience) => experience.outcomeStatus === "OPEN" && !experience.maximumFavorableExcursionBasis) ? loadAllAutonomousJournals(this) : [];
+      const positionManagementState = this.refreshPositionManagementState(experiences, openPositions, bundles, new Date().toISOString(), lifecycleHistory);
       const openExperiences = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
       const executionCapacityHints = buildExecutionCapacityHints(bundles, config.ownerPolicy.maxLeverage);
       const researchEvidence = await this.collectResearchEvidence(
