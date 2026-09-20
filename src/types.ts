@@ -214,6 +214,18 @@ export interface Lesson {
   updatedAt: string;
 }
 
+export interface PositionManagementState {
+  symbol: string;
+  positionSide: PositionSide;
+  entryPrice: string;
+  currentPrice: string;
+  currentReturnPct: number;
+  maximumFavorableReturnPct: number;
+  profitGivebackPct: number;
+  timeInTradeMinutes: number;
+  priorManagementActions: Action[];
+}
+
 export interface TradeExperience {
   experienceId: string;
   symbol: string;
@@ -231,6 +243,7 @@ export interface TradeExperience {
   positionNotional: string;
   realizedPnl: string;
   realizedPnlPct: string;
+  /** Highest positive percentage return observed during this open trade lifecycle. */
   maximumFavorableExcursion: string;
   maximumAdverseExcursion: string;
   drawdownContribution: string;
@@ -281,6 +294,7 @@ export interface DecisionContext {
   observedAt: string;
   mandate: string;
   openPositions: PositionSnapshot[];
+  positionManagementState?: PositionManagementState[];
   researchEvidence?: ResearchEvidence[];
   executionCapacityHints?: ExecutionCapacityHint[];
 }

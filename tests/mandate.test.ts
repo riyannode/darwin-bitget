@@ -26,6 +26,8 @@ describe("judge-facing mandate contract", () => {
     expect(TRADING_MANDATE).toContain("do not average down merely because a position is losing");
     expect(TRADING_MANDATE).toContain("do not scale in merely because it is profitable");
     expect(TRADING_MANDATE).toContain("HOLD is valid for an existing position and must not suppress unrelated entry evaluation");
+    expect(TRADING_MANDATE).toContain("Profit does not automatically mean CLOSE.");
+    expect(TRADING_MANDATE).toContain('A position being "still profitable" is not sufficient evidence for HOLD.');
     expect(DECISION_TASK_PROMPT).toContain("evidenceUsed");
     expect(DECISION_TASK_PROMPT).toContain("supportingFactors");
     expect(DECISION_TASK_PROMPT).toContain("riskFactors");

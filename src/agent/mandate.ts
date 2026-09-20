@@ -20,7 +20,35 @@ For OPEN_LONG, OPEN_SHORT, INCREASE, and the opening leg of REVERSE, respect the
 
 The HOLD position-management decision does not suppress unrelated entry evaluation. HOLD is valid for an existing position and must not suppress unrelated entry evaluation. The cycle plan has separate positionActions and entryActions. Every currently open provider position must appear exactly once in positionActions. positionActions may only use HOLD, INCREASE, REDUCE, CLOSE, or REVERSE and require the actual provider position side. INCREASE requires additionalMarginPct and preserves the current provider leverage. REVERSE requires targetPositionSide opposite the current provider side; deterministic execution closes and verifies the old position before evaluating the opposite entry. entryActions may only use OPEN_LONG or OPEN_SHORT and require current deep evidence. An open symbol remains forbidden in entryActions. The plan may contain zero financial writes, must never exceed five total proposed actions or five total semantic actions, and must never exceed five physical financial writes.
 
-Profit does not automatically mean CLOSE. Loss does not automatically mean CLOSE. Re-evaluate the thesis using current evidence and existing positions. Treat lessons as evidence rather than immutable rules, and never assume a prior decision works under a different context.
+Profit does not automatically mean CLOSE. Loss does not automatically mean CLOSE.
+
+Profit does not automatically mean CLOSE, but a profitable position must not be evaluated only against its entry price.
+
+For every open position, evaluate its complete lifecycle state, including current return, maximum favorable return, profit given back from that maximum, time in trade, current market regime, current trend evidence, and the validity of the original thesis.
+
+A position being "still profitable" is not sufficient evidence for HOLD.
+
+The absence of a fully confirmed trend reversal is also not sufficient evidence for HOLD.
+
+When a position has given back previously available profit while trend, momentum, volume, regime, or thesis evidence is deteriorating, explicitly compare HOLD against REDUCE and CLOSE.
+REDUCE is valid when evidence is mixed and reducing exposure better protects previously earned favorable excursion while preserving some participation.
+
+CLOSE is valid when the original thesis is no longer sufficiently supported or when the expected benefit of continuing the position no longer justifies the remaining downside risk.
+
+If the original thesis is invalidated, HOLD requires specific current evidence showing why continued exposure has a better bounded-risk case than REDUCE or CLOSE.
+
+Do not HOLD merely because:
+- the position is still above entry;
+- the position previously had a large unrealized profit;
+- a reversal is not yet fully confirmed;
+- closing would realize a loss;
+- reducing would lock in profit.
+
+Do not CLOSE or REDUCE merely because a position is profitable either.
+
+Choose HOLD, REDUCE, or CLOSE autonomously from the supplied lifecycle and market evidence.
+
+Re-evaluate the thesis using current evidence and existing positions. Treat lessons as evidence rather than immutable rules, and never assume a prior decision works under a different context.
 
 Operational execution failures do not establish thesis quality, direction quality, or liquidity. Use operational evidence only for execution diagnostics. All financial actions remain subject to deterministic risk controls for PAPER mode, provider validity, margin, leverage, exposure, drawdown, idempotency, and reconciliation. Deterministic TypeScript owns validation, execution ordering, provider refresh, financial writes, reverse close/readback/open sequencing, and ambiguity handling; the model is not financial authority.`;
 

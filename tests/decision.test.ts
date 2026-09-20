@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { assertOpenPositionCountWithinPlanLimit, buildCycleDecisionPlanSchema, buildDecisionPrompt, calculateActionCapacity, cycleDecisionPlanSchema, buildEvidenceSymbols, MAX_FINANCIAL_WRITES_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, selectEntryCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
-import type { AccountSnapshot, CycleDecisionPlan, Decision, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot, PositionSnapshot } from "../src/types.js";
+import type { AccountSnapshot, CycleDecisionPlan, Decision, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot, PositionManagementState, PositionSnapshot } from "../src/types.js";
 import { buildDecisionTaskPrompt, DECISION_TASK_PROMPT, PROMPT_VERSIONS } from "../src/agent/mandate.js";
 
 function snapshot(symbol: string, change = "1", volume = "100"): MarketSnapshot {
@@ -29,9 +29,9 @@ function decision(action: Decision["action"], symbol: string, side: "LONG" | "SH
   return { decisionId: id, cycleId: "cycle-1", action, positionSide: side, symbol, marginAllocationPct: action === "HOLD" || action === "INCREASE" || action === "REDUCE" || action === "CLOSE" ? "0" : "1", additionalMarginPct: action === "INCREASE" ? "5" : null, leverage: "2", reductionPct: action === "REDUCE" ? "50" : action === "CLOSE" ? "100" : null, targetPositionSide: action === "REVERSE" ? target : null, confidence: 0.7, thesis: "bounded thesis", strategyThesis: "bounded strategy", supportingFactors: ["deep evidence"], riskFactors: ["risk"], evidenceUsed: ["DEEP"], lessonsUsed: [], createdAt: "2026-09-12T00:00:00.000Z", ...overrides };
 }
 
-function context(positions: PositionSnapshot[], entrySymbols: string[] = ["NVDAUSDT"]): DecisionContext {
+function context(positions: PositionSnapshot[], entrySymbols: string[] = ["NVDAUSDT"], positionManagementState: PositionManagementState[] = []): DecisionContext {
   const symbols = [...new Set([...positions.map((item) => item.symbol), ...entrySymbols])];
-  return { bundles: symbols.map((symbol) => bundle(symbol, positions)), supportedUniverse: ["NVDAUSDT", "COINUSDT", "CRCLUSDT"], openPositionSymbols: positions.map((item) => item.symbol), entryCandidateSymbols: entrySymbols, experiences: [], openExperiences: [], lessons: [], observedAt: "2026-09-12T00:00:00.000Z", mandate: "mandate", openPositions: positions };
+  return { bundles: symbols.map((symbol) => bundle(symbol, positions)), supportedUniverse: ["NVDAUSDT", "COINUSDT", "CRCLUSDT"], openPositionSymbols: positions.map((item) => item.symbol), entryCandidateSymbols: entrySymbols, experiences: [], openExperiences: [], lessons: [], observedAt: "2026-09-12T00:00:00.000Z", mandate: "mandate", openPositions: positions, positionManagementState };
 }
 
 function plan(positionActions: Decision[] = [], entryActions: Decision[] = []): CycleDecisionPlan {
@@ -240,6 +240,7 @@ describe("cycle decision plan contract", () => {
     expect(prompt).toContain('"maxTotalActionsPerCycle":5');
     expect(prompt).toContain('"maxFinancialWritesPerCycle":5');
     expect(prompt).toContain('"executionCapacityHints"');
+    expect(prompt).toContain("positionManagementState contains deterministic TypeScript-computed lifecycle values");
     expect(prompt).toContain('"openPositionCount":1');
     expect(prompt).toContain('"remainingEntrySlots":4');
     expect(prompt).toContain("entryActions.length MUST NOT exceed remainingEntrySlots");
@@ -259,6 +260,15 @@ describe("cycle decision plan contract", () => {
     expect(DECISION_TASK_PROMPT).toContain("thesis: string");
     expect(DECISION_TASK_PROMPT).toContain("strategyThesis: string");
     expect(DECISION_TASK_PROMPT).toContain("confidence: number between 0 and 1");
+  });
+
+  it("includes deterministic position lifecycle state in the prompt", () => {
+    const prompt = buildDecisionPrompt(context([position("CRCLUSDT")], [], [{ symbol: "CRCLUSDT", positionSide: "LONG", entryPrice: "100", currentPrice: "106", currentReturnPct: 6, maximumFavorableReturnPct: 10, profitGivebackPct: 40, timeInTradeMinutes: 15, priorManagementActions: ["HOLD", "HOLD", "REDUCE", "HOLD"] }]), "cycle-1");
+    expect(prompt).toContain('"currentReturnPct":6');
+    expect(prompt).toContain('"maximumFavorableReturnPct":10');
+    expect(prompt).toContain('"profitGivebackPct":40');
+    expect(prompt).toContain('"timeInTradeMinutes":15');
+    expect(prompt).toContain('"priorManagementActions":["HOLD","HOLD","REDUCE","HOLD"]');
   });
 
   it("requires no entry actions when five positions consume the action capacity", () => {
