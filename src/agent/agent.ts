@@ -450,8 +450,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const intervalMinutes = this.activeScanIntervalMinutes(config.ownerPolicy);
       const hasActiveCycleMetadata = this.state.lastStatus === "RUNNING" || Boolean(this.state.cycleStartedAt);
       const staleCycleRecovered = hasActiveCycleMetadata && this.recoverStaleCycle();
+      const resumeState: AgentState = staleCycleRecovered
+        ? { ...nextState, lastStatus: "FAILED", cycleStartedAt: null, runtimeStatus: "ONLINE", currentStage: "ONLINE" }
+        : nextState;
+      if (staleCycleRecovered) this.setState(resumeState);
       await this.reconcileScheduler(intervalMinutes, {
         ensureSchedule: true,
+        baseState: resumeState,
         state: {
           paused: nextState.paused,
           emergencyStop: nextState.emergencyStop,
@@ -682,17 +687,17 @@ export class TraderAgent extends Agent<Env, AgentState> {
     }
   }
 
-  private async reconcileScheduler(intervalMinutes: number, options: { ensureSchedule?: boolean; now?: number; state?: Parameters<typeof reconcileTradingSchedule>[2] } = {}): Promise<SchedulerReconciliationResult> {
+  private async reconcileScheduler(intervalMinutes: number, options: { ensureSchedule?: boolean; now?: number; state?: Parameters<typeof reconcileTradingSchedule>[2]; baseState?: AgentState } = {}): Promise<SchedulerReconciliationResult> {
     const reconciliationState = options.state ?? {
       paused: this.state.paused,
       emergencyStop: this.state.emergencyStop,
       activeCycle: this.state.lastStatus === "RUNNING" || Boolean(this.state.cycleStartedAt),
       nextScanAt: this.state.nextScanAt,
     };
-    const { state: _state, ...schedulerOptions } = options;
+    const { state: _state, baseState, ...schedulerOptions } = options;
     const result = await reconcileTradingSchedule(this, intervalMinutes, reconciliationState, schedulerOptions);
     if (result.matchingSchedules.length === 1 && result.nextScanAt !== reconciliationState.nextScanAt) {
-      this.setState({ ...this.state, paused: reconciliationState.paused, emergencyStop: reconciliationState.emergencyStop, nextScanAt: result.nextScanAt });
+      this.setState({ ...(baseState ?? this.state), nextScanAt: result.nextScanAt });
     }
     return result;
   }

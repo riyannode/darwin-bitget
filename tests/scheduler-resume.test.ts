@@ -155,5 +155,6 @@ describe("authenticated RESUME scheduler recreation", () => {
 
     expect(harness.agent.scheduleEvery).toHaveBeenCalledOnce();
     expect(harness.scheduler.getSchedules().filter((entry) => entry.callback === "runScheduledCycle")).toHaveLength(1);
+    expect(harness.getPersistedState()).toMatchObject({ runtimeStatus: "ONLINE", currentStage: "ONLINE", paused: false });
   });
 });
