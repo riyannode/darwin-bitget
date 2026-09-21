@@ -142,6 +142,7 @@ export function reconcileLateExecution(input: LateExecutionReconciliationInput):
   if (!execution || !isReadbackOnlyExecutionMismatch(record)) throw new Error("LATE_RECONCILIATION_NOT_ELIGIBLE");
   if (decision.action !== "OPEN_LONG" && decision.action !== "OPEN_SHORT") throw new Error("LATE_RECONCILIATION_NOT_OPEN");
   if (!decision.positionSide) throw new Error("LATE_RECONCILIATION_POSITION_SIDE_REQUIRED");
+  if (providerTimestampIso(order.createdAt) !== order.createdAt || providerTimestampIso(fill.createdAt) !== fill.createdAt) throw new Error("LATE_RECONCILIATION_TIMESTAMP_INVALID");
 
   const expectedClientOid = execution.clientOrderId || record.executionRequest?.clientOrderId;
   if (!expectedClientOid || order.clientOid !== expectedClientOid || fill.clientOid !== expectedClientOid) throw new Error("LATE_RECONCILIATION_CLIENT_ORDER_MISMATCH");
@@ -176,7 +177,7 @@ export function reconcileLateExecution(input: LateExecutionReconciliationInput):
 }
 
 function buildReconciledExperience(existing: TradeExperience | undefined, decision: LateExecutionReconciliationInput["record"]["decision"], execution: NonNullable<DecisionExecutionRecord["executionResult"]>, fill: ProviderFillEvidence, position: PositionSnapshot): TradeExperience {
-  const entryTime = fill.createdAt || execution.submittedAt;
+  const entryTime = fill.createdAt;
   return {
     ...(existing ?? {
       experienceId: `late-reconciled-${decision.decisionId}`,

@@ -188,6 +188,10 @@ describe("late filled-open reconciliation", () => {
     expect(parseProviderOrderEvidence({ orderId: execution.providerOrderId, clientOid: execution.clientOrderId, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "24.54", cumExecQty: "24.54", avgPrice: "92.11", orderStatus: "filled", createdTime: "not-a-timestamp" })).toBeNull();
   });
 
+  it("rejects noncanonical timestamps supplied directly to reconciliation", () => {
+    expect(() => reconcileLateExecution(input({ fill: { ...fill!, createdAt: "1789968749337" } }))).toThrow("LATE_RECONCILIATION_TIMESTAMP_INVALID");
+  });
+
   it("rejects impossible ISO provider order dates", () => {
     expect(parseProviderOrderEvidence({ orderId: execution.providerOrderId, clientOid: execution.clientOrderId, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "24.54", cumExecQty: "24.54", avgPrice: "92.11", orderStatus: "filled", createdTime: "2026-02-30T00:00:00.000Z" })).toBeNull();
   });
