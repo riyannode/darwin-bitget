@@ -51,6 +51,12 @@ describe("futures risk gate", () => {
     expect(result.status).toBe("PASS");
   });
 
+  it("fails closed when the provider position has no usable local lifecycle", () => {
+    const result = evaluateRiskGate(config, { ...context(decision("REDUCE", "0", "1", "20")), positionDiscrepancies: ["LOCAL_EXPERIENCE_MISSING:BTCUSDT:LONG"] });
+    expect(result.status).toBe("BLOCK");
+    expect(result.codes).toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+  });
+
   it("calculates INCREASE post-action margin against the hard cap", () => {
     const twentyFourPercent: AccountSnapshot = { ...account, positions: [{ ...account.positions[0]!, marginAllocated: "240" }] };
     const accepted = evaluateRiskGate(config, context(decision("INCREASE", "0", "4", null, "5"), "1000", twentyFourPercent));

@@ -2,9 +2,9 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { loadRecentJournals, saveJournal } from "../src/storage/store.js";
+import { loadAllEvents, loadExperiences, loadPerformanceAggregate, loadPositionContext, loadRecentJournals, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
 import { buildPaperLogExport } from "../src/storage/paper-log.js";
-import type { AccountSnapshot, CycleDecisionPlan, DecisionContext, DecisionExecutionRecord, EvidenceBundle, Instrument, PositionManagementState, PositionSnapshot, TradingJournal } from "../src/types.js";
+import type { AccountSnapshot, CycleDecisionPlan, DecisionContext, DecisionExecutionRecord, EvidenceBundle, Instrument, PositionContext, PositionManagementState, PositionReasoning, PositionSnapshot, TradeExperience, TradingJournal } from "../src/types.js";
 
 vi.mock("agents", () => ({ Agent: class {}, routeAgentRequest: vi.fn() }));
 vi.mock("../src/trading/execution-planner.js", () => ({
@@ -19,6 +19,7 @@ import { decide } from "../src/agent/decision.js";
 import { TraderAgent } from "../src/agent/agent.js";
 import { executeCyclePlan } from "../src/trading/execution-planner.js";
 import { BitgetClient } from "../src/bitget/client.js";
+import type { PerformanceAggregate } from "../src/trading/performance.js";
 
 interface ObservableJournal extends TradingJournal {
   positionManagementState?: PositionManagementState[];
@@ -193,7 +194,46 @@ function verifiedCloseRecord(): DecisionExecutionRecord {
   } as DecisionExecutionRecord;
 }
 
-function cycleTestAgent(executor: SqlExecutor, events: Array<{ type: string; metadata?: Record<string, string> }>) {
+function openExecutionRecord(status: "filled" | "unknown", reconciliationStatus: "MISMATCH" | "UNKNOWN"): DecisionExecutionRecord {
+  const decision = { ...plan().positionActions[0], decisionId: "decision-open", action: "OPEN_LONG" as const, positionSide: "LONG" as const, symbol: "CRCLUSDT", marginAllocationPct: "1.5", reductionPct: null };
+  const executionResult = { provider: "test", providerOrderId: status === "filled" ? "provider-open" : undefined, clientOrderId: "client-open", symbol: "CRCLUSDT", action: "OPEN_LONG" as const, positionSide: "LONG" as const, providerSide: "buy" as const, tradeSide: "open" as const, marginAllocated: "100", leverage: "3", positionNotional: "300", requestedQuantity: "3", executedQuantity: status === "filled" ? "3" : "0", status, submittedAt: decision.createdAt, readBackAt: decision.createdAt, averageFillPrice: status === "filled" ? "100" : undefined };
+  return { decision, riskGateResult: { status: "PASS", codes: [], checkedAt: decision.createdAt }, executionResult, reconciliationResult: { status: reconciliationStatus, codes: reconciliationStatus === "MISMATCH" ? ["POSITION_READBACK_UNAVAILABLE", "POSITION_READBACK_MISSING"] : ["EXECUTION_UNKNOWN"], execution: executionResult } } as DecisionExecutionRecord;
+}
+
+function unresolvedExperienceFixture(): TradeExperience {
+  return {
+    experienceId: "unresolved-experience",
+    symbol: "CRCLUSDT",
+    positionSide: "LONG",
+    action: "OPEN_LONG",
+    entryDecisionId: "decision-open",
+    entryPrice: "100",
+    entryTime: "2026-09-21T00:00:30.000Z",
+    exitDecisionId: "",
+    exitPrice: "0",
+    exitTime: "",
+    selectedLeverage: "3",
+    marginAllocationPct: "1.5",
+    marginAllocated: "100",
+    positionNotional: "300",
+    realizedPnl: "0",
+    realizedPnlPct: "0",
+    maximumFavorableExcursion: "0",
+    maximumAdverseExcursion: "0",
+    drawdownContribution: "0",
+    liquidationDistance: "0",
+    entryThesis: "provider-confirmed entry",
+    exitThesis: "",
+    evidenceAtEntry: ["TICKER"],
+    evidenceAtExit: [],
+    lessonsUsed: [],
+    marketContext: "RANGE_LOW_VOL",
+    outcomeStatus: "EXECUTION_UNRESOLVED",
+    lastAction: "OPEN_LONG",
+  };
+}
+
+function cycleTestAgent(executor: SqlExecutor, events: Array<{ type: string; metadata?: Record<string, string> }>, discrepancies: string[] = []) {
   return {
     env: { TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_CATEGORY: "USDT-FUTURES" },
     state: { emergencyStop: false, paused: false, lastCycleId: null, lastScanAt: null, nextScanAt: null, model: "", runtimeStatus: "ONLINE", currentStage: "ONLINE", lastStatus: "IDLE", lastPolicyUpdateAt: null, cycleStartedAt: null, temporaryScanIntervalExpiresAt: null, temporaryScanIntervalCompleted: true, temporaryScanIntervalDurationMs: 0, userStorageVersion: 0 },
@@ -201,8 +241,9 @@ function cycleTestAgent(executor: SqlExecutor, events: Array<{ type: string; met
     activeScanIntervalMinutes: () => 5,
     setState(next: unknown) { (this as unknown as { state: unknown }).state = next; },
     recordEvent(type: string, _cycleId: string, metadata?: Record<string, string>) { events.push({ type, ...(metadata ? { metadata } : {}) }); },
-    recordPositionDiscrepancies: () => [],
+    recordPositionDiscrepancies: () => discrepancies,
     refreshPositionManagementState: () => [lifecycleState],
+    reconcileLateExecutions: async () => undefined,
     collectResearchEvidence: async () => undefined,
     persistPerformanceEquity: () => undefined,
     persistDecisionOutcome: async () => undefined,
@@ -281,6 +322,7 @@ describe("journal observability persistence", () => {
       recordEvent: () => undefined,
       recordPositionDiscrepancies: () => [],
       refreshPositionManagementState: () => lifecycleStateList,
+      reconcileLateExecutions: async () => undefined,
       collectResearchEvidence: async () => undefined,
       persistPerformanceEquity: () => undefined,
       persistDecisionOutcome: async () => undefined,
@@ -345,6 +387,135 @@ describe("journal observability persistence", () => {
     db.close();
   });
 
+  it("persists filled position-readback failures as EXECUTION_UNRESOLVED without a failure lesson", async () => {
+    const { db, executor } = memoryExecutor();
+    const events: Array<{ type: string; metadata?: Record<string, string> }> = [];
+    const fake = { sql: executor.sql, updatePerformanceReadModel: () => undefined, recordEvent(type: string, _cycleId: string, metadata?: Record<string, string>) { events.push({ type, ...(metadata ? { metadata } : {}) }); } };
+    const journal: TradingJournal = { ...baseJournal, cycleId: "cycle-unresolved" };
+    await (TraderAgent.prototype as unknown as { persistDecisionOutcome: (...args: unknown[]) => Promise<unknown> }).persistDecisionOutcome.call(fake, {} as never, openExecutionRecord("filled", "MISMATCH"), bundle(), [], [], journal.cycleId, journal.startedAt, journal, true);
+    const experiences = loadExperiences(executor, 10);
+    expect(experiences[0]?.outcomeStatus).toBe("EXECUTION_UNRESOLVED");
+    expect(events.map((event) => event.type)).toContain("EXECUTION_UNRESOLVED");
+    expect(journal.createdLessons).toEqual([]);
+    db.close();
+  });
+
+  it("retains EXECUTION_FAILURE behavior for a not-executed opening", async () => {
+    const { db, executor } = memoryExecutor();
+    const events: Array<{ type: string; metadata?: Record<string, string> }> = [];
+    const fake = { sql: executor.sql, updatePerformanceReadModel: () => undefined, recordEvent(type: string, _cycleId: string, metadata?: Record<string, string>) { events.push({ type, ...(metadata ? { metadata } : {}) }); } };
+    const journal: TradingJournal = { ...baseJournal, cycleId: "cycle-failure" };
+    await (TraderAgent.prototype as unknown as { persistDecisionOutcome: (...args: unknown[]) => Promise<unknown> }).persistDecisionOutcome.call(fake, {} as never, openExecutionRecord("unknown", "UNKNOWN"), bundle(), [], [], journal.cycleId, journal.startedAt, journal, true);
+    const experiences = loadExperiences(executor, 10);
+    expect(experiences[0]?.outcomeStatus).toBe("EXECUTION_FAILURE");
+    db.close();
+  });
+
+  it("blocks the whole cycle when any provider position lacks local lifecycle ownership", async () => {
+    const { db, executor } = memoryExecutor();
+    const events: Array<{ type: string; metadata?: Record<string, string> }> = [];
+    const entry = { ...plan().positionActions[0], decisionId: "entry-nvda", action: "OPEN_LONG" as const, positionSide: "LONG" as const, symbol: "NVDAUSDT", marginAllocationPct: "1", reductionPct: null };
+    vi.mocked(decide).mockResolvedValue({ plan: { positionActions: plan().positionActions, entryActions: [entry] as CycleDecisionPlan["entryActions"] }, ignoredLessonIds: [] });
+    vi.mocked(executeCyclePlan).mockImplementation(async () => { throw new Error("EXECUTION_PLANNER_SHOULD_NOT_RUN"); });
+    vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
+    vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
+    vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
+    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(account());
+
+    const fake = cycleTestAgent(executor, events, ["LOCAL_EXPERIENCE_MISSING:CRCLUSDT:LONG"]);
+    const journal = await (TraderAgent.prototype as unknown as { runCycle: () => Promise<TradingJournal> }).runCycle.call(fake);
+    expect(executeCyclePlan).not.toHaveBeenCalled();
+    expect(journal.discovery?.financialWritesPerformed).toBe(0);
+    expect(events.find((event) => event.type === "FINANCIAL_WRITES_STOPPED")?.metadata).toMatchObject({ code: "LOCAL_LIFECYCLE_UNRESOLVED" });
+    db.close();
+  });
+
+  it("persists owner late reconciliation exactly once across repeated orchestration calls", async () => {
+    const { db, executor } = memoryExecutor();
+    const record = openExecutionRecord("filled", "MISMATCH");
+    const journal: TradingJournal = { ...baseJournal, cycleId: "cycle-runtime", executionRecords: [record] };
+    saveJournal(executor, journal);
+    saveExperience(executor, {
+      ...unresolvedExperienceFixture(),
+      experienceId: "unresolved-persisted",
+      entryDecisionId: record.decision.decisionId,
+      symbol: record.decision.symbol,
+      positionSide: "LONG",
+      outcomeStatus: "EXECUTION_UNRESOLVED",
+    }, "2026-09-21T00:00:32.000Z");
+    const original = loadRecentJournals(executor, 1)[0]!;
+    const originalExecution = JSON.stringify(original.executionRecords?.[0]?.executionResult);
+    const originalReconciliation = JSON.stringify(original.executionRecords?.[0]?.reconciliationResult);
+    const events: string[] = [];
+    let eventSequence = 0;
+    const fake = {
+      env: { TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_CATEGORY: "USDT-FUTURES" },
+      state: { paused: true, emergencyStop: false },
+      ensureActivePolicy: () => ({ paperOnly: true, maxSinglePositionMarginPct: "30", maxLeverage: "5", maxDailyDrawdownPct: "10", drawdownCooldownMinutes: 60, scanIntervalMinutes: 5, emergencyStop: false }),
+      recordEvent(type: string, cycleId: string, metadata?: Record<string, string>) {
+        if (type === "LATE_EXECUTION_RECONCILED") events.push(type);
+        saveEvent(executor, { eventId: `event-${++eventSequence}`, type, cycleId, createdAt: `2026-09-21T00:01:0${eventSequence}.000Z`, ...(metadata ? { metadata } : {}) });
+      },
+      sql: executor.sql,
+    } as unknown as { state: { paused: boolean } };
+    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "getOrderDetailsRead").mockResolvedValue({ orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "3", cumExecQty: "3", avgPrice: "100", orderStatus: "filled", createdTime: "1789968749335" });
+    vi.spyOn(BitgetClient.prototype, "getFillHistoryRead").mockResolvedValue({ list: [{ execId: "fill-open", orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "3", execPrice: "100", createdTime: "1789968749337" }] });
+
+    const first = await (TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<{ status: string; experienceId: string }> }).reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId);
+    const initialContext = loadPositionContext(executor, "CRCLUSDT", "LONG");
+    if (!initialContext) throw new Error("missing reconciled context fixture");
+    const managementReasoning = (action: "HOLD" | "REDUCE", decisionId: string, createdAt: string): PositionReasoning => ({ action, thesis: action, strategyThesis: action, supportingFactors: [], riskFactors: [], evidenceUsed: [], lessonsUsed: [], confidence: 0.5, cycleId: "management-cycle", decisionId, createdAt });
+    const hold = managementReasoning("HOLD", "hold-decision", "2026-09-21T05:40:00.000Z");
+    const reduce = managementReasoning("REDUCE", "reduce-decision", "2026-09-21T05:50:00.000Z");
+    const preservedContext: PositionContext = { ...initialContext, managementEvents: [hold, reduce], latestManagement: reduce, updatedAt: "2026-09-21T05:55:00.000Z" };
+    savePositionContext(executor, preservedContext);
+    const contextBeforeSecond = JSON.stringify(preservedContext);
+    const experienceBeforeSecond = JSON.stringify(loadExperiences(executor, 100).find((experience) => experience.entryDecisionId === record.decision.decisionId));
+    const performanceBeforeSecond = JSON.stringify(loadPerformanceAggregate<PerformanceAggregate>(executor));
+    const eventsBeforeSecond = loadAllEvents(executor).filter((event) => event.type === "LATE_EXECUTION_RECONCILED").length;
+    const second = await (TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<{ status: string; experienceId: string }> }).reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId);
+    const persistedExperiences = loadExperiences(executor, 100).filter((experience) => experience.entryDecisionId === record.decision.decisionId);
+    const persistedContext = loadPositionContext(executor, "CRCLUSDT", "LONG");
+    const performance = loadPerformanceAggregate<PerformanceAggregate>(executor);
+    const persistedJournal = loadRecentJournals(executor, 1)[0]!;
+    const reconciliationEvents = loadAllEvents(executor).filter((event) => event.type === "LATE_EXECUTION_RECONCILED");
+
+    expect(first.status).toBe("RECONCILED");
+    expect(second.status).toBe("ALREADY_RECONCILED");
+    expect(second.experienceId).toBe(first.experienceId);
+    expect(persistedExperiences).toHaveLength(1);
+    expect(persistedExperiences[0]?.experienceId).toBe(first.experienceId);
+    expect(persistedExperiences[0]?.outcomeStatus).toBe("OPEN");
+    expect(persistedExperiences[0]?.entryPrice).toBe("100");
+    expect(persistedExperiences[0]?.entryTime).toBe("2026-09-21T05:32:29.337Z");
+    expect(Number.isFinite(Date.parse(persistedExperiences[0]?.entryTime ?? ""))).toBe(true);
+    expect(JSON.stringify(persistedContext)).toBe(contextBeforeSecond);
+    expect(persistedContext?.managementEvents).toEqual([hold, reduce]);
+    expect(persistedContext?.latestManagement).toEqual(reduce);
+    expect(persistedContext?.updatedAt).toBe("2026-09-21T05:55:00.000Z");
+    expect(JSON.stringify(persistedExperiences[0])).toBe(experienceBeforeSecond);
+    expect(performance?.totalTrades).toBe(1);
+    expect(performance?.openTrades).toBe(1);
+    expect(JSON.stringify(performance)).toBe(performanceBeforeSecond);
+    expect(events).toEqual(["LATE_EXECUTION_RECONCILED"]);
+    expect(reconciliationEvents).toHaveLength(eventsBeforeSecond);
+    expect(JSON.stringify(persistedJournal.executionRecords?.[0]?.executionResult)).toBe(originalExecution);
+    expect(JSON.stringify(persistedJournal.executionRecords?.[0]?.reconciliationResult)).toBe(originalReconciliation);
+    db.close();
+  });
+
+  it("rejects owner late reconciliation while runtime is not paused", async () => {
+    const { db, executor } = memoryExecutor();
+    const fake = {
+      state: { paused: false },
+      sql: executor.sql,
+    } as unknown as { state: { paused: boolean } };
+    await expect((TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<unknown> }).reconcileLateExecution.call(fake, "cycle-runtime", "decision-open")).rejects.toThrow("AGENT_MUST_BE_PAUSED");
+    db.close();
+  });
+
   it("persists a verified execution before a later portfolio refresh failure", async () => {
     const { db, executor } = memoryExecutor();
     const record = verifiedCloseRecord();
@@ -370,6 +541,7 @@ describe("journal observability persistence", () => {
       recordEvent: () => undefined,
       recordPositionDiscrepancies: () => [],
       refreshPositionManagementState: () => [lifecycleState],
+      reconcileLateExecutions: async () => undefined,
       collectResearchEvidence: async () => undefined,
       persistPerformanceEquity: () => undefined,
       persistDecisionOutcome: async () => undefined,

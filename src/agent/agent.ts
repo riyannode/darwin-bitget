@@ -62,6 +62,7 @@ import { reconcileExecution } from "../trading/reconcile.js";
 import { addDecimal, isDecimal, isPositiveDecimal } from "../trading/decimal.js";
 import { bootstrapPerformance, buildPerformanceAccounting, currentMonthDailyPnl, emptyPerformance, isPerformanceAggregate, POSITION_CONTEXT_READ_MODEL_VERSION, recordVerifiedClose, recordVerifiedOpen, recordVerifiedPartial, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate, type PerformanceObservation } from "../trading/performance.js";
 import { bootstrapPositionContexts, decisionReasoning, upsertPositionContext } from "./position-context.js";
+import { isReadbackOnlyExecutionMismatch, parseProviderFillEvidence, parseProviderOrderEvidence, reconcileLateExecution } from "../trading/late-reconciliation.js";
 import { EvaClient } from "../eva/client.js";
 import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
 import { availableResearchCapabilities } from "../research/capabilities.js";
@@ -169,6 +170,7 @@ function tradeLifecycleStatus(experience: TradeExperience): TradeLifecycleStatus
   if (experience.outcomeStatus === "OPEN") return experience.lastAction === "REDUCE" ? "PARTIALLY_REDUCED" : "OPEN";
   if (experience.outcomeStatus === "PROFITABLE" || experience.outcomeStatus === "LOSING" || experience.outcomeStatus === "BREAK_EVEN" || experience.outcomeStatus === "CLOSED_UNCLASSIFIED") return "CLOSED";
   if (experience.outcomeStatus === "BLOCKED") return "BLOCKED";
+  if (experience.outcomeStatus === "EXECUTION_UNRESOLVED") return "UNRESOLVED";
   return "EXECUTION_FAILURE";
 }
 
@@ -403,6 +405,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
       }
       if (body.action === "PAUSE") await this.setPaused(true);
       if (body.action === "EMERGENCY_STOP") await this.setEmergencyStop(true);
+      if (body.action === "RECONCILE_LATE_EXECUTION") {
+        try {
+          return json({ reconciliation: await this.reconcileLateExecution(body.cycleId, body.decisionId) });
+        } catch (error) {
+          return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "LATE_RECONCILIATION_FAILED" : "LATE_RECONCILIATION_FAILED" }, 409);
+        }
+      }
       return json(await this.getDashboardSnapshot());
     }
     if (url.pathname === "/policy" && request.method === "POST") {
@@ -644,6 +653,46 @@ export class TraderAgent extends Agent<Env, AgentState> {
       states.push(result.state);
     }
     return states;
+  }
+
+  public async reconcileLateExecution(originalCycleId: string, decisionId: string): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string }> {
+    if (!this.state.paused) throw new Error("AGENT_MUST_BE_PAUSED");
+    const journal = loadJournalsForDecisionIds(this, [decisionId], 2).find((candidate) => candidate.cycleId === originalCycleId);
+    if (!journal) throw new Error("LATE_RECONCILIATION_CYCLE_NOT_FOUND");
+    const record = normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === decisionId);
+    if (!record || !isReadbackOnlyExecutionMismatch(record) || !record.executionResult) throw new Error("LATE_RECONCILIATION_RECORD_NOT_ELIGIBLE");
+    const client = new BitgetClient(loadConfig(this.env, this.ensureActivePolicy()));
+    const bundle = (await client.collectEvidence([record.decision.symbol]))[0];
+    const position = bundle?.account.positions.find((candidate) => candidate.symbol === record.decision.symbol && candidate.positionSide === record.decision.positionSide);
+    if (!bundle || !position) throw new Error("LATE_RECONCILIATION_POSITION_MISSING");
+    const rawOrder = await client.getOrderDetailsRead(record.executionResult.providerOrderId, record.executionResult.clientOrderId);
+    const order = parseProviderOrderEvidence(rawOrder);
+    if (!order) throw new Error("LATE_RECONCILIATION_ORDER_INVALID");
+    const rawFills = await client.getFillHistoryRead(order.orderId);
+    const fill = parseProviderFillEvidence(rawFills, order);
+    if (!fill) throw new Error("LATE_RECONCILIATION_FILL_INVALID");
+    const experiences = loadAllExperiences(this);
+    const existingExperience = experiences.find((experience) => experience.entryDecisionId === decisionId && experience.symbol === record.decision.symbol && experience.positionSide === record.decision.positionSide);
+    const resolvedAt = new Date().toISOString();
+    const result = reconcileLateExecution({
+      record,
+      order,
+      fill,
+      currentPosition: position,
+      existingContext: loadPositionContext(this, record.decision.symbol, record.decision.positionSide!),
+      resolvedAt,
+      ...(existingExperience ? { existingExperience } : {}),
+    });
+    if (result.status === "ALREADY_RECONCILED") return { status: result.status, experienceId: result.experience.experienceId };
+    let performance = loadPerformanceAggregate<PerformanceAggregate>(this);
+    if (!isPerformanceAggregate(performance)) performance = bootstrapPerformance(loadAllAutonomousJournals(this), experiences, resolvedAt);
+    performance = recordVerifiedOpen(performance, bundle.account.portfolioEquity, resolvedAt);
+    saveExperience(this, result.experience, resolvedAt);
+    savePositionContext(this, result.positionContext);
+    savePerformanceAggregate(this, performance, resolvedAt);
+    const audited = loadAllEvents(this).some((event) => event.type === "LATE_EXECUTION_RECONCILED" && event.metadata?.originalCycleId === originalCycleId && event.metadata?.decisionId === decisionId);
+    if (!audited) this.recordEvent("LATE_EXECUTION_RECONCILED", originalCycleId, result.auditMetadata);
+    return { status: result.status, experienceId: result.experience.experienceId };
   }
 
   public async getDashboardSnapshot(livePortfolio?: DashboardSnapshot["portfolio"]): Promise<DashboardSnapshot> {
@@ -890,11 +939,17 @@ export class TraderAgent extends Agent<Env, AgentState> {
       journal.retrievedLessons = lessons.map((lesson) => lesson.lessonId);
       const plan: CycleDecisionPlan = decisionSet.plan;
       journal.cyclePlan = plan;
-      const execution = await executeCyclePlan(plan, {
+      const execution = journal.positionDiscrepancies && journal.positionDiscrepancies.length > 0
+        ? (() => {
+          this.recordEvent("FINANCIAL_WRITES_STOPPED", cycleId, { code: "LOCAL_LIFECYCLE_UNRESOLVED" });
+          this.recordEvent("PLAN_REMAINING_ACTIONS_SKIPPED", cycleId, { code: "LOCAL_LIFECYCLE_UNRESOLVED" });
+          return { records: [], finalPortfolio: undefined, stoppedAfterAmbiguity: true };
+        })()
+        : await executeCyclePlan(plan, {
         refreshEvidence: async (symbol) => (await client.collectEvidence([symbol]))[0],
         execute: async (action, actionBundle, decisionType, parentDecision) => {
           this.setState({ ...this.state, runtimeStatus: "RISK_CHECK", currentStage: "RISK_CHECK" });
-          return this.executeDecision(client, config, action, actionBundle, cycleId, supportedUniverse, drawdown.blocked, startedAt, decisionType, parentDecision);
+          return this.executeDecision(client, config, action, actionBundle, cycleId, supportedUniverse, drawdown.blocked, startedAt, decisionType, parentDecision, journal.positionDiscrepancies ?? []);
         },
         persist: async (record, actionBundle) => {
           appendExecutionRecordToJournal(journal, record, discovery);
@@ -1046,8 +1101,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
     startedAt: string,
     decisionType: "POSITION_MANAGEMENT" | "NEW_ENTRY",
     parentDecision?: Decision,
+    positionDiscrepancies: readonly string[] = [],
   ): Promise<DecisionExecutionRecord> {
-    const riskGateResult = evaluateRiskGate(config, { decision, instrument: bundle.instrument, account: bundle.account, market: bundle.market, evidenceObservedAt: bundle.market.observedAt, openOrderSymbols: bundle.account.openOrderSymbols, supportedUniverse, emergencyStop: this.state.emergencyStop || config.ownerPolicy.emergencyStop, dailyDrawdownBlocked });
+    const riskGateResult = evaluateRiskGate(config, { decision, instrument: bundle.instrument, account: bundle.account, market: bundle.market, evidenceObservedAt: bundle.market.observedAt, openOrderSymbols: bundle.account.openOrderSymbols, supportedUniverse, emergencyStop: this.state.emergencyStop || config.ownerPolicy.emergencyStop, dailyDrawdownBlocked, positionDiscrepancies });
     this.recordEvent("DECISION_CREATED", cycleId, { action: decision.action, symbol: decision.symbol, decisionType });
     this.recordEvent(riskGateResult.status === "PASS" ? "RISK_GATE_PASS" : "RISK_GATE_BLOCK", cycleId, { codes: riskGateResult.codes.join(","), decisionType, symbol: decision.symbol });
     const positionBefore = findPosition(bundle.account.positions, decision.symbol, decision.positionSide);
@@ -1109,6 +1165,15 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (isManagementDecision && (!isEntryDecision || verified)) this.updatePositionContext(record);
     const currentExperience = experiences.find((experience) => experience.outcomeStatus === "OPEN" && experience.symbol === decision.symbol && experience.positionSide === decision.positionSide);
     this.updatePerformanceReadModel(record, bundle, verified, currentExperience);
+    const filledPositionUnverified = isEntryDecision && executionResult?.status === "filled" && isReadbackOnlyExecutionMismatch(record);
+    if (!currentExperience && filledPositionUnverified && executionResult) {
+      const unresolved = reflect({ decision, outcome: "EXECUTION_UNRESOLVED", failureCode: reconciliationResult?.codes.join(",") || "POSITION_READBACK_UNAVAILABLE", symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", experienceStatus: "EXECUTION_UNRESOLVED", entryPrice: executionResult.averageFillPrice ?? bundle.market.lastPrice, exitPrice: executionResult.averageFillPrice ?? bundle.market.lastPrice, evidenceAtEntry: bundle.evidence.map((evidence) => evidence.type), evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: decision.lessonsUsed, marginAllocated: executionResult.marginAllocated, positionNotional: executionResult.positionNotional });
+      saveExperience(this, unresolved.experience, startedAt);
+      journal.experienceId = unresolved.experience.experienceId;
+      journal.experienceIds = [...(journal.experienceIds ?? []), unresolved.experience.experienceId];
+      this.recordEvent("EXECUTION_UNRESOLVED", cycleId, { symbol: decision.symbol, action: decision.action, codes: reconciliationResult?.codes.join(",") || "POSITION_READBACK_UNAVAILABLE" });
+      return {};
+    }
     if (!currentExperience && allowFailureReflection && (record.riskGateResult.status === "BLOCK" || (executionResult && !verified))) {
       const failure = record.riskGateResult.codes.length ? record.riskGateResult.codes.join(",") : "EXECUTION_FAILURE";
       const failureResult = reflect({ decision, outcome: record.riskGateResult.status === "BLOCK" ? "RISK_BLOCKED" : "EXECUTION_FAILURE", failureCode: failure, symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", experienceStatus: record.riskGateResult.status === "BLOCK" ? "BLOCKED" : "EXECUTION_FAILURE", entryPrice: bundle.market.lastPrice, exitPrice: bundle.market.lastPrice, evidenceAtEntry: bundle.evidence.map((evidence) => evidence.type), evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: decision.lessonsUsed, marginAllocated: record.executionRequest?.marginAllocated ?? "0", positionNotional: record.executionRequest?.positionNotional ?? "0" });
@@ -1293,10 +1358,11 @@ function calculateDrawdownPct(baseline: string, current: string): string {
   return (((equity - base) / base) * 100).toFixed(2);
 }
 
-function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } {
+function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const action = (value as { action?: unknown }).action;
-  return action === "START" || action === "PAUSE" || action === "RESUME" || action === "EMERGENCY_STOP";
+  const body = value as { action?: unknown; cycleId?: unknown; decisionId?: unknown };
+  if (body.action === "RECONCILE_LATE_EXECUTION") return typeof body.cycleId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.cycleId) && typeof body.decisionId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.decisionId);
+  return body.action === "START" || body.action === "PAUSE" || body.action === "RESUME" || body.action === "EMERGENCY_STOP";
 }
 
 function isPolicyBody(value: unknown): value is Record<string, unknown> {
