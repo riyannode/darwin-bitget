@@ -48,10 +48,10 @@ export interface LateExecutionReconciliationResult {
   auditMetadata: Record<string, string>;
 }
 
-export function parseProviderOrderEvidence(value: unknown, fallbackClientOid = ""): ProviderOrderEvidence | null {
+export function parseProviderOrderEvidence(value: unknown): ProviderOrderEvidence | null {
   const source = record(value);
   const orderId = text(source.orderId);
-  const clientOid = text(source.clientOid, fallbackClientOid);
+  const clientOid = text(source.clientOid);
   const symbol = text(source.symbol);
   const side = text(source.side).toLowerCase();
   const positionSide = providerPositionSide(source.posSide);
@@ -70,13 +70,13 @@ export function parseProviderFillEvidence(value: unknown, expectedOrder: Provide
   if (!Array.isArray(rows)) return null;
   const row = rows.find((candidate) => {
     const source = record(candidate);
-    return text(source.orderId) === expectedOrder.orderId && text(source.clientOid, expectedOrder.clientOid) === expectedOrder.clientOid;
+    return text(source.orderId) === expectedOrder.orderId && text(source.clientOid) === expectedOrder.clientOid;
   });
   if (!row) return null;
   const source = record(row);
   const fillId = text(source.execId, text(source.execLinkId));
   const orderId = text(source.orderId);
-  const clientOid = text(source.clientOid, expectedOrder.clientOid);
+  const clientOid = text(source.clientOid);
   const symbol = text(source.symbol);
   const side = text(source.side).toLowerCase();
   const positionSide = providerPositionSide(source.posSide);
@@ -110,8 +110,8 @@ export function reconcileLateExecution(input: LateExecutionReconciliationInput):
   if (order.positionSide !== decision.positionSide || fill.positionSide !== decision.positionSide || currentPosition.positionSide !== decision.positionSide) throw new Error("LATE_RECONCILIATION_SIDE_MISMATCH");
   if (!isPositiveDecimal(currentPosition.quantity)) throw new Error("LATE_RECONCILIATION_POSITION_MISSING");
   if (order.status !== "filled") throw new Error("LATE_RECONCILIATION_ORDER_NOT_FILLED");
-  if (compareDecimal(order.quantity, execution.executedQuantity) !== 0 || compareDecimal(fill.quantity, execution.executedQuantity) !== 0) throw new Error("LATE_RECONCILIATION_QUANTITY_MISMATCH");
-  if (compareDecimal(order.quantity, fill.quantity) !== 0) throw new Error("LATE_RECONCILIATION_FILL_QUANTITY_MISMATCH");
+  if (compareDecimal(order.executedQuantity, execution.executedQuantity) !== 0 || compareDecimal(fill.quantity, execution.executedQuantity) !== 0) throw new Error("LATE_RECONCILIATION_QUANTITY_MISMATCH");
+  if (compareDecimal(order.executedQuantity, fill.quantity) !== 0) throw new Error("LATE_RECONCILIATION_FILL_QUANTITY_MISMATCH");
   if (!isPositiveDecimal(order.averageFillPrice) || !isPositiveDecimal(fill.price) || compareDecimal(order.averageFillPrice, fill.price) !== 0) throw new Error("LATE_RECONCILIATION_PRICE_MISMATCH");
   if (currentPosition.entryPrice && isPositiveDecimal(currentPosition.entryPrice) && compareDecimal(currentPosition.entryPrice, fill.price) !== 0) throw new Error("LATE_RECONCILIATION_POSITION_ENTRY_MISMATCH");
   const expectedProviderSide = decision.positionSide === "LONG" ? "buy" : "sell";

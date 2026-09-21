@@ -666,7 +666,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const position = bundle?.account.positions.find((candidate) => candidate.symbol === record.decision.symbol && candidate.positionSide === record.decision.positionSide);
     if (!bundle || !position) throw new Error("LATE_RECONCILIATION_POSITION_MISSING");
     const rawOrder = await client.getOrderDetailsRead(record.executionResult.providerOrderId, record.executionResult.clientOrderId);
-    const order = parseProviderOrderEvidence(rawOrder, record.executionResult.clientOrderId);
+    const order = parseProviderOrderEvidence(rawOrder);
     if (!order) throw new Error("LATE_RECONCILIATION_ORDER_INVALID");
     const rawFills = await client.getFillHistoryRead(order.orderId);
     const fill = parseProviderFillEvidence(rawFills, order);

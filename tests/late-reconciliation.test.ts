@@ -171,6 +171,21 @@ describe("late filled-open reconciliation", () => {
     expect(() => reconcileLateExecution(input({ order: { ...order!, clientOid: "other-client" }, fill: { ...fill!, clientOid: "other-client" } }))).toThrow("LATE_RECONCILIATION_CLIENT_ORDER_MISMATCH");
   });
 
+  it("rejects provider order evidence without an explicit clientOid", () => {
+    expect(parseProviderOrderEvidence({ orderId: execution.providerOrderId, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "24.54", cumExecQty: "24.54", avgPrice: "92.11", orderStatus: "filled", createdTime: "1789968749335" })).toBeNull();
+  });
+
+  it("rejects provider fill evidence without an explicit clientOid", () => {
+    if (!order) throw new Error("fixture parse failed");
+    expect(parseProviderFillEvidence({ list: [{ execId: "fill-1", orderId: order.orderId, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "24.54", execPrice: "92.11", createdTime: "1789968749337" }] }, order)).toBeNull();
+  });
+
+  it("rejects authoritative order cumExecQty mismatch", () => {
+    const mismatchedOrder = parseProviderOrderEvidence({ orderId: execution.providerOrderId, clientOid: execution.clientOrderId, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "24.54", cumExecQty: "24.53", avgPrice: "92.11", orderStatus: "filled", createdTime: "1789968749335" });
+    expect(mismatchedOrder).not.toBeNull();
+    expect(() => reconcileLateExecution(input({ order: mismatchedOrder! }))).toThrow("LATE_RECONCILIATION_QUANTITY_MISMATCH");
+  });
+
   it("rejects symbol mismatch", () => {
     expect(() => reconcileLateExecution(input({ order: { ...order!, symbol: "MSTRUSDT" }, fill: { ...fill!, symbol: "MSTRUSDT" } }))).toThrow("LATE_RECONCILIATION_SYMBOL_MISMATCH");
   });
