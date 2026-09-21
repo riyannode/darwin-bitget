@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("agents", () => ({ Agent: class {}, routeAgentRequest: vi.fn() }));
 import { z } from "zod";
 import { failureDiagnostic, TraderAgent } from "../src/agent/agent.js";
+import { QwenJsonError } from "../src/agent/qwen.js";
 import { cycleReadModel } from "../src/storage/journal-normalizer.js";
 import { loadLatestCompletedCyclePlanFromHistory, loadLatestValidCyclePlan, saveCycle, saveJournal, saveLatestValidCyclePlan } from "../src/storage/store.js";
 import type { SqlExecutor } from "../src/storage/schema.js";
@@ -184,6 +185,17 @@ describe("cycle status read model", () => {
 });
 
 describe("safe failure diagnostics", () => {
+  it("persists Qwen JSON_PARSE as a structured safe diagnostic field", () => {
+    const diagnostic = failureDiagnostic(new QwenJsonError("QWEN_INVALID_JSON", { finishReason: "stop", textLength: 20, inputTokens: 10, outputTokens: 5, hasOpeningBrace: true, hasClosingBrace: true, parserStage: "JSON_PARSE" }));
+    expect(diagnostic).toMatchObject({ category: "RUNTIME_ERROR", code: "QWEN_INVALID_JSON", parserStage: "JSON_PARSE" });
+    expect(JSON.stringify(diagnostic)).not.toContain("model output");
+  });
+
+  it("persists Qwen RESPONSE_JSON_EXTRACTION as a structured safe diagnostic field", () => {
+    const diagnostic = failureDiagnostic(new QwenJsonError("QWEN_INVALID_JSON", { finishReason: "stop", textLength: 8, hasOpeningBrace: false, hasClosingBrace: false, parserStage: "RESPONSE_JSON_EXTRACTION" }));
+    expect(diagnostic).toMatchObject({ category: "RUNTIME_ERROR", code: "QWEN_INVALID_JSON", parserStage: "RESPONSE_JSON_EXTRACTION" });
+  });
+
   it("keeps multiline Zod issues structured and bounded", () => {
     const schema = z.object({ positionActions: z.array(z.object({ marginAllocationPct: z.literal("0") })) });
     const result = schema.safeParse({ positionActions: [{ marginAllocationPct: "10" }] });

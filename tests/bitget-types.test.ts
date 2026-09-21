@@ -37,6 +37,26 @@ describe("Bitget provider readback", () => {
     expect(portfolio.positions[0]).toMatchObject({ symbol: "CRCLUSDT", positionSide: "LONG", quantity: "32.69", entryPrice: "91.7", markPrice: "91.82", marginAllocated: "998.78", leverage: "3", notional: "2996.3654", unrealizedPnl: "-0.9807", unrealizedPnlPct: "-0.09", liquidationPrice: "44.2" });
   });
 
+  it("falls back to the same position mark for a single position without notional", () => {
+    const portfolio = parseDashboardPortfolio(
+      { usdtEquity: "50000", availableMargin: "47000" },
+      [{ symbol: "MSTRUSDT", posSide: "long", total: "16.43", avgPrice: "137.51", markPrice: "154.41", positionBalance: "847.17427378", unrealisedPnl: "277.667", profitRate: "0.3277566477096616", leverage: "3" }],
+      { list: [] },
+      "2026-09-21T04:14:48.616Z",
+    );
+    expect(portfolio.positions[0]?.notional).toBe("2536.9563");
+  });
+
+  it("prefers authoritative account positionValue for a single position", () => {
+    const portfolio = parseDashboardPortfolio(
+      { usdtEquity: "50000", availableMargin: "47000", positionValue: "2541.23" },
+      [{ symbol: "MSTRUSDT", posSide: "long", total: "16.43", avgPrice: "137.51", markPrice: "154.41", positionBalance: "847.17427378", unrealisedPnl: "277.667", profitRate: "0.3277566477096616", leverage: "3" }],
+      { list: [] },
+      "2026-09-21T04:14:48.616Z",
+    );
+    expect(portfolio.positions[0]?.notional).toBe("2541.23");
+  });
+
   it("normalizes the MSTR provider shape for model-facing evidence", () => {
     const portfolio = parseDashboardPortfolio(
       { usdtEquity: "50000", availableMargin: "47000" },
