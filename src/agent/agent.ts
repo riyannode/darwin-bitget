@@ -405,6 +405,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
       }
       if (body.action === "PAUSE") await this.setPaused(true);
       if (body.action === "EMERGENCY_STOP") await this.setEmergencyStop(true);
+      if (body.action === "RECONCILE_LATE_EXECUTION") {
+        try {
+          return json({ reconciliation: await this.reconcileLateExecution(body.cycleId, body.decisionId) });
+        } catch (error) {
+          return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "LATE_RECONCILIATION_FAILED" : "LATE_RECONCILIATION_FAILED" }, 409);
+        }
+      }
       return json(await this.getDashboardSnapshot());
     }
     if (url.pathname === "/policy" && request.method === "POST") {
@@ -648,64 +655,47 @@ export class TraderAgent extends Agent<Env, AgentState> {
     return states;
   }
 
-  private async reconcileLateExecutions(
-    client: BitgetClient,
-    positions: readonly PositionSnapshot[],
-    experiences: TradeExperience[],
-    currentCycleId: string,
-    portfolioEquity: string,
-    resolvedAt: string,
-  ): Promise<void> {
-    const pending = experiences.filter((experience) => experience.outcomeStatus === "EXECUTION_FAILURE" || experience.outcomeStatus === "EXECUTION_UNRESOLVED");
-    if (pending.length === 0) return;
-    const journals = loadJournalsForDecisionIds(this, pending.map((experience) => experience.entryDecisionId), 100);
-    const events = loadAllEvents(this);
-    let performance = loadPerformanceAggregate<PerformanceAggregate>(this);
-    for (const journal of journals) {
-      const records = normalizeCycleDecisions(journal).records;
-      for (const record of records) {
-        if (!isReadbackOnlyExecutionMismatch(record)) continue;
-        const experienceIndex = experiences.findIndex((experience) => experience.entryDecisionId === record.decision.decisionId && experience.symbol === record.decision.symbol && experience.positionSide === record.decision.positionSide);
-        const existingExperience = experienceIndex >= 0 ? experiences[experienceIndex] : undefined;
-        const position = positions.find((candidate) => candidate.symbol === record.decision.symbol && candidate.positionSide === record.decision.positionSide);
-        if (!position) continue;
-        try {
-          const execution = record.executionResult;
-          if (!execution) continue;
-          const rawOrder = await client.getOrderDetailsRead(execution.providerOrderId, execution.clientOrderId);
-          const order = parseProviderOrderEvidence(rawOrder, execution.clientOrderId);
-          if (!order) continue;
-          const rawFills = await client.getFillHistoryRead(order.orderId);
-          const fill = parseProviderFillEvidence(rawFills, order);
-          if (!fill) continue;
-          const reconciliationInput = {
-            record,
-            order,
-            fill,
-            currentPosition: position,
-            existingContext: loadPositionContext(this, record.decision.symbol, record.decision.positionSide!),
-            resolvedAt,
-            ...(existingExperience ? { existingExperience } : {}),
-          };
-          const result = reconcileLateExecution(reconciliationInput);
-          if (result.status === "RECONCILED") {
-            if (!isPerformanceAggregate(performance)) performance = bootstrapPerformance(loadAllAutonomousJournals(this), loadAllExperiences(this), resolvedAt);
-            performance = recordVerifiedOpen(performance, portfolioEquity, resolvedAt);
-            if (experienceIndex >= 0) experiences[experienceIndex] = result.experience;
-            else experiences.push(result.experience);
-            saveExperience(this, result.experience, resolvedAt);
-            savePositionContext(this, result.positionContext);
-            savePerformanceAggregate(this, performance, resolvedAt);
-          } else {
-            savePositionContext(this, result.positionContext);
-          }
-          const alreadyAudited = events.some((event) => event.type === "LATE_EXECUTION_RECONCILED" && event.metadata?.originalCycleId === record.decision.cycleId && event.metadata?.decisionId === record.decision.decisionId);
-          if (!alreadyAudited) this.recordEvent("LATE_EXECUTION_RECONCILED", currentCycleId, result.auditMetadata);
-        } catch {
-          // Reconciliation is fail-closed: provider/read/identity uncertainty leaves the original state untouched.
-        }
-      }
+  public async reconcileLateExecution(originalCycleId: string, decisionId: string): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string }> {
+    if (!this.state.paused) throw new Error("AGENT_MUST_BE_PAUSED");
+    const journal = loadJournalsForDecisionIds(this, [decisionId], 2).find((candidate) => candidate.cycleId === originalCycleId);
+    if (!journal) throw new Error("LATE_RECONCILIATION_CYCLE_NOT_FOUND");
+    const record = normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === decisionId);
+    if (!record || !isReadbackOnlyExecutionMismatch(record) || !record.executionResult) throw new Error("LATE_RECONCILIATION_RECORD_NOT_ELIGIBLE");
+    const client = new BitgetClient(loadConfig(this.env, this.ensureActivePolicy()));
+    const bundle = (await client.collectEvidence([record.decision.symbol]))[0];
+    const position = bundle?.account.positions.find((candidate) => candidate.symbol === record.decision.symbol && candidate.positionSide === record.decision.positionSide);
+    if (!bundle || !position) throw new Error("LATE_RECONCILIATION_POSITION_MISSING");
+    const rawOrder = await client.getOrderDetailsRead(record.executionResult.providerOrderId, record.executionResult.clientOrderId);
+    const order = parseProviderOrderEvidence(rawOrder, record.executionResult.clientOrderId);
+    if (!order) throw new Error("LATE_RECONCILIATION_ORDER_INVALID");
+    const rawFills = await client.getFillHistoryRead(order.orderId);
+    const fill = parseProviderFillEvidence(rawFills, order);
+    if (!fill) throw new Error("LATE_RECONCILIATION_FILL_INVALID");
+    const experiences = loadAllExperiences(this);
+    const existingExperience = experiences.find((experience) => experience.entryDecisionId === decisionId && experience.symbol === record.decision.symbol && experience.positionSide === record.decision.positionSide);
+    const resolvedAt = new Date().toISOString();
+    const result = reconcileLateExecution({
+      record,
+      order,
+      fill,
+      currentPosition: position,
+      existingContext: loadPositionContext(this, record.decision.symbol, record.decision.positionSide!),
+      resolvedAt,
+      ...(existingExperience ? { existingExperience } : {}),
+    });
+    if (result.status === "RECONCILED") {
+      let performance = loadPerformanceAggregate<PerformanceAggregate>(this);
+      if (!isPerformanceAggregate(performance)) performance = bootstrapPerformance(loadAllAutonomousJournals(this), experiences, resolvedAt);
+      performance = recordVerifiedOpen(performance, bundle.account.portfolioEquity, resolvedAt);
+      saveExperience(this, result.experience, resolvedAt);
+      savePositionContext(this, result.positionContext);
+      savePerformanceAggregate(this, performance, resolvedAt);
+    } else {
+      savePositionContext(this, result.positionContext);
     }
+    const audited = loadAllEvents(this).some((event) => event.type === "LATE_EXECUTION_RECONCILED" && event.metadata?.originalCycleId === originalCycleId && event.metadata?.decisionId === decisionId);
+    if (!audited) this.recordEvent("LATE_EXECUTION_RECONCILED", originalCycleId, result.auditMetadata);
+    return { status: result.status, experienceId: result.experience.experienceId };
   }
 
   public async getDashboardSnapshot(livePortfolio?: DashboardSnapshot["portfolio"]): Promise<DashboardSnapshot> {
@@ -905,7 +895,6 @@ export class TraderAgent extends Agent<Env, AgentState> {
         this.recordEvent("PLAN_REJECTED", cycleId, { code: "OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT", openPositionCount: String(openPositions.filter((position) => Number(position.quantity) > 0).length), maxActions: "5" });
         throw error;
       }
-      await this.reconcileLateExecutions(client, openPositions, experiences, cycleId, account.portfolioEquity, new Date().toISOString());
       journal.positionDiscrepancies = this.recordPositionDiscrepancies(experiences, openPositions, cycleId);
       recordLessonRetrieval(this, lessons.map((lesson) => lesson.lessonId), cycleId, startedAt);
       const drawdown = evaluateDrawdown(config.ownerPolicy, loadDailyDrawdownState(this), account.portfolioEquity, new Date());
@@ -953,7 +942,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
       journal.retrievedLessons = lessons.map((lesson) => lesson.lessonId);
       const plan: CycleDecisionPlan = decisionSet.plan;
       journal.cyclePlan = plan;
-      const execution = await executeCyclePlan(plan, {
+      const execution = journal.positionDiscrepancies && journal.positionDiscrepancies.length > 0
+        ? (() => {
+          this.recordEvent("FINANCIAL_WRITES_STOPPED", cycleId, { code: "LOCAL_LIFECYCLE_UNRESOLVED" });
+          this.recordEvent("PLAN_REMAINING_ACTIONS_SKIPPED", cycleId, { code: "LOCAL_LIFECYCLE_UNRESOLVED" });
+          return { records: [], finalPortfolio: undefined, stoppedAfterAmbiguity: true };
+        })()
+        : await executeCyclePlan(plan, {
         refreshEvidence: async (symbol) => (await client.collectEvidence([symbol]))[0],
         execute: async (action, actionBundle, decisionType, parentDecision) => {
           this.setState({ ...this.state, runtimeStatus: "RISK_CHECK", currentStage: "RISK_CHECK" });
@@ -1366,10 +1361,11 @@ function calculateDrawdownPct(baseline: string, current: string): string {
   return (((equity - base) / base) * 100).toFixed(2);
 }
 
-function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } {
+function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const action = (value as { action?: unknown }).action;
-  return action === "START" || action === "PAUSE" || action === "RESUME" || action === "EMERGENCY_STOP";
+  const body = value as { action?: unknown; cycleId?: unknown; decisionId?: unknown };
+  if (body.action === "RECONCILE_LATE_EXECUTION") return typeof body.cycleId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.cycleId) && typeof body.decisionId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.decisionId);
+  return body.action === "START" || body.action === "PAUSE" || body.action === "RESUME" || body.action === "EMERGENCY_STOP";
 }
 
 function isPolicyBody(value: unknown): value is Record<string, unknown> {

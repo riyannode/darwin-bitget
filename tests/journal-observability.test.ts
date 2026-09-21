@@ -199,7 +199,7 @@ function openExecutionRecord(status: "filled" | "unknown", reconciliationStatus:
   return { decision, riskGateResult: { status: "PASS", codes: [], checkedAt: decision.createdAt }, executionResult, reconciliationResult: { status: reconciliationStatus, codes: reconciliationStatus === "MISMATCH" ? ["POSITION_READBACK_UNAVAILABLE", "POSITION_READBACK_MISSING"] : ["EXECUTION_UNKNOWN"], execution: executionResult } } as DecisionExecutionRecord;
 }
 
-function cycleTestAgent(executor: SqlExecutor, events: Array<{ type: string; metadata?: Record<string, string> }>) {
+function cycleTestAgent(executor: SqlExecutor, events: Array<{ type: string; metadata?: Record<string, string> }>, discrepancies: string[] = []) {
   return {
     env: { TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_CATEGORY: "USDT-FUTURES" },
     state: { emergencyStop: false, paused: false, lastCycleId: null, lastScanAt: null, nextScanAt: null, model: "", runtimeStatus: "ONLINE", currentStage: "ONLINE", lastStatus: "IDLE", lastPolicyUpdateAt: null, cycleStartedAt: null, temporaryScanIntervalExpiresAt: null, temporaryScanIntervalCompleted: true, temporaryScanIntervalDurationMs: 0, userStorageVersion: 0 },
@@ -207,7 +207,7 @@ function cycleTestAgent(executor: SqlExecutor, events: Array<{ type: string; met
     activeScanIntervalMinutes: () => 5,
     setState(next: unknown) { (this as unknown as { state: unknown }).state = next; },
     recordEvent(type: string, _cycleId: string, metadata?: Record<string, string>) { events.push({ type, ...(metadata ? { metadata } : {}) }); },
-    recordPositionDiscrepancies: () => [],
+    recordPositionDiscrepancies: () => discrepancies,
     refreshPositionManagementState: () => [lifecycleState],
     reconcileLateExecutions: async () => undefined,
     collectResearchEvidence: async () => undefined,
@@ -374,6 +374,26 @@ describe("journal observability persistence", () => {
     await (TraderAgent.prototype as unknown as { persistDecisionOutcome: (...args: unknown[]) => Promise<unknown> }).persistDecisionOutcome.call(fake, {} as never, openExecutionRecord("unknown", "UNKNOWN"), bundle(), [], [], journal.cycleId, journal.startedAt, journal, true);
     const experiences = loadExperiences(executor, 10);
     expect(experiences[0]?.outcomeStatus).toBe("EXECUTION_FAILURE");
+    db.close();
+  });
+
+  it("blocks the whole cycle when any provider position lacks local lifecycle ownership", async () => {
+    const { db, executor } = memoryExecutor();
+    const events: Array<{ type: string; metadata?: Record<string, string> }> = [];
+    const entry = { ...plan().positionActions[0], decisionId: "entry-nvda", action: "OPEN_LONG" as const, positionSide: "LONG" as const, symbol: "NVDAUSDT", marginAllocationPct: "1", reductionPct: null };
+    vi.mocked(decide).mockResolvedValue({ plan: { positionActions: plan().positionActions, entryActions: [entry] as CycleDecisionPlan["entryActions"] }, ignoredLessonIds: [] });
+    vi.mocked(executeCyclePlan).mockImplementation(async () => { throw new Error("EXECUTION_PLANNER_SHOULD_NOT_RUN"); });
+    vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
+    vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
+    vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
+    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(account());
+
+    const fake = cycleTestAgent(executor, events, ["LOCAL_EXPERIENCE_MISSING:CRCLUSDT:LONG"]);
+    const journal = await (TraderAgent.prototype as unknown as { runCycle: () => Promise<TradingJournal> }).runCycle.call(fake);
+    expect(executeCyclePlan).not.toHaveBeenCalled();
+    expect(journal.discovery?.financialWritesPerformed).toBe(0);
+    expect(events.find((event) => event.type === "FINANCIAL_WRITES_STOPPED")?.metadata).toMatchObject({ code: "LOCAL_LIFECYCLE_UNRESOLVED" });
     db.close();
   });
 
