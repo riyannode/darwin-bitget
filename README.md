@@ -9,20 +9,21 @@ DARWIN Bitget is an autonomous PAPER futures trading agent for Bitget's 24/7 US-
 - Live Production: [darwin-bitget.vercel.app](https://darwin-bitget.vercel.app/)
 - Source: [github.com/riyannode/darwin-bitget](https://github.com/riyannode/darwin-bitget)
 - Judge Demo: `docker compose up --build`, then [http://localhost:3000/demo](http://localhost:3000/demo)
-- Final PAPER Log: pending final competition export
-- Demo Video: pending
-- X submission: pending
+- Frozen final competition export: not committed until collection is complete
 
 ## Judge Paths
 
 1. [Live Production](https://darwin-bitget.vercel.app/) — actual autonomous Bitget Demo PAPER runtime.
-2. Zero-credential Docker Judge Demo — deterministic recorded replay with no provider or model calls.
-3. Source / fork / self-host — a separate PAPER instance with the developer's own backend credentials.
-4. Final PAPER Log — `PENDING FINAL COMPETITION EXPORT` while history is still being collected.
+2. **Live PAPER journal/log export** — current autonomous evidence is available read-only from `/api/export/paper-log?format=json` and `/api/export/paper-log?format=csv`.
+3. **Zero-credential Docker Judge Demo** — deterministic recorded replay with no provider or model calls.
+4. **GitHub source / architecture / verification docs** — inspect the implementation and evidence boundaries.
+5. **Frozen final competition export** — not committed until the collection period is complete.
 
 ## What DARWIN Does
 
 Each autonomous cycle independently manages every currently open PAPER position and evaluates unrelated new opportunities from the current executable Bitget Demo stock-perpetual universe. DARWIN can independently HOLD, scale into, reduce, close, or reverse an existing position while continuing to evaluate unrelated new entry opportunities. Qwen returns a bounded cycle plan; deterministic validation, risk controls, provider readback, and reconciliation own financial authority. Journals, experiences, reflections, lessons, the compact performance aggregate, and position-context reasoning persist in Durable Object SQLite. An existing HOLD does not consume the new-entry opportunity slot.
+
+For each verified open position, deterministic TypeScript supplies Qwen with current return, maximum favorable return, the maximum-favorable-return basis, profit giveback from peak, time in trade, and recent management actions. `SINCE_ENTRY` means the peak is supported from the trade-entry lifecycle; `SINCE_FIRST_DETERMINISTIC_OBSERVATION` means a legacy position lacked a trustworthy persisted full-since-entry price series, so the peak is bounded to the first deterministic observation. Qwen compares HOLD, REDUCE, and CLOSE using that lifecycle evidence; TypeScript remains financial authority.
 
 ```text
 Executable Demo universe → lightweight scan → bounded entry shortlist
@@ -92,7 +93,9 @@ The Judge Demo is not a live Bitget session. It exists to make the architecture 
 
 ## Live Production
 
-The live site reads provider-only `/api/live/portfolio` for current `PROVIDER_LIVE` portfolio state, provider realized PnL, funding/fees when available, and current provider unrealized PnL. `/api/snapshot` is the slower Durable Object runtime/performance read and is not the live portfolio polling path. `/api/position-context` is a bounded persisted reasoning read keyed by symbol + side. The performance aggregate preserves provider-verified closures even when PnL enrichment is unavailable and keeps those outcomes out of win-rate classification. If the account or position provider read fails, the UI shows provider state as unavailable and does not show journal portfolio fallback. The detailed Open Position page is read-only. The dashboard is not a substitute for the full historical export.
+The live site reads provider-only `/api/live/portfolio` for current `PROVIDER_LIVE` portfolio state, provider realized PnL, funding/fees when available, and current provider unrealized PnL. A successful current provider read is evidenced by HTTP success, `source=PROVIDER_LIVE`, a valid `observedAt`, and provider portfolio/readback availability; optional `degraded`/`errors` fields are handled explicitly when present. The response does not expose a top-level freshness field. `/api/snapshot` is the slower Durable Object runtime/performance read and is not the live portfolio polling path. `/api/position-context` is a bounded persisted reasoning read keyed by symbol + side. The performance aggregate preserves provider-verified closures even when PnL enrichment is unavailable and keeps those outcomes out of win-rate classification. If the account or position provider read fails, the UI shows provider state as unavailable and does not show journal portfolio fallback. The detailed Open Position page is read-only. The dashboard is not a substitute for the full historical export.
+
+The current live PAPER journal is downloadable read-only through the two export endpoints above. It is current autonomous evidence, not the frozen final competition export; the latter remains uncommitted while the collection period continues.
 
 ## Deploy Your Own
 
@@ -141,7 +144,7 @@ Optional EVA secrets are documented separately in [docs/EVA_INTEGRATION.md](docs
 
 Deploy the Worker with the repository's actual script: `npm run deploy`. Fork/import the repository into Vercel, point its `/api` rewrite to your own Worker, deploy, and verify the browser reaches your Worker rather than the original production Worker.
 
-The first deployment remains PAPER-only. Before `START` or `RESUME`, verify Worker health, `/api/snapshot` reachability, provider-only `/api/live/portfolio` account and position access, `source=PROVIDER_LIVE`, `stale=false`, positions/open-orders readback, Qwen connectivity, and authenticated owner controls. Do not start an autonomous cycle until those checks pass. DARWIN Bitget is configured for Bitget Demo PAPER trading; this guide is not live-money trading instruction.
+The first deployment remains PAPER-only. Before `START` or `RESUME`, verify Worker health, `/api/snapshot` reachability, and a successful provider-only `/api/live/portfolio` read with HTTP success, `source=PROVIDER_LIVE`, valid `observedAt`, provider portfolio/readback availability, and explicit handling of any optional `degraded`/`errors` fields. Also verify positions/open-orders readback, Qwen connectivity, and authenticated owner controls. Do not start an autonomous cycle until those checks pass. DARWIN Bitget is configured for Bitget Demo PAPER trading; this guide is not live-money trading instruction.
 
 ## Documentation
 
@@ -158,4 +161,4 @@ The first deployment remains PAPER-only. Before `START` or `RESUME`, verify Work
 
 ## Final PAPER Log
 
-The final competition log is intentionally not committed yet. Reserve `submissions/paper-log-final.json` and `submissions/paper-log-final.csv`; generate them only after collection is complete. Final metrics use closed, provider-verified trades only. Open unrealized PnL and execution failures are not realized performance.
+The final competition export is intentionally not committed yet. Reserve `submissions/paper-log-final.json` and `submissions/paper-log-final.csv`; generate them only after collection is complete. The current live PAPER log remains available read-only from production through the JSON and CSV export endpoints. Final metrics use closed, provider-verified trades only. Open unrealized PnL and execution failures are not realized performance.

@@ -16,11 +16,14 @@ Present the paths in this order:
 
 1. [Live Production](https://darwin-bitget.vercel.app/) — actual autonomous
    Bitget Demo PAPER runtime.
-2. **Zero-credential Docker Judge Demo** — run `docker compose up --build` for
-   a deterministic, credential-free replay.
-3. **Source / fork / self-host** — deploy a separate PAPER instance with the
-   developer's own Cloudflare, Vercel, Bitget Demo, and Qwen configuration.
-4. **Final PAPER Log** — `PENDING FINAL COMPETITION EXPORT` until collection is
+2. **Live PAPER journal/log export** — current autonomous evidence is available
+   read-only from `/api/export/paper-log?format=json` and
+   `/api/export/paper-log?format=csv`.
+3. **Zero-credential Docker Judge Demo** — run `docker compose up --build` for
+   a deterministic, credential-free replay with no provider or model calls.
+4. **GitHub source / architecture / verification docs** — inspect the source and
+   evidence boundaries.
+5. **Frozen final competition export** — not committed until collection is
    complete.
 
 These contexts must not be conflated: the live site is production runtime,
@@ -53,7 +56,7 @@ Demo executable universe → scan → bounded entry shortlist
 open provider positions → management evidence
 entry candidates → entry evidence
 → Qwen CycleDecisionPlan { positionActions[], entryActions[] }
-→ deterministic validation → CLOSE → REDUCE → OPEN sequential planner
+→ deterministic validation → CLOSE/REVERSE-close → REDUCE → INCREASE → OPEN → REVERSE-open sequential planner
 → risk gate → PAPER write → readback → reconciliation → refreshed portfolio
 → journal → learning
 ```
@@ -76,7 +79,7 @@ Qwen proposes strategy, thesis, symbol, direction, management intent, margin all
 
 ## Agent-quality evidence contract
 
-The current prompt contracts are `darwin-mandate-v6`, `darwin-candidate-v1`, `darwin-decision-v9`, `darwin-reflection-v1`, and `darwin-backtest-v2`. Each action must explain its decision rationale, supporting evidence, risk and invalidation conditions, evidence limitations, and lessons used. INCREASE carries additional margin and preserves provider leverage; REVERSE carries previous side, target side, and two-leg verification. The dashboard exposes those fields grouped by cycle so a judge can distinguish model reasoning from deterministic risk authority.
+The current prompt contracts are `darwin-mandate-v7`, `darwin-candidate-v1`, `darwin-decision-v9`, `darwin-reflection-v1`, and `darwin-backtest-v2`. For each verified open position, deterministic TypeScript supplies Qwen with current return, maximum favorable return, maximum favorable return basis, profit giveback from peak, time in trade, and recent management actions. `SINCE_ENTRY` means the favorable-return peak is supported from the trade-entry lifecycle. `SINCE_FIRST_DETERMINISTIC_OBSERVATION` means a legacy position did not have a trustworthy persisted full-since-entry price series, so the peak is explicitly bounded to the first deterministic observation. Qwen uses this lifecycle evidence to compare HOLD vs REDUCE vs CLOSE; deterministic TypeScript remains financial authority. Each action must explain its decision rationale, supporting evidence, risk and invalidation conditions, evidence limitations, and lessons used. INCREASE carries additional margin and preserves provider leverage; REVERSE carries previous side, target side, and two-leg verification. The dashboard exposes those fields grouped by cycle so a judge can distinguish model reasoning from deterministic risk authority.
 
 ## Architectural differentiator for judging
 
@@ -105,14 +108,13 @@ The judge path is [https://darwin-bitget.vercel.app/](https://darwin-bitget.verc
 | --- | --- |
 | Source | [github.com/riyannode/darwin-bitget](https://github.com/riyannode/darwin-bitget) |
 | Live production | [darwin-bitget.vercel.app](https://darwin-bitget.vercel.app/) |
+| Live PAPER journal/log export | Read-only production endpoints: `/api/export/paper-log?format=json` and `/api/export/paper-log?format=csv` |
 | Canonical Docker Judge Demo | `docker compose up --build` → `http://localhost:3000/demo` |
 | Architecture | [docs/ARCHITECTURE.md](ARCHITECTURE.md) |
 | Demo guide | [docs/DEMO.md](DEMO.md) |
 | Deployment guide | [docs/DEPLOYMENT.md](DEPLOYMENT.md) |
 | Verification | [docs/VERIFICATION.md](VERIFICATION.md) |
-| Final PAPER log | PENDING FINAL COMPETITION EXPORT |
-| Demo video | PENDING |
-| X post | PENDING |
+| Frozen final competition export | Not committed until the collection period is complete |
 
 ## Canonical judge evaluation
 
@@ -139,6 +141,5 @@ Verified facts are listed in [docs/VERIFICATION.md](VERIFICATION.md). The manual
 - [ ] Continue collecting autonomous PAPER history.
 - [ ] Export the complete final competition log from Durable Object history.
 - [ ] Validate closed verified trades only for final metrics.
-- [ ] Record demo video and X submission link.
-- [ ] Recheck production SHA, `snapshot.commit`, `PROVIDER_LIVE`, and `stale=false`.
+- [ ] Recheck production SHA, `snapshot.commit`, and a successful `/api/live/portfolio` read with HTTP success, `source=PROVIDER_LIVE`, valid `observedAt`, and provider portfolio/readback available.
 - [ ] Keep credentials out of repository and submission artifacts.

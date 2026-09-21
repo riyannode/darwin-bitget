@@ -17,6 +17,8 @@ The live provider portfolio and persisted DARWIN evidence are deliberately separ
 
 The dashboard Cycle Plan groups actions into `POSITION MANAGEMENT` and `NEW ENTRY ACTIONS`. The compact Market Discovery section shows universe scanned count, selected entry candidates, existing positions managed, total proposed actions, and financial writes performed. Decision History groups actions by cycle rather than presenting one primary decision.
 
+For each verified open position, deterministic TypeScript supplies Qwen with current return, maximum favorable return, maximum favorable return basis, profit giveback from peak, time in trade, and recent management actions. `SINCE_ENTRY` means the favorable-return peak is supported from the trade-entry lifecycle. `SINCE_FIRST_DETERMINISTIC_OBSERVATION` means a legacy position did not have a trustworthy persisted full-since-entry price series, so the peak is explicitly bounded to the first deterministic observation. This lets Qwen compare HOLD vs REDUCE vs CLOSE without inventing lifecycle values; deterministic TypeScript remains financial authority.
+
 ## Implemented and verified in source
 
 - Bitget Demo UTA / PAPER mode is the execution environment.
@@ -31,13 +33,13 @@ The dashboard Cycle Plan groups actions into `POSITION MANAGEMENT` and `NEW ENTR
 
 ## Provider-live semantics
 
-`PROVIDER_LIVE` and `stale=false` mean the current account/position response came from the provider-only read path. Judge-demo fixtures are explicitly recorded replay evidence and are never labeled provider live. A dashboard cycle plan proves schema/rendering and discovery evidence; it does not by itself prove a production multi-write cycle.
+For a successful current provider read, verify HTTP success, `source=PROVIDER_LIVE`, a valid `observedAt`, and provider portfolio/readback availability. Optional `degraded`/`errors` fields identify explicitly handled partial provider reads when present. The response does not expose a top-level stale field. Judge-demo fixtures are explicitly recorded replay evidence and are never labeled provider live. A dashboard cycle plan proves schema/rendering and discovery evidence; it does not by itself prove a production multi-write cycle.
 
 ## Evidence classes and limitations
 
 - Journal evidence: Durable Object audit records of cycles, plans, decisions, risk results, writes, and learning.
 - Provider evidence: direct Bitget Demo order/position/readback and reconciliation facts.
-- Live dashboard state: current provider readback from `/api/live/portfolio` when `PROVIDER_LIVE` and non-stale.
+- Live dashboard state: current provider readback from `/api/live/portfolio` after HTTP success with `source=PROVIDER_LIVE`, valid `observedAt`, and provider portfolio/readback available.
 - Final competition PAPER log: a later full production export, still `PENDING FINAL COMPETITION EXPORT`.
 
 Do not claim a new autonomous financial write unless a real provider readback and `MATCHED` reconciliation show it. The Docker replay and manual harness are not autonomous competition history.

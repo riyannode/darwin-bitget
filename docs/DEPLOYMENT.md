@@ -108,7 +108,7 @@ Before `START`/`RESUME`, verify:
 1. Worker health.
 2. `/api/snapshot` reachable for Durable Object runtime state.
 3. Provider-only `/api/live/portfolio` account and position read succeeds.
-4. `/api/live/portfolio` returns `source=PROVIDER_LIVE` and a non-stale readback.
+4. `/api/live/portfolio` succeeds with `source=PROVIDER_LIVE`, a valid `observedAt`, and provider portfolio/readback available; handle optional `degraded`/`errors` explicitly when present.
 5. Positions/open orders readback succeeds.
 6. Qwen connectivity succeeds.
 7. Authenticated owner controls work.
@@ -131,4 +131,4 @@ Post-deploy acceptance observes at least two completed autonomous cycles. Each s
 
 ## Deployment verification and final artifacts
 
-Compare Worker source SHA from deploy output with `/api/snapshot.commit`. Verify the Vercel source/deployment SHA separately and ensure the frontend deployment corresponds to the same final PR HEAD. A healthy provider readback from `/api/live/portfolio` shows `PROVIDER_LIVE` and a non-stale result. Do not commit `submissions/paper-log-final.json` or `.csv` until the collection period is complete; final metrics use closed provider-verified trades only.
+Compare Worker source SHA from deploy output with `/api/snapshot.commit`. Verify the Vercel source/deployment SHA separately and ensure the frontend deployment corresponds to the same final PR HEAD. A healthy provider readback from `/api/live/portfolio` is an HTTP-success response with `source=PROVIDER_LIVE`, valid `observedAt`, and provider portfolio/readback available; optional `degraded`/`errors` fields are handled explicitly when present. Do not commit `submissions/paper-log-final.json` or `.csv` until the collection period is complete; final metrics use closed provider-verified trades only.
