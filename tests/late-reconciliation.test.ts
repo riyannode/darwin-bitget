@@ -131,6 +131,10 @@ describe("late filled-open reconciliation", () => {
     expect(result.experience.outcomeStatus).toBe("OPEN");
     expect(result.experience.entryDecisionId).toBe(decision.decisionId);
     expect(result.experience.entryPrice).toBe("92.11");
+    expect(order?.createdAt).toBe("2026-09-21T05:32:29.335Z");
+    expect(fill?.createdAt).toBe("2026-09-21T05:32:29.337Z");
+    expect(result.experience.entryTime).toBe("2026-09-21T05:32:29.337Z");
+    expect(Number.isFinite(Date.parse(result.experience.entryTime))).toBe(true);
     expect(result.positionContext.entryDecisionId).toBe(decision.decisionId);
     expect(result.auditMetadata.originalCycleId).toBe("source-cycle");
   });
@@ -178,6 +182,19 @@ describe("late filled-open reconciliation", () => {
   it("rejects provider fill evidence without an explicit clientOid", () => {
     if (!order) throw new Error("fixture parse failed");
     expect(parseProviderFillEvidence({ list: [{ execId: "fill-1", orderId: order.orderId, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "24.54", execPrice: "92.11", createdTime: "1789968749337" }] }, order)).toBeNull();
+  });
+
+  it("rejects malformed provider order timestamps", () => {
+    expect(parseProviderOrderEvidence({ orderId: execution.providerOrderId, clientOid: execution.clientOrderId, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "24.54", cumExecQty: "24.54", avgPrice: "92.11", orderStatus: "filled", createdTime: "not-a-timestamp" })).toBeNull();
+  });
+
+  it("rejects impossible ISO provider order dates", () => {
+    expect(parseProviderOrderEvidence({ orderId: execution.providerOrderId, clientOid: execution.clientOrderId, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "24.54", cumExecQty: "24.54", avgPrice: "92.11", orderStatus: "filled", createdTime: "2026-02-30T00:00:00.000Z" })).toBeNull();
+  });
+
+  it("rejects missing provider fill timestamps", () => {
+    if (!order) throw new Error("fixture parse failed");
+    expect(parseProviderFillEvidence({ list: [{ execId: "fill-1", orderId: order.orderId, clientOid: order.clientOid, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "24.54", execPrice: "92.11" }] }, order)).toBeNull();
   });
 
   it("rejects authoritative order cumExecQty mismatch", () => {

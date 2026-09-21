@@ -460,8 +460,8 @@ describe("journal observability persistence", () => {
       sql: executor.sql,
     } as unknown as { state: { paused: boolean } };
     vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
-    vi.spyOn(BitgetClient.prototype, "getOrderDetailsRead").mockResolvedValue({ orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "3", cumExecQty: "3", avgPrice: "100", orderStatus: "filled", createdTime: "2026-09-21T00:00:30.000Z" });
-    vi.spyOn(BitgetClient.prototype, "getFillHistoryRead").mockResolvedValue({ list: [{ execId: "fill-open", orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "3", execPrice: "100", createdTime: "2026-09-21T00:00:30.100Z" }] });
+    vi.spyOn(BitgetClient.prototype, "getOrderDetailsRead").mockResolvedValue({ orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "3", cumExecQty: "3", avgPrice: "100", orderStatus: "filled", createdTime: "1789968749335" });
+    vi.spyOn(BitgetClient.prototype, "getFillHistoryRead").mockResolvedValue({ list: [{ execId: "fill-open", orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "3", execPrice: "100", createdTime: "1789968749337" }] });
 
     const first = await (TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<{ status: string; experienceId: string }> }).reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId);
     const second = await (TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<{ status: string; experienceId: string }> }).reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId);
@@ -478,6 +478,8 @@ describe("journal observability persistence", () => {
     expect(persistedExperiences[0]?.experienceId).toBe(first.experienceId);
     expect(persistedExperiences[0]?.outcomeStatus).toBe("OPEN");
     expect(persistedExperiences[0]?.entryPrice).toBe("100");
+    expect(persistedExperiences[0]?.entryTime).toBe("2026-09-21T05:32:29.337Z");
+    expect(Number.isFinite(Date.parse(persistedExperiences[0]?.entryTime ?? ""))).toBe(true);
     expect(persistedContext?.entryDecisionId).toBe(record.decision.decisionId);
     expect(performance?.totalTrades).toBe(1);
     expect(performance?.openTrades).toBe(1);

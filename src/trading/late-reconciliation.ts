@@ -48,6 +48,47 @@ export interface LateExecutionReconciliationResult {
   auditMetadata: Record<string, string>;
 }
 
+const MAX_DATE_MILLISECONDS = 8_640_000_000_000_000;
+
+export function providerTimestampIso(value: unknown): string | null {
+  let milliseconds: number;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) return null;
+    milliseconds = value;
+  } else if (typeof value === "string") {
+    const normalized = value.trim();
+    if (!normalized) return null;
+    if (/^\d+$/.test(normalized)) {
+      const parsed = Number(normalized);
+      if (!Number.isSafeInteger(parsed)) return null;
+      milliseconds = parsed;
+    } else {
+      const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(Z|[+-]\d{2}:?\d{2})$/.exec(normalized);
+      if (!match) return null;
+      const year = Number(match[1]);
+      const month = Number(match[2]);
+      const day = Number(match[3]);
+      const hour = Number(match[4]);
+      const minute = Number(match[5]);
+      const second = match[6] ? Number(match[6]) : 0;
+      const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+      const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+      if (!daysInMonth || day < 1 || day > daysInMonth || hour > 23 || minute > 59 || second > 59) return null;
+      const parsed = Date.parse(normalized);
+      if (!Number.isFinite(parsed)) return null;
+      milliseconds = parsed;
+    }
+  } else {
+    return null;
+  }
+  if (milliseconds < 0 || milliseconds > MAX_DATE_MILLISECONDS) return null;
+  try {
+    return new Date(milliseconds).toISOString();
+  } catch {
+    return null;
+  }
+}
+
 export function parseProviderOrderEvidence(value: unknown): ProviderOrderEvidence | null {
   const source = record(value);
   const orderId = text(source.orderId);
@@ -60,7 +101,7 @@ export function parseProviderOrderEvidence(value: unknown): ProviderOrderEvidenc
   const executedQuantity = text(source.cumExecQty, text(source.filledQty));
   const averageFillPrice = text(source.avgPrice, text(source.priceAvg));
   const status = text(source.orderStatus, text(source.status)).toLowerCase();
-  const createdAt = text(source.createdTime, text(source.cTime));
+  const createdAt = providerTimestampIso(source.createdTime);
   if (!orderId || !clientOid || !symbol || (side !== "buy" && side !== "sell") || !positionSide || !tradeSide || !quantity || !executedQuantity || !averageFillPrice || status !== "filled" || !createdAt) return null;
   return { orderId, clientOid, symbol, side, positionSide, tradeSide, quantity, executedQuantity, averageFillPrice, status: "filled", createdAt };
 }
@@ -83,7 +124,7 @@ export function parseProviderFillEvidence(value: unknown, expectedOrder: Provide
   const tradeSide = text(source.tradeSide);
   const quantity = text(source.execQty);
   const price = text(source.execPrice);
-  const createdAt = text(source.createdTime, text(source.cTime));
+  const createdAt = providerTimestampIso(source.createdTime);
   if (!fillId || !orderId || !clientOid || !symbol || (side !== "buy" && side !== "sell") || !positionSide || !tradeSide || !quantity || !price || !createdAt) return null;
   return { fillId, orderId, clientOid, symbol, side, positionSide, tradeSide, quantity, price, createdAt };
 }
