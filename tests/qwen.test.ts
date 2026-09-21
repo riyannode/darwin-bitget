@@ -50,12 +50,36 @@ describe("bounded Qwen JSON handling", () => {
 
   it("classifies completed malformed JSON as QWEN_INVALID_JSON", async () => {
     mockedGenerateText.mockResolvedValue(result('{"value":}') as never);
-    await expect(generateQwenJson(config, schema, "system", "prompt")).rejects.toMatchObject({ code: "QWEN_INVALID_JSON" });
+    await expect(generateQwenJson(config, schema, "system", "prompt")).rejects.toMatchObject({ code: "QWEN_INVALID_JSON", diagnostic: { parserStage: "JSON_PARSE" } });
+    expect(mockedGenerateText).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries malformed JSON once and succeeds on the second model call", async () => {
+    mockedGenerateText
+      .mockResolvedValueOnce(result('{"value":}') as never)
+      .mockResolvedValueOnce(result('{"value":"recovered"}') as never);
+    await expect(generateQwenJson(config, schema, "system", "prompt", { retryMalformedJson: true })).resolves.toEqual({ value: "recovered" });
+    expect(mockedGenerateText).toHaveBeenCalledTimes(2);
+    expect(mockedGenerateText.mock.calls[1]?.[0]?.prompt).toContain("Previous response was not valid JSON");
+  });
+
+  it("fails after exactly two malformed JSON attempts", async () => {
+    mockedGenerateText
+      .mockResolvedValueOnce(result('{"value":}') as never)
+      .mockResolvedValueOnce(result('{"value":}') as never);
+    await expect(generateQwenJson(config, schema, "system", "prompt", { retryMalformedJson: true })).rejects.toMatchObject({ code: "QWEN_INVALID_JSON", diagnostic: { parserStage: "JSON_PARSE" } });
+    expect(mockedGenerateText).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports response JSON extraction failures separately", async () => {
+    mockedGenerateText.mockResolvedValue(result("not json") as never);
+    await expect(generateQwenJson(config, schema, "system", "prompt")).rejects.toMatchObject({ code: "QWEN_INVALID_JSON", diagnostic: { parserStage: "RESPONSE_JSON_EXTRACTION" } });
   });
 
   it("classifies length-finished output as QWEN_OUTPUT_TRUNCATED", async () => {
     mockedGenerateText.mockResolvedValue(result('{"value":"partial"', "length") as never);
     await expect(generateQwenJson(config, schema, "system", "prompt")).rejects.toMatchObject({ code: "QWEN_OUTPUT_TRUNCATED" });
+    expect(mockedGenerateText).toHaveBeenCalledTimes(1);
   });
 
   it("keeps raw model output out of bounded diagnostics", async () => {
@@ -70,6 +94,7 @@ describe("bounded Qwen JSON handling", () => {
   it("preserves Zod validation errors", async () => {
     mockedGenerateText.mockResolvedValue(result('{"value":123}') as never);
     await expect(generateQwenJson(config, schema, "system", "prompt")).rejects.toMatchObject({ name: "ZodError" });
+    expect(mockedGenerateText).toHaveBeenCalledTimes(1);
   });
 
   it("passes the configured generic token budget to generateText", async () => {

@@ -187,6 +187,15 @@ export function parseDashboardPortfolio(accountValue: unknown, positionsValue: u
   };
 }
 
+export function accountForEvidenceSymbol(account: AccountSnapshot, symbol: string): AccountSnapshot {
+  const position = account.positions.find((candidate) => candidate.symbol === symbol);
+  return {
+    ...account,
+    positionNotional: position?.notional ?? "0",
+    positionQuantity: position?.quantity ?? "0",
+  };
+}
+
 function providerRows(value: unknown): Record<string, unknown>[] {
   if (Array.isArray(value)) return records(value);
   const payload = record(value);

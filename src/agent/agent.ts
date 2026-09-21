@@ -806,6 +806,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     this.setState({ ...this.state, lastCycleId: cycleId, lastScanAt: startedAt, nextScanAt, model: config.qwenModel, runtimeStatus: "SCANNING", currentStage: "SCANNING", lastStatus: "RUNNING", cycleStartedAt: startedAt });
     saveCycle(this, cycleId, "RUNNING", startedAt, null);
     const journal: TradingJournal = { cycleId, agentVersion: config.version ?? "0.2.0", promptVersion: MANDATE_VERSION, model: config.qwenModel, mode: config.agentMode, startedAt, retrievedLessons: [], createdLessons: [] };
+    let decisionGenerationStarted = false;
     this.recordEvent("CYCLE_STARTED", cycleId);
     try {
       const client = new BitgetClient(config);
@@ -873,6 +874,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
         cycleId,
       );
       const context = { bundles, supportedUniverse, openPositionSymbols, entryCandidateSymbols: selectedEntryCandidateSymbols, experiences, openExperiences, lessons, openPositions, positionManagementState, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE, ...(researchEvidence === undefined ? {} : { researchEvidence }), executionCapacityHints };
+      decisionGenerationStarted = true;
       const decisionSet = await decide(config, context, cycleId);
       if (decisionSet.ignoredLessonIds.length) this.recordEvent("LESSON_REFERENCE_IGNORED", cycleId, { count: String(decisionSet.ignoredLessonIds.length), ids: decisionSet.ignoredLessonIds.slice(0, 8).join(",") });
       journal.marketContext = { scan, deep: bundles.map((candidate) => ({ market: candidate.market, regime: candidate.marketRegime })) };
@@ -921,7 +923,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
       saveJournal(this, journal);
       saveCycle(this, cycleId, "FAILED", startedAt, journal.completedAt);
       const diagnostic = failureDiagnostic(error);
-      this.recordEvent("CYCLE_FAILED", cycleId, { ...diagnostic, durationMs: String(journal.durationMs) });
+      const failureStage = decisionGenerationStarted && error instanceof ZodError ? "decision_schema_validation" : undefined;
+      if (failureStage) this.recordEvent("DECISION_SCHEMA_VALIDATION_FAILED", cycleId, { ...diagnostic, stage: failureStage });
+      this.recordEvent("CYCLE_FAILED", cycleId, { ...diagnostic, ...(failureStage ? { stage: failureStage } : {}), durationMs: String(journal.durationMs) });
       if ((diagnostic.code ?? "").includes("TIMEOUT")) this.recordEvent("CYCLE_TIMEOUT", cycleId, diagnostic);
       this.setState({ ...this.state, runtimeStatus: "ERROR", currentStage: "ERROR", lastStatus: "FAILED", cycleStartedAt: null });
       throw error;

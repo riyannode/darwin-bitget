@@ -260,6 +260,11 @@ describe("cycle decision plan contract", () => {
     expect(DECISION_TASK_PROMPT).toContain("thesis: string");
     expect(DECISION_TASK_PROMPT).toContain("strategyThesis: string");
     expect(DECISION_TASK_PROMPT).toContain("confidence: number between 0 and 1");
+    expect(DECISION_TASK_PROMPT).toContain("HARD OUTPUT LIMITS");
+    expect(DECISION_TASK_PROMPT).toContain("thesis: <=500 characters");
+    expect(DECISION_TASK_PROMPT).toContain("strategyThesis: <=500 characters");
+    expect(DECISION_TASK_PROMPT).toContain("each supportingFactors item: <=240 characters");
+    expect(DECISION_TASK_PROMPT).toContain("each riskFactors item: <=240 characters");
   });
 
   it("includes deterministic position lifecycle state in the prompt", () => {
