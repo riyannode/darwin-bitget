@@ -2,7 +2,8 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
 import { loadRecentJournals, saveJournal } from "../src/storage/store.js";
-import type { AccountSnapshot, CycleDecisionPlan, DecisionContext, EvidenceBundle, Instrument, PositionManagementState, PositionSnapshot, TradingJournal } from "../src/types.js";
+import { buildPaperLogExport } from "../src/storage/paper-log.js";
+import type { AccountSnapshot, CycleDecisionPlan, DecisionContext, DecisionExecutionRecord, EvidenceBundle, Instrument, PositionManagementState, PositionSnapshot, TradingJournal } from "../src/types.js";
 
 vi.mock("agents", () => ({ Agent: class {}, routeAgentRequest: vi.fn() }));
 vi.mock("../src/trading/execution-planner.js", () => ({
@@ -162,6 +163,35 @@ function plan(): CycleDecisionPlan {
   } as CycleDecisionPlan;
 }
 
+function verifiedCloseRecord(): DecisionExecutionRecord {
+  const decision = { ...plan().positionActions[0], decisionId: "decision-close", action: "CLOSE" as const, reductionPct: "100" };
+  const executionResult = {
+    provider: "test",
+    providerOrderId: "provider-order-1",
+    clientOrderId: "client-order-1",
+    symbol: "CRCLUSDT",
+    action: "CLOSE",
+    positionSide: "LONG" as const,
+    providerSide: "sell" as const,
+    tradeSide: "close" as const,
+    marginAllocated: "0",
+    leverage: "3",
+    positionNotional: "300",
+    requestedQuantity: "3",
+    executedQuantity: "3",
+    status: "filled" as const,
+    submittedAt: "2026-09-21T00:00:31.000Z",
+    readBackAt: "2026-09-21T00:00:32.000Z",
+  };
+  return {
+    decision,
+    riskGateResult: { status: "PASS", codes: [], checkedAt: "2026-09-21T00:00:31.000Z" },
+    executionRequest: { cycleId: "cycle-runtime", decisionId: "decision-close", symbol: "CRCLUSDT", action: "CLOSE", positionSide: "LONG", providerSide: "sell", tradeSide: "close", marginAllocated: "0", leverage: "3", positionNotional: "300", reductionPct: "100", quantity: "3", clientOrderId: "client-order-1" },
+    executionResult,
+    reconciliationResult: { status: "MATCHED", codes: [], execution: executionResult },
+  } as DecisionExecutionRecord;
+}
+
 describe("journal observability persistence", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -210,7 +240,13 @@ describe("journal observability persistence", () => {
       captured.context = context;
       return { plan: plan(), ignoredLessonIds: [] };
     });
-    vi.mocked(executeCyclePlan).mockResolvedValue({ records: [], finalPortfolio: undefined, stoppedAfterAmbiguity: false });
+    vi.mocked(executeCyclePlan).mockImplementation(async (_plan, callbacks) => {
+      const holdDecision = plan().positionActions[0];
+      if (!holdDecision) throw new Error("TEST_HOLD_DECISION_MISSING");
+      const record: DecisionExecutionRecord = { decision: holdDecision, riskGateResult: { status: "PASS", codes: [], checkedAt: "2026-09-21T00:00:31.000Z" } };
+      await callbacks.persist(record, bundle());
+      return { records: [record], finalPortfolio: undefined, stoppedAfterAmbiguity: false };
+    });
 
     vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
     vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
@@ -229,6 +265,7 @@ describe("journal observability persistence", () => {
       refreshPositionManagementState: () => lifecycleStateList,
       collectResearchEvidence: async () => undefined,
       persistPerformanceEquity: () => undefined,
+      persistDecisionOutcome: async () => undefined,
       sql: executor.sql,
     } as unknown as { state: unknown };
 
@@ -238,7 +275,67 @@ describe("journal observability persistence", () => {
     expect(saved.positionManagementState).toBe(lifecycleStateList);
     expect(saved.positionManagementState).toEqual([lifecycleState]);
     expect(saved.promptVersions).toEqual({ mandate: "darwin-mandate-v7", decision: "darwin-decision-v9" });
+    expect(saved.executionRecords).toHaveLength(1);
+    expect(saved.discovery?.financialWritesPerformed).toBe(0);
     expect((loadRecentJournals(executor, 1)[0] as ObservableJournal).positionManagementState).toEqual(captured.context?.positionManagementState);
+    db.close();
+  });
+
+  it("persists a verified execution before a later portfolio refresh failure", async () => {
+    const { db, executor } = memoryExecutor();
+    const record = verifiedCloseRecord();
+    const decideMock = vi.mocked(decide);
+    decideMock.mockResolvedValue({ plan: { positionActions: [record.decision] as CycleDecisionPlan["positionActions"], entryActions: [] }, ignoredLessonIds: [] });
+    vi.mocked(executeCyclePlan).mockImplementation(async (_plan, callbacks) => {
+      await callbacks.persist(record, bundle());
+      await callbacks.refreshPortfolio();
+      return { records: [record], finalPortfolio: undefined, stoppedAfterAmbiguity: false };
+    });
+    vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
+    vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
+    vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
+    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockRejectedValue(new Error("POST_WRITE_REFRESH_FAILURE"));
+
+    const fake = {
+      env: { TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_CATEGORY: "USDT-FUTURES" },
+      state: { emergencyStop: false, paused: false, lastCycleId: null, lastScanAt: null, nextScanAt: null, model: "", runtimeStatus: "ONLINE", currentStage: "ONLINE", lastStatus: "IDLE", lastPolicyUpdateAt: null, cycleStartedAt: null, temporaryScanIntervalExpiresAt: null, temporaryScanIntervalCompleted: true, temporaryScanIntervalDurationMs: 0, userStorageVersion: 0 },
+      ensureActivePolicy: () => ({ paperOnly: true, maxSinglePositionMarginPct: "30", maxLeverage: "5", maxDailyDrawdownPct: "10", drawdownCooldownMinutes: 60, scanIntervalMinutes: 5, emergencyStop: false }),
+      activeScanIntervalMinutes: () => 5,
+      setState(next: unknown) { (this as unknown as { state: unknown }).state = next; },
+      recordEvent: () => undefined,
+      recordPositionDiscrepancies: () => [],
+      refreshPositionManagementState: () => [lifecycleState],
+      collectResearchEvidence: async () => undefined,
+      persistPerformanceEquity: () => undefined,
+      persistDecisionOutcome: async () => undefined,
+      sql: executor.sql,
+    } as unknown as { state: unknown };
+
+    await expect((TraderAgent.prototype as unknown as { runCycle: () => Promise<TradingJournal> }).runCycle.call(fake)).rejects.toThrow("POST_WRITE_REFRESH_FAILURE");
+    const saved = loadRecentJournals(executor, 1)[0];
+    expect(saved).toBeDefined();
+    expect(saved?.cyclePlan?.positionActions).toHaveLength(1);
+    expect(saved?.executionRecords).toHaveLength(1);
+    expect(saved?.executionRecords?.[0]?.executionResult?.status).toBe("filled");
+    expect(saved?.executionRecords?.[0]?.reconciliationResult?.status).toBe("MATCHED");
+    expect(saved?.discovery?.financialWritesPerformed).toBe(1);
+
+    const exported = buildPaperLogExport({
+      generatedAt: "2026-09-21T00:01:00.000Z",
+      period: { start: null, end: null },
+      environment: "test",
+      model: "qwen",
+      version: "0.2.0",
+      commit: "test",
+      cycles: [{ cycleId: saved!.cycleId, status: "FAILED", startedAt: saved!.startedAt, completedAt: saved!.completedAt ?? null }],
+      journals: [saved!],
+      experiences: [],
+      events: [],
+    });
+    expect(exported.cycles[0]?.status).toBe("FAILED");
+    expect(exported.cycles[0]?.execution.financialWritesPerformed).toBe(1);
+    expect(exported.cycles[0]?.execution.verifiedExecutions).toBe(1);
     db.close();
   });
 });

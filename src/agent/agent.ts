@@ -132,6 +132,19 @@ export function failureDiagnostic(error: unknown): Record<string, string> {
   return { category: "RUNTIME_ERROR", code, message: safeDiagnosticMessage(detail, "Runtime error") };
 }
 
+export function appendExecutionRecordToJournal(journal: TradingJournal, record: DecisionExecutionRecord, discovery: CycleDiscovery): void {
+  const existing = journal.executionRecords ?? [];
+  const recordIndex = existing.findIndex((candidate) => candidate.decision.decisionId === record.decision.decisionId);
+  const executionRecords = recordIndex >= 0
+    ? existing.map((candidate, index) => index === recordIndex ? record : candidate)
+    : [...existing, record];
+  journal.executionRecords = executionRecords;
+  journal.discovery = {
+    ...(journal.discovery ?? discovery),
+    financialWritesPerformed: executionRecords.filter((candidate) => Boolean(candidate.executionResult)).length,
+  };
+}
+
 function schedulerMetrics(events: readonly { type: string; metadata?: Record<string, string> }[]): DashboardSnapshot["scheduler"] {
   const durations = events.flatMap((event) => event.type === "CYCLE_COMPLETED" && event.metadata?.durationMs ? [Number(event.metadata.durationMs)] : []).filter((value) => Number.isFinite(value));
   return {
@@ -875,6 +888,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
           return this.executeDecision(client, config, action, actionBundle, cycleId, supportedUniverse, drawdown.blocked, startedAt, decisionType, parentDecision);
         },
         persist: async (record, actionBundle) => {
+          appendExecutionRecordToJournal(journal, record, discovery);
+          saveJournal(this, journal);
           await this.persistDecisionOutcome(config, record, actionBundle, experiences, lessons, cycleId, startedAt, journal, record.decision.action !== "HOLD");
         },
         refreshPortfolio: async () => client.getDashboardPortfolio(),
