@@ -72,6 +72,7 @@ export interface RiskContext {
   supportedUniverse: readonly string[];
   emergencyStop: boolean;
   dailyDrawdownBlocked: boolean;
+  positionDiscrepancies?: readonly string[];
   now?: Date;
 }
 
@@ -88,6 +89,7 @@ export function evaluateRiskGate(config: RuntimeConfig, context: RiskContext): R
   if (instrument.symbol !== decision.symbol || instrument.status.toLowerCase() !== "online") addCode(codes, "INSTRUMENT_UNAVAILABLE");
   if (!isFresh(context.evidenceObservedAt, config.evidenceMaxAgeSeconds, now)) addCode(codes, "STALE_EVIDENCE");
   if (context.dailyDrawdownBlocked) addCode(codes, "DAILY_DRAWDOWN");
+  if (context.positionDiscrepancies?.some((code) => code === `LOCAL_EXPERIENCE_MISSING:${decision.symbol}:${decision.positionSide ?? "NONE"}` || code === `PROVIDER_POSITION_MISSING:${decision.symbol}:${decision.positionSide ?? "NONE"}`)) addCode(codes, "LOCAL_LIFECYCLE_UNRESOLVED");
   if (decision.action === "HOLD") return { status: codes.length === 0 ? "PASS" : "BLOCK", codes, checkedAt: now.toISOString() };
 
   if (context.openOrderSymbols.includes(decision.symbol)) addCode(codes, "DUPLICATE_ORDER");

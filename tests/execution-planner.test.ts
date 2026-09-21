@@ -51,6 +51,25 @@ describe("sequential cycle execution planner", () => {
     expect(resultValue.records).toHaveLength(1);
   });
 
+  it("stops after a filled write whose position readback is unresolved", async () => {
+    const first = decision("CLOSE", "CRCLUSDT");
+    const second = decision("OPEN_LONG", "NVDAUSDT");
+    const executed: string[] = [];
+    const resultValue = await executeCyclePlan({ positionActions: [first] as CycleDecisionPlan["positionActions"], entryActions: [second] as CycleDecisionPlan["entryActions"] }, {
+      refreshEvidence: async (symbol) => bundle(symbol, "100"),
+      execute: async (item) => {
+        executed.push(item.symbol);
+        const base = result(item);
+        return { ...base, reconciliationResult: { ...base.reconciliationResult!, status: "MISMATCH" as const, codes: ["POSITION_READBACK_UNAVAILABLE"] } };
+      },
+      persist: async () => undefined,
+      refreshPortfolio: async () => account("100"),
+    });
+    expect(resultValue.stoppedAfterAmbiguity).toBe(true);
+    expect(executed).toEqual(["CRCLUSDT"]);
+    expect(resultValue.records).toHaveLength(1);
+  });
+
   it("expands REVERSE into a verified close, unrelated entry, then opposite entry", async () => {
     const reverse: Decision = { ...decision("CLOSE", "CRCLUSDT"), decisionId: "reverse-1", action: "REVERSE", marginAllocationPct: "10", targetPositionSide: "SHORT", reductionPct: null };
     const unrelated = decision("OPEN_LONG", "NVDAUSDT");

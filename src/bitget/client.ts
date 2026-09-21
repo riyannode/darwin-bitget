@@ -187,6 +187,17 @@ export class BitgetClient {
     return parsePositionSymbols(result.data);
   }
 
+  public async getOrderDetailsRead(orderId?: string, clientOid?: string): Promise<unknown> {
+    const params: Record<string, string> = {};
+    if (orderId) params.orderId = orderId;
+    if (clientOid) params.clientOid = clientOid;
+    return (await this.callRead<unknown>("getOrderDetails", params)).data;
+  }
+
+  public async getFillHistoryRead(orderId: string): Promise<unknown> {
+    return (await this.callRead<unknown>("getFillHistory", { category: this.category, orderId, limit: "100" })).data;
+  }
+
   public async getDashboardPortfolio(): Promise<AccountSnapshot> {
     const observedAt = new Date().toISOString();
     const [accountResult, positionsResult, openOrdersResult] = await Promise.all([
