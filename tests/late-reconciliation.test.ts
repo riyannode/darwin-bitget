@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { DecisionExecutionRecord, PositionContext, PositionSnapshot, TradeExperience } from "../src/types.js";
+import type { DecisionExecutionRecord, PositionContext, PositionReasoning, PositionSnapshot, TradeExperience } from "../src/types.js";
 import { parseProviderFillEvidence, parseProviderOrderEvidence, reconcileLateExecution } from "../src/trading/late-reconciliation.js";
 import { emptyPerformance, recordVerifiedOpen } from "../src/trading/performance.js";
 
@@ -119,6 +119,22 @@ const oldContext: PositionContext = {
   updatedAt: "2026-09-21T02:06:16.913Z",
 };
 
+function managementReasoning(action: "HOLD" | "REDUCE", decisionId: string, createdAt: string): PositionReasoning {
+  return {
+    action,
+    thesis: action,
+    strategyThesis: action,
+    supportingFactors: [],
+    riskFactors: [],
+    evidenceUsed: [],
+    lessonsUsed: [],
+    confidence: 0.5,
+    cycleId: "management-cycle",
+    decisionId,
+    createdAt,
+  };
+}
+
 function input(overrides: Partial<Parameters<typeof reconcileLateExecution>[0]> = {}) {
   if (!order || !fill) throw new Error("fixture parse failed");
   return { record, order, fill, currentPosition: position, existingExperience: unresolvedExperience, existingContext: oldContext, resolvedAt: "2026-09-21T06:00:00.000Z", ...overrides };
@@ -145,6 +161,44 @@ describe("late filled-open reconciliation", () => {
     expect(second.status).toBe("ALREADY_RECONCILED");
     expect(second.experience.experienceId).toBe(first.experience.experienceId);
     expect(second.positionContext.entryDecisionId).toBe(decision.decisionId);
+  });
+
+  it("returns an already reconciled context byte-for-byte unchanged", () => {
+    const existingExperience: TradeExperience = { ...unresolvedExperience, experienceId: "reconciled-experience", outcomeStatus: "OPEN" };
+    const hold = managementReasoning("HOLD", "hold-decision", "2026-09-21T05:40:00.000Z");
+    const reduce = managementReasoning("REDUCE", "reduce-decision", "2026-09-21T05:50:00.000Z");
+    const existingContext: PositionContext = {
+      symbol: decision.symbol,
+      positionSide: decision.positionSide,
+      experienceId: existingExperience.experienceId,
+      entryDecisionId: decision.decisionId,
+      managementEvents: [hold, reduce],
+      latestManagement: reduce,
+      updatedAt: "2026-09-21T05:55:00.000Z",
+    };
+    const before = JSON.stringify(existingContext);
+    const result = reconcileLateExecution(input({ existingExperience, existingContext }));
+
+    expect(result.status).toBe("ALREADY_RECONCILED");
+    expect(result.positionContext).toBe(existingContext);
+    expect(JSON.stringify(result.positionContext)).toBe(before);
+    expect(result.positionContext.managementEvents).toEqual([hold, reduce]);
+    expect(result.positionContext.latestManagement).toEqual(reduce);
+    expect(result.positionContext.updatedAt).toBe("2026-09-21T05:55:00.000Z");
+    expect(result.experience).toBe(existingExperience);
+  });
+
+  it("fails closed when an open reconciled lifecycle has no matching context", () => {
+    const existingExperience: TradeExperience = { ...unresolvedExperience, experienceId: "reconciled-experience", outcomeStatus: "OPEN" };
+    expect(() => reconcileLateExecution(input({ existingExperience, existingContext: null }))).toThrow("LATE_RECONCILIATION_STATE_INCONSISTENCY");
+  });
+
+  it("fails closed when an open reconciled lifecycle points to another entry context", () => {
+    const existingExperience: TradeExperience = { ...unresolvedExperience, experienceId: "reconciled-experience", outcomeStatus: "OPEN" };
+    expect(() => reconcileLateExecution(input({
+      existingExperience,
+      existingContext: { ...oldContext, experienceId: existingExperience.experienceId, entryDecisionId: "other-entry" },
+    }))).toThrow("LATE_RECONCILIATION_STATE_INCONSISTENCY");
   });
 
   it("keeps the original mismatch evidence unchanged", () => {
@@ -204,6 +258,14 @@ describe("late filled-open reconciliation", () => {
   it("rejects authoritative order cumExecQty mismatch", () => {
     const mismatchedOrder = parseProviderOrderEvidence({ orderId: execution.providerOrderId, clientOid: execution.clientOrderId, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "24.54", cumExecQty: "24.53", avgPrice: "92.11", orderStatus: "filled", createdTime: "1789968749335" });
     expect(mismatchedOrder).not.toBeNull();
+    expect(() => reconcileLateExecution(input({ order: mismatchedOrder! }))).toThrow("LATE_RECONCILIATION_QUANTITY_MISMATCH");
+  });
+
+  it("rejects a filled order whose requested quantity differs from its executed quantity", () => {
+    const mismatchedOrder = parseProviderOrderEvidence({ orderId: execution.providerOrderId, clientOid: execution.clientOrderId, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "25", cumExecQty: "24.54", avgPrice: "92.11", orderStatus: "filled", createdTime: "1789968749335" });
+    expect(mismatchedOrder).not.toBeNull();
+    expect(mismatchedOrder?.quantity).toBe("25");
+    expect(mismatchedOrder?.executedQuantity).toBe("24.54");
     expect(() => reconcileLateExecution(input({ order: mismatchedOrder! }))).toThrow("LATE_RECONCILIATION_QUANTITY_MISMATCH");
   });
 

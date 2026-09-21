@@ -2,9 +2,9 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { loadAllEvents, loadExperiences, loadPerformanceAggregate, loadPositionContext, loadRecentJournals, saveEvent, saveExperience, saveJournal } from "../src/storage/store.js";
+import { loadAllEvents, loadExperiences, loadPerformanceAggregate, loadPositionContext, loadRecentJournals, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
 import { buildPaperLogExport } from "../src/storage/paper-log.js";
-import type { AccountSnapshot, CycleDecisionPlan, DecisionContext, DecisionExecutionRecord, EvidenceBundle, Instrument, PositionManagementState, PositionSnapshot, TradeExperience, TradingJournal } from "../src/types.js";
+import type { AccountSnapshot, CycleDecisionPlan, DecisionContext, DecisionExecutionRecord, EvidenceBundle, Instrument, PositionContext, PositionManagementState, PositionReasoning, PositionSnapshot, TradeExperience, TradingJournal } from "../src/types.js";
 
 vi.mock("agents", () => ({ Agent: class {}, routeAgentRequest: vi.fn() }));
 vi.mock("../src/trading/execution-planner.js", () => ({
@@ -464,6 +464,17 @@ describe("journal observability persistence", () => {
     vi.spyOn(BitgetClient.prototype, "getFillHistoryRead").mockResolvedValue({ list: [{ execId: "fill-open", orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "3", execPrice: "100", createdTime: "1789968749337" }] });
 
     const first = await (TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<{ status: string; experienceId: string }> }).reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId);
+    const initialContext = loadPositionContext(executor, "CRCLUSDT", "LONG");
+    if (!initialContext) throw new Error("missing reconciled context fixture");
+    const managementReasoning = (action: "HOLD" | "REDUCE", decisionId: string, createdAt: string): PositionReasoning => ({ action, thesis: action, strategyThesis: action, supportingFactors: [], riskFactors: [], evidenceUsed: [], lessonsUsed: [], confidence: 0.5, cycleId: "management-cycle", decisionId, createdAt });
+    const hold = managementReasoning("HOLD", "hold-decision", "2026-09-21T05:40:00.000Z");
+    const reduce = managementReasoning("REDUCE", "reduce-decision", "2026-09-21T05:50:00.000Z");
+    const preservedContext: PositionContext = { ...initialContext, managementEvents: [hold, reduce], latestManagement: reduce, updatedAt: "2026-09-21T05:55:00.000Z" };
+    savePositionContext(executor, preservedContext);
+    const contextBeforeSecond = JSON.stringify(preservedContext);
+    const experienceBeforeSecond = JSON.stringify(loadExperiences(executor, 100).find((experience) => experience.entryDecisionId === record.decision.decisionId));
+    const performanceBeforeSecond = JSON.stringify(loadPerformanceAggregate<PerformanceAggregate>(executor));
+    const eventsBeforeSecond = loadAllEvents(executor).filter((event) => event.type === "LATE_EXECUTION_RECONCILED").length;
     const second = await (TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<{ status: string; experienceId: string }> }).reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId);
     const persistedExperiences = loadExperiences(executor, 100).filter((experience) => experience.entryDecisionId === record.decision.decisionId);
     const persistedContext = loadPositionContext(executor, "CRCLUSDT", "LONG");
@@ -480,11 +491,16 @@ describe("journal observability persistence", () => {
     expect(persistedExperiences[0]?.entryPrice).toBe("100");
     expect(persistedExperiences[0]?.entryTime).toBe("2026-09-21T05:32:29.337Z");
     expect(Number.isFinite(Date.parse(persistedExperiences[0]?.entryTime ?? ""))).toBe(true);
-    expect(persistedContext?.entryDecisionId).toBe(record.decision.decisionId);
+    expect(JSON.stringify(persistedContext)).toBe(contextBeforeSecond);
+    expect(persistedContext?.managementEvents).toEqual([hold, reduce]);
+    expect(persistedContext?.latestManagement).toEqual(reduce);
+    expect(persistedContext?.updatedAt).toBe("2026-09-21T05:55:00.000Z");
+    expect(JSON.stringify(persistedExperiences[0])).toBe(experienceBeforeSecond);
     expect(performance?.totalTrades).toBe(1);
     expect(performance?.openTrades).toBe(1);
+    expect(JSON.stringify(performance)).toBe(performanceBeforeSecond);
     expect(events).toEqual(["LATE_EXECUTION_RECONCILED"]);
-    expect(reconciliationEvents).toHaveLength(1);
+    expect(reconciliationEvents).toHaveLength(eventsBeforeSecond);
     expect(JSON.stringify(persistedJournal.executionRecords?.[0]?.executionResult)).toBe(originalExecution);
     expect(JSON.stringify(persistedJournal.executionRecords?.[0]?.reconciliationResult)).toBe(originalReconciliation);
     db.close();

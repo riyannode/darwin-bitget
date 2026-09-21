@@ -152,6 +152,7 @@ export function reconcileLateExecution(input: LateExecutionReconciliationInput):
   if (order.positionSide !== decision.positionSide || fill.positionSide !== decision.positionSide || currentPosition.positionSide !== decision.positionSide) throw new Error("LATE_RECONCILIATION_SIDE_MISMATCH");
   if (!isPositiveDecimal(currentPosition.quantity)) throw new Error("LATE_RECONCILIATION_POSITION_MISSING");
   if (order.status !== "filled") throw new Error("LATE_RECONCILIATION_ORDER_NOT_FILLED");
+  if (compareDecimal(order.quantity, order.executedQuantity) !== 0) throw new Error("LATE_RECONCILIATION_QUANTITY_MISMATCH");
   if (compareDecimal(order.executedQuantity, execution.executedQuantity) !== 0 || compareDecimal(fill.quantity, execution.executedQuantity) !== 0) throw new Error("LATE_RECONCILIATION_QUANTITY_MISMATCH");
   if (compareDecimal(order.executedQuantity, fill.quantity) !== 0) throw new Error("LATE_RECONCILIATION_FILL_QUANTITY_MISMATCH");
   if (!isPositiveDecimal(order.averageFillPrice) || !isPositiveDecimal(fill.price) || compareDecimal(order.averageFillPrice, fill.price) !== 0) throw new Error("LATE_RECONCILIATION_PRICE_MISMATCH");
@@ -161,10 +162,17 @@ export function reconcileLateExecution(input: LateExecutionReconciliationInput):
   if (!isOpeningTradeSide(order.tradeSide, decision.positionSide) || !isOpeningTradeSide(fill.tradeSide, decision.positionSide)) throw new Error("LATE_RECONCILIATION_TRADE_SIDE_MISMATCH");
 
   if (existingExperience?.outcomeStatus === "OPEN" && existingExperience.entryDecisionId === decision.decisionId) {
+    if (
+      !existingContext
+      || existingContext.symbol !== decision.symbol
+      || existingContext.positionSide !== decision.positionSide
+      || existingContext.experienceId !== existingExperience.experienceId
+      || existingContext.entryDecisionId !== decision.decisionId
+    ) throw new Error("LATE_RECONCILIATION_STATE_INCONSISTENCY");
     return {
       status: "ALREADY_RECONCILED",
       experience: existingExperience,
-      positionContext: upsertPositionContext(existingContext ?? null, decision, resolvedAt, existingExperience) ?? existingContext ?? throwContextError(),
+      positionContext: existingContext,
       auditMetadata: auditMetadata(record, existingExperience, order, resolvedAt),
     };
   }
@@ -235,10 +243,6 @@ function auditMetadata(record: DecisionExecutionRecord, experience: TradeExperie
 function isOpeningTradeSide(value: string, side: PositionSide): boolean {
   const normalized = value.toLowerCase();
   return normalized === "open" || normalized === (side === "LONG" ? "open_long" : "open_short");
-}
-
-function throwContextError(): never {
-  throw new Error("LATE_RECONCILIATION_CONTEXT_FAILED");
 }
 
 function record(value: unknown): Record<string, unknown> {

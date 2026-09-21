@@ -683,16 +683,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
       resolvedAt,
       ...(existingExperience ? { existingExperience } : {}),
     });
-    if (result.status === "RECONCILED") {
-      let performance = loadPerformanceAggregate<PerformanceAggregate>(this);
-      if (!isPerformanceAggregate(performance)) performance = bootstrapPerformance(loadAllAutonomousJournals(this), experiences, resolvedAt);
-      performance = recordVerifiedOpen(performance, bundle.account.portfolioEquity, resolvedAt);
-      saveExperience(this, result.experience, resolvedAt);
-      savePositionContext(this, result.positionContext);
-      savePerformanceAggregate(this, performance, resolvedAt);
-    } else {
-      savePositionContext(this, result.positionContext);
-    }
+    if (result.status === "ALREADY_RECONCILED") return { status: result.status, experienceId: result.experience.experienceId };
+    let performance = loadPerformanceAggregate<PerformanceAggregate>(this);
+    if (!isPerformanceAggregate(performance)) performance = bootstrapPerformance(loadAllAutonomousJournals(this), experiences, resolvedAt);
+    performance = recordVerifiedOpen(performance, bundle.account.portfolioEquity, resolvedAt);
+    saveExperience(this, result.experience, resolvedAt);
+    savePositionContext(this, result.positionContext);
+    savePerformanceAggregate(this, performance, resolvedAt);
     const audited = loadAllEvents(this).some((event) => event.type === "LATE_EXECUTION_RECONCILED" && event.metadata?.originalCycleId === originalCycleId && event.metadata?.decisionId === decisionId);
     if (!audited) this.recordEvent("LATE_EXECUTION_RECONCILED", originalCycleId, result.auditMetadata);
     return { status: result.status, experienceId: result.experience.experienceId };
