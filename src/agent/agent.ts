@@ -3,7 +3,7 @@ import { ZodError } from "zod";
 import type { BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionManagementState, PositionSnapshot, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
-import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
+import { MANDATE_VERSION, PROMPT_VERSIONS, TRADING_MANDATE } from "./mandate.js";
 import { assertOpenPositionCountWithinPlanLimit, buildEvidenceSymbols, calculateActionCapacity, decide, rankMarketCandidates, selectEntryCandidates } from "./decision.js";
 import { reconcileTradingSchedule, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES, type SchedulerReconciliationResult } from "./scheduler.js";
 import { authorizeOwner } from "./owner-auth.js";
@@ -848,6 +848,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (backtest) { saveBacktest(this, backtest); journal.backtest = backtest; this.recordEvent("BACKTEST_COMPLETED", cycleId); }
       const lifecycleHistory = experiences.some((experience) => experience.outcomeStatus === "OPEN" && !experience.maximumFavorableExcursionBasis) ? loadAllAutonomousJournals(this) : [];
       const positionManagementState = this.refreshPositionManagementState(experiences, openPositions, bundles, new Date().toISOString(), lifecycleHistory);
+      journal.positionManagementState = positionManagementState;
+      journal.promptVersions = { mandate: PROMPT_VERSIONS.mandate, decision: PROMPT_VERSIONS.decision };
       const openExperiences = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
       const executionCapacityHints = buildExecutionCapacityHints(bundles, config.ownerPolicy.maxLeverage);
       const researchEvidence = await this.collectResearchEvidence(

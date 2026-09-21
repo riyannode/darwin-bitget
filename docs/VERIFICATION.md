@@ -36,8 +36,9 @@ The repository is intended to verify the following through typecheck, unit tests
 - the bounded position-context path joins exact symbol + side, preserves original verified entry evidence, and exposes latest management evidence without Qwen calls;
 - same-side re-entry resets management history and excludes decisions created before the current entry boundary;
 - Open Position and Trade History distinguish provider-live facts from persisted DARWIN decision evidence.
+- deterministic TypeScript supplies each verified open position's current return, maximum favorable return and basis, profit giveback, time in trade, and recent management actions; Qwen does not calculate or invent these lifecycle values;
 
-The current prompt contracts are `darwin-mandate-v6`, `darwin-candidate-v1`, `darwin-decision-v9`, `darwin-reflection-v1`, and `darwin-backtest-v2`.
+The current prompt contracts are `darwin-mandate-v7`, `darwin-candidate-v1`, `darwin-decision-v9`, `darwin-reflection-v1`, and `darwin-backtest-v2`.
 
 ### PRODUCTION VERIFIED
 
@@ -52,7 +53,7 @@ GET /api/export/paper-log?format=json
 GET /api/export/paper-log?format=csv
 ```
 
-The export is read-only, includes HOLD cycles, exports every semantic action separately with its action category and cycle-level discovery fields, records REVERSE's close and opposite-entry physical writes separately under the parent intent, excludes manual harness and Docker records, and preserves sanitized provider diagnostics. Performance aggregate state is separate from the export's bounded historical projection. It does not expose credentials, auth headers, passphrases, or model chain-of-thought. The final competition export is still `PENDING FINAL COMPETITION EXPORT`.
+The current live PAPER log is read-only and available now through the JSON and CSV export endpoints above. It includes HOLD cycles, exports every semantic action separately with its action category and cycle-level discovery fields, records REVERSE's close and opposite-entry physical writes separately under the parent intent, excludes manual harness and Docker records, and preserves sanitized provider diagnostics. Performance aggregate state is separate from the export's bounded historical projection. It does not expose credentials, auth headers, passphrases, or model chain-of-thought. This current live export is not the frozen final competition export, which remains uncommitted until collection is complete.
 
 ## Not claimed
 

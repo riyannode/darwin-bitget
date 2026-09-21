@@ -37,7 +37,7 @@ Before `START` or `RESUME` on a self-hosted Worker, verify:
 1. Worker health.
 2. Snapshot reachable.
 3. Provider-only `/api/live/portfolio` account read succeeds.
-4. `/api/live/portfolio` returns `source=PROVIDER_LIVE` and a non-stale result.
+4. `/api/live/portfolio` succeeds with `source=PROVIDER_LIVE`, a valid `observedAt`, and provider portfolio/readback available; handle optional `degraded`/`errors` explicitly when present.
 5. Positions and open orders readback succeeds.
 6. Qwen connectivity succeeds.
 7. Owner controls authenticate.
