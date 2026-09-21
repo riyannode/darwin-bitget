@@ -538,6 +538,11 @@ export interface TradingJournal {
   cycleId: string;
   agentVersion: string;
   promptVersion?: string;
+  positionManagementState?: PositionManagementState[];
+  promptVersions?: {
+    mandate: string;
+    decision: string;
+  };
   model: string;
   mode: AgentMode;
   startedAt: string;
