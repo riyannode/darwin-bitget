@@ -1,6 +1,7 @@
 export type Action = "OPEN_LONG" | "OPEN_SHORT" | "HOLD" | "INCREASE" | "REDUCE" | "CLOSE" | "REVERSE";
 export type FinancialWriteAction = Exclude<Action, "HOLD" | "REVERSE">;
 export type PositionSide = "LONG" | "SHORT";
+export type MaximumFavorableExcursionBasis = "SINCE_ENTRY" | "SINCE_FIRST_DETERMINISTIC_OBSERVATION";
 export type AgentMode = "AUTONOMOUS" | "EVA_EVALUATION";
 export type TradingMode = "PAPER";
 export type RiskStatus = "PASS" | "BLOCK";
@@ -214,6 +215,19 @@ export interface Lesson {
   updatedAt: string;
 }
 
+export interface PositionManagementState {
+  symbol: string;
+  positionSide: PositionSide;
+  entryPrice: string;
+  currentPrice: string;
+  currentReturnPct: number;
+  maximumFavorableReturnPct: number;
+  maximumFavorableReturnBasis: MaximumFavorableExcursionBasis;
+  profitGivebackPct: number;
+  timeInTradeMinutes: number;
+  priorManagementActions: Action[];
+}
+
 export interface TradeExperience {
   experienceId: string;
   symbol: string;
@@ -231,7 +245,10 @@ export interface TradeExperience {
   positionNotional: string;
   realizedPnl: string;
   realizedPnlPct: string;
+  /** Highest positive percentage return observed during this open trade lifecycle. */
   maximumFavorableExcursion: string;
+  /** Whether the percentage-return peak is entry-based or legacy first-observation-based. */
+  maximumFavorableExcursionBasis?: MaximumFavorableExcursionBasis;
   maximumAdverseExcursion: string;
   drawdownContribution: string;
   liquidationDistance: string;
@@ -281,6 +298,7 @@ export interface DecisionContext {
   observedAt: string;
   mandate: string;
   openPositions: PositionSnapshot[];
+  positionManagementState?: PositionManagementState[];
   researchEvidence?: ResearchEvidence[];
   executionCapacityHints?: ExecutionCapacityHint[];
 }

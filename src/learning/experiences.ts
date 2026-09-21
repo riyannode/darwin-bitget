@@ -19,6 +19,7 @@ const experienceSchema = z.object({
   marginAllocated: z.string(),
   positionNotional: z.string(),
   maximumFavorableExcursion: z.string(),
+  maximumFavorableExcursionBasis: z.enum(["SINCE_ENTRY", "SINCE_FIRST_DETERMINISTIC_OBSERVATION"]).optional(),
   maximumAdverseExcursion: z.string(),
   drawdownContribution: z.string(),
   liquidationDistance: z.string(),

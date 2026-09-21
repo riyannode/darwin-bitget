@@ -3,9 +3,9 @@ import { describe, expect, it } from "vitest";
 import { DECISION_TASK_PROMPT, MANDATE_VERSION, PROMPT_VERSIONS, TRADING_MANDATE } from "../src/agent/mandate.js";
 
 describe("judge-facing mandate contract", () => {
-  it("uses the v6 mandate and requires independent management and entry reasoning", () => {
-    expect(PROMPT_VERSIONS.mandate).toBe("darwin-mandate-v6");
-    expect(MANDATE_VERSION).toBe("darwin-mandate-v6");
+  it("uses the v7 mandate and requires independent management and entry reasoning", () => {
+    expect(PROMPT_VERSIONS.mandate).toBe("darwin-mandate-v7");
+    expect(MANDATE_VERSION).toBe("darwin-mandate-v7");
     expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v9");
     expect(TRADING_MANDATE).not.toContain("You are not required to trade.");
     expect(TRADING_MANDATE).toContain("Do not force a trade.");
@@ -26,6 +26,8 @@ describe("judge-facing mandate contract", () => {
     expect(TRADING_MANDATE).toContain("do not average down merely because a position is losing");
     expect(TRADING_MANDATE).toContain("do not scale in merely because it is profitable");
     expect(TRADING_MANDATE).toContain("HOLD is valid for an existing position and must not suppress unrelated entry evaluation");
+    expect(TRADING_MANDATE).toContain("Profit does not automatically mean CLOSE.");
+    expect(TRADING_MANDATE).toContain('A position being "still profitable" is not sufficient evidence for HOLD.');
     expect(DECISION_TASK_PROMPT).toContain("evidenceUsed");
     expect(DECISION_TASK_PROMPT).toContain("supportingFactors");
     expect(DECISION_TASK_PROMPT).toContain("riskFactors");

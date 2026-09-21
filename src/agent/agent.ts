@@ -1,6 +1,6 @@
 import { Agent } from "agents";
 import { ZodError } from "zod";
-import type { BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionSnapshot, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
+import type { BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionManagementState, PositionSnapshot, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { MANDATE_VERSION, TRADING_MANDATE } from "./mandate.js";
@@ -67,6 +67,7 @@ import { availableResearchCapabilities } from "../research/capabilities.js";
 import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../research/executor.js";
 import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
+import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } from "../trading/position-management.js";
 
 
 interface AgentState {
@@ -598,6 +599,38 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (next) savePositionContext(this, next);
   }
 
+  private refreshPositionManagementState(
+    experiences: TradeExperience[],
+    positions: readonly PositionSnapshot[],
+    bundles: readonly EvidenceBundle[],
+    observedAt: string,
+    lifecycleHistory: readonly TradingJournal[] = [],
+  ): PositionManagementState[] {
+    const states: PositionManagementState[] = [];
+    for (const position of positions.filter((candidate) => Number(candidate.quantity) > 0)) {
+      const experienceIndex = experiences.findIndex((candidate) => candidate.outcomeStatus === "OPEN" && candidate.symbol === position.symbol && candidate.positionSide === position.positionSide);
+      if (experienceIndex < 0) continue;
+      const experience = experiences[experienceIndex];
+      if (!experience) continue;
+      const bundle = bundles.find((candidate) => candidate.instrument.symbol === position.symbol);
+      const currentPrice = bundle?.market.lastPrice ?? position.markPrice;
+      if (!currentPrice) continue;
+      const positionContext = loadPositionContext(this, position.symbol, position.positionSide);
+      let experienceForRefresh = experience;
+      if (!experience.maximumFavorableExcursionBasis) {
+        const historicalPeak = reconstructMaximumFavorableReturnPct(position, experience, lifecycleHistory);
+        if (historicalPeak !== null) experienceForRefresh = { ...experience, maximumFavorableExcursion: String(Math.max(Number(experience.maximumFavorableExcursion) || 0, historicalPeak)), maximumFavorableExcursionBasis: "SINCE_ENTRY" };
+      }
+      const result = buildPositionManagementState(position, experienceForRefresh, currentPrice, bundle?.market.observedAt ?? observedAt, positionContext);
+      if (result.experience !== experience) {
+        experiences[experienceIndex] = result.experience;
+        saveExperience(this, result.experience, observedAt);
+      }
+      states.push(result.state);
+    }
+    return states;
+  }
+
   public async getDashboardSnapshot(livePortfolio?: DashboardSnapshot["portfolio"]): Promise<DashboardSnapshot> {
     if (livePortfolio) this.persistPerformanceEquity(livePortfolio.portfolioEquity, livePortfolio.observedAt);
     const config = loadConfig(this.env, this.ensureActivePolicy());
@@ -813,6 +846,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
         }
       }
       if (backtest) { saveBacktest(this, backtest); journal.backtest = backtest; this.recordEvent("BACKTEST_COMPLETED", cycleId); }
+      const lifecycleHistory = experiences.some((experience) => experience.outcomeStatus === "OPEN" && !experience.maximumFavorableExcursionBasis) ? loadAllAutonomousJournals(this) : [];
+      const positionManagementState = this.refreshPositionManagementState(experiences, openPositions, bundles, new Date().toISOString(), lifecycleHistory);
       const openExperiences = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
       const executionCapacityHints = buildExecutionCapacityHints(bundles, config.ownerPolicy.maxLeverage);
       const researchEvidence = await this.collectResearchEvidence(
@@ -822,7 +857,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
         selectedEntryCandidateSymbols,
         cycleId,
       );
-      const context = { bundles, supportedUniverse, openPositionSymbols, entryCandidateSymbols: selectedEntryCandidateSymbols, experiences, openExperiences, lessons, openPositions, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE, ...(researchEvidence === undefined ? {} : { researchEvidence }), executionCapacityHints };
+      const context = { bundles, supportedUniverse, openPositionSymbols, entryCandidateSymbols: selectedEntryCandidateSymbols, experiences, openExperiences, lessons, openPositions, positionManagementState, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE, ...(researchEvidence === undefined ? {} : { researchEvidence }), executionCapacityHints };
       const decisionSet = await decide(config, context, cycleId);
       if (decisionSet.ignoredLessonIds.length) this.recordEvent("LESSON_REFERENCE_IGNORED", cycleId, { count: String(decisionSet.ignoredLessonIds.length), ids: decisionSet.ignoredLessonIds.slice(0, 8).join(",") });
       journal.marketContext = { scan, deep: bundles.map((candidate) => ({ market: candidate.market, regime: candidate.marketRegime })) };

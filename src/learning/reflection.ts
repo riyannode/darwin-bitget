@@ -129,6 +129,7 @@ function buildExperience(input: ReflectionInput, now: string): TradeExperience {
     realizedPnl: input.realizedPnl ?? "0",
     realizedPnlPct: input.realizedPnlPct ?? "0",
     maximumFavorableExcursion: "0",
+    maximumFavorableExcursionBasis: "SINCE_ENTRY",
     maximumAdverseExcursion: "0",
     drawdownContribution: "0",
     liquidationDistance: "0",
