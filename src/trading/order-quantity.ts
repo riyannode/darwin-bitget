@@ -26,6 +26,12 @@ function decimalText(value: bigint, scale: number): string {
   return fraction ? `${text.slice(0, -scale)}.${fraction}` : text.slice(0, -scale);
 }
 
+function decimalTextFixed(value: bigint, scale: number): string {
+  const text = value.toString().padStart(scale + 1, "0");
+  if (scale === 0) return text;
+  return `${text.slice(0, -scale)}.${text.slice(-scale)}`;
+}
+
 function compareDecimal(left: string, right: string): number {
   const leftParts = decimalParts(left);
   const rightParts = decimalParts(right);
@@ -58,6 +64,17 @@ function percentage(value: string, percentageValue: string): string {
   return decimalText(scaledValue.integer * scaledPercentage.integer, scaledValue.scale + scaledPercentage.scale + 2);
 }
 
+function quantizeDown(value: string, step: string): string {
+  const valueParts = decimalParts(value);
+  const stepParts = decimalParts(step);
+  if (stepParts.integer <= 0n) return value;
+  const scale = Math.max(valueParts.scale, stepParts.scale);
+  const valueInteger = valueParts.integer * 10n ** BigInt(scale - valueParts.scale);
+  const stepInteger = stepParts.integer * 10n ** BigInt(scale - stepParts.scale);
+  const quantized = (valueInteger / stepInteger) * stepInteger;
+  return decimalTextFixed(quantized / 10n ** BigInt(scale - stepParts.scale), stepParts.scale);
+}
+
 function isOpening(action: Decision["action"]): boolean {
   return action === "OPEN_LONG" || action === "OPEN_SHORT" || action === "INCREASE";
 }
@@ -84,9 +101,11 @@ export function calculateExecutionAmounts(decision: Decision, bundle: EvidenceBu
   const fullNotional = opening ? multiplyDecimal(marginAllocated, leverage) : current?.notional ?? "0";
   const fullQuantity = opening ? divideDecimal(fullNotional, bundle.market.lastPrice, bundle.instrument.quantityPrecision) : current?.quantity ?? "0";
   const reductionPct = decision.action === "REDUCE" ? decision.reductionPct : decision.action === "CLOSE" ? "100" : null;
-  const positionNotional = reductionPct ? percentage(fullNotional, reductionPct) : fullNotional;
-  const quantity = reductionPct ? percentage(fullQuantity, reductionPct) : fullQuantity;
-  return { marginAllocated: reductionPct ? percentage(marginAllocated, reductionPct) : marginAllocated, leverage, fullNotional, fullQuantity, reductionPct, positionNotional, quantity };
+  const rawQuantity = reductionPct ? percentage(fullQuantity, reductionPct) : fullQuantity;
+  const quantity = decision.action === "REDUCE" ? quantizeDown(rawQuantity, bundle.instrument.quantityStep) : rawQuantity;
+  const positionNotional = decision.action === "REDUCE" ? multiplyDecimal(quantity, bundle.market.lastPrice) : reductionPct ? percentage(fullNotional, reductionPct) : fullNotional;
+  const executableMargin = decision.action === "REDUCE" ? divideDecimal(positionNotional, leverage, 8) : reductionPct ? percentage(marginAllocated, reductionPct) : marginAllocated;
+  return { marginAllocated: executableMargin, leverage, fullNotional, fullQuantity, reductionPct, positionNotional, quantity };
 }
 
 function isMultiple(value: string, step: string): boolean {

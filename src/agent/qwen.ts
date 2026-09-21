@@ -7,9 +7,11 @@ import { QWEN_DATA_BOUNDARY } from "./mandate.js";
 interface QwenRequestOptions {
   maxOutputTokens?: number;
   timeoutMs?: number;
+  retryMalformedJson?: boolean;
 }
 
 export type QwenJsonErrorCode = "QWEN_OUTPUT_TRUNCATED" | "QWEN_INVALID_JSON";
+export type QwenParserStage = "RESPONSE_JSON_EXTRACTION" | "JSON_PARSE";
 
 export interface QwenOutputDiagnostic {
   finishReason: string;
@@ -18,6 +20,7 @@ export interface QwenOutputDiagnostic {
   outputTokens?: number;
   hasOpeningBrace: boolean;
   hasClosingBrace: boolean;
+  parserStage?: QwenParserStage;
 }
 
 export class QwenJsonError extends Error {
@@ -68,6 +71,7 @@ function formatDiagnostic(diagnostic: QwenOutputDiagnostic): string {
     `outputTokens=${diagnostic.outputTokens === undefined ? "UNKNOWN" : diagnostic.outputTokens}`,
     `hasOpeningBrace=${diagnostic.hasOpeningBrace}`,
     `hasClosingBrace=${diagnostic.hasClosingBrace}`,
+    ...(diagnostic.parserStage ? [`parserStage=${diagnostic.parserStage}`] : []),
   ].join(" ");
 }
 
@@ -87,13 +91,30 @@ export async function generateQwenJson<T>(config: RuntimeConfig, schema: z.ZodTy
   if (!config.qwenApiKey) throw new Error("QWEN_CREDENTIALS_REQUIRED");
   const provider = createOpenAICompatible({ name: "qwen", apiKey: config.qwenApiKey, baseURL: config.qwenBaseUrl });
   const schemaText = JSON.stringify(z.toJSONSchema(schema, { target: "draft-07", unrepresentable: "any" }));
-  const result = await generateText({ model: provider.chatModel(config.qwenModel), system: `${QWEN_DATA_BOUNDARY}\n${system}\nReturn valid JSON only. Match this JSON Schema: ${schemaText}`, prompt, maxOutputTokens: options.maxOutputTokens ?? 1600, temperature: 0, providerOptions: { qwen: { enable_thinking: false } }, abortSignal: AbortSignal.timeout(options.timeoutMs ?? 45_000) });
-  const diagnostic = diagnosticFor(result, result.text);
-  if (isTruncatedFinishReason(diagnostic.finishReason)) throw new QwenJsonError("QWEN_OUTPUT_TRUNCATED", diagnostic);
-  try {
-    return schema.parse(JSON.parse(responseJson(result.text)));
-  } catch (error) {
-    if (error instanceof z.ZodError) throw error;
-    throw new QwenJsonError("QWEN_INVALID_JSON", diagnostic);
+  const maxAttempts = options.retryMalformedJson === true ? 2 : 1;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const attemptPrompt = attempt === 0 ? prompt : `${prompt}\n\nPrevious response was not valid JSON. Return exactly one valid JSON object matching the schema, with no markdown or surrounding text.`;
+    const result = await generateText({ model: provider.chatModel(config.qwenModel), system: `${QWEN_DATA_BOUNDARY}\n${system}\nReturn valid JSON only. Match this JSON Schema: ${schemaText}`, prompt: attemptPrompt, maxOutputTokens: options.maxOutputTokens ?? 1600, temperature: 0, providerOptions: { qwen: { enable_thinking: false } }, abortSignal: AbortSignal.timeout(options.timeoutMs ?? 45_000) });
+    const diagnostic = diagnosticFor(result, result.text);
+    if (isTruncatedFinishReason(diagnostic.finishReason)) throw new QwenJsonError("QWEN_OUTPUT_TRUNCATED", diagnostic);
+
+    let jsonText: string;
+    try {
+      jsonText = responseJson(result.text);
+    } catch {
+      const error = new QwenJsonError("QWEN_INVALID_JSON", { ...diagnostic, parserStage: "RESPONSE_JSON_EXTRACTION" });
+      if (attempt + 1 < maxAttempts) continue;
+      throw error;
+    }
+
+    try {
+      return schema.parse(JSON.parse(jsonText));
+    } catch (error) {
+      if (error instanceof z.ZodError) throw error;
+      const jsonError = new QwenJsonError("QWEN_INVALID_JSON", { ...diagnostic, parserStage: "JSON_PARSE" });
+      if (attempt + 1 < maxAttempts) continue;
+      throw jsonError;
+    }
   }
+  throw new Error("QWEN_INVALID_JSON");
 }

@@ -212,7 +212,7 @@ export async function selectCandidates(
 ): Promise<string[]> {
   const candidateScan = scan.map((snapshot) => [snapshot.symbol, snapshot.lastPrice, snapshot.priceChange24h, snapshot.volume24h]);
   const candidatePool = scan.map((snapshot) => snapshot.symbol);
-  const result = await generateQwenJson(config, candidateSchema, `${TRADING_MANDATE}\n${CANDIDATE_TASK_PROMPT}`, JSON.stringify({ candidatePool, scan: candidateScan }), { maxOutputTokens: CANDIDATE_MAX_OUTPUT_TOKENS, timeoutMs: 30_000 });
+  const result = await generateQwenJson(config, candidateSchema, `${TRADING_MANDATE}\n${CANDIDATE_TASK_PROMPT}`, JSON.stringify({ candidatePool, scan: candidateScan }), { maxOutputTokens: CANDIDATE_MAX_OUTPUT_TOKENS, timeoutMs: 30_000, retryMalformedJson: true });
   const candidates = result.symbols;
   if (candidates.some((symbol) => !supportedUniverse.includes(symbol) || !candidatePool.includes(symbol))) throw new Error("SYMBOL_NOT_ALLOWED");
   return candidates;
@@ -327,7 +327,7 @@ export function boundExitDecisions(exitDecisions: readonly Decision[], openPosit
 
 export async function decide(config: RuntimeConfig, context: DecisionContext, cycleId: string): Promise<AutonomousDecisionSet> {
   const actionCapacity = calculateActionCapacity(liveOpenPositions(context.openPositions).length);
-  const generated = await generateQwenJson(config, buildCycleDecisionPlanSchema(actionCapacity.openPositionCount), `${context.mandate}\n${buildDecisionTaskPrompt(config.bitgetSignalEnabled === true, actionCapacity.openPositionCount, actionCapacity.remainingEntrySlots)}\nReturn positionActions and entryActions only. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: DECISION_MAX_OUTPUT_TOKENS, timeoutMs: 60_000 });
+  const generated = await generateQwenJson(config, buildCycleDecisionPlanSchema(actionCapacity.openPositionCount), `${context.mandate}\n${buildDecisionTaskPrompt(config.bitgetSignalEnabled === true, actionCapacity.openPositionCount, actionCapacity.remainingEntrySlots)}\nReturn positionActions and entryActions only. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: DECISION_MAX_OUTPUT_TOKENS, timeoutMs: 60_000, retryMalformedJson: true });
   const createdAt = new Date().toISOString();
   const knownLessons = new Set(context.lessons.map((lesson) => lesson.lessonId));
   const ignoredLessonIds: string[] = [];

@@ -417,7 +417,13 @@ function lastSuccessfulEventForFailedCycle(cycleId: string, events: readonly Act
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   const failedIndex = cycleEvents.findIndex((event) => event.type === "CYCLE_FAILED");
   if (failedIndex <= 0) return null;
-  return cycleEvents[failedIndex - 1]?.type ?? null;
+  return cycleEvents.slice(0, failedIndex).reverse().find((event) => event.type !== "DECISION_SCHEMA_VALIDATION_FAILED")?.type ?? null;
+}
+
+function explicitFailureStage(cycleId: string, events: readonly ActivityEvent[]): string | null {
+  const cycleEvents = events.filter((event) => event.cycleId === cycleId);
+  const failed = cycleEvents.find((event) => event.type === "CYCLE_FAILED");
+  return failed?.metadata?.stage ?? cycleEvents.find((event) => event.type === "DECISION_SCHEMA_VALIDATION_FAILED")?.metadata?.stage ?? null;
 }
 
 function deriveExecutionOutcome(cycleId: string, events: readonly ActivityEvent[]): string | null {
@@ -505,7 +511,7 @@ export function buildPaperLogExport(input: {
         },
         failure: cycle.status === "FAILED" ? {
           code: failureCode,
-          stage: deriveFailureStage(lastSuccessfulEvent, executionOutcome),
+          stage: explicitFailureStage(cycle.cycleId, events) ?? deriveFailureStage(lastSuccessfulEvent, executionOutcome),
           lastSuccessfulEvent,
           executionOutcome,
         } : null,
@@ -587,7 +593,7 @@ export function buildPaperLogExport(input: {
     byCode[code] = (byCode[code] ?? 0) + 1;
     const lastEvent = lastSuccessfulEventForFailedCycle(event.cycleId, events);
     const outcome = deriveExecutionOutcome(event.cycleId, events);
-    const stage = deriveFailureStage(lastEvent, outcome) ?? "unknown";
+    const stage = explicitFailureStage(event.cycleId, events) ?? deriveFailureStage(lastEvent, outcome) ?? "unknown";
     byStage[stage] = (byStage[stage] ?? 0) + 1;
   }
 

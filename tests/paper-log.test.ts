@@ -256,6 +256,21 @@ describe("paper log export", () => {
     expect(exported.failureBreakdown.byStage.decision).toBe(1);
   });
 
+  it("uses explicit decision schema validation telemetry without treating it as the last successful event", () => {
+    const current = journal(77, "HOLD");
+    current.cycleId = "cycle-schema-fail";
+    const events: ActivityEvent[] = [
+      { eventId: "schema-1", type: "CYCLE_STARTED", cycleId: current.cycleId, createdAt: current.startedAt },
+      { eventId: "schema-2", type: "MARKET_SCAN", cycleId: current.cycleId, createdAt: "2026-09-12T00:00:01.000Z" },
+      { eventId: "schema-3", type: "DECISION_SCHEMA_VALIDATION_FAILED", cycleId: current.cycleId, createdAt: "2026-09-12T00:00:02.000Z", metadata: { stage: "decision_schema_validation", code: "ZOD_VALIDATION_FAILED" } },
+      { eventId: "schema-4", type: "CYCLE_FAILED", cycleId: current.cycleId, createdAt: "2026-09-12T00:00:03.000Z", metadata: { category: "ZOD_VALIDATION_FAILED", code: "ZOD_VALIDATION_FAILED", stage: "decision_schema_validation" } },
+    ];
+    const exported = buildPaperLogExport({ generatedAt: "2026-09-12T00:03:00.000Z", period: { start: null, end: null }, environment: "test", model: "qwen3.8-max", version: "0.3.0", commit: "abc123", cycles: [{ cycleId: current.cycleId, status: "FAILED", startedAt: current.startedAt, completedAt: current.completedAt ?? null }], journals: [current], experiences: [], events });
+    expect(exported.cycles[0]?.failure?.stage).toBe("decision_schema_validation");
+    expect(exported.cycles[0]?.failure?.lastSuccessfulEvent).toBe("MARKET_SCAN");
+    expect(exported.failureBreakdown.byStage.decision_schema_validation).toBe(1);
+  });
+
   it("sorts cycles newest first and recent window is deterministic", () => {
     const journals = Array.from({ length: 30 }, (_, index) => journal(index, "HOLD"));
     const events: ActivityEvent[] = journals.map((entry) => ({ eventId: `event-${entry.cycleId}`, type: "CYCLE_COMPLETED", cycleId: entry.cycleId, createdAt: entry.startedAt }));

@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
 import { loadRecentJournals, saveJournal } from "../src/storage/store.js";
 import { buildPaperLogExport } from "../src/storage/paper-log.js";
@@ -192,6 +193,23 @@ function verifiedCloseRecord(): DecisionExecutionRecord {
   } as DecisionExecutionRecord;
 }
 
+function cycleTestAgent(executor: SqlExecutor, events: Array<{ type: string; metadata?: Record<string, string> }>) {
+  return {
+    env: { TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_CATEGORY: "USDT-FUTURES" },
+    state: { emergencyStop: false, paused: false, lastCycleId: null, lastScanAt: null, nextScanAt: null, model: "", runtimeStatus: "ONLINE", currentStage: "ONLINE", lastStatus: "IDLE", lastPolicyUpdateAt: null, cycleStartedAt: null, temporaryScanIntervalExpiresAt: null, temporaryScanIntervalCompleted: true, temporaryScanIntervalDurationMs: 0, userStorageVersion: 0 },
+    ensureActivePolicy: () => ({ paperOnly: true, maxSinglePositionMarginPct: "30", maxLeverage: "5", maxDailyDrawdownPct: "10", drawdownCooldownMinutes: 60, scanIntervalMinutes: 5, emergencyStop: false }),
+    activeScanIntervalMinutes: () => 5,
+    setState(next: unknown) { (this as unknown as { state: unknown }).state = next; },
+    recordEvent(type: string, _cycleId: string, metadata?: Record<string, string>) { events.push({ type, ...(metadata ? { metadata } : {}) }); },
+    recordPositionDiscrepancies: () => [],
+    refreshPositionManagementState: () => [lifecycleState],
+    collectResearchEvidence: async () => undefined,
+    persistPerformanceEquity: () => undefined,
+    persistDecisionOutcome: async () => undefined,
+    sql: executor.sql,
+  } as unknown as { state: unknown };
+}
+
 describe("journal observability persistence", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -278,6 +296,52 @@ describe("journal observability persistence", () => {
     expect(saved.executionRecords).toHaveLength(1);
     expect(saved.discovery?.financialWritesPerformed).toBe(0);
     expect((loadRecentJournals(executor, 1)[0] as ObservableJournal).positionManagementState).toEqual(captured.context?.positionManagementState);
+    db.close();
+  });
+
+  it("attributes a pre-write decision Zod failure and records no financial write", async () => {
+    const { db, executor } = memoryExecutor();
+    const events: Array<{ type: string; metadata?: Record<string, string> }> = [];
+    vi.mocked(decide).mockRejectedValue(new z.ZodError([{ code: "too_big", origin: "string", maximum: 500, inclusive: true, path: ["positionActions", 0, "strategyThesis"], message: "Too big" }]));
+    vi.mocked(executeCyclePlan).mockReset();
+    vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
+    vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
+    vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
+    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(account());
+
+    const fake = cycleTestAgent(executor, events);
+    await expect((TraderAgent.prototype as unknown as { runCycle: () => Promise<TradingJournal> }).runCycle.call(fake)).rejects.toThrow();
+    expect(executeCyclePlan).not.toHaveBeenCalled();
+    const schemaEvent = events.find((event) => event.type === "DECISION_SCHEMA_VALIDATION_FAILED");
+    expect(schemaEvent?.metadata).toMatchObject({ stage: "decision_schema_validation", code: "ZOD_VALIDATION_FAILED" });
+    const failedEvent = events.find((event) => event.type === "CYCLE_FAILED");
+    expect(failedEvent?.metadata).toMatchObject({ stage: "decision_schema_validation" });
+    const saved = loadRecentJournals(executor, 1)[0];
+    expect(saved?.executionRecords).toBeUndefined();
+    expect(saved?.discovery?.financialWritesPerformed).toBe(0);
+    db.close();
+  });
+
+  it("does not attribute a downstream Zod failure to decision schema validation", async () => {
+    const { db, executor } = memoryExecutor();
+    const events: Array<{ type: string; metadata?: Record<string, string> }> = [];
+    vi.mocked(decide).mockResolvedValue({ plan: plan(), ignoredLessonIds: [] });
+    vi.mocked(executeCyclePlan).mockRejectedValue(new z.ZodError([{ code: "custom", path: ["downstream"], message: "Downstream failure" }]));
+    vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
+    vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
+    vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
+    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(account());
+
+    const fake = cycleTestAgent(executor, events);
+    await expect((TraderAgent.prototype as unknown as { runCycle: () => Promise<TradingJournal> }).runCycle.call(fake)).rejects.toThrow();
+    expect(events.some((event) => event.type === "DECISION_SCHEMA_VALIDATION_FAILED")).toBe(false);
+    const failedEvent = events.find((event) => event.type === "CYCLE_FAILED");
+    expect(failedEvent?.metadata?.stage).toBeUndefined();
+    const saved = loadRecentJournals(executor, 1)[0];
+    expect(saved?.executionRecords).toBeUndefined();
+    expect(saved?.discovery?.financialWritesPerformed).toBe(0);
     db.close();
   });
 

@@ -1,7 +1,7 @@
 import { BitgetRestClient, loadConfig as loadBitgetConfig } from "@bitget-ai/bitget-agent-sdk";
 import type { AccountSnapshot, EvidenceBundle, ExecutionResult, ExecutionRequest, Instrument, MarketSnapshot, RuntimeConfig } from "../types.js";
 import { classifyMarketRegime } from "../trading/market-regime.js";
-import { parseAccount, parseDashboardPortfolio, parseFillSummary, parseHistoricalBars, parseInstruments, parsePositionHistorySummary, parsePositionSymbols, parseTicker, record } from "./types.js";
+import { accountForEvidenceSymbol, parseDashboardPortfolio, parseFillSummary, parseHistoricalBars, parseInstruments, parsePositionHistorySummary, parsePositionSymbols, parseTicker, record } from "./types.js";
 import { BitgetGatewayClient, PRIVATE_BITGET_OPERATIONS, type PrivateBitgetOperation } from "./gateway-client.js";
 
 export function formatBitgetReadFailure(operation: string, symbol = "ACCOUNT"): string {
@@ -241,16 +241,12 @@ export class BitgetClient {
     const accountResult = await this.callRead<unknown>("getAccountAssets", {});
     const positionsResult = await this.callRead<unknown>("getPositionInfo", { category: this.category });
     const openOrdersResult = await this.callRead<unknown>("getOpenOrders", buildOpenOrdersReadParams(this.category));
+    const canonicalAccount = parseDashboardPortfolio(accountResult.data, positionsResult.data, openOrdersResult.data, new Date().toISOString());
     return Promise.all(selected.map(async (instrument) => {
       const market = await this.getMarketSnapshot(instrument.symbol);
       const historicalBars = await this.getHistoricalBars(instrument.symbol);
+      const account = accountForEvidenceSymbol(canonicalAccount, instrument.symbol);
       const observedAt = new Date().toISOString();
-      const accountPayload = {
-        account: accountResult.data,
-        positions: positionsResult.data,
-        openOrders: openOrdersResult.data,
-      };
-      const account = parseAccount(accountPayload, instrument, market, observedAt);
       return {
           market,
           account,

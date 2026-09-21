@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeProviderProfitRate, parseAccount, parseDashboardPortfolio, parseFillSummary, parseInstruments, parsePositionHistorySummary } from "../src/bitget/types.js";
+import { accountForEvidenceSymbol, normalizeProviderProfitRate, parseAccount, parseDashboardPortfolio, parseFillSummary, parseInstruments, parsePositionHistorySummary } from "../src/bitget/types.js";
 import type { Instrument, MarketSnapshot } from "../src/types.js";
 
 describe("Bitget provider readback", () => {
@@ -35,6 +35,66 @@ describe("Bitget provider readback", () => {
 
     expect(portfolio).toMatchObject({ portfolioEquity: "50000", availableMargin: "47000", marginUsage: "3000", openOrders: 1, unrealizedPnl: "-0.9807" });
     expect(portfolio.positions[0]).toMatchObject({ symbol: "CRCLUSDT", positionSide: "LONG", quantity: "32.69", entryPrice: "91.7", markPrice: "91.82", marginAllocated: "998.78", leverage: "3", notional: "2996.3654", unrealizedPnl: "-0.9807", unrealizedPnlPct: "-0.09", liquidationPrice: "44.2" });
+  });
+
+  it("falls back to the same position mark for a single position without notional", () => {
+    const portfolio = parseDashboardPortfolio(
+      { usdtEquity: "50000", availableMargin: "47000" },
+      [{ symbol: "MSTRUSDT", posSide: "long", total: "16.43", avgPrice: "137.51", markPrice: "154.41", positionBalance: "847.17427378", unrealisedPnl: "277.667", profitRate: "0.3277566477096616", leverage: "3" }],
+      { list: [] },
+      "2026-09-21T04:14:48.616Z",
+    );
+    expect(portfolio.positions[0]?.notional).toBe("2536.9563");
+  });
+
+  it("prefers authoritative account positionValue for a single position", () => {
+    const portfolio = parseDashboardPortfolio(
+      { usdtEquity: "50000", availableMargin: "47000", positionValue: "2541.23" },
+      [{ symbol: "MSTRUSDT", posSide: "long", total: "16.43", avgPrice: "137.51", markPrice: "154.41", positionBalance: "847.17427378", unrealisedPnl: "277.667", profitRate: "0.3277566477096616", leverage: "3" }],
+      { list: [] },
+      "2026-09-21T04:14:48.616Z",
+    );
+    expect(portfolio.positions[0]?.notional).toBe("2541.23");
+  });
+
+  it("normalizes the MSTR provider shape for model-facing evidence", () => {
+    const portfolio = parseDashboardPortfolio(
+      { usdtEquity: "50000", availableMargin: "47000" },
+      [{ symbol: "HOODUSDT", posSide: "long", total: "19.61", avgPrice: "115.06", markPrice: "120.43", positionBalance: "788.62", unrealisedPnl: "105.30", profitRate: "0.1335", leverage: "3" }, { symbol: "MSTRUSDT", posSide: "long", total: "16.43", positionBalance: "847.17427378", avgPrice: "137.51", unrealisedPnl: "277.667", profitRate: "0.3277566477096616", markPrice: "154.41", leverage: "3" }],
+      { list: [] },
+      "2026-09-21T04:14:48.616Z",
+    );
+    const mstr = accountForEvidenceSymbol(portfolio, "MSTRUSDT");
+
+    expect(mstr.positions).toHaveLength(2);
+    expect(mstr.positions.find((position) => position.symbol === "MSTRUSDT")).toMatchObject({
+      quantity: "16.43",
+      entryPrice: "137.51",
+      markPrice: "154.41",
+      notional: "2536.9563",
+      marginAllocated: "847.17427378",
+      unrealizedPnl: "277.667",
+      unrealizedPnlPct: "32.77566477096616",
+    });
+    expect(mstr.positionNotional).toBe("2536.9563");
+    expect(mstr.positionQuantity).toBe("16.43");
+    expect(mstr.totalPositionNotional).toBe("4898.5886");
+    expect(mstr.unrealizedPnl).toBe("382.967");
+  });
+
+  it("keeps bundle-local position totals correct when MSTR is not the first bundle", () => {
+    const portfolio = parseDashboardPortfolio(
+      { usdtEquity: "50000", availableMargin: "47000" },
+      [{ symbol: "HOODUSDT", posSide: "long", total: "19.61", avgPrice: "115.06", markPrice: "120.43", positionBalance: "788.62", unrealisedPnl: "105.30", profitRate: "0.1335", leverage: "3" }, { symbol: "MSTRUSDT", posSide: "long", total: "16.43", positionBalance: "847.17427378", avgPrice: "137.51", unrealisedPnl: "277.667", profitRate: "0.3277566477096616", markPrice: "154.41", leverage: "3" }],
+      { list: [] },
+      "2026-09-21T04:14:48.616Z",
+    );
+    const hood = accountForEvidenceSymbol(portfolio, "HOODUSDT");
+    const mstr = accountForEvidenceSymbol(portfolio, "MSTRUSDT");
+
+    expect(hood.positionNotional).toBe("2361.6323");
+    expect(mstr.positionNotional).toBe("2536.9563");
+    expect(mstr.positions.find((position) => position.symbol === "MSTRUSDT")?.unrealizedPnl).toBe("277.667");
   });
 
   it("prefers account-level realized PnL over position-level values", () => {
