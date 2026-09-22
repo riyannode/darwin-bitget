@@ -226,6 +226,24 @@ describe("provider ledger persistence and sync", () => {
     expect((db.prepare("SELECT origin FROM provider_orders WHERE provider_order_id = 'order-2'").get() as { origin: string }).origin).toBe("PROVIDER_EXTERNAL");
   });
 
+  it("inherits exact provider-order origin for fills and leaves unknown fills unattributed", () => {
+    const { executor } = memoryExecutor();
+    const externalOrder = normalizeProviderOrder(orderFixture({ orderId: "ext-order-1", clientOid: null }), "PROVIDER_EXTERNAL", observedAt)!;
+    upsertProviderOrder(executor, externalOrder, observedAt);
+    recordIdempotency(executor, "paper-cycle-1", "cycle-1", "decision-1", observedAt);
+    recordProviderOrderReference(executor, "paper-cycle-1", "darwin-order-1");
+    const darwinOrder = normalizeProviderOrder(orderFixture({ orderId: "darwin-order-1" }), "DARWIN", observedAt)!;
+    upsertProviderOrder(executor, darwinOrder, observedAt);
+
+    const externalFill = normalizeProviderFill(fillFixture({ execId: "ext-fill-1", orderId: "ext-order-1", clientOid: null }), resolveProviderOrigin(executor, "ext-order-1", null), observedAt)!;
+    const darwinFill = normalizeProviderFill(fillFixture({ execId: "darwin-fill-1", orderId: "darwin-order-1", clientOid: null }), resolveProviderOrigin(executor, "darwin-order-1", null), observedAt)!;
+    const unknownFill = normalizeProviderFill(fillFixture({ execId: "unknown-fill-1", orderId: "unknown-order-1", clientOid: null }), resolveProviderOrigin(executor, "unknown-order-1", null), observedAt)!;
+
+    expect(externalFill.origin).toBe("PROVIDER_EXTERNAL");
+    expect(darwinFill.origin).toBe("DARWIN");
+    expect(unknownFill.origin).toBe("UNATTRIBUTED");
+  });
+
   it("backfills all resources through bounded pages and is idempotent on repeat", async () => {
     const { db, executor } = memoryExecutor();
     const calls: Array<{ resource: string; cursor?: string }> = [];

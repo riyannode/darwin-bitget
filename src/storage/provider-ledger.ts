@@ -73,7 +73,7 @@ export function resolveProviderOrigin(executor: SqlExecutor, providerOrderId: st
     const idempotency = executor.sql<{ provider_order_id: string }>`SELECT provider_order_id FROM idempotency WHERE provider_order_id = ${providerOrderId} LIMIT 1`;
     if (idempotency.length > 0) return "DARWIN";
     const existing = executor.sql<{ origin: ProviderOrigin }>`SELECT origin FROM provider_orders WHERE provider_order_id = ${providerOrderId} LIMIT 1`;
-    if (existing[0]?.origin === "DARWIN") return "DARWIN";
+    if (existing[0]?.origin) return existing[0].origin;
   }
   return fallback;
 }
