@@ -81,6 +81,7 @@ export function ensureStorage(executor: SqlExecutor): void {
     close_fee_total TEXT,
     total_funding TEXT,
     cash_dividend TEXT,
+    origin TEXT NOT NULL CHECK (origin IN ('DARWIN', 'PROVIDER_EXTERNAL')),
     raw_provider_json TEXT NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL
@@ -98,6 +99,7 @@ export function ensureStorage(executor: SqlExecutor): void {
     position_balance TEXT,
     balance TEXT,
     provider_timestamp TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('DARWIN', 'PROVIDER_EXTERNAL')),
     raw_provider_json TEXT NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL
@@ -110,6 +112,10 @@ export function ensureStorage(executor: SqlExecutor): void {
     last_error TEXT,
     updated_at TEXT NOT NULL
   )`;
+  const positionHistoryColumns = executor.sql<{ name: string }>`SELECT name FROM pragma_table_info('provider_position_history')`;
+  if (!positionHistoryColumns.some((column) => column.name === "origin")) executor.sql`ALTER TABLE provider_position_history ADD COLUMN origin TEXT NOT NULL DEFAULT 'PROVIDER_EXTERNAL'`;
+  const financialRecordColumns = executor.sql<{ name: string }>`SELECT name FROM pragma_table_info('provider_financial_records')`;
+  if (!financialRecordColumns.some((column) => column.name === "origin")) executor.sql`ALTER TABLE provider_financial_records ADD COLUMN origin TEXT NOT NULL DEFAULT 'PROVIDER_EXTERNAL'`;
   executor.sql`CREATE INDEX IF NOT EXISTS journals_created_at_idx ON journals(created_at DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS experiences_created_at_idx ON experiences(created_at DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS position_context_symbol_idx ON position_context(symbol, position_side)`;

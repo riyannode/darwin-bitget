@@ -156,13 +156,13 @@ export function upsertProviderPositionHistory(executor: SqlExecutor, record: Pro
       position_side, opening_time, closing_time, avg_entry_price, avg_exit_price,
       closing_quantity, max_position_size, closing_value, max_position_value,
       position_pnl, position_roi, open_fee_total, close_fee_total, total_funding,
-      cash_dividend, raw_provider_json, first_seen_at, last_seen_at
+      cash_dividend, origin, raw_provider_json, first_seen_at, last_seen_at
     ) VALUES (
       ${record.providerPositionHistoryKey}, ${record.providerPositionHistoryId}, ${record.category}, ${record.symbol},
       ${record.positionSide}, ${record.openingTime}, ${record.closingTime}, ${record.avgEntryPrice}, ${record.avgExitPrice},
       ${record.closingQuantity}, ${record.maxPositionSize}, ${record.closingValue}, ${record.maxPositionValue},
       ${record.positionPnl}, ${record.positionRoi}, ${record.openFeeTotal}, ${record.closeFeeTotal}, ${record.totalFunding},
-      ${record.cashDividend}, ${record.rawProviderJson}, ${observedAt}, ${observedAt}
+      ${record.cashDividend}, ${record.origin}, ${record.rawProviderJson}, ${observedAt}, ${observedAt}
     )
     ON CONFLICT(provider_position_history_key) DO UPDATE SET
       provider_position_history_id = excluded.provider_position_history_id,
@@ -183,6 +183,7 @@ export function upsertProviderPositionHistory(executor: SqlExecutor, record: Pro
       close_fee_total = excluded.close_fee_total,
       total_funding = excluded.total_funding,
       cash_dividend = excluded.cash_dividend,
+      origin = excluded.origin,
       raw_provider_json = excluded.raw_provider_json,
       last_seen_at = excluded.last_seen_at
   `;
@@ -193,11 +194,11 @@ export function upsertProviderFinancialRecord(executor: SqlExecutor, record: Pro
     INSERT INTO provider_financial_records (
       provider_record_key, provider_record_id, category, symbol, type, coin, amount,
       fee, position_amount, position_balance, balance, provider_timestamp,
-      raw_provider_json, first_seen_at, last_seen_at
+      origin, raw_provider_json, first_seen_at, last_seen_at
     ) VALUES (
       ${record.providerRecordKey}, ${record.providerRecordId}, ${record.category}, ${record.symbol}, ${record.type}, ${record.coin}, ${record.amount},
       ${record.fee}, ${record.positionAmount}, ${record.positionBalance}, ${record.balance}, ${record.providerTimestamp},
-      ${record.rawProviderJson}, ${observedAt}, ${observedAt}
+      ${record.origin}, ${record.rawProviderJson}, ${observedAt}, ${observedAt}
     )
     ON CONFLICT(provider_record_key) DO UPDATE SET
       provider_record_id = excluded.provider_record_id,
@@ -211,6 +212,7 @@ export function upsertProviderFinancialRecord(executor: SqlExecutor, record: Pro
       position_balance = excluded.position_balance,
       balance = excluded.balance,
       provider_timestamp = excluded.provider_timestamp,
+      origin = excluded.origin,
       raw_provider_json = excluded.raw_provider_json,
       last_seen_at = excluded.last_seen_at
   `;
@@ -263,9 +265,18 @@ export function providerLedgerDiagnostics(executor: SqlExecutor, category: strin
           : executor.sql<CountRow>`SELECT COUNT(*) AS count FROM provider_financial_records WHERE category = ${category}`;
     return Number(rows[0]?.count ?? 0);
   };
-  const originRows = executor.sql<OriginCountRow>`SELECT origin, COUNT(*) AS count FROM provider_orders WHERE category = ${category} GROUP BY origin`;
   const origins = { DARWIN: 0, PROVIDER_EXTERNAL: 0 };
-  for (const row of originRows) if (row.origin in origins) origins[row.origin] = Number(row.count);
+  const originTables = ["provider_orders", "provider_fills", "provider_position_history", "provider_financial_records"] as const;
+  for (const table of originTables) {
+    const rows = table === "provider_orders"
+      ? executor.sql<OriginCountRow>`SELECT origin, COUNT(*) AS count FROM provider_orders WHERE category = ${category} GROUP BY origin`
+      : table === "provider_fills"
+        ? executor.sql<OriginCountRow>`SELECT origin, COUNT(*) AS count FROM provider_fills WHERE category = ${category} GROUP BY origin`
+        : table === "provider_position_history"
+          ? executor.sql<OriginCountRow>`SELECT origin, COUNT(*) AS count FROM provider_position_history WHERE category = ${category} GROUP BY origin`
+          : executor.sql<OriginCountRow>`SELECT origin, COUNT(*) AS count FROM provider_financial_records WHERE category = ${category} GROUP BY origin`;
+    for (const row of rows) if (row.origin in origins) origins[row.origin] += Number(row.count);
+  }
   const sync = loadProviderSyncState(executor, category);
   return {
     category,

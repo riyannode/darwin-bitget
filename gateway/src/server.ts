@@ -18,6 +18,13 @@ const tradeHistoryCategory = z.enum(["SPOT", "MARGIN", "USDT-FUTURES", "COIN-FUT
 const financialCategory = z.enum(["SPOT", "MARGIN", "USDT-FUTURES", "COIN-FUTURES", "USDC-FUTURES", "OTHER"]);
 const timestampField = z.string().regex(/^\d{1,20}$/);
 const limitField = z.string().regex(/^\d{1,3}$/).refine((value) => Number(value) >= 1 && Number(value) <= 100, "limit must be between 1 and 100");
+const MAX_PROVIDER_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+const hasValidBoundedWindow = (value: { startTime?: string | undefined; endTime?: string | undefined }): boolean => {
+  if (!value.startTime || !value.endTime) return false;
+  const start = Number(value.startTime);
+  const end = Number(value.endTime);
+  return Number.isSafeInteger(start) && Number.isSafeInteger(end) && end >= start && end - start <= MAX_PROVIDER_WINDOW_MS;
+};
 const categoryBody = z.object({ category: futuresCategory }).strict();
 const setLeverageBody = z.object({
   category: z.enum(["USDT-FUTURES"]),
@@ -46,7 +53,7 @@ const fillHistoryBody = z.object({
   endTime: timestampField.optional(),
   limit: limitField,
   cursor: z.string().min(1).max(256).optional(),
-}).strict().refine((value) => Boolean(value.orderId || value.startTime || value.endTime), "orderId or time window is required");
+}).strict().refine((value) => Boolean(value.orderId) || hasValidBoundedWindow(value), "orderId or complete bounded time window is required");
 const orderHistoryBody = z.object({
   category: tradeHistoryCategory,
   symbol: z.string().regex(/^[A-Z0-9]{3,30}$/).optional(),
@@ -54,7 +61,7 @@ const orderHistoryBody = z.object({
   endTime: timestampField.optional(),
   limit: limitField,
   cursor: z.string().min(1).max(256).optional(),
-}).strict();
+}).strict().refine(hasValidBoundedWindow, "complete bounded time window is required");
 const positionsHistoryBody = z.object({
   category: futuresCategory,
   symbol: z.string().regex(/^[A-Z0-9]{3,30}$/).optional(),
@@ -62,7 +69,7 @@ const positionsHistoryBody = z.object({
   endTime: timestampField.optional(),
   limit: limitField,
   cursor: z.string().min(1).max(256).optional(),
-}).strict();
+}).strict().refine(hasValidBoundedWindow, "complete bounded time window is required");
 const financialRecordsBody = z.object({
   category: financialCategory,
   coin: z.string().regex(/^[A-Z0-9]{1,20}$/).optional(),
@@ -71,7 +78,7 @@ const financialRecordsBody = z.object({
   endTime: timestampField.optional(),
   limit: limitField,
   cursor: z.string().min(1).max(256).optional(),
-}).strict();
+}).strict().refine(hasValidBoundedWindow, "complete bounded time window is required");
 
 const ACTIONS: Record<string, { operation: PrivateBitgetOperation; schema: z.ZodType<Record<string, unknown>> }> = {
   "account-assets": { operation: "getAccountAssets", schema: emptyBody },

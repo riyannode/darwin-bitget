@@ -146,6 +146,21 @@ describe("provider ledger normalization", () => {
     expect(fill?.rawProviderJson).toContain("fill-1");
     expect(history?.rawProviderJson).toContain("position-1");
     expect(financial?.rawProviderJson).toContain("financial-1");
+
+    const actualFieldNames = normalizeProviderPositionHistory({
+      category,
+      symbol: "CRCLUSDT",
+      posSide: "long",
+      positionId: "actual-1",
+      createdTime: "1730181468493",
+      updatedTime: "1730182468493",
+      openTotalPos: "8.5",
+      closeTotalPos: "8.5",
+      openAvgPrice: "96.15",
+      closeAvgPrice: "101.25",
+      netProfit: "16.575",
+    }, observedAt);
+    expect(actualFieldNames).toMatchObject({ openingTime: "2024-10-29T05:57:48.493Z", closingQuantity: "8.5", maxPositionSize: "8.5" });
   });
 
   it("rejects malformed provider rows and fingerprints rows without provider IDs", () => {
@@ -206,10 +221,10 @@ describe("provider ledger persistence and sync", () => {
       calls.push(cursor ? { resource, cursor } : { resource });
     };
     const client: ProviderLedgerReadClient = {
-      async getOrderHistoryRead(params) { recordCall("orders", params.cursor); return params.cursor ? { list: [] } : { list: [orderFixture()] }; },
-      async getFillHistoryWindowRead(params) { recordCall("fills", params.cursor); return params.cursor ? { list: [] } : { list: [fillFixture()] }; },
-      async getPositionHistoryRead(params) { recordCall("positions", params.cursor); return params.cursor ? { list: [] } : { list: [positionHistoryFixture()] }; },
-      async getFinancialRecordsRead(params) { recordCall("financial", params.cursor); return params.cursor ? { list: [] } : { list: [financialFixture()] }; },
+      async getOrderHistoryRead(params) { recordCall("orders", params.cursor); return params.cursor ? { list: [], cursor: null } : { list: [orderFixture()], cursor: null }; },
+      async getFillHistoryWindowRead(params) { recordCall("fills", params.cursor); return params.cursor ? { list: [], cursor: null } : { list: [fillFixture()], cursor: null }; },
+      async getPositionHistoryRead(params) { recordCall("positions", params.cursor); return params.cursor ? { list: [], cursor: null } : { list: [positionHistoryFixture()], cursor: null }; },
+      async getFinancialRecordsRead(params) { recordCall("financial", params.cursor); return params.cursor ? { list: [], cursor: null } : { list: [financialFixture()], cursor: null }; },
     };
 
     const first = await syncProviderLedger(client, executor, { category, mode: "recent", now: new Date("2026-09-22T00:00:00.000Z"), recentWindowMs: 60 * 60 * 1000 });
@@ -229,10 +244,10 @@ describe("provider ledger persistence and sync", () => {
     const { executor } = memoryExecutor();
     const windows: Array<{ start: number; end: number }> = [];
     const client: ProviderLedgerReadClient = {
-      async getOrderHistoryRead(params) { windows.push({ start: Number(params.startTime), end: Number(params.endTime) }); return { list: [] }; },
-      async getFillHistoryWindowRead() { return { list: [] }; },
-      async getPositionHistoryRead() { return { list: [] }; },
-      async getFinancialRecordsRead() { return { list: [] }; },
+      async getOrderHistoryRead(params) { windows.push({ start: Number(params.startTime), end: Number(params.endTime) }); return { list: [], cursor: null }; },
+      async getFillHistoryWindowRead() { return { list: [], cursor: null }; },
+      async getPositionHistoryRead() { return { list: [], cursor: null }; },
+      async getFinancialRecordsRead() { return { list: [], cursor: null }; },
     };
     const now = new Date("2026-09-22T00:00:00.000Z").getTime();
 
@@ -247,9 +262,9 @@ describe("provider ledger persistence and sync", () => {
   it("retains completed resource checkpoints when a later resource fails", async () => {
     const { executor } = memoryExecutor();
     const client: ProviderLedgerReadClient = {
-      async getOrderHistoryRead() { return { list: [orderFixture()] }; },
-      async getFillHistoryWindowRead() { return { list: [fillFixture()] }; },
-      async getPositionHistoryRead() { return { list: [positionHistoryFixture()] }; },
+      async getOrderHistoryRead() { return { list: [orderFixture()], cursor: null }; },
+      async getFillHistoryWindowRead() { return { list: [fillFixture()], cursor: null }; },
+      async getPositionHistoryRead() { return { list: [positionHistoryFixture()], cursor: null }; },
       async getFinancialRecordsRead() { throw new Error("FINANCIAL_PROVIDER_UNAVAILABLE"); },
     };
 
@@ -268,15 +283,48 @@ describe("provider ledger persistence and sync", () => {
     const { executor } = memoryExecutor();
     const client: ProviderLedgerReadClient = {
       async getOrderHistoryRead() { return { list: [orderFixture()], cursor: "same-cursor" }; },
-      async getFillHistoryWindowRead() { return { list: [] }; },
-      async getPositionHistoryRead() { return { list: [] }; },
-      async getFinancialRecordsRead() { return { list: [] }; },
+      async getFillHistoryWindowRead() { return { list: [], cursor: null }; },
+      async getPositionHistoryRead() { return { list: [], cursor: null }; },
+      async getFinancialRecordsRead() { return { list: [], cursor: null }; },
     };
 
     const result = await syncProviderLedger(client, executor, { category, mode: "recent", now: new Date("2026-09-22T00:00:00.000Z"), recentWindowMs: 60 * 60 * 1000 });
 
     expect(result.status).toBe("PARTIAL");
     expect(result.errors.some((error) => error.includes("PROVIDER_CURSOR_REPEATED"))).toBe(true);
+  });
+
+  it("derives a cursor from the last provider row when the response omits one", async () => {
+    const { executor } = memoryExecutor();
+    const cursors: Array<string | undefined> = [];
+    const client: ProviderLedgerReadClient = {
+      async getOrderHistoryRead(params) { cursors.push(params.cursor); return params.cursor ? { list: [], cursor: null } : { list: [orderFixture()] }; },
+      async getFillHistoryWindowRead() { return { list: [], cursor: null }; },
+      async getPositionHistoryRead() { return { list: [], cursor: null }; },
+      async getFinancialRecordsRead() { return { list: [], cursor: null }; },
+    };
+
+    const result = await syncProviderLedger(client, executor, { category, mode: "recent", now: new Date("2026-09-22T00:00:00.000Z"), recentWindowMs: 60 * 60 * 1000 });
+
+    expect(result.status).toBe("SUCCESS");
+    expect(cursors).toEqual([undefined, "order-1"]);
+  });
+
+  it("does not checkpoint an unexpected provider page shape", async () => {
+    const { executor } = memoryExecutor();
+    const client: ProviderLedgerReadClient = {
+      async getOrderHistoryRead() { return { unexpected: true }; },
+      async getFillHistoryWindowRead() { return { list: [], cursor: null }; },
+      async getPositionHistoryRead() { return { list: [], cursor: null }; },
+      async getFinancialRecordsRead() { return { list: [], cursor: null }; },
+    };
+
+    const result = await syncProviderLedger(client, executor, { category, mode: "recent", now: new Date("2026-09-22T00:00:00.000Z"), recentWindowMs: 60 * 60 * 1000 });
+    const state = loadProviderSyncState(executor, category);
+
+    expect(result.status).toBe("PARTIAL");
+    expect(result.errors.some((error) => error.includes("INVALID_PROVIDER_PAGE"))).toBe(true);
+    expect(state?.lastSuccessfulSyncAt).toBeNull();
   });
 
   it("reports bounded diagnostics without exposing raw provider payloads", () => {
@@ -290,7 +338,7 @@ describe("provider ledger persistence and sync", () => {
     const diagnostics = providerLedgerDiagnostics(executor, category);
 
     expect(diagnostics.counts).toEqual({ orders: 2, fills: 1, positionHistory: 0, financialRecords: 0 });
-    expect(diagnostics.origins).toEqual({ DARWIN: 1, PROVIDER_EXTERNAL: 1 });
+    expect(diagnostics.origins).toEqual({ DARWIN: 2, PROVIDER_EXTERNAL: 1 });
     expect(JSON.stringify(diagnostics)).not.toContain("order-1");
   });
 });

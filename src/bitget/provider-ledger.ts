@@ -77,6 +77,7 @@ export interface ProviderPositionHistoryRecord {
   closeFeeTotal: string | null;
   totalFunding: string | null;
   cashDividend: string | null;
+  origin: ProviderOrigin;
   rawProviderJson: string;
 }
 
@@ -93,6 +94,7 @@ export interface ProviderFinancialRecord {
   positionBalance: string | null;
   balance: string | null;
   providerTimestamp: string;
+  origin: ProviderOrigin;
   rawProviderJson: string;
 }
 
@@ -194,14 +196,14 @@ export function normalizeProviderFill(value: unknown, origin: ProviderOrigin, ob
   };
 }
 
-export function normalizeProviderPositionHistory(value: unknown, observedAt: string): ProviderPositionHistoryRecord | null {
+export function normalizeProviderPositionHistory(value: unknown, observedAt: string, origin: ProviderOrigin = "PROVIDER_EXTERNAL"): ProviderPositionHistoryRecord | null {
   const row = asRecord(value);
   const category = text(row.category);
   const symbol = text(row.symbol);
   const positionSide = text(row.posSide ?? row.positionSide ?? row.holdSide).toUpperCase();
-  const openingTime = providerTimestampIso(row.openTime ?? row.openingTime ?? row.ctime);
+  const openingTime = providerTimestampIso(row.openTime ?? row.openingTime ?? row.createdTime ?? row.ctime);
   const closingTime = providerTimestampIso(row.closeTime ?? row.closingTime ?? row.updatedTime ?? row.utime);
-  if (!category || !symbol || !positionSide || (!openingTime && !closingTime)) return null;
+  if (!category || !symbol || !positionSide || !openingTime || !closingTime) return null;
   const providerPositionHistoryId = nullableText(row.positionId ?? row.id ?? row.posId);
   const key = providerPositionHistoryId ?? stableProviderFingerprint(row);
   return {
@@ -214,8 +216,8 @@ export function normalizeProviderPositionHistory(value: unknown, observedAt: str
     closingTime: closingTime ?? "",
     avgEntryPrice: decimalText(row.openAvgPrice ?? row.avgOpenPrice ?? row.openPriceAvg ?? row.entryPrice),
     avgExitPrice: decimalText(row.closeAvgPrice ?? row.avgClosePrice ?? row.closePriceAvg ?? row.exitPrice),
-    closingQuantity: decimalText(row.closeTotal ?? row.closeQty ?? row.closeQuantity ?? row.total) ?? "0",
-    maxPositionSize: decimalText(row.maxPositionSize ?? row.maxSize),
+    closingQuantity: decimalText(row.closeTotalPos ?? row.closeTotal ?? row.closeQty ?? row.closeQuantity ?? row.total) ?? "0",
+    maxPositionSize: decimalText(row.openTotalPos ?? row.maxPositionSize ?? row.maxSize),
     closingValue: decimalText(row.closePositionValue ?? row.closeValue ?? row.positionValue),
     maxPositionValue: decimalText(row.maxPositionValue),
     positionPnl: decimalText(row.netProfit ?? row.pnl ?? row.cumRealisedPnl ?? row.realizedPnl),
@@ -224,11 +226,12 @@ export function normalizeProviderPositionHistory(value: unknown, observedAt: str
     closeFeeTotal: decimalText(row.closeFeeTotal ?? row.closeFee),
     totalFunding: decimalText(row.totalFunding),
     cashDividend: decimalText(row.cashDividend),
+    origin,
     rawProviderJson: rawJson(row),
   };
 }
 
-export function normalizeProviderFinancialRecord(value: unknown, observedAt: string): ProviderFinancialRecord | null {
+export function normalizeProviderFinancialRecord(value: unknown, observedAt: string, origin: ProviderOrigin = "PROVIDER_EXTERNAL"): ProviderFinancialRecord | null {
   const row = asRecord(value);
   const category = text(row.category);
   const type = text(row.type);
@@ -249,6 +252,7 @@ export function normalizeProviderFinancialRecord(value: unknown, observedAt: str
     positionBalance: decimalText(row.positionBalance),
     balance: decimalText(row.balance),
     providerTimestamp,
+    origin,
     rawProviderJson: rawJson(row),
   };
 }
@@ -256,9 +260,21 @@ export function normalizeProviderFinancialRecord(value: unknown, observedAt: str
 export function providerPage(value: unknown): ProviderPage {
   const payload = asRecord(value);
   const nested = asRecord(payload.data);
-  const source = Array.isArray(value) ? value : Array.isArray(payload.list) ? payload.list : Array.isArray(nested.list) ? nested.list : Array.isArray(payload.data) ? payload.data : [];
-  const cursorValue = payload.cursor ?? nested.cursor ?? payload.nextCursor ?? nested.nextCursor;
-  return { rows: source.map(asRecord), cursor: nullableText(cursorValue) };
+  const source = Array.isArray(value)
+    ? value
+    : Array.isArray(payload.list)
+      ? payload.list
+      : Array.isArray(nested.list)
+        ? nested.list
+        : Array.isArray(payload.data)
+          ? payload.data
+          : null;
+  if (!source) throw new Error("INVALID_PROVIDER_PAGE");
+  const hasExplicitCursor = "cursor" in payload || "cursor" in nested || "nextCursor" in payload || "nextCursor" in nested;
+  const explicitCursor = payload.cursor ?? nested.cursor ?? payload.nextCursor ?? nested.nextCursor;
+  const lastRow = asRecord(source[source.length - 1]);
+  const fallbackCursor = text(lastRow.orderId ?? lastRow.execId ?? lastRow.positionId ?? lastRow.tradeId ?? lastRow.id ?? lastRow.ts);
+  return { rows: source.map(asRecord), cursor: hasExplicitCursor ? nullableText(explicitCursor) : nullableText(fallbackCursor) };
 }
 
 function providerFeeTotal(row: Record<string, unknown>, feeDetailsJson: string | null): string | null {

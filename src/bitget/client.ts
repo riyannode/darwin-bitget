@@ -403,7 +403,15 @@ export class BitgetClient {
       }
       if (request.tradeSide === "close" && !enriched.realizedPnl) {
         try {
-          const history = await this.callOperation<unknown>("getPositionsHistory", { category: this.category, symbol: request.symbol, limit: "20" });
+          const startTime = Date.parse(reference.submittedAt);
+          const endTime = Date.now();
+          const history = await this.callOperation<unknown>("getPositionsHistory", {
+            category: this.category,
+            symbol: request.symbol,
+            startTime: String(Math.max(0, startTime)),
+            endTime: String(Math.max(startTime, endTime)),
+            limit: "20",
+          });
           const summary = parsePositionHistorySummary(history.data, { symbol: request.symbol, positionSide: request.positionSide, submittedAt: reference.submittedAt });
           enriched = {
             ...enriched,

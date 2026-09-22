@@ -5,7 +5,6 @@ import {
   normalizeProviderPositionHistory,
   providerPage,
   type ProviderLedgerReadParams,
-  type ProviderOrigin,
 } from "./provider-ledger.js";
 import {
   loadProviderSyncState,
@@ -22,10 +21,15 @@ import {
 import type { SqlExecutor } from "../storage/schema.js";
 
 const MAX_PROVIDER_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
-const DEFAULT_INITIAL_LOOKBACK_MS = 90 * 24 * 60 * 60 * 1000;
+const MAX_PROVIDER_HISTORY_MS = 90 * 24 * 60 * 60 * 1000;
+const DEFAULT_INITIAL_LOOKBACK_MS = MAX_PROVIDER_HISTORY_MS;
 const DEFAULT_RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_OVERLAP_MS = 15 * 60 * 1000;
 const MAX_PAGES_PER_WINDOW = 1000;
+const DEFAULT_MAX_PAGES_PER_RUN = 1000;
+const DEFAULT_MAX_ROWS_PER_RUN = 100_000;
+
+type ResourceName = keyof ProviderSyncCheckpoints;
 
 export interface ProviderLedgerReadClient {
   getOrderHistoryRead(params: ProviderLedgerReadParams): Promise<unknown>;
@@ -41,12 +45,15 @@ export interface ProviderLedgerSyncOptions {
   initialLookbackMs?: number;
   recentWindowMs?: number;
   overlapMs?: number;
+  maxPagesPerRun?: number;
+  maxRowsPerRun?: number;
 }
 
 export interface ProviderLedgerSyncResult {
   status: "SUCCESS" | "PARTIAL";
   category: string;
   observedAt: string;
+  truncated: boolean;
   resources: Record<string, { pages: number; rows: number; malformedRows: number }>;
   errors: string[];
 }
@@ -58,11 +65,11 @@ interface Window {
   endIso: string;
 }
 
-interface ResourceResult {
+interface SyncBudget {
   pages: number;
   rows: number;
-  malformedRows: number;
-  checkpoint: ProviderResourceCheckpoint;
+  maxPages: number;
+  maxRows: number;
 }
 
 export async function syncProviderLedger(
@@ -77,17 +84,37 @@ export async function syncProviderLedger(
   const windows = buildWindows(now.getTime(), options, previous);
   const resources: ProviderLedgerSyncResult["resources"] = {};
   const errors: string[] = [];
+  const budget: SyncBudget = {
+    pages: 0,
+    rows: 0,
+    maxPages: Math.max(1, options.maxPagesPerRun ?? DEFAULT_MAX_PAGES_PER_RUN),
+    maxRows: Math.max(1, options.maxRowsPerRun ?? DEFAULT_MAX_ROWS_PER_RUN),
+  };
 
-  const run = async (name: string, read: (params: ProviderLedgerReadParams) => Promise<unknown>, processRow: (row: Record<string, unknown>) => boolean): Promise<void> => {
+  const run = async (name: ResourceName, read: (params: ProviderLedgerReadParams) => Promise<unknown>, processRow: (row: Record<string, unknown>) => boolean): Promise<void> => {
     let totals = { pages: 0, rows: 0, malformedRows: 0 };
+    const resumeCheckpoint = state.checkpoints[name];
+    const resourceWindows = windowsForResource(windows, resumeCheckpoint);
     try {
-      for (const window of windows) {
-        const page = await readPaged(read, options.category, window, processRow);
+      for (const window of resourceWindows) {
+        const resumeCursor = resumeCheckpoint && resumeCheckpoint.windowStart === window.startIso && resumeCheckpoint.windowEnd === window.endIso
+          ? resumeCheckpoint.cursor
+          : undefined;
+        const page = await readPaged(read, options.category, window, processRow, budget, resumeCursor, (cursor) => {
+          state.checkpoints = {
+            ...state.checkpoints,
+            [name]: { windowStart: window.startIso, windowEnd: window.endIso, cursor },
+          };
+          state.lastError = null;
+          state.updatedAt = observedAt;
+          saveProviderSyncState(executor, state);
+        });
         totals = {
           pages: totals.pages + page.pages,
           rows: totals.rows + page.rows,
           malformedRows: totals.malformedRows + page.malformedRows,
         };
+        if (page.malformedRows > 0) throw new Error(`PROVIDER_MALFORMED_ROWS_${name}_${page.malformedRows}`);
       }
       resources[name] = { ...totals };
       state.checkpoints = {
@@ -124,13 +151,15 @@ export async function syncProviderLedger(
     return true;
   });
   await run("positionHistory", client.getPositionHistoryRead.bind(client), (row) => {
-    const record = normalizeProviderPositionHistory(row, observedAt);
+    const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid));
+    const record = normalizeProviderPositionHistory(row, observedAt, origin);
     if (!record) return false;
     upsertProviderPositionHistory(executor, record, observedAt);
     return true;
   });
   await run("financialRecords", client.getFinancialRecordsRead.bind(client), (row) => {
-    const record = normalizeProviderFinancialRecord(row, observedAt);
+    const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid));
+    const record = normalizeProviderFinancialRecord(row, observedAt, origin);
     if (!record) return false;
     upsertProviderFinancialRecord(executor, record, observedAt);
     return true;
@@ -146,6 +175,7 @@ export async function syncProviderLedger(
     status: errors.length > 0 ? "PARTIAL" : "SUCCESS",
     category: options.category,
     observedAt,
+    truncated: errors.some((error) => /BUDGET_EXCEEDED|PAGE_LIMIT_EXCEEDED/.test(error)),
     resources,
     errors,
   };
@@ -156,14 +186,17 @@ async function readPaged(
   category: string,
   window: Window,
   processRow: (row: Record<string, unknown>) => boolean,
+  budget: SyncBudget,
+  startingCursor: string | undefined,
+  onCursor: (cursor: string) => void,
 ): Promise<{ pages: number; rows: number; malformedRows: number }> {
-  let cursor: string | undefined;
+  let cursor: string | undefined = startingCursor;
   const seenCursors = new Set<string>();
   let pages = 0;
   let rows = 0;
   let malformedRows = 0;
   while (true) {
-    if (pages >= MAX_PAGES_PER_WINDOW) throw new Error("PROVIDER_PAGE_LIMIT_EXCEEDED");
+    if (pages >= MAX_PAGES_PER_WINDOW || budget.pages >= budget.maxPages) throw new Error("PROVIDER_PAGE_BUDGET_EXCEEDED");
     if (cursor && seenCursors.has(cursor)) throw new Error("PROVIDER_CURSOR_REPEATED");
     if (cursor) seenCursors.add(cursor);
     const params: ProviderLedgerReadParams = {
@@ -174,13 +207,18 @@ async function readPaged(
       ...(cursor ? { cursor } : {}),
     };
     const response = providerPage(await read(params));
+    if (budget.rows + response.rows.length > budget.maxRows) throw new Error("PROVIDER_ROW_BUDGET_EXCEEDED");
     pages += 1;
+    budget.pages += 1;
     for (const row of response.rows) {
       rows += 1;
+      budget.rows += 1;
       if (!processRow(row)) malformedRows += 1;
     }
+    if (malformedRows > 0) throw new Error(`PROVIDER_MALFORMED_ROWS_${malformedRows}`);
     if (!response.cursor) break;
     cursor = response.cursor;
+    onCursor(cursor);
   }
   return { pages, rows, malformedRows };
 }
@@ -188,12 +226,12 @@ async function readPaged(
 function buildWindows(nowMs: number, options: ProviderLedgerSyncOptions, previous: ProviderSyncState | null): Window[] {
   const overlapMs = Math.max(0, Math.min(options.overlapMs ?? DEFAULT_OVERLAP_MS, MAX_PROVIDER_WINDOW_MS - 1));
   const lookbackMs = options.mode === "backfill"
-    ? Math.min(options.initialLookbackMs ?? DEFAULT_INITIAL_LOOKBACK_MS, DEFAULT_INITIAL_LOOKBACK_MS)
+    ? Math.min(options.initialLookbackMs ?? DEFAULT_INITIAL_LOOKBACK_MS, MAX_PROVIDER_HISTORY_MS)
     : Math.min(options.recentWindowMs ?? DEFAULT_RECENT_WINDOW_MS, MAX_PROVIDER_WINDOW_MS);
   const previousMs = previous?.lastSuccessfulSyncAt ? Date.parse(previous.lastSuccessfulSyncAt) : NaN;
-  const startMs = Number.isFinite(previousMs) && options.mode === "recent"
-    ? Math.max(0, previousMs - overlapMs)
-    : Math.max(0, nowMs - lookbackMs);
+  const historyFloorMs = nowMs - MAX_PROVIDER_HISTORY_MS;
+  const requestedStartMs = Number.isFinite(previousMs) && options.mode === "recent" ? previousMs - overlapMs : nowMs - lookbackMs;
+  const startMs = Math.max(0, historyFloorMs, requestedStartMs);
   const windows: Window[] = [];
   let cursor = startMs;
   while (cursor < nowMs) {
@@ -209,6 +247,15 @@ function buildWindows(nowMs: number, options: ProviderLedgerSyncOptions, previou
     windows.push({ startMs: nowMs, endMs: nowMs, startIso: iso, endIso: iso });
   }
   return windows;
+}
+
+function windowsForResource(windows: Window[], checkpoint: ProviderResourceCheckpoint | undefined): Window[] {
+  if (!checkpoint?.cursor) return windows;
+  const startMs = Date.parse(checkpoint.windowStart);
+  const endMs = Date.parse(checkpoint.windowEnd);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return windows;
+  const resumeWindow = { startMs, endMs, startIso: checkpoint.windowStart, endIso: checkpoint.windowEnd };
+  return [resumeWindow, ...windows.filter((window) => window.startIso !== resumeWindow.startIso || window.endIso !== resumeWindow.endIso)];
 }
 
 function initialSyncState(category: string, updatedAt: string, previous: ProviderSyncState | null): ProviderSyncState {
