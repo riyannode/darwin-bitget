@@ -3,6 +3,7 @@ import { ZodError } from "zod";
 import type { BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionManagementState, PositionSnapshot, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
+import { syncProviderLedger } from "../bitget/provider-sync.js";
 import { MANDATE_VERSION, PROMPT_VERSIONS, TRADING_MANDATE } from "./mandate.js";
 import { assertOpenPositionCountWithinPlanLimit, buildEvidenceSymbols, calculateActionCapacity, decide, rankMarketCandidates, selectEntryCandidates } from "./decision.js";
 import { QwenJsonError } from "./qwen.js";
@@ -40,6 +41,7 @@ import {
   loadActiveOwnerPolicy,
   clampHistoryLimit,
   recordIdempotency,
+  recordProviderOrderReference,
   recordLessonApplication,
   recordLessonRetrieval,
   saveBacktest,
@@ -70,6 +72,7 @@ import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../re
 import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
 import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } from "../trading/position-management.js";
+import { providerLedgerDiagnostics } from "../storage/provider-ledger.js";
 
 
 interface AgentState {
@@ -390,6 +393,19 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (url.pathname === "/agent-journal" && request.method === "GET") return this.getAgentJournal(url);
     if (url.pathname === "/trade-history" && request.method === "GET") return this.getTradeHistory(url);
     if (url.pathname === "/learning" && request.method === "GET") return this.getLearning(url);
+    if (url.pathname === "/provider-ledger" && request.method === "GET") {
+      ensureStorage(this);
+      const config = loadConfig(this.env, this.ensureActivePolicy());
+      return json(providerLedgerDiagnostics(this, config.bitgetCategory));
+    }
+    if (url.pathname === "/provider-ledger/backfill" && request.method === "POST") {
+      const auth = authorizeOwner(request, this.env);
+      if (!auth.authorized) return json({ error: auth.code }, auth.status);
+      ensureStorage(this);
+      const config = loadConfig(this.env, this.ensureActivePolicy());
+      const result = await syncProviderLedger(new BitgetClient(config), this, { category: config.bitgetCategory, mode: "backfill" });
+      return json({ source: "PROVIDER_READ_ONLY_BACKFILL", ...result, diagnostics: providerLedgerDiagnostics(this, config.bitgetCategory) });
+    }
     if (url.pathname === "/policy" && request.method === "GET") return this.getPolicyRead();
     if (url.pathname === "/export/paper-log" && request.method === "GET") return this.exportPaperLog(url);
     if ((url.pathname === "/control" || url.pathname === "/policy" || url.pathname === "/eva/connection-test") && request.method === "POST") {
@@ -1114,6 +1130,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (!recordIdempotency(this, executionRequest.clientOrderId, cycleId, decision.decisionId, startedAt)) throw new Error("DUPLICATE_ORDER");
     this.recordEvent("PAPER_ORDER_SUBMITTED", cycleId, { symbol: decision.symbol, action: decision.action, decisionType });
     const executionResult = await executePaperOrder(client, executionRequest);
+    if (executionResult.providerOrderId) recordProviderOrderReference(this, executionRequest.clientOrderId, executionResult.providerOrderId);
     this.setState({ ...this.state, runtimeStatus: "RECONCILING", currentStage: "RECONCILING" });
     let positionAfter: PositionSnapshot | undefined;
     let readbackFailure = false;

@@ -68,6 +68,28 @@ describe("Bitget gateway", () => {
     expect(provider.call).toHaveBeenCalledWith("placeOrder", body);
   });
 
+  it("routes bounded read-only provider history actions", async () => {
+    const provider = providerFixture();
+    const handler = createGatewayHandler({ serviceSecret: "service-secret", provider });
+    const headers = { authorization: "Bearer service-secret", "content-type": "application/json" };
+
+    const requests = [
+      ["/v1/bitget/order-history", { category: "USDT-FUTURES", startTime: "1730000000000", endTime: "1730086400000", limit: "100" }],
+      ["/v1/bitget/fill-history", { category: "USDT-FUTURES", startTime: "1730000000000", endTime: "1730086400000", limit: "100", cursor: "cursor-1" }],
+      ["/v1/bitget/positions-history", { category: "USDT-FUTURES", startTime: "1730000000000", endTime: "1730086400000", limit: "100" }],
+      ["/v1/bitget/financial-records", { category: "OTHER", startTime: "1730000000000", endTime: "1730086400000", limit: "100" }],
+    ] as const;
+
+    for (const [path, body] of requests) {
+      const response = await handler(request(path, { method: "POST", headers, body: JSON.stringify(body) }));
+      expect(response.status).toBe(200);
+    }
+
+    expect(provider.call).toHaveBeenCalledWith("getOrderHistory", requests[0][1]);
+    expect(provider.call).toHaveBeenCalledWith("getFillHistory", requests[1][1]);
+    expect(provider.call).toHaveBeenCalledWith("getPositionsHistory", requests[2][1]);
+    expect(provider.call).toHaveBeenCalledWith("getFinancialRecords", requests[3][1]);
+  });
   it("sanitizes provider errors and does not leak credentials", async () => {
     const provider: GatewayProvider = {
       call: vi.fn(async () => { throw Object.assign(new Error("ACCESS-KEY=secret-value"), { code: "403" }); }),

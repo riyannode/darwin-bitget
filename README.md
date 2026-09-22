@@ -97,6 +97,14 @@ The live site reads provider-only `/api/live/portfolio` for current `PROVIDER_LI
 
 The current live PAPER journal is downloadable read-only through the two export endpoints above. It is current autonomous evidence, not the frozen final competition export; the latter remains uncommitted while the collection period continues.
 
+### Provider-verified execution
+
+DARWIN's financial state is read from the linked Bitget PAPER Unified Account. Provider account equity, positions, execution history, and PnL can be independently compared against DARWIN's audit trail.
+
+[View provider evidence →](docs/PROVIDER_EVIDENCE.md)
+
+Reviewers can also download the complete autonomous journal directly from the live dashboard.
+
 ## Deploy Your Own
 
 The public [live site](https://darwin-bitget.vercel.app/) remains the fastest

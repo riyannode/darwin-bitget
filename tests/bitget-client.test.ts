@@ -46,6 +46,25 @@ describe("Bitget read diagnostics", () => {
     } finally { vi.unstubAllGlobals(); }
   });
 
+  it("reads provider ledger resources through the authenticated gateway without financial writes", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => gatewayResponse({ list: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const client = new BitgetClient(gatewayConfig());
+      const params = { category: "USDT-FUTURES", startTime: "1730000000000", endTime: "1730086400000", limit: "100", cursor: "cursor-1" };
+      await client.getOrderHistoryRead(params);
+      await client.getFillHistoryWindowRead(params);
+      await client.getPositionHistoryRead(params);
+      await client.getFinancialRecordsRead({ ...params, category: "OTHER" });
+      expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
+        "/v1/bitget/order-history",
+        "/v1/bitget/fill-history",
+        "/v1/bitget/positions-history",
+        "/v1/bitget/financial-records",
+      ]);
+      expect(fetchMock.mock.calls.every(([input, init]) => init?.method === "POST" && !String(input).includes("place-order"))).toBe(true);
+    } finally { vi.unstubAllGlobals(); }
+  });
   it("keeps account and positions live when open-orders readback is temporarily unavailable", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = new URL(String(input)).pathname;
