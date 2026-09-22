@@ -1,9 +1,9 @@
 # Provider-Verified PAPER Evidence
 
-Runtime: `AUTONOMOUS / PAPER`  
-Commit: `3ad1a64b2a3314be3ca3da6e2571304aa2c23186`  
-Evidence captured: `2026-09-22`  
-Provider: **Bitget Unified Account**
+- Runtime: `AUTONOMOUS / PAPER`
+- Commit: `3ad1a64b2a3314be3ca3da6e2571304aa2c23186`
+- Evidence captured: `2026-09-22`
+- Provider: **Bitget Unified Account**
 
 DARWIN does not treat its internal journal as the financial source of truth.
 
