@@ -13,7 +13,12 @@ export type GatewayLogRecord = Record<string, string | number>;
 export type GatewayLogger = (record: GatewayLogRecord) => void;
 
 const emptyBody = z.object({}).strict();
-const categoryBody = z.object({ category: z.enum(["USDT-FUTURES"]) }).strict();
+const futuresCategory = z.enum(["USDT-FUTURES", "COIN-FUTURES", "USDC-FUTURES"]);
+const tradeHistoryCategory = z.enum(["SPOT", "MARGIN", "USDT-FUTURES", "COIN-FUTURES", "USDC-FUTURES"]);
+const financialCategory = z.enum(["SPOT", "MARGIN", "USDT-FUTURES", "COIN-FUTURES", "USDC-FUTURES", "OTHER"]);
+const timestampField = z.string().regex(/^\d{1,20}$/);
+const limitField = z.string().regex(/^\d{1,3}$/).refine((value) => Number(value) >= 1 && Number(value) <= 100, "limit must be between 1 and 100");
+const categoryBody = z.object({ category: futuresCategory }).strict();
 const setLeverageBody = z.object({
   category: z.enum(["USDT-FUTURES"]),
   symbol: z.string().regex(/^[A-Z0-9]{3,30}$/),
@@ -35,14 +40,37 @@ const orderDetailsBody = z.object({
   clientOid: z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/).optional(),
 }).strict().refine((value) => Boolean(value.orderId || value.clientOid), "orderId or clientOid is required");
 const fillHistoryBody = z.object({
-  category: z.enum(["USDT-FUTURES"]),
-  orderId: z.string().min(1).max(128),
-  limit: z.string().regex(/^\d{1,3}$/),
+  category: tradeHistoryCategory,
+  orderId: z.string().min(1).max(128).optional(),
+  startTime: timestampField.optional(),
+  endTime: timestampField.optional(),
+  limit: limitField,
+  cursor: z.string().min(1).max(256).optional(),
+}).strict().refine((value) => Boolean(value.orderId || value.startTime || value.endTime), "orderId or time window is required");
+const orderHistoryBody = z.object({
+  category: tradeHistoryCategory,
+  symbol: z.string().regex(/^[A-Z0-9]{3,30}$/).optional(),
+  startTime: timestampField.optional(),
+  endTime: timestampField.optional(),
+  limit: limitField,
+  cursor: z.string().min(1).max(256).optional(),
 }).strict();
 const positionsHistoryBody = z.object({
-  category: z.enum(["USDT-FUTURES"]),
-  symbol: z.string().regex(/^[A-Z0-9]{3,30}$/),
-  limit: z.string().regex(/^\d{1,3}$/),
+  category: futuresCategory,
+  symbol: z.string().regex(/^[A-Z0-9]{3,30}$/).optional(),
+  startTime: timestampField.optional(),
+  endTime: timestampField.optional(),
+  limit: limitField,
+  cursor: z.string().min(1).max(256).optional(),
+}).strict();
+const financialRecordsBody = z.object({
+  category: financialCategory,
+  coin: z.string().regex(/^[A-Z0-9]{1,20}$/).optional(),
+  type: z.string().min(1).max(64).optional(),
+  startTime: timestampField.optional(),
+  endTime: timestampField.optional(),
+  limit: limitField,
+  cursor: z.string().min(1).max(256).optional(),
 }).strict();
 
 const ACTIONS: Record<string, { operation: PrivateBitgetOperation; schema: z.ZodType<Record<string, unknown>> }> = {
@@ -54,7 +82,9 @@ const ACTIONS: Record<string, { operation: PrivateBitgetOperation; schema: z.Zod
   "place-order": { operation: "placeOrder", schema: placeOrderBody },
   "order-details": { operation: "getOrderDetails", schema: orderDetailsBody },
   "fill-history": { operation: "getFillHistory", schema: fillHistoryBody },
+  "order-history": { operation: "getOrderHistory", schema: orderHistoryBody },
   "positions-history": { operation: "getPositionsHistory", schema: positionsHistoryBody },
+  "financial-records": { operation: "getFinancialRecords", schema: financialRecordsBody },
 };
 
 const MAX_BODY_BYTES = 32 * 1024;

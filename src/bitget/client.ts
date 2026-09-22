@@ -2,6 +2,7 @@ import { BitgetRestClient, loadConfig as loadBitgetConfig } from "@bitget-ai/bit
 import type { AccountSnapshot, EvidenceBundle, ExecutionResult, ExecutionRequest, Instrument, MarketSnapshot, RuntimeConfig } from "../types.js";
 import { classifyMarketRegime } from "../trading/market-regime.js";
 import { accountForEvidenceSymbol, parseDashboardPortfolio, parseFillSummary, parseHistoricalBars, parseInstruments, parsePositionHistorySummary, parsePositionSymbols, parseTicker, record } from "./types.js";
+import type { ProviderLedgerReadParams } from "./provider-ledger.js";
 import { BitgetGatewayClient, PRIVATE_BITGET_OPERATIONS, type PrivateBitgetOperation } from "./gateway-client.js";
 
 export function formatBitgetReadFailure(operation: string, symbol = "ACCOUNT"): string {
@@ -24,6 +25,10 @@ export class BitgetReadError extends Error {
 
 export function buildOpenOrdersReadParams(category: string): Record<string, string> {
   return { category };
+}
+
+function compactProviderReadParams(params: ProviderLedgerReadParams): Record<string, string> {
+  return Object.fromEntries(Object.entries(params).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
 }
 
 export function executableIntersection(publicInstruments: readonly Instrument[], demoInstruments: readonly Instrument[], category: string): Instrument[] {
@@ -196,6 +201,22 @@ export class BitgetClient {
 
   public async getFillHistoryRead(orderId: string): Promise<unknown> {
     return (await this.callRead<unknown>("getFillHistory", { category: this.category, orderId, limit: "100" })).data;
+  }
+
+  public async getOrderHistoryRead(params: ProviderLedgerReadParams): Promise<unknown> {
+    return (await this.callRead<unknown>("getOrderHistory", compactProviderReadParams(params))).data;
+  }
+
+  public async getFillHistoryWindowRead(params: ProviderLedgerReadParams): Promise<unknown> {
+    return (await this.callRead<unknown>("getFillHistory", compactProviderReadParams(params))).data;
+  }
+
+  public async getPositionHistoryRead(params: ProviderLedgerReadParams): Promise<unknown> {
+    return (await this.callRead<unknown>("getPositionsHistory", compactProviderReadParams(params))).data;
+  }
+
+  public async getFinancialRecordsRead(params: ProviderLedgerReadParams): Promise<unknown> {
+    return (await this.callRead<unknown>("getFinancialRecords", compactProviderReadParams(params))).data;
   }
 
   public async getDashboardPortfolio(): Promise<AccountSnapshot> {

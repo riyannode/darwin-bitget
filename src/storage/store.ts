@@ -485,6 +485,14 @@ export function loadAllEvents(executor: SqlExecutor): ActivityEvent[] {
   });
 }
 
+export function recordProviderOrderReference(executor: SqlExecutor, clientOrderId: string, providerOrderId: string): void {
+  executor.sql`
+    UPDATE idempotency
+    SET provider_order_id = ${providerOrderId}
+    WHERE client_order_id = ${clientOrderId}
+  `;
+}
+
 export function recordIdempotency(
   executor: SqlExecutor,
   clientOrderId: string,

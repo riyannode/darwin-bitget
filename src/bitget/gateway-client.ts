@@ -19,7 +19,9 @@ export const PRIVATE_BITGET_OPERATIONS = [
   "placeOrder",
   "getOrderDetails",
   "getFillHistory",
+  "getOrderHistory",
   "getPositionsHistory",
+  "getFinancialRecords",
 ] as const;
 
 export type PrivateBitgetOperation = (typeof PRIVATE_BITGET_OPERATIONS)[number];
@@ -33,7 +35,9 @@ const ROUTES: Record<PrivateBitgetOperation, string> = {
   placeOrder: "/v1/bitget/place-order",
   getOrderDetails: "/v1/bitget/order-details",
   getFillHistory: "/v1/bitget/fill-history",
+  getOrderHistory: "/v1/bitget/order-history",
   getPositionsHistory: "/v1/bitget/positions-history",
+  getFinancialRecords: "/v1/bitget/financial-records",
 };
 
 export interface BitgetGatewayResponse<T> {
