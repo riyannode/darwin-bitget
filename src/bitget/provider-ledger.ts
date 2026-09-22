@@ -1,6 +1,6 @@
 import { addDecimal, isDecimal } from "../trading/decimal.js";
 
-export type ProviderOrigin = "DARWIN" | "PROVIDER_EXTERNAL";
+export type ProviderOrigin = "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
 
 export interface ProviderLedgerReadParams {
   category: string;
@@ -67,10 +67,17 @@ export interface ProviderPositionHistoryRecord {
   closingTime: string;
   avgEntryPrice: string | null;
   avgExitPrice: string | null;
+  openTotalPos: string | null;
+  closeTotalPos: string | null;
+  /** Derived convenience alias of closeTotalPos; not a provider-native authority field. */
   closingQuantity: string;
+  cumRealisedPnl: string | null;
+  netProfit: string | null;
+  /** Derived convenience alias of openTotalPos; not a provider-native authority field. */
   maxPositionSize: string | null;
   closingValue: string | null;
   maxPositionValue: string | null;
+  /** Derived convenience alias of netProfit; cumRealisedPnl and netProfit remain separate. */
   positionPnl: string | null;
   positionRoi: string | null;
   openFeeTotal: string | null;
@@ -87,6 +94,7 @@ export interface ProviderFinancialRecord {
   category: string;
   symbol: string | null;
   type: string;
+  positionType: string | null;
   coin: string | null;
   amount: string | null;
   fee: string | null;
@@ -196,7 +204,7 @@ export function normalizeProviderFill(value: unknown, origin: ProviderOrigin, ob
   };
 }
 
-export function normalizeProviderPositionHistory(value: unknown, observedAt: string, origin: ProviderOrigin = "PROVIDER_EXTERNAL"): ProviderPositionHistoryRecord | null {
+export function normalizeProviderPositionHistory(value: unknown, observedAt: string, origin: ProviderOrigin = "UNATTRIBUTED"): ProviderPositionHistoryRecord | null {
   const row = asRecord(value);
   const category = text(row.category);
   const symbol = text(row.symbol);
@@ -214,13 +222,17 @@ export function normalizeProviderPositionHistory(value: unknown, observedAt: str
     positionSide,
     openingTime: openingTime ?? "",
     closingTime: closingTime ?? "",
-    avgEntryPrice: decimalText(row.openAvgPrice ?? row.avgOpenPrice ?? row.openPriceAvg ?? row.entryPrice),
-    avgExitPrice: decimalText(row.closeAvgPrice ?? row.avgClosePrice ?? row.closePriceAvg ?? row.exitPrice),
-    closingQuantity: decimalText(row.closeTotalPos ?? row.closeTotal ?? row.closeQty ?? row.closeQuantity ?? row.total) ?? "0",
-    maxPositionSize: decimalText(row.openTotalPos ?? row.maxPositionSize ?? row.maxSize),
+    avgEntryPrice: decimalText(row.openPriceAvg ?? row.openAvgPrice ?? row.avgOpenPrice ?? row.entryPrice),
+    avgExitPrice: decimalText(row.closePriceAvg ?? row.closeAvgPrice ?? row.avgClosePrice ?? row.exitPrice),
+    openTotalPos: decimalText(row.openTotalPos),
+    closeTotalPos: decimalText(row.closeTotalPos),
+    closingQuantity: decimalText(row.closeTotalPos) ?? "0",
+    cumRealisedPnl: decimalText(row.cumRealisedPnl),
+    netProfit: decimalText(row.netProfit),
+    maxPositionSize: decimalText(row.openTotalPos),
     closingValue: decimalText(row.closePositionValue ?? row.closeValue ?? row.positionValue),
     maxPositionValue: decimalText(row.maxPositionValue),
-    positionPnl: decimalText(row.netProfit ?? row.pnl ?? row.cumRealisedPnl ?? row.realizedPnl),
+    positionPnl: decimalText(row.netProfit),
     positionRoi: decimalText(row.roi ?? row.profitRate),
     openFeeTotal: decimalText(row.openFeeTotal ?? row.openFee),
     closeFeeTotal: decimalText(row.closeFeeTotal ?? row.closeFee),
@@ -231,7 +243,7 @@ export function normalizeProviderPositionHistory(value: unknown, observedAt: str
   };
 }
 
-export function normalizeProviderFinancialRecord(value: unknown, observedAt: string, origin: ProviderOrigin = "PROVIDER_EXTERNAL"): ProviderFinancialRecord | null {
+export function normalizeProviderFinancialRecord(value: unknown, observedAt: string, origin: ProviderOrigin = "UNATTRIBUTED"): ProviderFinancialRecord | null {
   const row = asRecord(value);
   const category = text(row.category);
   const type = text(row.type);
@@ -245,6 +257,7 @@ export function normalizeProviderFinancialRecord(value: unknown, observedAt: str
     category,
     symbol: nullableText(row.symbol),
     type,
+    positionType: nullableText(row.positionType),
     coin: nullableText(row.coin),
     amount: decimalText(row.amount),
     fee: decimalText(row.fee),

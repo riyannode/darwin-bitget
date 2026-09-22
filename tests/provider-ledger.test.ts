@@ -91,19 +91,18 @@ function positionHistoryFixture(overrides: Record<string, unknown> = {}) {
     category,
     symbol: "CRCLUSDT",
     posSide: "long",
-    openTime: "1730181468493",
-    closeTime: "1730182468493",
-    openAvgPrice: "96.15",
-    closeAvgPrice: "101.25",
-    closeTotal: "3.25",
-    maxPositionSize: "3.25",
-    closePositionValue: "329.06",
-    maxPositionValue: "312.5",
+    openPriceAvg: "96.15",
+    closePriceAvg: "101.25",
+    openTotalPos: "3.25",
+    closeTotalPos: "3.25",
+    cumRealisedPnl: "16.706",
     netProfit: "16.575",
-    profitRate: "0.053",
+    totalFunding: "-0.01",
     openFeeTotal: "0.125",
     closeFeeTotal: "0.131",
-    totalFunding: "-0.01",
+    cashDividend: "0",
+    createdTime: "1730181468493",
+    updatedTime: "1730182468493",
     ...overrides,
   };
 }
@@ -114,6 +113,7 @@ function financialFixture(overrides: Record<string, unknown> = {}) {
     category,
     symbol: "CRCLUSDT",
     type: "ORDER_DEALT_IN",
+    positionType: "crossed",
     coin: "USDT",
     amount: "312.5",
     fee: "-0.125",
@@ -140,8 +140,8 @@ describe("provider ledger normalization", () => {
 
     expect(order).toMatchObject({ providerOrderId: "order-1", qty: "3.25", avgPrice: "96.15384615", feeTotal: "0.125", origin: "DARWIN" });
     expect(fill).toMatchObject({ execId: "fill-1", execQty: "3.25", execPrice: "96.15384615", feeTotal: "0.125", origin: "DARWIN" });
-    expect(history).toMatchObject({ providerPositionHistoryKey: "position-1", positionSide: "LONG", closingQuantity: "3.25", positionPnl: "16.575" });
-    expect(financial).toMatchObject({ providerRecordKey: "USDT-FUTURES:financial-1", providerRecordId: "financial-1", amount: "312.5" });
+    expect(history).toMatchObject({ providerPositionHistoryKey: "position-1", positionSide: "LONG", closingQuantity: "3.25", positionPnl: "16.575", origin: "UNATTRIBUTED" });
+    expect(financial).toMatchObject({ providerRecordKey: "USDT-FUTURES:financial-1", providerRecordId: "financial-1", positionType: "crossed", amount: "312.5", origin: "UNATTRIBUTED" });
     expect(order?.rawProviderJson).toContain("order-1");
     expect(fill?.rawProviderJson).toContain("fill-1");
     expect(history?.rawProviderJson).toContain("position-1");
@@ -156,11 +156,12 @@ describe("provider ledger normalization", () => {
       updatedTime: "1730182468493",
       openTotalPos: "8.5",
       closeTotalPos: "8.5",
-      openAvgPrice: "96.15",
-      closeAvgPrice: "101.25",
+      openPriceAvg: "96.15",
+      closePriceAvg: "101.25",
+      cumRealisedPnl: "16.575",
       netProfit: "16.575",
     }, observedAt);
-    expect(actualFieldNames).toMatchObject({ openingTime: "2024-10-29T05:57:48.493Z", closingQuantity: "8.5", maxPositionSize: "8.5" });
+    expect(actualFieldNames).toMatchObject({ openingTime: "2024-10-29T05:57:48.493Z", closingQuantity: "8.5", openTotalPos: "8.5", closeTotalPos: "8.5", cumRealisedPnl: "16.575", netProfit: "16.575", maxPositionSize: "8.5" });
   });
 
   it("rejects malformed provider rows and fingerprints rows without provider IDs", () => {
@@ -200,12 +201,23 @@ describe("provider ledger persistence and sync", () => {
     expect((db.prepare("SELECT amount FROM provider_financial_records WHERE provider_record_key = 'USDT-FUTURES:financial-1'").get() as { amount: string }).amount).toBe("313");
   });
 
+  it("persists historical orders that reuse a client OID", () => {
+    const { db, executor } = memoryExecutor();
+    const first = normalizeProviderOrder(orderFixture({ orderId: "reuse-1", createdTime: "1730181468493", updatedTime: "1730181468593" }), "PROVIDER_EXTERNAL", observedAt)!;
+    const second = normalizeProviderOrder(orderFixture({ orderId: "reuse-2", createdTime: "1730182468493", updatedTime: "1730182468593" }), "PROVIDER_EXTERNAL", observedAt)!;
+
+    upsertProviderOrder(executor, first, observedAt);
+    upsertProviderOrder(executor, second, "2026-09-22T00:01:00.000Z");
+
+    expect((db.prepare("SELECT COUNT(*) AS count FROM provider_orders WHERE category = 'USDT-FUTURES' AND client_oid = 'paper-cycle-1'").get() as { count: number }).count).toBe(2);
+  });
+
   it("attributes DARWIN and external orders using durable idempotency, not prefixes", () => {
     const { db, executor } = memoryExecutor();
     recordIdempotency(executor, "paper-cycle-1", "cycle-1", "decision-1", observedAt);
     recordProviderOrderReference(executor, "paper-cycle-1", "order-1");
     const darwin = normalizeProviderOrder(orderFixture(), resolveProviderOrigin(executor, "order-1", "paper-cycle-1"), observedAt)!;
-    const external = normalizeProviderOrder(orderFixture({ orderId: "order-2", clientOid: "paper-not-in-idempotency" }), resolveProviderOrigin(executor, "order-2", "paper-not-in-idempotency"), observedAt)!;
+    const external = normalizeProviderOrder(orderFixture({ orderId: "order-2", clientOid: "paper-not-in-idempotency" }), resolveProviderOrigin(executor, "order-2", "paper-not-in-idempotency", "PROVIDER_EXTERNAL"), observedAt)!;
     upsertProviderOrder(executor, darwin, observedAt);
     upsertProviderOrder(executor, external, observedAt);
 
@@ -333,12 +345,14 @@ describe("provider ledger persistence and sync", () => {
     const fill = normalizeProviderFill(fillFixture(), "DARWIN", observedAt)!;
     upsertProviderOrder(executor, order, observedAt);
     upsertProviderFill(executor, fill, observedAt);
+    upsertProviderPositionHistory(executor, normalizeProviderPositionHistory(positionHistoryFixture(), observedAt)!, observedAt);
+    upsertProviderFinancialRecord(executor, normalizeProviderFinancialRecord(financialFixture(), observedAt)!, observedAt);
     upsertProviderOrder(executor, normalizeProviderOrder(orderFixture({ orderId: "external", clientOid: "external-1" }), "PROVIDER_EXTERNAL", observedAt)!, observedAt);
 
     const diagnostics = providerLedgerDiagnostics(executor, category);
 
-    expect(diagnostics.counts).toEqual({ orders: 2, fills: 1, positionHistory: 0, financialRecords: 0 });
-    expect(diagnostics.origins).toEqual({ DARWIN: 2, PROVIDER_EXTERNAL: 1 });
+    expect(diagnostics.counts).toEqual({ orders: 2, fills: 1, positionHistory: 1, financialRecords: 1 });
+    expect(diagnostics.origins).toEqual({ DARWIN: 2, PROVIDER_EXTERNAL: 1, UNATTRIBUTED: 2 });
     expect(JSON.stringify(diagnostics)).not.toContain("order-1");
   });
 });

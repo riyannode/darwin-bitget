@@ -40,6 +40,7 @@ export interface ProviderLedgerDiagnostics {
   origins: {
     DARWIN: number;
     PROVIDER_EXTERNAL: number;
+    UNATTRIBUTED: number;
   };
   sync: ProviderSyncState | null;
   lastPartialOrFailureReason: string | null;
@@ -63,7 +64,7 @@ interface SyncStateRow {
   updated_at: string;
 }
 
-export function resolveProviderOrigin(executor: SqlExecutor, providerOrderId: string | null, clientOid: string | null): ProviderOrigin {
+export function resolveProviderOrigin(executor: SqlExecutor, providerOrderId: string | null, clientOid: string | null, fallback: ProviderOrigin = "UNATTRIBUTED"): ProviderOrigin {
   if (clientOid) {
     const idempotency = executor.sql<{ client_order_id: string }>`SELECT client_order_id FROM idempotency WHERE client_order_id = ${clientOid} LIMIT 1`;
     if (idempotency.length > 0) return "DARWIN";
@@ -74,7 +75,7 @@ export function resolveProviderOrigin(executor: SqlExecutor, providerOrderId: st
     const existing = executor.sql<{ origin: ProviderOrigin }>`SELECT origin FROM provider_orders WHERE provider_order_id = ${providerOrderId} LIMIT 1`;
     if (existing[0]?.origin === "DARWIN") return "DARWIN";
   }
-  return "PROVIDER_EXTERNAL";
+  return fallback;
 }
 
 export function upsertProviderOrder(executor: SqlExecutor, record: ProviderOrderRecord, observedAt: string): void {
@@ -154,12 +155,14 @@ export function upsertProviderPositionHistory(executor: SqlExecutor, record: Pro
     INSERT INTO provider_position_history (
       provider_position_history_key, provider_position_history_id, category, symbol,
       position_side, opening_time, closing_time, avg_entry_price, avg_exit_price,
+      open_total_pos, close_total_pos, cum_realised_pnl, net_profit,
       closing_quantity, max_position_size, closing_value, max_position_value,
       position_pnl, position_roi, open_fee_total, close_fee_total, total_funding,
       cash_dividend, origin, raw_provider_json, first_seen_at, last_seen_at
     ) VALUES (
       ${record.providerPositionHistoryKey}, ${record.providerPositionHistoryId}, ${record.category}, ${record.symbol},
       ${record.positionSide}, ${record.openingTime}, ${record.closingTime}, ${record.avgEntryPrice}, ${record.avgExitPrice},
+      ${record.openTotalPos}, ${record.closeTotalPos}, ${record.cumRealisedPnl}, ${record.netProfit},
       ${record.closingQuantity}, ${record.maxPositionSize}, ${record.closingValue}, ${record.maxPositionValue},
       ${record.positionPnl}, ${record.positionRoi}, ${record.openFeeTotal}, ${record.closeFeeTotal}, ${record.totalFunding},
       ${record.cashDividend}, ${record.origin}, ${record.rawProviderJson}, ${observedAt}, ${observedAt}
@@ -173,6 +176,10 @@ export function upsertProviderPositionHistory(executor: SqlExecutor, record: Pro
       closing_time = excluded.closing_time,
       avg_entry_price = excluded.avg_entry_price,
       avg_exit_price = excluded.avg_exit_price,
+      open_total_pos = excluded.open_total_pos,
+      close_total_pos = excluded.close_total_pos,
+      cum_realised_pnl = excluded.cum_realised_pnl,
+      net_profit = excluded.net_profit,
       closing_quantity = excluded.closing_quantity,
       max_position_size = excluded.max_position_size,
       closing_value = excluded.closing_value,
@@ -192,11 +199,11 @@ export function upsertProviderPositionHistory(executor: SqlExecutor, record: Pro
 export function upsertProviderFinancialRecord(executor: SqlExecutor, record: ProviderFinancialRecord, observedAt: string): void {
   executor.sql`
     INSERT INTO provider_financial_records (
-      provider_record_key, provider_record_id, category, symbol, type, coin, amount,
+      provider_record_key, provider_record_id, category, symbol, type, position_type, coin, amount,
       fee, position_amount, position_balance, balance, provider_timestamp,
       origin, raw_provider_json, first_seen_at, last_seen_at
     ) VALUES (
-      ${record.providerRecordKey}, ${record.providerRecordId}, ${record.category}, ${record.symbol}, ${record.type}, ${record.coin}, ${record.amount},
+      ${record.providerRecordKey}, ${record.providerRecordId}, ${record.category}, ${record.symbol}, ${record.type}, ${record.positionType}, ${record.coin}, ${record.amount},
       ${record.fee}, ${record.positionAmount}, ${record.positionBalance}, ${record.balance}, ${record.providerTimestamp},
       ${record.origin}, ${record.rawProviderJson}, ${observedAt}, ${observedAt}
     )
@@ -205,6 +212,7 @@ export function upsertProviderFinancialRecord(executor: SqlExecutor, record: Pro
       category = excluded.category,
       symbol = excluded.symbol,
       type = excluded.type,
+      position_type = excluded.position_type,
       coin = excluded.coin,
       amount = excluded.amount,
       fee = excluded.fee,
@@ -265,7 +273,7 @@ export function providerLedgerDiagnostics(executor: SqlExecutor, category: strin
           : executor.sql<CountRow>`SELECT COUNT(*) AS count FROM provider_financial_records WHERE category = ${category}`;
     return Number(rows[0]?.count ?? 0);
   };
-  const origins = { DARWIN: 0, PROVIDER_EXTERNAL: 0 };
+  const origins = { DARWIN: 0, PROVIDER_EXTERNAL: 0, UNATTRIBUTED: 0 };
   const originTables = ["provider_orders", "provider_fills", "provider_position_history", "provider_financial_records"] as const;
   for (const table of originTables) {
     const rows = table === "provider_orders"

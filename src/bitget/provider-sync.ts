@@ -137,7 +137,7 @@ export async function syncProviderLedger(
   };
 
   await run("historyOrders", client.getOrderHistoryRead.bind(client), (row) => {
-    const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid));
+    const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid), "PROVIDER_EXTERNAL");
     const record = normalizeProviderOrder(row, origin, observedAt);
     if (!record) return false;
     upsertProviderOrder(executor, record, observedAt);

@@ -34,7 +34,7 @@ export function ensureStorage(executor: SqlExecutor): void {
     fee_details_json TEXT,
     created_time TEXT NOT NULL,
     updated_time TEXT NOT NULL,
-    origin TEXT NOT NULL CHECK (origin IN ('DARWIN', 'PROVIDER_EXTERNAL')),
+    origin TEXT NOT NULL CHECK (origin IN ('DARWIN', 'PROVIDER_EXTERNAL', 'UNATTRIBUTED')),
     raw_provider_json TEXT NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL
@@ -56,7 +56,7 @@ export function ensureStorage(executor: SqlExecutor): void {
     fee_details_json TEXT,
     created_time TEXT NOT NULL,
     updated_time TEXT,
-    origin TEXT NOT NULL CHECK (origin IN ('DARWIN', 'PROVIDER_EXTERNAL')),
+    origin TEXT NOT NULL CHECK (origin IN ('DARWIN', 'PROVIDER_EXTERNAL', 'UNATTRIBUTED')),
     raw_provider_json TEXT NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL
@@ -71,6 +71,10 @@ export function ensureStorage(executor: SqlExecutor): void {
     closing_time TEXT NOT NULL,
     avg_entry_price TEXT,
     avg_exit_price TEXT,
+    open_total_pos TEXT,
+    close_total_pos TEXT,
+    cum_realised_pnl TEXT,
+    net_profit TEXT,
     closing_quantity TEXT NOT NULL,
     max_position_size TEXT,
     closing_value TEXT,
@@ -81,7 +85,7 @@ export function ensureStorage(executor: SqlExecutor): void {
     close_fee_total TEXT,
     total_funding TEXT,
     cash_dividend TEXT,
-    origin TEXT NOT NULL CHECK (origin IN ('DARWIN', 'PROVIDER_EXTERNAL')),
+    origin TEXT NOT NULL CHECK (origin IN ('DARWIN', 'PROVIDER_EXTERNAL', 'UNATTRIBUTED')),
     raw_provider_json TEXT NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL
@@ -92,6 +96,7 @@ export function ensureStorage(executor: SqlExecutor): void {
     category TEXT NOT NULL,
     symbol TEXT,
     type TEXT NOT NULL,
+    position_type TEXT,
     coin TEXT,
     amount TEXT,
     fee TEXT,
@@ -99,7 +104,7 @@ export function ensureStorage(executor: SqlExecutor): void {
     position_balance TEXT,
     balance TEXT,
     provider_timestamp TEXT NOT NULL,
-    origin TEXT NOT NULL CHECK (origin IN ('DARWIN', 'PROVIDER_EXTERNAL')),
+    origin TEXT NOT NULL CHECK (origin IN ('DARWIN', 'PROVIDER_EXTERNAL', 'UNATTRIBUTED')),
     raw_provider_json TEXT NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL
@@ -113,9 +118,15 @@ export function ensureStorage(executor: SqlExecutor): void {
     updated_at TEXT NOT NULL
   )`;
   const positionHistoryColumns = executor.sql<{ name: string }>`SELECT name FROM pragma_table_info('provider_position_history')`;
-  if (!positionHistoryColumns.some((column) => column.name === "origin")) executor.sql`ALTER TABLE provider_position_history ADD COLUMN origin TEXT NOT NULL DEFAULT 'PROVIDER_EXTERNAL'`;
+  if (!positionHistoryColumns.some((column) => column.name === "open_total_pos")) executor.sql`ALTER TABLE provider_position_history ADD COLUMN open_total_pos TEXT`;
+  if (!positionHistoryColumns.some((column) => column.name === "close_total_pos")) executor.sql`ALTER TABLE provider_position_history ADD COLUMN close_total_pos TEXT`;
+  if (!positionHistoryColumns.some((column) => column.name === "cum_realised_pnl")) executor.sql`ALTER TABLE provider_position_history ADD COLUMN cum_realised_pnl TEXT`;
+  if (!positionHistoryColumns.some((column) => column.name === "net_profit")) executor.sql`ALTER TABLE provider_position_history ADD COLUMN net_profit TEXT`;
+  if (!positionHistoryColumns.some((column) => column.name === "origin")) executor.sql`ALTER TABLE provider_position_history ADD COLUMN origin TEXT NOT NULL DEFAULT 'UNATTRIBUTED'`;
   const financialRecordColumns = executor.sql<{ name: string }>`SELECT name FROM pragma_table_info('provider_financial_records')`;
-  if (!financialRecordColumns.some((column) => column.name === "origin")) executor.sql`ALTER TABLE provider_financial_records ADD COLUMN origin TEXT NOT NULL DEFAULT 'PROVIDER_EXTERNAL'`;
+  if (!financialRecordColumns.some((column) => column.name === "position_type")) executor.sql`ALTER TABLE provider_financial_records ADD COLUMN position_type TEXT`;
+  if (!financialRecordColumns.some((column) => column.name === "origin")) executor.sql`ALTER TABLE provider_financial_records ADD COLUMN origin TEXT NOT NULL DEFAULT 'UNATTRIBUTED'`;
+  executor.sql`DROP INDEX IF EXISTS provider_orders_category_client_oid_uq`;
   executor.sql`CREATE INDEX IF NOT EXISTS journals_created_at_idx ON journals(created_at DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS experiences_created_at_idx ON experiences(created_at DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS position_context_symbol_idx ON position_context(symbol, position_side)`;
@@ -125,7 +136,6 @@ export function ensureStorage(executor: SqlExecutor): void {
   executor.sql`CREATE INDEX IF NOT EXISTS backtests_created_at_idx ON backtests(created_at DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_orders_category_updated_idx ON provider_orders(category, updated_time DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_orders_client_oid_idx ON provider_orders(client_oid)`;
-  executor.sql`CREATE UNIQUE INDEX IF NOT EXISTS provider_orders_category_client_oid_uq ON provider_orders(category, client_oid) WHERE client_oid IS NOT NULL`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_order_created_idx ON provider_fills(provider_order_id, created_time)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_category_created_idx ON provider_fills(category, created_time DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_client_oid_idx ON provider_fills(client_oid)`;

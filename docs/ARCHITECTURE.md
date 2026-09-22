@@ -60,6 +60,13 @@ The performance aggregate stores `totalTrades`, `openTrades`, `closedTrades`, wi
 
 The position-context read model is keyed by `symbol:positionSide`. It preserves verified original entry reasoning from `TradeExperience` plus its original Decision and tracks bounded latest management events only at or after the current lifecycle's entry time. A verified same-side re-entry replaces the entry linkage and resets management history. It never uses failed, blocked, unresolved, synthetic, or opposite-side entries as live-position origin. Provider state answers what position exists; persisted structured evidence answers why DARWIN opened or manages it. This is not chain-of-thought.
 
+### Provider ledger Phase 1 scope
+
+The Phase 1 provider ledger currently syncs the configured DARWIN trading category,
+which is `USDT-FUTURES` in the production configuration. This is not yet a
+complete multi-category Unified Account financial mirror. Future full-account
+coverage must separately sync relevant financial categories such as `OTHER`.
+
 ## Authority boundary
 
 Qwen proposes rationale, evidence references, position management, and new entries. Qwen is not financial authority. Deterministic TypeScript owns plan validation, supported-universe and open-position checks, owner policy, risk gates, idempotency, execution ordering, provider readback, reconciliation, and write count.
