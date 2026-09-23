@@ -211,7 +211,7 @@ export function loadOpenExperiences(executor: SqlExecutor, limit = MAX_HISTORY_L
 }
 
 const MAX_FALLBACK_JOURNAL_ROWS = 25;
-const MAX_FALLBACK_JOURNAL_BYTES = 256 * 1024;
+const MAX_LOOKUP_JOURNAL_BYTES = 256 * 1024;
 const MAX_FALLBACK_JSON_NODES = 20_000;
 
 function journalContainsAnyDecisionId(payload: string, decisionIds: ReadonlySet<string>): boolean {
@@ -252,6 +252,7 @@ export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: r
     FROM journals AS j
     JOIN journal_decision_lookup AS indexed ON indexed.cycle_id = j.cycle_id
     JOIN json_each(${JSON.stringify(requested)}) AS requested ON requested.value = indexed.decision_id
+    WHERE length(CAST(j.payload AS BLOB)) <= ${MAX_LOOKUP_JOURNAL_BYTES}
     GROUP BY j.cycle_id
     ORDER BY MAX(j.created_at) DESC, j.cycle_id
     LIMIT ${maxRows}
@@ -272,7 +273,7 @@ export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: r
   }
   const missingIds = requested.filter((id) => !indexedIds.has(id));
   if (missingIds.length > 0) {
-    const fallbackRows = executor.sql<JournalRow>`WITH recent_journals AS MATERIALIZED (SELECT cycle_id FROM journals ORDER BY created_at DESC LIMIT ${MAX_FALLBACK_JOURNAL_ROWS}) SELECT journal.payload FROM recent_journals JOIN journals AS journal USING (cycle_id) WHERE length(CAST(journal.payload AS BLOB)) <= ${MAX_FALLBACK_JOURNAL_BYTES}`;
+    const fallbackRows = executor.sql<JournalRow>`WITH recent_journals AS MATERIALIZED (SELECT cycle_id FROM journals ORDER BY created_at DESC LIMIT ${MAX_FALLBACK_JOURNAL_ROWS}) SELECT journal.payload FROM recent_journals JOIN journals AS journal USING (cycle_id) WHERE length(CAST(journal.payload AS BLOB)) <= ${MAX_LOOKUP_JOURNAL_BYTES}`;
     const missingSet = new Set(missingIds);
     for (const row of fallbackRows) {
       if (!journalContainsAnyDecisionId(row.payload, missingSet)) continue;

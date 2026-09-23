@@ -91,13 +91,32 @@ describe("journal decision lookup without global backfill", () => {
     db.close();
   });
 
-  it("skips a single legacy payload larger than the bounded fallback byte budget", () => {
-    const oversized = JSON.stringify({ cycleId: "oversized-cycle", decision: { decisionId: "oversized-decision" }, padding: "x".repeat(256 * 1024) });
+  it("skips oversized payloads on both indexed and fallback lookup paths", () => {
+    const oversized = JSON.stringify({ cycleId: "oversized-cycle", decision: { decisionId: "oversized-fallback-decision" }, padding: "x".repeat(256 * 1024) });
     const db = createDatabase([{ cycleId: "oversized-cycle", createdAt: "2026-09-24T00:00:00.000Z", payload: oversized }]);
+    const queries: string[] = [];
+    const executor = sqliteExecutor(db, queries);
+    ensureStorage(executor);
+
+    expect(loadJournalsForDecisionIds(executor, ["oversized-fallback-decision"])).toEqual([]);
+    const fallbackQuery = queries.find((query) => query.includes("WITH recent_journals AS MATERIALIZED"));
+    expect(fallbackQuery).toContain("length(CAST(journal.payload AS BLOB))");
+
+    const indexedPayload = JSON.stringify({ cycleId: "oversized-indexed-cycle", decision: { decisionId: "oversized-indexed-decision" }, padding: "x".repeat(256 * 1024) });
+    db.prepare("INSERT INTO journals (cycle_id, payload, created_at) VALUES (?, ?, ?)").run("oversized-indexed-cycle", indexedPayload, "2026-09-25T00:00:00.000Z");
+    expect(loadJournalsForDecisionIds(executor, ["oversized-indexed-decision"])).toEqual([]);
+    const indexedQuery = queries.find((query) => query.includes("JOIN journal_decision_lookup"));
+    expect(indexedQuery).toContain("length(CAST(j.payload AS BLOB))");
+    db.close();
+  });
+
+  it("does not search older unindexed journals outside the 25-row fallback window", () => {
+    const rows = [historicalJournal("outside-window", "too-old-decision", "2026-09-01T00:00:00.000Z"), ...Array.from({ length: 25 }, (_, index) => historicalJournal(`recent-${index}`, `recent-decision-${index}`, new Date(Date.UTC(2026, 8, 2) + index * 60_000).toISOString()))];
+    const db = createDatabase(rows);
     const executor = sqliteExecutor(db);
     ensureStorage(executor);
 
-    expect(loadJournalsForDecisionIds(executor, ["oversized-decision"])).toEqual([]);
+    expect(loadJournalsForDecisionIds(executor, ["too-old-decision"])).toEqual([]);
     db.close();
   });
 
