@@ -52,6 +52,8 @@ import {
   saveExperience,
   saveJournal,
   saveLesson,
+  hasEvent,
+  persistProviderLifecycleRepair,
 } from "../storage/store.js";
 import { buildPaperLogExport, parsePaperLogPeriod, paperLogToCsv } from "../storage/paper-log.js";
 import { cyclePlanDecisions, cycleReadModel, normalizeCycleDecisions } from "../storage/journal-normalizer.js";
@@ -61,7 +63,7 @@ import { loadOwnerPolicy, updateOwnerPolicy } from "../trading/policy.js";
 import { buildExecutionRequest, executePaperOrder } from "../trading/execution.js";
 import { executeCyclePlan } from "../trading/execution-planner.js";
 import { reconcileExecution } from "../trading/reconcile.js";
-import { addDecimal, isDecimal, isPositiveDecimal } from "../trading/decimal.js";
+import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal } from "../trading/decimal.js";
 import { bootstrapPerformance, buildPerformanceAccounting, currentMonthDailyPnl, emptyPerformance, isPerformanceAggregate, POSITION_CONTEXT_READ_MODEL_VERSION, recordVerifiedClose, recordVerifiedOpen, recordVerifiedPartial, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate, type PerformanceObservation } from "../trading/performance.js";
 import { bootstrapPositionContexts, decisionReasoning, upsertPositionContext } from "./position-context.js";
 import { isReadbackOnlyExecutionMismatch, parseProviderFillEvidence, parseProviderOrderEvidence, reconcileLateExecution } from "../trading/late-reconciliation.js";
@@ -72,7 +74,8 @@ import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../re
 import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
 import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } from "../trading/position-management.js";
-import { providerLedgerDiagnostics } from "../storage/provider-ledger.js";
+import { providerLedgerDiagnostics, loadProviderLifecycleEvidence } from "../storage/provider-ledger.js";
+import { classifyProviderLifecycle, type ProviderLifecycleHistory } from "../trading/provider-lifecycle-reconciliation.js";
 
 
 interface AgentState {
@@ -428,6 +431,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
           return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "LATE_RECONCILIATION_FAILED" : "LATE_RECONCILIATION_FAILED" }, 409);
         }
       }
+      if (body.action === "REPAIR_PROVIDER_CLOSED_LIFECYCLE") {
+        try {
+          return json({ reconciliation: await this.repairProviderClosedLifecycle(body.experienceId, body.providerPositionHistoryId) });
+        } catch (error) {
+          return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "PROVIDER_LIFECYCLE_REPAIR_FAILED" : "PROVIDER_LIFECYCLE_REPAIR_FAILED" }, 409);
+        }
+      }
       return json(await this.getDashboardSnapshot());
     }
     if (url.pathname === "/policy" && request.method === "POST") {
@@ -669,6 +679,70 @@ export class TraderAgent extends Agent<Env, AgentState> {
       states.push(result.state);
     }
     return states;
+  }
+
+  public async repairProviderClosedLifecycle(experienceId: string, providerPositionHistoryId: string): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string; providerPositionHistoryId: string }> {
+    if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
+    ensureStorage(this);
+    const experience = loadAllExperiences(this).find((candidate) => candidate.experienceId === experienceId);
+    if (!experience) throw new Error("EXPERIENCE_NOT_FOUND");
+    const eventId = providerLifecycleRepairEventId(experienceId, providerPositionHistoryId);
+    if (experience.financialSource === "PROVIDER_LEDGER" && experience.providerPositionHistoryId === providerPositionHistoryId && experience.outcomeStatus !== "OPEN") {
+      if (!hasEvent(this, eventId)) throw new Error("PROVIDER_LIFECYCLE_REPAIR_STATE_INCONSISTENT");
+      return { status: "ALREADY_RECONCILED", experienceId, providerPositionHistoryId };
+    }
+    if (experience.outcomeStatus !== "OPEN" || !experience.positionSide) throw new Error("LOCAL_LIFECYCLE_NOT_OPEN");
+
+    const context = loadPositionContext(this, experience.symbol, experience.positionSide);
+    if (!context || context.entryDecisionId !== experience.entryDecisionId || (context.experienceId && context.experienceId !== experience.experienceId)) {
+      throw new Error("POSITION_CONTEXT_IDENTITY_MISMATCH");
+    }
+    const config = loadConfig(this.env, this.ensureActivePolicy());
+    const portfolio = await new BitgetClient(config).getDashboardPortfolio();
+    if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
+    const evidence = loadProviderLifecycleEvidence(this, experience, config.bitgetCategory, providerPositionHistoryId, portfolio.positions);
+    const reconciliation = classifyProviderLifecycle(evidence);
+    if (reconciliation.classification !== "LOCAL_OPEN_PROVIDER_CLOSED" || !evidence.history) {
+      throw new Error(`PROVIDER_LIFECYCLE_${reconciliation.classification}:${reconciliation.reason}`);
+    }
+    const history = evidence.history;
+    const closedExperience = providerClosedExperience(experience, history, reconciliation.closedQuantity ?? "");
+    const closedContext: PositionContext = {
+      ...context,
+      experienceId: experience.experienceId,
+      lifecycleStatus: "CLOSED",
+      closedAt: history.closingTime,
+      closedProviderPositionHistoryId: providerPositionHistoryId,
+      updatedAt: new Date().toISOString(),
+    };
+    const createdAt = new Date().toISOString();
+    const event = {
+      eventId,
+      type: "PROVIDER_LIFECYCLE_REPAIRED",
+      cycleId: context.entryReasoning?.cycleId || "PROVIDER_LEDGER_RECONCILIATION",
+      createdAt,
+      metadata: {
+        experienceId,
+        entryDecisionId: experience.entryDecisionId,
+        providerPositionHistoryId,
+        symbol: experience.symbol,
+        positionSide: experience.positionSide,
+        origin: "DARWIN",
+        providerPositionHistoryOrigin: history.origin,
+        closedQuantity: reconciliation.closedQuantity ?? "",
+        netProfit: history.netProfit ?? "",
+        legacyLocalRealizedPnl: experience.realizedPnl,
+      },
+    };
+    const written = persistProviderLifecycleRepair(this, (closure) => this.ctx.storage.transactionSync(closure), experience, context, closedExperience, closedContext, event);
+    if (!written) {
+      const latest = loadAllExperiences(this).find((candidate) => candidate.experienceId === experienceId);
+      if (latest?.financialSource !== "PROVIDER_LEDGER" || latest.providerPositionHistoryId !== providerPositionHistoryId || latest.outcomeStatus === "OPEN") {
+        throw new Error("PROVIDER_LIFECYCLE_REPAIR_STATE_INCONSISTENT");
+      }
+      return { status: "ALREADY_RECONCILED", experienceId, providerPositionHistoryId };
+    }
+    return { status: "RECONCILED", experienceId, providerPositionHistoryId };
   }
 
   public async reconcileLateExecution(originalCycleId: string, decisionId: string): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string }> {
@@ -1368,6 +1442,50 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 }
 
+function providerLifecycleRepairEventId(experienceId: string, providerPositionHistoryId: string): string {
+  return `provider-lifecycle-repair:${experienceId}:${providerPositionHistoryId}`;
+}
+
+function requiredProviderDecimal(value: string | null, field: string): string {
+  if (!isDecimal(value ?? undefined)) throw new Error(`PROVIDER_FINANCIAL_EVIDENCE_MISSING:${field}`);
+  return value as string;
+}
+
+function providerClosedExperience(experience: TradeExperience, history: ProviderLifecycleHistory, closedQuantity: string): TradeExperience {
+  const entryPrice = requiredProviderDecimal(history.avgEntryPrice, "avgEntryPrice");
+  const exitPrice = requiredProviderDecimal(history.avgExitPrice, "avgExitPrice");
+  const cumRealisedPnl = requiredProviderDecimal(history.cumRealisedPnl, "cumRealisedPnl");
+  const netProfit = requiredProviderDecimal(history.netProfit, "netProfit");
+  const openFeeTotal = requiredProviderDecimal(history.openFeeTotal, "openFeeTotal");
+  const closeFeeTotal = requiredProviderDecimal(history.closeFeeTotal, "closeFeeTotal");
+  const totalFunding = requiredProviderDecimal(history.totalFunding, "totalFunding");
+  const cashDividend = requiredProviderDecimal(history.cashDividend, "cashDividend");
+  const providerPositionHistoryId = history.providerPositionHistoryId;
+  if (!providerPositionHistoryId) throw new Error("PROVIDER_POSITION_HISTORY_ID_MISSING");
+  const outcomeStatus = compareDecimal(netProfit, "0") > 0 ? "PROFITABLE" : compareDecimal(netProfit, "0") < 0 ? "LOSING" : "BREAK_EVEN";
+  return {
+    ...experience,
+    entryPrice,
+    entryTime: history.openingTime,
+    exitPrice,
+    exitTime: history.closingTime,
+    realizedPnl: netProfit,
+    outcomeStatus,
+    realizedPnlVerified: true,
+    financialSource: "PROVIDER_LEDGER",
+    origin: "DARWIN",
+    providerPositionHistoryId,
+    closedQuantity,
+    cumRealisedPnl,
+    netProfit,
+    openFeeTotal,
+    closeFeeTotal,
+    totalFunding,
+    cashDividend,
+    ...(experience.financialSource === "PROVIDER_LEDGER" ? {} : { legacyLocalRealizedPnl: experience.realizedPnl }),
+  };
+}
+
 function calculateDrawdownPct(baseline: string, current: string): string {
   const base = Number(baseline);
   const equity = Number(current);
@@ -1375,9 +1493,10 @@ function calculateDrawdownPct(baseline: string, current: string): string {
   return (((equity - base) / base) * 100).toFixed(2);
 }
 
-function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string } {
+function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string } | { action: "REPAIR_PROVIDER_CLOSED_LIFECYCLE"; experienceId: string; providerPositionHistoryId: string } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const body = value as { action?: unknown; cycleId?: unknown; decisionId?: unknown };
+  const body = value as { action?: unknown; cycleId?: unknown; decisionId?: unknown; experienceId?: unknown; providerPositionHistoryId?: unknown };
+  if (body.action === "REPAIR_PROVIDER_CLOSED_LIFECYCLE") return typeof body.experienceId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.experienceId) && typeof body.providerPositionHistoryId === "string" && /^[A-Za-z0-9:_-]{1,128}$/.test(body.providerPositionHistoryId);
   if (body.action === "RECONCILE_LATE_EXECUTION") return typeof body.cycleId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.cycleId) && typeof body.decisionId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.decisionId);
   return body.action === "START" || body.action === "PAUSE" || body.action === "RESUME" || body.action === "EMERGENCY_STOP";
 }

@@ -1,3 +1,5 @@
+import type { TradeExperience } from "../types.js";
+import type { ProviderLifecycleEvidence, ProviderLifecyclePosition, ProviderEvidenceOrigin } from "../trading/provider-lifecycle-reconciliation.js";
 import type {
   ProviderFillRecord,
   ProviderFinancialRecord,
@@ -224,6 +226,74 @@ export function upsertProviderFinancialRecord(executor: SqlExecutor, record: Pro
       raw_provider_json = excluded.raw_provider_json,
       last_seen_at = excluded.last_seen_at
   `;
+}
+
+export function loadProviderLifecycleEvidence(
+  executor: SqlExecutor,
+  experience: TradeExperience,
+  category: string,
+  providerPositionHistoryId: string,
+  providerPositions: readonly ProviderLifecyclePosition[],
+): ProviderLifecycleEvidence {
+  const historyRows = executor.sql<{
+    provider_position_history_id: string | null; symbol: string; position_side: string; open_total_pos: string | null; close_total_pos: string | null;
+    avg_entry_price: string | null; avg_exit_price: string | null; cum_realised_pnl: string | null; net_profit: string | null;
+    open_fee_total: string | null; close_fee_total: string | null; total_funding: string | null; cash_dividend: string | null;
+    opening_time: string; closing_time: string; origin: ProviderEvidenceOrigin;
+  }>`SELECT provider_position_history_id, symbol, position_side, open_total_pos, close_total_pos, avg_entry_price, avg_exit_price, cum_realised_pnl, net_profit, open_fee_total, close_fee_total, total_funding, cash_dividend, opening_time, closing_time, origin FROM provider_position_history WHERE category = ${category} AND provider_position_history_id = ${providerPositionHistoryId}`;
+  const row = historyRows[0];
+  if (historyRows.length > 1) return { experience, providerPositions, history: null, entryIdentity: null, orders: [], fills: [] };
+
+  const identities = executor.sql<{ client_order_id: string; provider_order_id: string | null }>`SELECT client_order_id, provider_order_id FROM idempotency WHERE decision_id = ${experience.entryDecisionId} ORDER BY created_at, client_order_id`;
+  const identityPairs = [...new Set(identities.filter((identity) => identity.provider_order_id).map((identity) => JSON.stringify([identity.client_order_id, identity.provider_order_id])))];
+  const entryIdentity = identityPairs.length === 1 && identities.length === 1 && identities[0]?.provider_order_id
+    ? { entryDecisionId: experience.entryDecisionId, clientOid: identities[0].client_order_id, providerOrderId: identities[0].provider_order_id }
+    : null;
+  const orders = row
+    ? executor.sql<{
+      provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null; origin: ProviderEvidenceOrigin;
+    }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} AND created_time >= ${row.opening_time} AND created_time <= ${row.closing_time}`
+    : executor.sql<{
+      provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null; origin: ProviderEvidenceOrigin;
+    }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} ORDER BY created_time DESC LIMIT 500`;
+  const fills = row
+    ? executor.sql<{
+      provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null;
+      exec_qty: string; created_time: string; origin: ProviderEvidenceOrigin;
+    }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND created_time >= ${row.opening_time} AND created_time <= ${row.closing_time}`
+    : executor.sql<{
+      provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null;
+      exec_qty: string; created_time: string; origin: ProviderEvidenceOrigin;
+    }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} ORDER BY created_time DESC LIMIT 500`;
+  const mappedOrders = orders.map((order) => ({ providerOrderId: order.provider_order_id, clientOid: order.client_oid, symbol: order.symbol, positionSide: order.pos_side?.toUpperCase() ?? null, tradeSide: order.trade_side?.toLowerCase() ?? null, origin: order.origin }));
+  const mappedFills = fills.map((fill) => ({ providerOrderId: fill.provider_order_id, clientOid: fill.client_oid, symbol: fill.symbol, positionSide: fill.pos_side?.toUpperCase() ?? null, tradeSide: fill.trade_side?.toLowerCase() ?? null, quantity: fill.exec_qty, createdAt: fill.created_time, origin: fill.origin }));
+  if (!row) return { experience, providerPositions, history: null, entryIdentity, orders: mappedOrders, fills: mappedFills };
+
+  return {
+    experience,
+    providerPositions,
+    history: {
+      providerPositionHistoryId: row.provider_position_history_id,
+      symbol: row.symbol,
+      positionSide: row.position_side,
+      openTotalPos: row.open_total_pos,
+      closeTotalPos: row.close_total_pos,
+      avgEntryPrice: row.avg_entry_price,
+      avgExitPrice: row.avg_exit_price,
+      cumRealisedPnl: row.cum_realised_pnl,
+      netProfit: row.net_profit,
+      openFeeTotal: row.open_fee_total,
+      closeFeeTotal: row.close_fee_total,
+      totalFunding: row.total_funding,
+      cashDividend: row.cash_dividend,
+      openingTime: row.opening_time,
+      closingTime: row.closing_time,
+      origin: row.origin,
+    },
+    entryIdentity,
+    orders: mappedOrders,
+    fills: mappedFills,
+  };
 }
 
 export function loadProviderSyncState(executor: SqlExecutor, category: string): ProviderSyncState | null {

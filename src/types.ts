@@ -263,6 +263,18 @@ export interface TradeExperience {
   fees?: string;
   funding?: string;
   realizedPnlVerified?: boolean;
+  financialSource?: "LOCAL" | "PROVIDER_LEDGER";
+  origin?: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
+  providerPositionHistoryId?: string;
+  closedQuantity?: string;
+  cumRealisedPnl?: string;
+  netProfit?: string;
+  openFeeTotal?: string;
+  closeFeeTotal?: string;
+  totalFunding?: string;
+  cashDividend?: string;
+  /** Prior local estimate retained as evidence when provider ledger replaces it. */
+  legacyLocalRealizedPnl?: string;
 }
 
 export interface BacktestMetric {
@@ -759,5 +771,8 @@ export interface PositionContext {
   entryReasoning?: PositionReasoning;
   latestManagement?: PositionReasoning;
   managementEvents: PositionReasoning[];
+  lifecycleStatus?: "OPEN" | "CLOSED";
+  closedAt?: string;
+  closedProviderPositionHistoryId?: string;
   updatedAt: string;
 }

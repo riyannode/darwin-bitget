@@ -449,6 +449,46 @@ export function saveEvent(executor: SqlExecutor, event: ActivityEvent): void {
   `;
 }
 
+export function hasEvent(executor: SqlExecutor, eventId: string): boolean {
+  return executor.sql<{ event_id: string }>`SELECT event_id FROM events WHERE event_id = ${eventId} LIMIT 1`.length > 0;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const entries = Object.entries(value).filter(([, item]) => item !== undefined).sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+export function persistProviderLifecycleRepair(
+  executor: SqlExecutor,
+  transactionSync: <T>(closure: () => T) => T,
+  expectedExperience: TradeExperience,
+  expectedContext: PositionContext,
+  experience: TradeExperience,
+  context: PositionContext,
+  event: ActivityEvent,
+): boolean {
+  return transactionSync(() => {
+    if (hasEvent(executor, event.eventId)) return false;
+    const experienceRows = executor.sql<ExperienceRow>`SELECT payload FROM experiences WHERE experience_id = ${expectedExperience.experienceId}`;
+    const currentExperience = experienceRows[0] ? JSON.parse(experienceRows[0].payload) as TradeExperience : null;
+    if (experienceRows.length !== 1 || canonicalJson(currentExperience) !== canonicalJson(expectedExperience) || currentExperience?.outcomeStatus !== "OPEN") {
+      throw new Error("PROVIDER_LIFECYCLE_REPAIR_CONFLICT");
+    }
+    const contextKey = `${expectedContext.symbol}:${expectedContext.positionSide}`;
+    const contextRows = executor.sql<PositionContextRow>`SELECT payload FROM position_context WHERE context_key = ${contextKey}`;
+    const currentContext = contextRows[0] ? JSON.parse(contextRows[0].payload) as PositionContext : null;
+    if (contextRows.length !== 1 || canonicalJson(currentContext) !== canonicalJson(expectedContext)) throw new Error("POSITION_CONTEXT_CHANGED_DURING_REPAIR");
+    saveExperience(executor, experience, event.createdAt);
+    savePositionContext(executor, context);
+    saveEvent(executor, event);
+    return true;
+  });
+}
+
 export function loadRecentEvents(executor: SqlExecutor, limit = 25): ActivityEvent[] {
   const rows = executor.sql<EventRow>`SELECT event_id, event_type, cycle_id, payload, created_at FROM events ORDER BY created_at DESC LIMIT ${clampHistoryLimit(limit, 25)}`;
   return rows.flatMap((row) => {

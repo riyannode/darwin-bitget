@@ -34,6 +34,17 @@ const experienceSchema = z.object({
   fees: z.string().optional(),
   funding: z.string().optional(),
   realizedPnlVerified: z.boolean().optional(),
+  financialSource: z.enum(["LOCAL", "PROVIDER_LEDGER"]).optional(),
+  origin: z.enum(["DARWIN", "PROVIDER_EXTERNAL", "UNATTRIBUTED"]).optional(),
+  providerPositionHistoryId: z.string().optional(),
+  closedQuantity: z.string().optional(),
+  cumRealisedPnl: z.string().optional(),
+  netProfit: z.string().optional(),
+  openFeeTotal: z.string().optional(),
+  closeFeeTotal: z.string().optional(),
+  totalFunding: z.string().optional(),
+  cashDividend: z.string().optional(),
+  legacyLocalRealizedPnl: z.string().optional(),
 });
 
 export function parseExperience(value: unknown): TradeExperience {
