@@ -630,6 +630,18 @@ export interface DashboardSnapshot {
     latestEquity: string | null;
     performanceBaselineAt: string | null;
     dailyPnl: Record<string, { pnl: string; trades: number; dailyReturnPct?: string }>;
+    financialSource?: "PROVIDER_LEDGER";
+    scope?: "DARWIN_ATTRIBUTED";
+    unresolvedClosedLifecycles?: number;
+  };
+  accountPerformance: {
+    equitySource: "PROVIDER_LIVE" | "UNAVAILABLE";
+    currentEquity: string | null;
+    externalFlowStatus: "VERIFIED" | "UNVERIFIED";
+    netExternalInflows: string;
+    netPnlSinceBaseline: string;
+    financialRecordCoverage: "COMPLETE" | "PARTIAL" | "UNAVAILABLE";
+    financialRecordCategories: Array<{ category: string; status: "SUCCESS" | "PARTIAL" | "NOT_SYNCED"; lastSuccessfulSyncAt: string | null }>;
   };
   performanceAccounting: PerformanceAccountingReadModel;
   trades: TradeLogEntry[];
@@ -678,6 +690,8 @@ export interface DashboardSnapshot {
     configuredIntervalMinutes: number;
     matchingScheduleCount: number;
     schedulerHealthy: boolean;
+    tradingSchedulerHealthy: boolean;
+    providerSyncSchedulerHealthy: boolean;
     schedulerErrorCode?: string;
   };
   learning: {
@@ -702,7 +716,7 @@ export interface PerformanceAccountingReadModel {
   currentEquityObservedAt: string | null;
   equityDeltaSinceBaseline: string;
   netExternalInflows: string;
-  externalFlowStatus: "VERIFIED" | "UNVERIFIED_ZERO_FLOW_INVARIANT";
+  externalFlowStatus: "VERIFIED" | "UNVERIFIED";
   netPnlSinceBaseline: string;
   closedEpisodeRealizedPnl: string;
   openEpisodePartialRealizedPnl: string;
@@ -739,9 +753,24 @@ export interface TradeLogEntry {
   positionSide?: PositionSide | null;
   openedAt?: string;
   closedAt?: string;
+  entryTime?: string;
+  exitTime?: string;
   entryReasoning?: PositionReasoning;
   exitReasoning?: PositionReasoning;
   managementEvents?: PositionReasoning[];
+  financialSource?: "PROVIDER_LEDGER" | "PROVIDER_LIVE" | "UNRESOLVED";
+  reasoningSource?: "DARWIN_PERSISTED";
+  origin?: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
+  providerPositionHistoryId?: string;
+  quantity?: string;
+  openQuantity?: string;
+  closeQuantity?: string;
+  cumRealisedPnl?: string;
+  netProfit?: string;
+  openFeeTotal?: string;
+  closeFeeTotal?: string;
+  totalFunding?: string;
+  cashDividend?: string;
 }
 
 export interface PositionReasoning {

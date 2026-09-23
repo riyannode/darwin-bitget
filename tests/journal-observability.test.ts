@@ -453,6 +453,7 @@ describe("journal observability persistence", () => {
       env: { TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_CATEGORY: "USDT-FUTURES" },
       state: { paused: true, emergencyStop: false },
       ensureActivePolicy: () => ({ paperOnly: true, maxSinglePositionMarginPct: "30", maxLeverage: "5", maxDailyDrawdownPct: "10", drawdownCooldownMinutes: 60, scanIntervalMinutes: 5, emergencyStop: false }),
+      performanceWithEquity: (TraderAgent.prototype as unknown as { performanceWithEquity: (equity: string, observedAt: string) => PerformanceAggregate }).performanceWithEquity,
       recordEvent(type: string, cycleId: string, metadata?: Record<string, string>) {
         if (type === "LATE_EXECUTION_RECONCILED") events.push(type);
         saveEvent(executor, { eventId: `event-${++eventSequence}`, type, cycleId, createdAt: `2026-09-21T00:01:0${eventSequence}.000Z`, ...(metadata ? { metadata } : {}) });
@@ -496,8 +497,8 @@ describe("journal observability persistence", () => {
     expect(persistedContext?.latestManagement).toEqual(reduce);
     expect(persistedContext?.updatedAt).toBe("2026-09-21T05:55:00.000Z");
     expect(JSON.stringify(persistedExperiences[0])).toBe(experienceBeforeSecond);
-    expect(performance?.totalTrades).toBe(1);
-    expect(performance?.openTrades).toBe(1);
+    expect(performance?.totalTrades).toBe(0);
+    expect(performance?.openTrades).toBe(0);
     expect(JSON.stringify(performance)).toBe(performanceBeforeSecond);
     expect(events).toEqual(["LATE_EXECUTION_RECONCILED"]);
     expect(reconciliationEvents).toHaveLength(eventsBeforeSecond);

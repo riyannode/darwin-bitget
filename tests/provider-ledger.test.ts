@@ -9,7 +9,7 @@ import {
   providerTimestampIso,
   stableProviderFingerprint,
 } from "../src/bitget/provider-ledger.js";
-import { syncProviderLedger, type ProviderLedgerReadClient } from "../src/bitget/provider-sync.js";
+import { PROVIDER_FINANCIAL_CATEGORIES, syncProviderLedger, type ProviderLedgerReadClient } from "../src/bitget/provider-sync.js";
 import {
   loadProviderSyncState,
   providerLedgerDiagnostics,
@@ -273,6 +273,49 @@ describe("provider ledger persistence and sync", () => {
     expect((db.prepare("SELECT COUNT(*) AS count FROM provider_position_history").get() as { count: number }).count).toBe(1);
     expect((db.prepare("SELECT COUNT(*) AS count FROM provider_financial_records").get() as { count: number }).count).toBe(1);
     expect(loadProviderSyncState(executor, category)?.lastSuccessfulSyncAt).toBe("2026-09-22T00:00:00.000Z");
+  });
+
+  it("supports financial-record-only category sync without touching trading lifecycle resources", async () => {
+    const { executor } = memoryExecutor();
+    const calls: string[] = [];
+    const client: ProviderLedgerReadClient = {
+      async getOrderHistoryRead() { calls.push("orders"); throw new Error("MUST_NOT_SYNC_ORDERS"); },
+      async getFillHistoryWindowRead() { calls.push("fills"); throw new Error("MUST_NOT_SYNC_FILLS"); },
+      async getPositionHistoryRead() { calls.push("positions"); throw new Error("MUST_NOT_SYNC_POSITIONS"); },
+      async getFinancialRecordsRead(params) { calls.push(`financial:${params.category}`); return { list: [financialFixture({ category: params.category })], cursor: null }; },
+    };
+    const result = await syncProviderLedger(client, executor, {
+      category: "SPOT",
+      mode: "recent",
+      financialRecordsOnly: true,
+      now: new Date("2026-09-22T00:00:00.000Z"),
+      recentWindowMs: 60 * 60 * 1000,
+    });
+    expect(result.status).toBe("SUCCESS");
+    expect(calls).toEqual(["financial:SPOT"]);
+    expect(providerLedgerDiagnostics(executor, "SPOT").counts.financialRecords).toBe(1);
+    expect(providerLedgerDiagnostics(executor, "SPOT").counts.orders).toBe(0);
+  });
+
+  it("syncs account financial records for exactly the six documented categories", async () => {
+    const { executor } = memoryExecutor();
+    const financialCategories: string[] = [];
+    const lifecycleResources: string[] = [];
+    const client: ProviderLedgerReadClient = {
+      async getOrderHistoryRead(params) { lifecycleResources.push(`orders:${params.category}`); return { list: [], cursor: null }; },
+      async getFillHistoryWindowRead(params) { lifecycleResources.push(`fills:${params.category}`); return { list: [], cursor: null }; },
+      async getPositionHistoryRead(params) { lifecycleResources.push(`positions:${params.category}`); return { list: [], cursor: null }; },
+      async getFinancialRecordsRead(params) { financialCategories.push(params.category); return { list: [], cursor: null }; },
+    };
+    for (const syncCategory of PROVIDER_FINANCIAL_CATEGORIES) {
+      const result = await syncProviderLedger(client, executor, { category: syncCategory, mode: "recent", financialRecordsOnly: syncCategory !== "USDT-FUTURES", now: new Date(observedAt), recentWindowMs: 60 * 60 * 1000 });
+      expect(result.status).toBe("SUCCESS");
+    }
+    expect(financialCategories).toEqual(PROVIDER_FINANCIAL_CATEGORIES);
+    expect(lifecycleResources).toEqual(["orders:USDT-FUTURES", "fills:USDT-FUTURES", "positions:USDT-FUTURES"]);
+    for (const syncCategory of PROVIDER_FINANCIAL_CATEGORIES) {
+      expect(providerLedgerDiagnostics(executor, syncCategory).sync).toMatchObject({ lastSuccessfulSyncAt: observedAt, lastError: null });
+    }
   });
 
   it("uses bounded overlapping windows for backfill", async () => {

@@ -3,16 +3,16 @@ import { ZodError } from "zod";
 import type { ActivityEvent, BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionManagementState, PositionSnapshot, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
-import { syncProviderLedger } from "../bitget/provider-sync.js";
+import { syncProviderLedger, PROVIDER_FINANCIAL_CATEGORIES, PROVIDER_TRADE_LIFECYCLE_CATEGORY } from "../bitget/provider-sync.js";
 import { MANDATE_VERSION, PROMPT_VERSIONS, TRADING_MANDATE } from "./mandate.js";
 import { assertOpenPositionCountWithinPlanLimit, buildEvidenceSymbols, calculateActionCapacity, decide, rankMarketCandidates, selectEntryCandidates } from "./decision.js";
 import { QwenJsonError } from "./qwen.js";
-import { reconcileTradingSchedule, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES, type SchedulerReconciliationResult } from "./scheduler.js";
+import { reconcileTradingSchedule, reconcileProviderLedgerSchedule, PROVIDER_LEDGER_INTERVAL_SECONDS, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES, type SchedulerReconciliationResult } from "./scheduler.js";
 import { authorizeOwner } from "./owner-auth.js";
 import { retrieveLessons } from "../learning/lesson-retrieval.js";
 import { reflect, reflectWithQwen } from "../learning/reflection.js";
 import { backtestFailureMetadata, createBacktestLesson, runCooldownBacktestSafely } from "../learning/backtest.js";
-import { ensureStorage } from "../storage/schema.js";
+import { ensureStorage, type SqlExecutor } from "../storage/schema.js";
 import {
   loadLatestBacktest,
   loadLatestJournal,
@@ -63,7 +63,7 @@ import { buildExecutionRequest, executePaperOrder } from "../trading/execution.j
 import { executeCyclePlan } from "../trading/execution-planner.js";
 import { reconcileExecution } from "../trading/reconcile.js";
 import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal } from "../trading/decimal.js";
-import { bootstrapPerformance, buildPerformanceAccounting, currentMonthDailyPnl, emptyPerformance, isPerformanceAggregate, POSITION_CONTEXT_READ_MODEL_VERSION, recordVerifiedClose, recordVerifiedOpen, recordVerifiedPartial, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate, type PerformanceObservation } from "../trading/performance.js";
+import { buildPerformanceAccounting, classifiedWinRate, emptyPerformance, isPerformanceAggregate, migratePerformanceEquityObservations, PERFORMANCE_READ_MODEL_VERSION, POSITION_CONTEXT_READ_MODEL_VERSION, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate, type PerformanceObservation } from "../trading/performance.js";
 import { bootstrapPositionContexts, decisionReasoning, upsertPositionContext } from "./position-context.js";
 import { isReadbackOnlyExecutionMismatch, parseProviderFillEvidence, parseProviderOrderEvidence, reconcileLateExecution } from "../trading/late-reconciliation.js";
 import { EvaClient } from "../eva/client.js";
@@ -73,8 +73,9 @@ import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../re
 import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
 import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } from "../trading/position-management.js";
-import { providerLedgerDiagnostics, loadProviderLifecycleEvidence } from "../storage/provider-ledger.js";
+import { providerLedgerDiagnostics, loadProviderLifecycleEvidence, loadProviderLifecycleHistoryCandidateIds, loadProviderPositionHistories } from "../storage/provider-ledger.js";
 import { classifyProviderLifecycle, type ProviderLifecycleHistory } from "../trading/provider-lifecycle-reconciliation.js";
+import { rebuildProviderPerformance, type ProviderPerformanceLifecycle } from "../trading/provider-performance.js";
 
 
 interface AgentState {
@@ -168,6 +169,8 @@ function schedulerMetrics(events: readonly { type: string; metadata?: Record<str
     configuredIntervalMinutes: 0,
     matchingScheduleCount: 0,
     schedulerHealthy: false,
+    tradingSchedulerHealthy: false,
+    providerSyncSchedulerHealthy: false,
   };
 }
 
@@ -179,7 +182,74 @@ function tradeLifecycleStatus(experience: TradeExperience): TradeLifecycleStatus
   return "EXECUTION_FAILURE";
 }
 
-function tradeLogEntries(experiences: readonly TradeExperience[], journals: readonly TradingJournal[], contexts: ReadonlyMap<string, PositionContext> = new Map()): DashboardSnapshot["trades"] {
+interface ResolvedProviderTradeFact {
+  source: "PROVIDER_LEDGER" | "PROVIDER_LIVE" | "UNRESOLVED";
+  history?: ProviderLifecycleHistory;
+  position?: PositionSnapshot;
+  providerPositionHistoryId?: string;
+  origin: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
+}
+
+function resolveProviderTradeFacts(
+  executor: SqlExecutor,
+  experiences: readonly TradeExperience[],
+  category: string,
+  positions: readonly PositionSnapshot[],
+): { facts: Map<string, ResolvedProviderTradeFact>; lifecycles: ProviderPerformanceLifecycle[] } {
+  const facts = new Map<string, ResolvedProviderTradeFact>();
+  const lifecycles: ProviderPerformanceLifecycle[] = [];
+  const ownersByHistoryId = new Map<string, string>();
+  const histories = loadProviderPositionHistories(executor, category);
+  for (const experience of experiences) {
+    if (!experience.positionSide) {
+      facts.set(experience.experienceId, { source: "UNRESOLVED", origin: "UNATTRIBUTED" });
+      continue;
+    }
+    const candidateHistoryIds = loadProviderLifecycleHistoryCandidateIds(executor, experience, category);
+    const candidates: ProviderLifecycleHistory[] = [];
+    for (const history of histories.filter((row) => row.providerPositionHistoryId && candidateHistoryIds.has(row.providerPositionHistoryId))) {
+      const evidence = loadProviderLifecycleEvidence(executor, experience, category, history.providerPositionHistoryId!, positions);
+      const classification = classifyProviderLifecycle(evidence).classification;
+      if (classification === "MATCHED_CLOSED" || classification === "LOCAL_OPEN_PROVIDER_CLOSED") candidates.push(history);
+    }
+    const candidate = candidates[0];
+    if (candidates.length === 1 && candidate && typeof candidate.providerPositionHistoryId === "string") {
+      const history = candidate;
+      const historyId = typeof history.providerPositionHistoryId === "string" ? history.providerPositionHistoryId : null;
+      if (!historyId) continue;
+      const priorOwner = ownersByHistoryId.get(historyId);
+      if (priorOwner && priorOwner !== experience.experienceId) {
+        facts.set(priorOwner, { source: "UNRESOLVED", origin: "UNATTRIBUTED" });
+        facts.set(experience.experienceId, { source: "UNRESOLVED", origin: "UNATTRIBUTED" });
+        const lifecycleIndex = lifecycles.findIndex((lifecycle) => lifecycle.lifecycleId === historyId);
+        if (lifecycleIndex >= 0) lifecycles.splice(lifecycleIndex, 1);
+        continue;
+      }
+      ownersByHistoryId.set(historyId, experience.experienceId);
+      facts.set(experience.experienceId, { source: "PROVIDER_LEDGER", history, providerPositionHistoryId: historyId, origin: "DARWIN" });
+      lifecycles.push({ lifecycleId: historyId, origin: "DARWIN", status: "CLOSED", ...(history.netProfit === null ? {} : { netProfit: history.netProfit }), ...(history.closingTime ? { closedAt: history.closingTime } : {}) });
+      continue;
+    }
+    const livePosition = candidates.length === 0 ? positions.find((position) => position.symbol === experience.symbol && position.positionSide === experience.positionSide && isPositiveDecimal(position.quantity)) : undefined;
+    if (experience.outcomeStatus === "OPEN" && livePosition) {
+      const evidence = loadProviderLifecycleEvidence(executor, experience, category, "", positions);
+      if (classifyProviderLifecycle(evidence).classification === "MATCHED_OPEN" && evidence.entryIdentity) {
+        facts.set(experience.experienceId, { source: "PROVIDER_LIVE", position: livePosition, origin: "DARWIN" });
+        lifecycles.push({ lifecycleId: `open:${evidence.entryIdentity.providerOrderId}`, origin: "DARWIN", status: "OPEN" });
+        continue;
+      }
+    }
+    facts.set(experience.experienceId, { source: "UNRESOLVED", origin: "UNATTRIBUTED" });
+  }
+  return { facts, lifecycles };
+}
+
+function tradeLogEntries(
+  experiences: readonly TradeExperience[],
+  journals: readonly TradingJournal[],
+  contexts: ReadonlyMap<string, PositionContext> = new Map(),
+  financialFacts: ReadonlyMap<string, { source: "PROVIDER_LEDGER" | "PROVIDER_LIVE" | "UNRESOLVED"; history?: ProviderLifecycleHistory; position?: PositionSnapshot; providerPositionHistoryId?: string; origin: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED" }> = new Map(),
+): DashboardSnapshot["trades"] {
   const decisions = journals.flatMap((journal) => cyclePlanDecisions(journal));
   const verifiedOpenIds = verifiedLifecycleFacts(journals).verifiedOpenIds;
   return experiences.filter((experience) => experience.action !== "HOLD").map((experience) => {
@@ -193,24 +263,46 @@ function tradeLogEntries(experiences: readonly TradeExperience[], journals: read
     const entryReasoning = context?.entryDecisionId === experience.entryDecisionId ? context.entryReasoning : entryDecision ? decisionReasoning(entryDecision) : undefined;
     const exitReasoning = exitDecision ? decisionReasoning(exitDecision) : undefined;
     const managementEvents = context?.entryDecisionId === experience.entryDecisionId ? context.managementEvents : lifecycleDecisions.map(decisionReasoning);
+    const facts = financialFacts.get(experience.experienceId);
+    const history = facts?.history;
+    const livePosition = facts?.position;
+    const isProviderClosed = facts?.source === "PROVIDER_LEDGER" && history !== undefined;
+    const openedAt = history?.openingTime ?? (livePosition?.openedAt ?? "UNAVAILABLE");
+    const closedAt = history?.closingTime;
     return {
       tradeId: experience.experienceId,
-      timestamp: experience.entryTime,
+      timestamp: openedAt,
       symbol: experience.symbol,
       action,
       marginAllocationPct: experience.marginAllocationPct,
       marginAllocated: experience.marginAllocated,
       leverage: experience.selectedLeverage,
       positionNotional: experience.positionNotional,
-      entry: experience.entryPrice,
-      exit: experience.exitPrice,
-      realizedPnl: experience.realizedPnl,
-      status: tradeLifecycleStatus(experience),
+      entry: history?.avgEntryPrice ?? livePosition?.entryPrice ?? "UNAVAILABLE",
+      exit: history?.avgExitPrice ?? "UNAVAILABLE",
+      realizedPnl: history?.netProfit ?? "UNAVAILABLE",
+      status: isProviderClosed ? "CLOSED" : tradeLifecycleStatus(experience),
       thesis: experience.entryThesis,
       orderReference: record?.executionResult?.providerOrderId ?? record?.executionResult?.clientOrderId ?? journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
       positionSide: experience.positionSide,
-      openedAt: experience.entryTime,
-      ...(experience.exitTime ? { closedAt: experience.exitTime } : {}),
+      openedAt,
+      entryTime: openedAt,
+      ...(closedAt ? { closedAt, exitTime: closedAt } : {}),
+      financialSource: isProviderClosed ? "PROVIDER_LEDGER" : facts?.source ?? "UNRESOLVED",
+      reasoningSource: "DARWIN_PERSISTED",
+      origin: facts?.origin ?? "UNATTRIBUTED",
+      ...(facts?.providerPositionHistoryId ? { providerPositionHistoryId: facts.providerPositionHistoryId } : {}),
+      ...(history ? {
+        quantity: history.closeTotalPos ?? history.openTotalPos ?? "UNAVAILABLE",
+        openQuantity: history.openTotalPos ?? "UNAVAILABLE",
+        closeQuantity: history.closeTotalPos ?? "UNAVAILABLE",
+        cumRealisedPnl: history.cumRealisedPnl ?? "UNAVAILABLE",
+        netProfit: history.netProfit ?? "UNAVAILABLE",
+        openFeeTotal: history.openFeeTotal ?? "UNAVAILABLE",
+        closeFeeTotal: history.closeFeeTotal ?? "UNAVAILABLE",
+        totalFunding: history.totalFunding ?? "UNAVAILABLE",
+        cashDividend: history.cashDividend ?? "UNAVAILABLE",
+      } : livePosition ? { quantity: livePosition.quantity } : {}),
       ...(entryReasoning ? { entryReasoning } : {}),
       ...(exitReasoning ? { exitReasoning } : {}),
       ...(managementEvents.length ? { managementEvents } : {}),
@@ -399,18 +491,22 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const activeCycle = this.state.lastStatus === "RUNNING";
     this.setState({ ...this.state, emergencyStop: policy.emergencyStop, model: config.qwenModel, runtimeStatus: activeCycle ? this.state.runtimeStatus : this.state.paused || policy.emergencyStop ? "PAUSED" : "ONLINE", currentStage: activeCycle ? this.state.currentStage : this.state.paused || policy.emergencyStop ? "PAUSED" : "ONLINE" });
     if (!this.state.paused && !policy.emergencyStop) await this.reconcileScheduler(this.activeScanIntervalMinutes(policy), { ensureSchedule: true });
+    try {
+      const healthy = await reconcileProviderLedgerSchedule(this);
+      if (!healthy) this.recordEventBestEffort("PROVIDER_SYNC_SCHEDULE_UNHEALTHY", "CONTROL", { intervalSeconds: String(PROVIDER_LEDGER_INTERVAL_SECONDS) });
+    } catch {
+      this.recordEventBestEffort("PROVIDER_SYNC_SCHEDULE_UNHEALTHY", "CONTROL", { intervalSeconds: String(PROVIDER_LEDGER_INTERVAL_SECONDS), code: "SCHEDULE_RECONCILIATION_FAILED" });
+    }
   }
 
   public override async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/snapshot" && request.method === "GET") {
       let livePortfolio: DashboardSnapshot["portfolio"] | undefined;
-      if (url.searchParams.get("includeLive") === "true") {
-        try {
-          livePortfolio = await new BitgetClient(loadConfig(this.env, this.ensureActivePolicy())).getDashboardPortfolio();
-        } catch {
-          livePortfolio = undefined;
-        }
+      try {
+        livePortfolio = await new BitgetClient(loadConfig(this.env, this.ensureActivePolicy())).getDashboardPortfolio();
+      } catch {
+        livePortfolio = undefined;
       }
       return json(await this.getDashboardSnapshot(livePortfolio));
     }
@@ -421,7 +517,14 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (url.pathname === "/provider-ledger" && request.method === "GET") {
       ensureStorage(this);
       const config = loadConfig(this.env, this.ensureActivePolicy());
-      return json(providerLedgerDiagnostics(this, config.bitgetCategory));
+      const categories = PROVIDER_FINANCIAL_CATEGORIES.map((category) => providerLedgerDiagnostics(this, category));
+      const configured = categories.find((entry) => entry.category === config.bitgetCategory) ?? providerLedgerDiagnostics(this, config.bitgetCategory);
+      return json({ ...configured, categories: categories.map((entry) => ({
+        ...entry,
+        status: entry.sync?.lastError ? "PARTIAL" : entry.sync?.lastSuccessfulSyncAt ? "SUCCESS" : "NOT_SYNCED",
+        rowCount: entry.counts.financialRecords,
+        checkpoint: entry.sync?.checkpoints.financialRecords ?? null,
+      })) });
     }
     if (url.pathname === "/provider-ledger/backfill" && request.method === "POST") {
       const auth = authorizeOwner(request, this.env);
@@ -486,6 +589,34 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (!config.evaAgentId || !config.evaAgentApiKey || !config.evaGatewayUrl) throw new Error("EVA_CREDENTIAL_MISSING");
     const result = await new EvaClient({ ...(config.evaApiUrl ? { apiUrl: config.evaApiUrl } : {}), gatewayUrl: config.evaGatewayUrl, agentId: config.evaAgentId, agentApiKey: config.evaAgentApiKey, identity: { name: EVA_AGENT_NAME, version: config.version ?? "local", model: config.qwenModel } }).connectAndTest();
     return { ...result, agentId: config.evaAgentId, protocol: EVA_PROTOCOL_VERSION, capabilities: [...EVA_CAPABILITIES], executionProviders: [...EVA_EXECUTION_PROVIDERS], endpoint: config.evaGatewayUrl };
+  }
+
+  public async runScheduledProviderSync(): Promise<void> {
+    try {
+      ensureStorage(this);
+      const config = loadConfig(this.env, this.ensureActivePolicy());
+      const client = new BitgetClient(config);
+      const results = [];
+      for (const category of PROVIDER_FINANCIAL_CATEGORIES) {
+        results.push(await syncProviderLedger(client, this, {
+          category,
+          mode: "recent",
+          ...(category === PROVIDER_TRADE_LIFECYCLE_CATEGORY ? {} : { financialRecordsOnly: true }),
+          recentWindowMs: 24 * 60 * 60 * 1000,
+          overlapMs: 15 * 60 * 1000,
+          maxPagesPerRun: 120,
+          maxRowsPerRun: 12_000,
+        }));
+      }
+      const failures = results.filter((result) => result.status !== "SUCCESS").length;
+      this.recordEventBestEffort(failures === 0 ? "PROVIDER_SYNC_COMPLETED" : "PROVIDER_SYNC_PARTIAL", "CONTROL", {
+        categories: String(results.length),
+        failures: String(failures),
+        source: "READ_ONLY_PROVIDER_LEDGER",
+      });
+    } catch (error) {
+      this.recordEventBestEffort("PROVIDER_SYNC_FAILED", "CONTROL", failureDiagnostic(error));
+    }
   }
 
   public async runScheduledCycle(): Promise<void> {
@@ -619,7 +750,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     }
     if (isPerformanceAggregate(performance) && positionContextBootstrapped?.version === POSITION_CONTEXT_READ_MODEL_VERSION) return;
     const history = this.readBootstrapHistory();
-    if (!isPerformanceAggregate(performance)) savePerformanceAggregate(this, bootstrapPerformance(loadAllAutonomousJournals(this), loadAllExperiences(this), initializedAt), initializedAt);
+    if (!isPerformanceAggregate(performance)) savePerformanceAggregate(this, migratePerformanceEquityObservations(performance, initializedAt), initializedAt);
     if (positionContextBootstrapped?.version !== POSITION_CONTEXT_READ_MODEL_VERSION) {
       for (const context of bootstrapPositionContexts(history.journals, history.experiences, initializedAt)) savePositionContext(this, context);
       savePositionContextBootstrap(this, POSITION_CONTEXT_READ_MODEL_VERSION, initializedAt);
@@ -635,15 +766,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
     return { journals, experiences };
   }
 
-  private updatePerformanceReadModel(record: DecisionExecutionRecord, bundle: EvidenceBundle, verified: boolean, currentExperience?: TradeExperience): void {
-    if (!verified || !record.executionResult) return;
-    const observedAt = record.executionResult.readBackAt;
-    const equity = record.accountAfter?.portfolioEquity ?? bundle.account.portfolioEquity;
-    let performance = this.performanceWithEquity(equity, observedAt);
-    if (record.decision.action === "OPEN_LONG" || record.decision.action === "OPEN_SHORT") performance = recordVerifiedOpen(performance, equity, observedAt);
-    if (record.decision.action === "CLOSE") performance = recordVerifiedClose(performance, record.executionResult.realizedPnl, equity, observedAt, currentExperience?.realizedPnl, record.executionResult.realizedPnlSource);
-    if (record.decision.action === "REDUCE") performance = recordVerifiedPartial(performance, record.executionResult.realizedPnl ?? "", equity, observedAt);
-    savePerformanceAggregate(this, performance, observedAt);
+  private updatePerformanceReadModel(_record: DecisionExecutionRecord, bundle: EvidenceBundle, verified: boolean, _currentExperience?: TradeExperience): void {
+    if (!verified || !_record.executionResult) return;
+    const observedAt = _record.executionResult.readBackAt;
+    const equity = _record.accountAfter?.portfolioEquity ?? bundle.account.portfolioEquity;
+    this.persistPerformanceEquity(equity, observedAt);
   }
 
   private persistPerformanceEquity(equity: string, observedAt: string): void {
@@ -652,7 +779,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
 
   private performanceWithEquity(equity: string, observedAt: string): PerformanceAggregate {
     let performance = loadPerformanceAggregate<PerformanceAggregate>(this);
-    if (!isPerformanceAggregate(performance)) performance = emptyPerformance(observedAt);
+    if (!isPerformanceAggregate(performance)) performance = migratePerformanceEquityObservations(performance, observedAt);
     if (!performance.competitionBaselineEquity && isPositiveDecimal(equity)) performance = { ...performance, competitionBaselineEquity: equity, latestEquity: equity, performanceBaselineAt: observedAt };
     return updateEquity(performance, equity, observedAt);
   }
@@ -802,9 +929,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       ...(existingExperience ? { existingExperience } : {}),
     });
     if (result.status === "ALREADY_RECONCILED") return { status: result.status, experienceId: result.experience.experienceId };
-    let performance = loadPerformanceAggregate<PerformanceAggregate>(this);
-    if (!isPerformanceAggregate(performance)) performance = bootstrapPerformance(loadAllAutonomousJournals(this), experiences, resolvedAt);
-    performance = recordVerifiedOpen(performance, bundle.account.portfolioEquity, resolvedAt);
+    const performance = this.performanceWithEquity(bundle.account.portfolioEquity, resolvedAt);
     saveExperience(this, result.experience, resolvedAt);
     savePositionContext(this, result.positionContext);
     savePerformanceAggregate(this, performance, resolvedAt);
@@ -814,6 +939,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   public async getDashboardSnapshot(livePortfolio?: DashboardSnapshot["portfolio"]): Promise<DashboardSnapshot> {
+    ensureStorage(this);
     if (livePortfolio) this.persistPerformanceEquity(livePortfolio.portfolioEquity, livePortfolio.observedAt);
     const config = loadConfig(this.env, this.ensureActivePolicy());
     const journal = loadLatestJournal(this);
@@ -834,27 +960,82 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const configuredIntervalMinutes = temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes;
     const scheduler = await this.getSchedulerDiagnostics(configuredIntervalMinutes);
     const persistedPerformance = loadPerformanceAggregate<PerformanceAggregate>(this);
-    const accounting = isPerformanceAggregate(persistedPerformance)
+    const accountingBase = isPerformanceAggregate(persistedPerformance)
       ? buildPerformanceAccounting(persistedPerformance, livePortfolio ? { portfolioEquity: livePortfolio.portfolioEquity, observedAt: livePortfolio.observedAt, unrealizedPnl: livePortfolio.unrealizedPnl, ...(livePortfolio.unrealizedPnlSource ? { unrealizedPnlSource: livePortfolio.unrealizedPnlSource } : {}) } satisfies PerformanceObservation : undefined)
       : buildPerformanceAccounting(emptyPerformance(new Date().toISOString()), livePortfolio ? { portfolioEquity: livePortfolio.portfolioEquity, observedAt: livePortfolio.observedAt, unrealizedPnl: livePortfolio.unrealizedPnl, ...(livePortfolio.unrealizedPnlSource ? { unrealizedPnlSource: livePortfolio.unrealizedPnlSource } : {}) } satisfies PerformanceObservation : undefined);
-    const performance = isPerformanceAggregate(persistedPerformance) ? {
-      totalPnl: accounting.netPnlSinceBaseline,
+    const providerPerformance = rebuildProviderPerformance(resolveProviderTradeFacts(this, loadAllExperiences(this), PROVIDER_TRADE_LIFECYCLE_CATEGORY, livePortfolio?.positions ?? []).lifecycles);
+    const financialRecordCategories = PROVIDER_FINANCIAL_CATEGORIES.map((category) => {
+      const sync = providerLedgerDiagnostics(this, category).sync;
+      return { category, status: sync?.lastError ? "PARTIAL" as const : sync?.lastSuccessfulSyncAt ? "SUCCESS" as const : "NOT_SYNCED" as const, lastSuccessfulSyncAt: sync?.lastSuccessfulSyncAt ?? null };
+    });
+    const allFinancialCategoriesComplete = financialRecordCategories.every((category) => category.status === "SUCCESS");
+    const accountPerformance: DashboardSnapshot["accountPerformance"] = {
+      equitySource: livePortfolio ? "PROVIDER_LIVE" : "UNAVAILABLE",
+      currentEquity: livePortfolio?.portfolioEquity ?? null,
+      externalFlowStatus: "UNVERIFIED",
+      netExternalInflows: "UNAVAILABLE",
+      netPnlSinceBaseline: "UNAVAILABLE",
+      financialRecordCoverage: allFinancialCategoriesComplete ? "COMPLETE" : financialRecordCategories.some((category) => category.status === "PARTIAL") ? "PARTIAL" : "UNAVAILABLE",
+      financialRecordCategories,
+    };
+    const cacheBase = isPerformanceAggregate(persistedPerformance) ? persistedPerformance : migratePerformanceEquityObservations(persistedPerformance, new Date().toISOString());
+    const providerPerformanceCache: PerformanceAggregate = {
+      ...cacheBase,
+      version: PERFORMANCE_READ_MODEL_VERSION,
+      totalPnl: providerPerformance.verifiedRealizedPnl,
+      totalTrades: livePortfolio ? providerPerformance.totalTrades : providerPerformance.closedTrades,
+      openTrades: livePortfolio ? providerPerformance.openTrades : 0,
+      closedTrades: providerPerformance.closedTrades,
+      wins: providerPerformance.wins,
+      losses: providerPerformance.losses,
+      breakeven: providerPerformance.breakeven,
+      winRate: classifiedWinRate(providerPerformance.wins, providerPerformance.losses, providerPerformance.breakeven),
+      closedEpisodeRealizedPnl: providerPerformance.closedEpisodeRealizedPnl,
+      openEpisodePartialRealizedPnl: "UNAVAILABLE",
+      verifiedRealizedPnl: providerPerformance.verifiedRealizedPnl,
+      providerDailyPnl: providerPerformance.dailyPnl,
+      financialSource: "PROVIDER_LEDGER",
+      providerOpenTradeCountKnown: Boolean(livePortfolio),
+      netExternalInflows: "UNAVAILABLE",
+      externalFlowStatus: "UNVERIFIED",
+    };
+    if (JSON.stringify(persistedPerformance) !== JSON.stringify(providerPerformanceCache)) savePerformanceAggregate(this, providerPerformanceCache, livePortfolio?.observedAt ?? new Date().toISOString());
+    const accounting = {
+      ...accountingBase,
+      netExternalInflows: "UNAVAILABLE",
+      externalFlowStatus: "UNVERIFIED" as const,
+      netPnlSinceBaseline: "UNAVAILABLE",
+      closedEpisodeRealizedPnl: providerPerformance.closedEpisodeRealizedPnl,
+      openEpisodePartialRealizedPnl: "UNAVAILABLE",
+      verifiedRealizedPnl: providerPerformance.verifiedRealizedPnl,
+      wins: providerPerformance.wins,
+      losses: providerPerformance.losses,
+      breakeven: providerPerformance.breakeven,
+      classifiedClosedTrades: providerPerformance.wins + providerPerformance.losses + providerPerformance.breakeven,
+      winRatePct: classifiedWinRate(providerPerformance.wins, providerPerformance.losses, providerPerformance.breakeven),
+      source: livePortfolio ? "PROVIDER_LIVE" as const : "UNAVAILABLE" as const,
+    };
+    const performance = {
+      totalPnl: providerPerformance.verifiedRealizedPnl,
       winRate: accounting.winRatePct,
       dailyDrawdown: drawdownPct,
-      totalTrades: persistedPerformance.totalTrades,
-      openTrades: persistedPerformance.openTrades,
-      closedTrades: persistedPerformance.closedTrades,
-      wins: persistedPerformance.wins,
-      losses: persistedPerformance.losses,
-      breakeven: persistedPerformance.breakeven,
-      closedEpisodeRealizedPnl: persistedPerformance.closedEpisodeRealizedPnl,
-      openEpisodePartialRealizedPnl: persistedPerformance.openEpisodePartialRealizedPnl,
-      verifiedRealizedPnl: accounting.verifiedRealizedPnl,
+      totalTrades: livePortfolio ? providerPerformance.totalTrades : null,
+      openTrades: livePortfolio ? providerPerformance.openTrades : null,
+      closedTrades: providerPerformance.closedTrades,
+      wins: providerPerformance.wins,
+      losses: providerPerformance.losses,
+      breakeven: providerPerformance.breakeven,
+      closedEpisodeRealizedPnl: providerPerformance.closedEpisodeRealizedPnl,
+      openEpisodePartialRealizedPnl: "UNAVAILABLE",
+      verifiedRealizedPnl: providerPerformance.verifiedRealizedPnl,
       competitionBaselineEquity: accounting.baselineEquity,
       latestEquity: accounting.currentEquity,
       performanceBaselineAt: accounting.baselineObservedAt,
-      dailyPnl: currentMonthDailyPnl(persistedPerformance),
-    } : { ...unavailablePerformance(), dailyDrawdown: drawdownPct };
+      dailyPnl: providerPerformance.dailyPnl,
+      financialSource: "PROVIDER_LEDGER" as const,
+      scope: "DARWIN_ATTRIBUTED" as const,
+      unresolvedClosedLifecycles: providerPerformance.unresolvedClosedLifecycles,
+    };
     return {
       version: config.version ?? "0.2.0",
       commit: config.commit ?? "local",
@@ -871,6 +1052,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       portfolio: livePortfolio ?? null,
       portfolioFreshness: livePortfolio ? { source: "PROVIDER_LIVE", observedAt: livePortfolio.observedAt, stale: false } : { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" },
       performance,
+      accountPerformance,
       performanceAccounting: accounting,
       trades: [],
       latestDecision: latestValidCycle?.plan.entryActions[0] ?? latestValidCycle?.plan.positionActions[0] ?? null,
@@ -885,8 +1067,17 @@ export class TraderAgent extends Agent<Env, AgentState> {
       activity: events,
       lastPolicyUpdate: events.find((event) => event.type === "POLICY_UPDATED") ?? null,
       // Snapshot scheduler metrics intentionally cover the same bounded recent event window.
-      scheduler: { ...schedulerMetrics(events), ...scheduler },
+      scheduler: { ...schedulerMetrics(events), ...scheduler, tradingSchedulerHealthy: scheduler.schedulerHealthy, providerSyncSchedulerHealthy: await this.isProviderSyncSchedulerHealthy() },
     };
+  }
+
+  private async isProviderSyncSchedulerHealthy(): Promise<boolean> {
+    try {
+      const schedules = (await this.listSchedules()).filter((schedule) => schedule.callback === "runScheduledProviderSync");
+      return schedules.length === 1 && schedules[0]?.type === "interval" && schedules[0]?.intervalSeconds === PROVIDER_LEDGER_INTERVAL_SECONDS;
+    } catch {
+      return false;
+    }
   }
 
   private async getSchedulerDiagnostics(intervalMinutes: number, now = Date.now()): Promise<Pick<DashboardSnapshot["scheduler"], "nextScanAt" | "nextScanStale" | "configuredIntervalMinutes" | "matchingScheduleCount" | "schedulerHealthy" | "schedulerErrorCode">> {
@@ -933,7 +1124,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
     return json({ source: "DARWIN_PERSISTED", context: loadPositionContext(this, symbol, positionSide) });
   }
 
-  private getTradeHistory(url: URL): Response {
+  private async getTradeHistory(url: URL): Promise<Response> {
+    ensureStorage(this);
     const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
     const experiences = loadExperiences(this, limit);
     const journals = loadRecentJournals(this, limit);
@@ -943,8 +1135,18 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const context = loadPositionContext(this, experience.symbol, experience.positionSide);
       if (context) contexts.set(`${experience.symbol}:${experience.positionSide}`, context);
     }
-    const trades = tradeLogEntries(experiences, journals, contexts);
-    return json({ trades, limit });
+    const config = loadConfig(this.env, this.ensureActivePolicy());
+    let positions: PositionSnapshot[] = [];
+    if (experiences.some((experience) => experience.outcomeStatus === "OPEN")) {
+      try {
+        positions = (await new BitgetClient(config).getDashboardPortfolio()).positions;
+      } catch {
+        // Missing current provider evidence keeps open-trade financials unresolved.
+      }
+    }
+    const facts = resolveProviderTradeFacts(this, experiences, PROVIDER_TRADE_LIFECYCLE_CATEGORY, positions).facts;
+    const trades = tradeLogEntries(experiences, journals, contexts, facts);
+    return json({ trades, financialSource: "PROVIDER_LEDGER_OR_LIVE", reasoningSource: "DARWIN_PERSISTED", limit });
   }
 
   private getLearning(url: URL): Response {

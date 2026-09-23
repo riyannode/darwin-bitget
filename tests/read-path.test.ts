@@ -75,7 +75,12 @@ describe("bounded Durable Object read paths", () => {
     expect(clampHistoryLimit(0)).toBe(25);
 
     const sql = vi.fn(() => [] as never[]);
-    const fake = { sql };
+    const fake = {
+      sql,
+      env: { TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_CATEGORY: "USDT-FUTURES" },
+      ensureActivePolicy: () => policy,
+    };
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ ...portfolio, positions: [] });
     for (const method of ["getAgentJournal", "getTradeHistory", "getLearning"] as const) {
       const handler = (TraderAgent.prototype as unknown as Record<string, (url: URL) => Promise<Response> | Response>)[method];
       expect(handler).toBeDefined();
@@ -95,6 +100,7 @@ describe("bounded Durable Object read paths", () => {
       listSchedules: async () => [],
       reconcileScheduler: (TraderAgent.prototype as unknown as { reconcileScheduler: (intervalMinutes: number, options?: { now?: number }) => Promise<unknown> }).reconcileScheduler,
       getSchedulerDiagnostics: (TraderAgent.prototype as unknown as { getSchedulerDiagnostics: (intervalMinutes: number) => Promise<unknown> }).getSchedulerDiagnostics,
+      isProviderSyncSchedulerHealthy: (TraderAgent.prototype as unknown as { isProviderSyncSchedulerHealthy: () => Promise<boolean> }).isProviderSyncSchedulerHealthy,
       sql(strings: TemplateStringsArray, ...values: unknown[]) {
         queries.push(strings.reduce((query, part, index) => query + part + (index < values.length ? "?" : ""), ""));
         return [];
@@ -106,7 +112,7 @@ describe("bounded Durable Object read paths", () => {
     expect(snapshot.scheduler).toMatchObject({ nextScanAt: null, nextScanStale: true, configuredIntervalMinutes: 15, matchingScheduleCount: 0, schedulerHealthy: true });
     expect(queries.filter((query) => query.includes("FROM events")).length).toBe(1);
     expect(queries.filter((query) => query.includes("FROM risk_state")).length).toBe(3);
-    expect(queries.some((query) => query.includes("FROM experiences"))).toBe(false);
+    expect(queries.some((query) => query.includes("FROM experiences"))).toBe(true);
     expect(queries.some((query) => query.includes("FROM lessons"))).toBe(false);
     expect(queries.some((query) => query.includes("FROM backtests"))).toBe(false);
   });

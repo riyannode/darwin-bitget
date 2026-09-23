@@ -4,6 +4,7 @@ import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
 import { hasEvent, loadAllEvents, loadAllExperiences, loadPositionContext, persistProviderLifecycleRepair, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
 import { TraderAgent } from "../src/agent/agent.js";
 import { BitgetClient } from "../src/bitget/client.js";
+import type { PerformanceAggregate } from "../src/trading/performance.js";
 import type { PositionContext, TradeExperience, TradingJournal } from "../src/types.js";
 
 vi.mock("agents", () => ({ Agent: class {} }));
@@ -92,6 +93,12 @@ function fakeAgent(executor: SqlExecutor, db: DatabaseSync, paused: boolean) {
     ctx: { storage: { transactionSync: <T>(closure: () => T) => { db.exec("BEGIN IMMEDIATE"); try { const value = closure(); db.exec("COMMIT"); return value; } catch (error) { db.exec("ROLLBACK"); throw error; } } } },
     ensureActivePolicy: () => ({ paperOnly: true, maxSinglePositionMarginPct: "30", maxLeverage: "5", maxDailyDrawdownPct: "10", drawdownCooldownMinutes: 60, scanIntervalMinutes: 5, emergencyStop: false }),
     repairProviderClosedLifecycle: TraderAgent.prototype.repairProviderClosedLifecycle,
+    getTradeHistory: (TraderAgent.prototype as unknown as { getTradeHistory: (url: URL) => Promise<Response> }).getTradeHistory,
+    getDashboardSnapshot: TraderAgent.prototype.getDashboardSnapshot,
+    getSchedulerDiagnostics: async () => ({ nextScanAt: null, nextScanStale: false, configuredIntervalMinutes: 5, matchingScheduleCount: 0, schedulerHealthy: true }),
+    isProviderSyncSchedulerHealthy: async () => false,
+    persistPerformanceEquity: (TraderAgent.prototype as unknown as { persistPerformanceEquity: (equity: string, observedAt: string) => void }).persistPerformanceEquity,
+    performanceWithEquity: (TraderAgent.prototype as unknown as { performanceWithEquity: (equity: string, observedAt: string) => PerformanceAggregate }).performanceWithEquity,
     onRequest: TraderAgent.prototype.onRequest,
   };
 }
@@ -181,6 +188,41 @@ describe("paused provider lifecycle repair", () => {
     expect(event[0]?.metadata).toMatchObject({ origin: "DARWIN", providerPositionHistoryOrigin: "UNATTRIBUTED", providerPositionHistoryId: HISTORY_ID, closedQuantity: "7.51", netProfit: "33.19485709", legacyLocalRealizedPnl: "19.1364" });
     expect(providerRead).toHaveBeenCalledTimes(1);
     expect(executePaperOrder).not.toHaveBeenCalled();
+
+    const historyResponse = await agent.onRequest.call(agent, new Request("https://example.test/trade-history?limit=25"));
+    const historyBody = await historyResponse.json() as { trades: Array<Record<string, unknown>> };
+    const samsung = historyBody.trades.find((trade) => trade.tradeId === EXPERIENCE_ID);
+    expect(samsung).toMatchObject({ symbol: "SAMSUNGUSDT", positionSide: "LONG", status: "CLOSED", entry: "198.02", exit: "202.66", entryTime: OPENED_AT, exitTime: CLOSED_AT, realizedPnl: "33.19485709", quantity: "7.51", cumRealisedPnl: "34.8487", netProfit: "33.19485709", openFeeTotal: "-0.89227812", closeFeeTotal: "-0.91318734", totalFunding: "0.15162255", cashDividend: "0", financialSource: "PROVIDER_LEDGER", reasoningSource: "DARWIN_PERSISTED", origin: "DARWIN", providerPositionHistoryId: HISTORY_ID });
+    expect(samsung?.realizedPnl).not.toBe("19.1364");
+
+    const originalSql = agent.sql;
+    let performanceCacheWrites = 0;
+    let injectedFailure = false;
+    agent.sql = ((strings: TemplateStringsArray, ...values: unknown[]) => {
+      const query = strings.join("?");
+      if (query.includes("INSERT INTO risk_state")) {
+        performanceCacheWrites += 1;
+        if (performanceCacheWrites === 2 && !injectedFailure) {
+          injectedFailure = true;
+          throw new Error("performance-rebuild-fault");
+        }
+      }
+      return originalSql(strings, ...values as (string | number | boolean | null)[]);
+    }) as typeof agent.sql;
+    await expect(agent.getDashboardSnapshot.call(agent, { positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never)).rejects.toThrow("performance-rebuild-fault");
+    expect(injectedFailure).toBe(true);
+
+    const snapshot = await agent.getDashboardSnapshot.call(agent, { positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    expect(snapshot.performance).toMatchObject({ financialSource: "PROVIDER_LEDGER", scope: "DARWIN_ATTRIBUTED", totalTrades: 1, openTrades: 0, closedTrades: 1, wins: 1, losses: 0, breakeven: 0, totalPnl: "33.19485709", closedEpisodeRealizedPnl: "33.19485709", verifiedRealizedPnl: "33.19485709" });
+    expect(snapshot.accountPerformance).toMatchObject({ equitySource: "PROVIDER_LIVE", externalFlowStatus: "UNVERIFIED", netExternalInflows: "UNAVAILABLE", netPnlSinceBaseline: "UNAVAILABLE" });
+    const repeatedSnapshot = await agent.getDashboardSnapshot.call(agent, { positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    expect(repeatedSnapshot.performance.closedTrades).toBe(1);
+    expect(repeatedSnapshot.performance.totalPnl).toBe("33.19485709");
+    const liveSnapshotResponse = await agent.onRequest.call(agent, new Request("https://example.test/snapshot"));
+    const liveSnapshot = await liveSnapshotResponse.json() as { portfolioFreshness: { source: string }; accountPerformance: { equitySource: string } };
+    expect(liveSnapshot.portfolioFreshness.source).toBe("PROVIDER_LIVE");
+    expect(liveSnapshot.accountPerformance.equitySource).toBe("PROVIDER_LIVE");
+    expect(providerRead).toHaveBeenCalledTimes(2);
 
     const writesBeforeRetry = db.prepare("SELECT (SELECT COUNT(*) FROM events) + (SELECT COUNT(*) FROM experiences) + (SELECT COUNT(*) FROM position_context) AS count").get() as { count: number };
     providerRead.mockClear();

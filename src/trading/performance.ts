@@ -2,10 +2,10 @@ import type { AccountSnapshot, TradeExperience, TradingJournal } from "../types.
 import { cyclePlanDecisions, effectiveExecutionResult, effectiveReconciliationResult, normalizeCycleDecisions } from "../storage/journal-normalizer.js";
 import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal, isZeroDecimal, subtractDecimal } from "./decimal.js";
 
-export const PERFORMANCE_READ_MODEL_VERSION = "performance-v2";
+export const PERFORMANCE_READ_MODEL_VERSION = "performance-v3-provider-ledger";
 export const POSITION_CONTEXT_READ_MODEL_VERSION = "position-context-v2";
 export const MAX_PERSISTED_PERFORMANCE_DAYS = 62;
-export const ZERO_EXTERNAL_FLOW_INVARIANT = "UNVERIFIED_ZERO_FLOW_INVARIANT";
+export const EXTERNAL_FLOW_UNVERIFIED = "UNVERIFIED";
 
 export interface PerformanceDay {
   openingEquity: string;
@@ -33,8 +33,11 @@ export interface PerformanceAggregate {
   openEpisodePartialRealizedPnl: string;
   verifiedRealizedPnl: string;
   dailyPnl: Record<string, PerformanceDay>;
+  financialSource?: "PROVIDER_LEDGER";
+  providerOpenTradeCountKnown?: boolean;
+  providerDailyPnl?: Record<string, { pnl: string; trades: number }>;
   netExternalInflows?: string;
-  externalFlowStatus?: "VERIFIED" | typeof ZERO_EXTERNAL_FLOW_INVARIANT;
+  externalFlowStatus?: "VERIFIED" | typeof EXTERNAL_FLOW_UNVERIFIED;
   baselineSource?: string;
   baselineInitializationReason?: string;
   competitionStartVerified?: boolean;
@@ -69,7 +72,7 @@ export interface PerformanceAccounting {
   currentEquityObservedAt: string | null;
   equityDeltaSinceBaseline: string;
   netExternalInflows: string;
-  externalFlowStatus: "VERIFIED" | typeof ZERO_EXTERNAL_FLOW_INVARIANT;
+  externalFlowStatus: "VERIFIED" | typeof EXTERNAL_FLOW_UNVERIFIED;
   netPnlSinceBaseline: string;
   closedEpisodeRealizedPnl: string;
   openEpisodePartialRealizedPnl: string;
@@ -130,8 +133,8 @@ export function emptyPerformance(initializedAt: string): PerformanceAggregate {
     openEpisodePartialRealizedPnl: "0",
     verifiedRealizedPnl: "",
     dailyPnl: {},
-    netExternalInflows: "0",
-    externalFlowStatus: ZERO_EXTERNAL_FLOW_INVARIANT,
+    netExternalInflows: "UNAVAILABLE",
+    externalFlowStatus: EXTERNAL_FLOW_UNVERIFIED,
     baselineSource: "UNAVAILABLE",
     baselineInitializationReason: "UNINITIALIZED",
     competitionStartVerified: false,
@@ -143,6 +146,33 @@ export function emptyPerformance(initializedAt: string): PerformanceAggregate {
   };
 }
 
+export function migratePerformanceEquityObservations(previous: unknown, initializedAt: string): PerformanceAggregate {
+  const migrated = emptyPerformance(initializedAt);
+  if (!previous || typeof previous !== "object") return migrated;
+  const source = previous as Partial<PerformanceAggregate>;
+  const baseline = typeof source.competitionBaselineEquity === "string" && isPositiveDecimal(source.competitionBaselineEquity)
+    ? source.competitionBaselineEquity : null;
+  const latest = typeof source.latestEquity === "string" && isPositiveDecimal(source.latestEquity)
+    ? source.latestEquity : null;
+  const peak = typeof source.peakEquity === "string" && isPositiveDecimal(source.peakEquity)
+    ? source.peakEquity : baseline ?? latest;
+  const validDate = (value: unknown): value is string => typeof value === "string" && Number.isFinite(Date.parse(value));
+  return {
+    ...migrated,
+    performanceBaselineAt: validDate(source.performanceBaselineAt) ? source.performanceBaselineAt : null,
+    competitionBaselineEquity: baseline,
+    latestEquity: latest,
+    latestEquityObservedAt: validDate(source.latestEquityObservedAt) ? source.latestEquityObservedAt : null,
+    peakEquity: peak,
+    peakEquityObservedAt: validDate(source.peakEquityObservedAt) ? source.peakEquityObservedAt : null,
+    currentDrawdownPct: typeof source.currentDrawdownPct === "string" && isDecimal(source.currentDrawdownPct) ? source.currentDrawdownPct : "0",
+    maxDrawdownPct: typeof source.maxDrawdownPct === "string" && isDecimal(source.maxDrawdownPct) ? source.maxDrawdownPct : "0",
+    baselineSource: baseline ? "PRESERVED_PRIOR_EQUITY_OBSERVATION" : "UNAVAILABLE",
+    baselineInitializationReason: baseline ? "PRESERVED_PRIOR_BASELINE_DURING_PROVIDER_AUTHORITY_MIGRATION" : "UNINITIALIZED",
+    competitionStartVerified: false,
+  };
+}
+
 export function normalizePerformanceAggregate(performance: PerformanceAggregate): PerformanceAggregate {
   const baseline = performance.competitionBaselineEquity;
   const latest = performance.latestEquity;
@@ -151,8 +181,8 @@ export function normalizePerformanceAggregate(performance: PerformanceAggregate)
     ...performance,
     closedEpisodeRealizedPnl: performance.closedEpisodeRealizedPnl ?? "0",
     openEpisodePartialRealizedPnl: performance.openEpisodePartialRealizedPnl ?? "0",
-    netExternalInflows: performance.netExternalInflows ?? "0",
-    externalFlowStatus: performance.externalFlowStatus ?? ZERO_EXTERNAL_FLOW_INVARIANT,
+    netExternalInflows: performance.netExternalInflows ?? "UNAVAILABLE",
+    externalFlowStatus: performance.externalFlowStatus ?? EXTERNAL_FLOW_UNVERIFIED,
     baselineSource: performance.baselineSource ?? (baseline ? "PERSISTED_PERFORMANCE_AGGREGATE" : "UNAVAILABLE"),
     baselineInitializationReason: performance.baselineInitializationReason ?? (baseline ? "PRESERVED_EXISTING_BASELINE" : "UNINITIALIZED"),
     competitionStartVerified: performance.competitionStartVerified ?? false,
@@ -262,7 +292,7 @@ export function buildPerformanceAccounting(performance: PerformanceAggregate, ob
   const baselineEquity = normalized.competitionBaselineEquity;
   const equityDeltaSinceBaseline = baselineEquity && currentEquity ? subtractDecimal(currentEquity, baselineEquity) : "UNAVAILABLE";
   const netExternalInflows = normalized.netExternalInflows ?? "0";
-  const netPnlSinceBaseline = baselineEquity && currentEquity && isDecimal(netExternalInflows)
+  const netPnlSinceBaseline = normalized.externalFlowStatus === "VERIFIED" && baselineEquity && currentEquity && isDecimal(netExternalInflows)
     ? subtractDecimal(equityDeltaSinceBaseline, netExternalInflows)
     : "UNAVAILABLE";
   const peakEquity = normalized.peakEquity && currentEquity && compareDecimal(currentEquity, normalized.peakEquity) > 0 ? currentEquity : normalized.peakEquity;
@@ -278,7 +308,7 @@ export function buildPerformanceAccounting(performance: PerformanceAggregate, ob
     currentEquityObservedAt,
     equityDeltaSinceBaseline,
     netExternalInflows,
-    externalFlowStatus: normalized.externalFlowStatus ?? ZERO_EXTERNAL_FLOW_INVARIANT,
+    externalFlowStatus: normalized.externalFlowStatus ?? EXTERNAL_FLOW_UNVERIFIED,
     netPnlSinceBaseline,
     closedEpisodeRealizedPnl: normalized.closedEpisodeRealizedPnl,
     openEpisodePartialRealizedPnl: normalized.openEpisodePartialRealizedPnl,
@@ -404,7 +434,7 @@ function ratioPercent(numerator: number, denominator: number): string {
   return decimalText(BigInt(numerator) * 10000000000n / BigInt(denominator), 8);
 }
 
-function classifiedWinRate(wins: number, losses: number, breakeven: number): string {
+export function classifiedWinRate(wins: number, losses: number, breakeven: number): string {
   return ratioPercent(wins, wins + losses + breakeven);
 }
 

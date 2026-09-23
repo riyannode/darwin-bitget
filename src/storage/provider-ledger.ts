@@ -1,5 +1,5 @@
 import type { TradeExperience } from "../types.js";
-import type { ProviderLifecycleEvidence, ProviderLifecyclePosition, ProviderEvidenceOrigin } from "../trading/provider-lifecycle-reconciliation.js";
+import type { ProviderLifecycleEvidence, ProviderLifecycleHistory, ProviderLifecyclePosition, ProviderEvidenceOrigin } from "../trading/provider-lifecycle-reconciliation.js";
 import type {
   ProviderFillRecord,
   ProviderFinancialRecord,
@@ -226,6 +226,49 @@ export function upsertProviderFinancialRecord(executor: SqlExecutor, record: Pro
       raw_provider_json = excluded.raw_provider_json,
       last_seen_at = excluded.last_seen_at
   `;
+}
+
+export function loadProviderPositionHistories(executor: SqlExecutor, category: string): ProviderLifecycleHistory[] {
+  const rows = executor.sql<{
+    provider_position_history_id: string | null; symbol: string; position_side: string; open_total_pos: string | null; close_total_pos: string | null;
+    avg_entry_price: string | null; avg_exit_price: string | null; cum_realised_pnl: string | null; net_profit: string | null;
+    open_fee_total: string | null; close_fee_total: string | null; total_funding: string | null; cash_dividend: string | null;
+    opening_time: string; closing_time: string; origin: ProviderEvidenceOrigin;
+  }>`SELECT provider_position_history_id, symbol, position_side, open_total_pos, close_total_pos, avg_entry_price, avg_exit_price, cum_realised_pnl, net_profit, open_fee_total, close_fee_total, total_funding, cash_dividend, opening_time, closing_time, origin FROM provider_position_history WHERE category = ${category} ORDER BY opening_time, provider_position_history_id`;
+  return rows.map((row) => ({
+    providerPositionHistoryId: row.provider_position_history_id,
+    symbol: row.symbol,
+    positionSide: row.position_side,
+    openTotalPos: row.open_total_pos,
+    closeTotalPos: row.close_total_pos,
+    avgEntryPrice: row.avg_entry_price,
+    avgExitPrice: row.avg_exit_price,
+    cumRealisedPnl: row.cum_realised_pnl,
+    netProfit: row.net_profit,
+    openFeeTotal: row.open_fee_total,
+    closeFeeTotal: row.close_fee_total,
+    totalFunding: row.total_funding,
+    cashDividend: row.cash_dividend,
+    openingTime: row.opening_time,
+    closingTime: row.closing_time,
+    origin: row.origin,
+  }));
+}
+
+export function loadProviderLifecycleHistoryCandidateIds(executor: SqlExecutor, experience: TradeExperience, category: string): Set<string> {
+  const rows = executor.sql<{ provider_position_history_id: string }>`
+    SELECT DISTINCT h.provider_position_history_id
+    FROM provider_position_history h
+    JOIN idempotency i ON i.decision_id = ${experience.entryDecisionId}
+    JOIN provider_orders o ON o.category = h.category AND o.provider_order_id = i.provider_order_id AND o.client_oid = i.client_order_id
+    JOIN provider_fills f ON f.category = o.category AND f.provider_order_id = o.provider_order_id AND f.client_oid = o.client_oid
+    WHERE h.category = ${category} AND h.provider_position_history_id IS NOT NULL
+      AND h.symbol = ${experience.symbol} AND UPPER(h.position_side) = ${experience.positionSide?.toUpperCase() ?? ""}
+      AND o.symbol = h.symbol AND UPPER(o.pos_side) = UPPER(h.position_side) AND LOWER(o.trade_side) = 'open' AND o.origin = 'DARWIN'
+      AND f.symbol = h.symbol AND UPPER(f.pos_side) = UPPER(h.position_side) AND LOWER(f.trade_side) = 'open' AND f.origin = 'DARWIN'
+      AND ABS((julianday(f.created_time) - julianday(h.opening_time)) * 86400.0) <= 5
+  `;
+  return new Set(rows.map((row) => row.provider_position_history_id));
 }
 
 export function loadProviderLifecycleEvidence(
