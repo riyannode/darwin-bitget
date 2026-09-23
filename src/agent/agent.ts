@@ -73,8 +73,9 @@ import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../re
 import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
 import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } from "../trading/position-management.js";
-import { providerLedgerDiagnostics, loadProviderLifecycleEvidence, loadProviderLifecycleHistoryCandidateIds, loadProviderPositionHistories } from "../storage/provider-ledger.js";
-import { classifyProviderLifecycle, type ProviderLifecycleHistory } from "../trading/provider-lifecycle-reconciliation.js";
+import { providerLedgerDiagnostics, loadProviderFinancialRecordsSince, loadProviderLifecycleEvidence, loadProviderPositionHistories } from "../storage/provider-ledger.js";
+import { calculateNetPnlSinceBaseline, calculateVerifiedExternalFlows, isFinancialRecordCoverageComplete } from "../trading/external-flow.js";
+import { classifyProviderLifecycle, providerWeightedEntryPriceMatches, type ProviderLifecycleHistory } from "../trading/provider-lifecycle-reconciliation.js";
 import { rebuildProviderPerformance, type ProviderPerformanceLifecycle } from "../trading/provider-performance.js";
 
 
@@ -190,59 +191,162 @@ interface ResolvedProviderTradeFact {
   origin: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
 }
 
+function providerHistoryProbeExperience(history: ProviderLifecycleHistory, decisionId: string, isOpen: boolean): TradeExperience {
+  return {
+    experienceId: `provider-history:${history.providerPositionHistoryId}`,
+    symbol: history.symbol,
+    positionSide: history.positionSide as TradeExperience["positionSide"],
+    action: history.positionSide === "SHORT" ? "OPEN_SHORT" : "OPEN_LONG",
+    entryDecisionId: decisionId,
+    entryPrice: history.avgEntryPrice ?? "0",
+    entryTime: history.openingTime,
+    exitDecisionId: "",
+    exitPrice: "0",
+    exitTime: history.closingTime,
+    selectedLeverage: "UNAVAILABLE",
+    marginAllocationPct: "UNAVAILABLE",
+    marginAllocated: "UNAVAILABLE",
+    positionNotional: "UNAVAILABLE",
+    realizedPnl: "UNAVAILABLE",
+    realizedPnlPct: "UNAVAILABLE",
+    maximumFavorableExcursion: "0",
+    maximumAdverseExcursion: "0",
+    drawdownContribution: "0",
+    liquidationDistance: "0",
+    entryThesis: "",
+    exitThesis: "",
+    evidenceAtEntry: [],
+    evidenceAtExit: [],
+    lessonsUsed: [],
+    marketContext: "",
+    outcomeStatus: isOpen ? "OPEN" : "CLOSED_UNCLASSIFIED",
+  };
+}
+
+function providerHistoryDecisionId(executor: SqlExecutor, history: ProviderLifecycleHistory, category: string): string | null {
+  if (!history.providerPositionHistoryId) return null;
+  const rows = executor.sql<{ decision_id: string }>`
+    SELECT DISTINCT i.decision_id
+    FROM provider_position_history h
+    JOIN provider_fills f ON f.category = h.category AND f.symbol = h.symbol
+      AND UPPER(f.pos_side) = UPPER(h.position_side) AND LOWER(f.trade_side) = 'open'
+      AND ABS((julianday(f.created_time) - julianday(h.opening_time)) * 86400.0) <= 5
+    JOIN provider_orders o ON o.category = f.category AND o.provider_order_id = f.provider_order_id
+      AND o.client_oid = f.client_oid AND o.symbol = f.symbol
+      AND UPPER(o.pos_side) = UPPER(f.pos_side) AND LOWER(o.trade_side) = 'open' AND o.origin = 'DARWIN'
+    JOIN idempotency i ON i.client_order_id = f.client_oid AND i.provider_order_id = f.provider_order_id
+    WHERE h.category = ${category} AND h.provider_position_history_id = ${history.providerPositionHistoryId}
+      AND f.origin = 'DARWIN'
+  `;
+  return rows.length === 1 ? rows[0]!.decision_id : null;
+}
+
+function providerLiveOpeningOrderIdentity(executor: SqlExecutor, position: PositionSnapshot, category: string): { providerOrderId: string; decisionId: string } | null {
+  const openedAt = position.openedAt ? Date.parse(position.openedAt) : null;
+  if (openedAt !== null && !Number.isFinite(openedAt)) return null;
+  const rows = executor.sql<{ provider_order_id: string; decision_id: string; fill_time: string; exec_qty: string; exec_price: string }>`
+    SELECT o.provider_order_id, i.decision_id, f.created_time AS fill_time, f.exec_qty, f.exec_price
+    FROM provider_orders o
+    JOIN provider_fills f ON f.category = o.category AND f.provider_order_id = o.provider_order_id
+      AND f.client_oid = o.client_oid AND f.symbol = o.symbol AND UPPER(f.pos_side) = UPPER(o.pos_side)
+      AND LOWER(f.trade_side) = 'open' AND f.origin = 'DARWIN'
+    JOIN idempotency i ON i.provider_order_id = o.provider_order_id AND i.client_order_id = o.client_oid
+    WHERE o.category = ${category} AND o.symbol = ${position.symbol}
+      AND UPPER(o.pos_side) = UPPER(${position.positionSide}) AND LOWER(o.trade_side) = 'open' AND o.origin = 'DARWIN'
+    ORDER BY f.created_time, o.provider_order_id
+  `;
+  const openedByOrder = new Map<string, { decisionIds: Set<string>; fills: Array<{ quantity: string; execPrice: string }> }>();
+  for (const row of rows) {
+    const fillTime = Date.parse(row.fill_time);
+    if (!Number.isFinite(fillTime) || (openedAt !== null && Math.abs(fillTime - openedAt) > 5_000)) continue;
+    const entry = openedByOrder.get(row.provider_order_id) ?? { decisionIds: new Set<string>(), fills: [] };
+    entry.decisionIds.add(row.decision_id);
+    entry.fills.push({ quantity: row.exec_qty, execPrice: row.exec_price });
+    openedByOrder.set(row.provider_order_id, entry);
+  }
+  const matches = [...openedByOrder].filter(([, entry]) => {
+    try {
+      return entry.decisionIds.size === 1
+        && compareDecimal(entry.fills.reduce((sum, fill) => addDecimal(sum, fill.quantity), "0"), position.quantity) === 0
+        && providerWeightedEntryPriceMatches(entry.fills, position.entryPrice);
+    } catch { return false; }
+  });
+  if (matches.length !== 1) return null;
+  const [providerOrderId, match] = matches[0]!;
+  return { providerOrderId, decisionId: [...match.decisionIds][0]! };
+}
+
 export function resolveProviderTradeFacts(
   executor: SqlExecutor,
   experiences: readonly TradeExperience[],
   category: string,
   positions: readonly PositionSnapshot[],
-): { facts: Map<string, ResolvedProviderTradeFact>; lifecycles: ProviderPerformanceLifecycle[] } {
+): { facts: Map<string, ResolvedProviderTradeFact>; lifecycles: ProviderPerformanceLifecycle[]; providerOnlyHistories: ProviderLifecycleHistory[]; providerOnlyOpenPositions: Array<{ position: PositionSnapshot; providerOrderId: string }> } {
   const facts = new Map<string, ResolvedProviderTradeFact>();
   const lifecycles: ProviderPerformanceLifecycle[] = [];
-  const ownersByHistoryId = new Map<string, string>();
   const histories = loadProviderPositionHistories(executor, category);
+  const historiesByDecision = new Map<string, Array<{ history: ProviderLifecycleHistory; historyId: string; probeId: string }>>();
+
+  // Resolve provider history and opening identity before consulting local experiences or reasoning.
+  for (const history of histories) {
+    const historyId = history.providerPositionHistoryId;
+    if (!historyId || history.origin === "PROVIDER_EXTERNAL") continue;
+    const decisionId = providerHistoryDecisionId(executor, history, category);
+    if (!decisionId) continue;
+    const historyHasClose = Boolean(history.closeTotalPos && isPositiveDecimal(history.closeTotalPos) && history.closingTime && Number.isFinite(Date.parse(history.closingTime)));
+    const livePosition = !historyHasClose ? positions.find((position) => position.symbol === history.symbol && position.positionSide === history.positionSide && isPositiveDecimal(position.quantity)) : undefined;
+    const probeId = `provider-history:${historyId}`;
+    const probe = providerHistoryProbeExperience(history, decisionId, Boolean(livePosition));
+    const evidence = loadProviderLifecycleEvidence(executor, probe, category, historyId, livePosition ? [livePosition] : []);
+    const classification = classifyProviderLifecycle(evidence).classification;
+    if (classification === "MATCHED_CLOSED" || classification === "LOCAL_OPEN_PROVIDER_CLOSED") {
+      facts.set(probeId, { source: "PROVIDER_LEDGER", history, providerPositionHistoryId: historyId, origin: "DARWIN" });
+      lifecycles.push({ lifecycleId: historyId, origin: "DARWIN", status: "CLOSED", ...(history.netProfit === null ? {} : { netProfit: history.netProfit }), ...(history.closingTime ? { closedAt: history.closingTime } : {}) });
+      const matches = historiesByDecision.get(decisionId) ?? [];
+      matches.push({ history, historyId, probeId });
+      historiesByDecision.set(decisionId, matches);
+    } else if (classification === "MATCHED_OPEN") {
+      lifecycles.push({ lifecycleId: historyId, origin: "DARWIN", status: "OPEN" });
+    }
+  }
+
+  const openPositionsByDecision = new Map<string, Array<{ position: PositionSnapshot; providerOrderId: string }>>();
+  for (const position of positions.filter((candidate) => isPositiveDecimal(candidate.quantity))) {
+    const identity = providerLiveOpeningOrderIdentity(executor, position, category);
+    if (!identity) continue;
+    const lifecycleId = `open:${identity.providerOrderId}`;
+    if (!lifecycles.some((lifecycle) => lifecycle.lifecycleId === lifecycleId)) lifecycles.push({ lifecycleId, origin: "DARWIN", status: "OPEN" });
+    const matches = openPositionsByDecision.get(identity.decisionId) ?? [];
+    matches.push({ position, providerOrderId: identity.providerOrderId });
+    openPositionsByDecision.set(identity.decisionId, matches);
+  }
+
+  // Local experiences only enrich already-resolved provider facts; they never create financial lifecycles.
+  const joinedHistoryIds = new Set<string>();
+  const joinedOpenOrderIds = new Set<string>();
   for (const experience of experiences) {
     if (!experience.positionSide) {
       facts.set(experience.experienceId, { source: "UNRESOLVED", origin: "UNATTRIBUTED" });
       continue;
     }
-    const candidateHistoryIds = loadProviderLifecycleHistoryCandidateIds(executor, experience, category);
-    const candidates: ProviderLifecycleHistory[] = [];
-    for (const history of histories.filter((row) => row.providerPositionHistoryId && candidateHistoryIds.has(row.providerPositionHistoryId))) {
-      // Current position rows lack a lifecycle ID; they cannot disprove a fully joined historical lifecycle.
-      const evidence = loadProviderLifecycleEvidence(executor, experience, category, history.providerPositionHistoryId!, []);
-      const classification = classifyProviderLifecycle(evidence).classification;
-      if (classification === "MATCHED_CLOSED" || classification === "LOCAL_OPEN_PROVIDER_CLOSED") candidates.push(history);
+    const closed = (historiesByDecision.get(experience.entryDecisionId) ?? []).filter(({ history }) => history.symbol === experience.symbol && history.positionSide === experience.positionSide);
+    const opened = (openPositionsByDecision.get(experience.entryDecisionId) ?? []).filter(({ position }) => position.symbol === experience.symbol && position.positionSide === experience.positionSide);
+    if (closed.length === 1 && opened.length === 0) {
+      const candidate = closed[0]!;
+      facts.set(experience.experienceId, facts.get(candidate.probeId)!);
+      joinedHistoryIds.add(candidate.historyId);
+    } else if (opened.length === 1 && closed.length === 0) {
+      const candidate = opened[0]!;
+      facts.set(experience.experienceId, { source: "PROVIDER_LIVE", position: candidate.position, origin: "DARWIN" });
+      joinedOpenOrderIds.add(candidate.providerOrderId);
+    } else {
+      facts.set(experience.experienceId, { source: "UNRESOLVED", origin: "UNATTRIBUTED" });
     }
-    const candidate = candidates[0];
-    if (candidates.length === 1 && candidate && typeof candidate.providerPositionHistoryId === "string") {
-      const history = candidate;
-      const historyId = typeof history.providerPositionHistoryId === "string" ? history.providerPositionHistoryId : null;
-      if (!historyId) continue;
-      const priorOwner = ownersByHistoryId.get(historyId);
-      if (priorOwner && priorOwner !== experience.experienceId) {
-        facts.set(priorOwner, { source: "UNRESOLVED", origin: "UNATTRIBUTED" });
-        facts.set(experience.experienceId, { source: "UNRESOLVED", origin: "UNATTRIBUTED" });
-        const lifecycleIndex = lifecycles.findIndex((lifecycle) => lifecycle.lifecycleId === historyId);
-        if (lifecycleIndex >= 0) lifecycles.splice(lifecycleIndex, 1);
-        continue;
-      }
-      ownersByHistoryId.set(historyId, experience.experienceId);
-      facts.set(experience.experienceId, { source: "PROVIDER_LEDGER", history, providerPositionHistoryId: historyId, origin: "DARWIN" });
-      lifecycles.push({ lifecycleId: historyId, origin: "DARWIN", status: "CLOSED", ...(history.netProfit === null ? {} : { netProfit: history.netProfit }), ...(history.closingTime ? { closedAt: history.closingTime } : {}) });
-      continue;
-    }
-    const livePosition = candidates.length === 0 ? positions.find((position) => position.symbol === experience.symbol && position.positionSide === experience.positionSide && isPositiveDecimal(position.quantity)) : undefined;
-    if (experience.outcomeStatus === "OPEN" && livePosition) {
-      const evidence = loadProviderLifecycleEvidence(executor, experience, category, "", positions);
-      if (classifyProviderLifecycle(evidence).classification === "MATCHED_OPEN" && evidence.entryIdentity) {
-        facts.set(experience.experienceId, { source: "PROVIDER_LIVE", position: livePosition, origin: "DARWIN" });
-        lifecycles.push({ lifecycleId: `open:${evidence.entryIdentity.providerOrderId}`, origin: "DARWIN", status: "OPEN" });
-        continue;
-      }
-    }
-    facts.set(experience.experienceId, { source: "UNRESOLVED", origin: "UNATTRIBUTED" });
   }
-  return { facts, lifecycles };
+
+  const providerOnlyHistories = [...historiesByDecision.values()].flat().filter((candidate) => !joinedHistoryIds.has(candidate.historyId)).map((candidate) => candidate.history);
+  const providerOnlyOpenPositions = [...openPositionsByDecision.values()].flat().filter((candidate) => !joinedOpenOrderIds.has(candidate.providerOrderId));
+  return { facts, lifecycles, providerOnlyHistories, providerOnlyOpenPositions };
 }
 
 function tradeLogEntries(
@@ -268,21 +372,31 @@ function tradeLogEntries(
     const history = facts?.history;
     const livePosition = facts?.position;
     const isProviderClosed = facts?.source === "PROVIDER_LEDGER" && history !== undefined;
-    const openedAt = history?.openingTime ?? (livePosition?.openedAt ?? "UNAVAILABLE");
+    const isProviderLive = facts?.source === "PROVIDER_LIVE" && livePosition !== undefined;
+    const openedAt = history?.openingTime ?? livePosition?.openedAt ?? "UNAVAILABLE";
     const closedAt = history?.closingTime;
+    const persistedReasoning = Boolean(entryReasoning || exitReasoning || managementEvents.length || experience.entryThesis.trim());
+    const financialStatus = isProviderClosed ? "CLOSED" : isProviderLive ? "OPEN" : "UNRESOLVED";
     return {
       tradeId: experience.experienceId,
       timestamp: openedAt,
       symbol: experience.symbol,
       action,
-      marginAllocationPct: experience.marginAllocationPct,
-      marginAllocated: experience.marginAllocated,
-      leverage: experience.selectedLeverage,
-      positionNotional: experience.positionNotional,
+      marginAllocationPct: "UNAVAILABLE",
+      marginAllocated: isProviderLive ? livePosition.marginAllocated : "UNAVAILABLE",
+      leverage: isProviderLive ? livePosition.leverage : "UNAVAILABLE",
+      positionNotional: isProviderLive ? livePosition.notional : "UNAVAILABLE",
+      intendedMarginAllocated: experience.marginAllocated,
+      intendedMarginAllocationPct: experience.marginAllocationPct,
+      intendedLeverage: experience.selectedLeverage,
+      intendedPositionNotional: experience.positionNotional,
+      legacyEntryPrice: experience.entryPrice,
+      legacyEntryTime: experience.entryTime,
       entry: history?.avgEntryPrice ?? livePosition?.entryPrice ?? "UNAVAILABLE",
       exit: history?.avgExitPrice ?? "UNAVAILABLE",
       realizedPnl: history?.netProfit ?? "UNAVAILABLE",
-      status: isProviderClosed ? "CLOSED" : tradeLifecycleStatus(experience),
+      status: financialStatus,
+      localLifecycleStatus: tradeLifecycleStatus(experience),
       thesis: experience.entryThesis,
       orderReference: record?.executionResult?.providerOrderId ?? record?.executionResult?.clientOrderId ?? journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
       positionSide: experience.positionSide,
@@ -290,7 +404,7 @@ function tradeLogEntries(
       entryTime: openedAt,
       ...(closedAt ? { closedAt, exitTime: closedAt } : {}),
       financialSource: isProviderClosed ? "PROVIDER_LEDGER" : facts?.source ?? "UNRESOLVED",
-      reasoningSource: "DARWIN_PERSISTED",
+      ...(persistedReasoning ? { reasoningSource: "DARWIN_PERSISTED" as const } : {}),
       origin: facts?.origin ?? "UNATTRIBUTED",
       ...(facts?.providerPositionHistoryId ? { providerPositionHistoryId: facts.providerPositionHistoryId } : {}),
       ...(history ? {
@@ -303,7 +417,7 @@ function tradeLogEntries(
         closeFeeTotal: history.closeFeeTotal ?? "UNAVAILABLE",
         totalFunding: history.totalFunding ?? "UNAVAILABLE",
         cashDividend: history.cashDividend ?? "UNAVAILABLE",
-      } : livePosition ? { quantity: livePosition.quantity } : {}),
+      } : livePosition ? { quantity: livePosition.quantity, unrealizedPnl: livePosition.unrealizedPnl } : { quantity: "UNAVAILABLE", unrealizedPnl: "UNAVAILABLE" }),
       ...(entryReasoning ? { entryReasoning } : {}),
       ...(exitReasoning ? { exitReasoning } : {}),
       ...(managementEvents.length ? { managementEvents } : {}),
@@ -532,8 +646,19 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (!auth.authorized) return json({ error: auth.code }, auth.status);
       ensureStorage(this);
       const config = loadConfig(this.env, this.ensureActivePolicy());
-      const result = await syncProviderLedger(new BitgetClient(config), this, { category: config.bitgetCategory, mode: "backfill" });
-      return json({ source: "PROVIDER_READ_ONLY_BACKFILL", ...result, diagnostics: providerLedgerDiagnostics(this, config.bitgetCategory) });
+      const storedPerformance = loadPerformanceAggregate<PerformanceAggregate>(this);
+      const baselineAt = isPerformanceAggregate(storedPerformance) ? storedPerformance.performanceBaselineAt : null;
+      const results = [];
+      for (const category of PROVIDER_FINANCIAL_CATEGORIES) {
+        results.push(await syncProviderLedger(new BitgetClient(config), this, {
+          category,
+          mode: "backfill",
+          financialRecordsOnly: category !== "USDT-FUTURES",
+          ...(baselineAt ? { coverageStartAt: baselineAt } : {}),
+        }));
+      }
+      const diagnostics = PROVIDER_FINANCIAL_CATEGORIES.map((category) => providerLedgerDiagnostics(this, category));
+      return json({ source: "PROVIDER_READ_ONLY_BACKFILL", baselineAt, results, categories: diagnostics.map((entry) => ({ category: entry.category, rowCount: entry.counts.financialRecords, sync: entry.sync, coverage: entry.sync?.financialRecordCoverage ?? null })) });
     }
     if (url.pathname === "/policy" && request.method === "GET") return this.getPolicyRead();
     if (url.pathname === "/export/paper-log" && request.method === "GET") return this.exportPaperLog(url);
@@ -965,18 +1090,32 @@ export class TraderAgent extends Agent<Env, AgentState> {
       ? buildPerformanceAccounting(persistedPerformance, livePortfolio ? { portfolioEquity: livePortfolio.portfolioEquity, observedAt: livePortfolio.observedAt, unrealizedPnl: livePortfolio.unrealizedPnl, ...(livePortfolio.unrealizedPnlSource ? { unrealizedPnlSource: livePortfolio.unrealizedPnlSource } : {}) } satisfies PerformanceObservation : undefined)
       : buildPerformanceAccounting(emptyPerformance(new Date().toISOString()), livePortfolio ? { portfolioEquity: livePortfolio.portfolioEquity, observedAt: livePortfolio.observedAt, unrealizedPnl: livePortfolio.unrealizedPnl, ...(livePortfolio.unrealizedPnlSource ? { unrealizedPnlSource: livePortfolio.unrealizedPnlSource } : {}) } satisfies PerformanceObservation : undefined);
     const providerPerformance = rebuildProviderPerformance(resolveProviderTradeFacts(this, loadAllExperiences(this), PROVIDER_TRADE_LIFECYCLE_CATEGORY, livePortfolio?.positions ?? []).lifecycles);
+    const baselineAt = accountingBase.baselineObservedAt;
     const financialRecordCategories = PROVIDER_FINANCIAL_CATEGORIES.map((category) => {
       const sync = providerLedgerDiagnostics(this, category).sync;
-      return { category, status: sync?.lastError ? "PARTIAL" as const : sync?.lastSuccessfulSyncAt ? "SUCCESS" as const : "NOT_SYNCED" as const, lastSuccessfulSyncAt: sync?.lastSuccessfulSyncAt ?? null };
+      const coverage = sync?.financialRecordCoverage ?? null;
+      const lastError = coverage?.lastError ?? sync?.lastError ?? null;
+      const complete = isFinancialRecordCoverageComplete(coverage ?? undefined, baselineAt, new Date(), lastError);
+      return {
+        category,
+        status: complete ? "SUCCESS" as const : coverage ? "PARTIAL" as const : "NOT_SYNCED" as const,
+        lastSuccessfulSyncAt: coverage?.lastSuccessfulSyncAt ?? null,
+        coveredFrom: coverage?.coveredFrom ?? null,
+        coveredThrough: coverage?.coveredThrough ?? null,
+        lastError,
+      };
     });
     const allFinancialCategoriesComplete = financialRecordCategories.every((category) => category.status === "SUCCESS");
+    const flowRecords = baselineAt ? PROVIDER_FINANCIAL_CATEGORIES.flatMap((category) => loadProviderFinancialRecordsSince(this, category, baselineAt)) : [];
+    const flows = calculateVerifiedExternalFlows(flowRecords, financialRecordCategories.map((category) => ({ complete: category.status === "SUCCESS", lastError: category.lastError })));
+    const netPnlSinceBaseline = calculateNetPnlSinceBaseline(livePortfolio?.portfolioEquity, accountingBase.baselineEquity, flows);
     const accountPerformance: DashboardSnapshot["accountPerformance"] = {
       equitySource: livePortfolio ? "PROVIDER_LIVE" : "UNAVAILABLE",
       currentEquity: livePortfolio?.portfolioEquity ?? null,
-      externalFlowStatus: "UNVERIFIED",
-      netExternalInflows: "UNAVAILABLE",
-      netPnlSinceBaseline: "UNAVAILABLE",
-      financialRecordCoverage: allFinancialCategoriesComplete ? "COMPLETE" : financialRecordCategories.some((category) => category.status === "PARTIAL") ? "PARTIAL" : "UNAVAILABLE",
+      externalFlowStatus: flows.status,
+      netExternalInflows: flows.netExternalInflows,
+      netPnlSinceBaseline,
+      financialRecordCoverage: allFinancialCategoriesComplete ? "COMPLETE" : financialRecordCategories.every((category) => category.status === "NOT_SYNCED") ? "UNAVAILABLE" : "PARTIAL",
       financialRecordCategories,
     };
     const cacheBase = isPerformanceAggregate(persistedPerformance) ? persistedPerformance : migratePerformanceEquityObservations(persistedPerformance, new Date().toISOString());
@@ -997,15 +1136,15 @@ export class TraderAgent extends Agent<Env, AgentState> {
       providerDailyPnl: providerPerformance.dailyPnl,
       financialSource: "PROVIDER_LEDGER",
       providerOpenTradeCountKnown: Boolean(livePortfolio),
-      netExternalInflows: "UNAVAILABLE",
-      externalFlowStatus: "UNVERIFIED",
+      netExternalInflows: flows.netExternalInflows,
+      externalFlowStatus: flows.status,
     };
     if (JSON.stringify(persistedPerformance) !== JSON.stringify(providerPerformanceCache)) savePerformanceAggregate(this, providerPerformanceCache, livePortfolio?.observedAt ?? new Date().toISOString());
     const accounting = {
       ...accountingBase,
-      netExternalInflows: "UNAVAILABLE",
-      externalFlowStatus: "UNVERIFIED" as const,
-      netPnlSinceBaseline: "UNAVAILABLE",
+      netExternalInflows: flows.netExternalInflows,
+      externalFlowStatus: flows.status,
+      netPnlSinceBaseline,
       closedEpisodeRealizedPnl: providerPerformance.closedEpisodeRealizedPnl,
       openEpisodePartialRealizedPnl: "UNAVAILABLE",
       verifiedRealizedPnl: providerPerformance.verifiedRealizedPnl,
@@ -1138,16 +1277,71 @@ export class TraderAgent extends Agent<Env, AgentState> {
     }
     const config = loadConfig(this.env, this.ensureActivePolicy());
     let positions: PositionSnapshot[] = [];
-    if (experiences.some((experience) => experience.outcomeStatus === "OPEN")) {
-      try {
-        positions = (await new BitgetClient(config).getDashboardPortfolio()).positions;
-      } catch {
-        // Missing current provider evidence keeps open-trade financials unresolved.
-      }
+    try {
+      positions = (await new BitgetClient(config).getDashboardPortfolio()).positions;
+    } catch {
+      // Missing current provider evidence keeps open-trade financials unresolved.
     }
-    const facts = resolveProviderTradeFacts(this, experiences, PROVIDER_TRADE_LIFECYCLE_CATEGORY, positions).facts;
-    const trades = tradeLogEntries(experiences, journals, contexts, facts);
-    return json({ trades, financialSource: "PROVIDER_LEDGER_OR_LIVE", reasoningSource: "DARWIN_PERSISTED", limit });
+    const resolved = resolveProviderTradeFacts(this, experiences, PROVIDER_TRADE_LIFECYCLE_CATEGORY, positions);
+    const localTrades = tradeLogEntries(experiences, journals, contexts, resolved.facts);
+    const providerOnlyTrades: DashboardSnapshot["trades"] = resolved.providerOnlyHistories.map((history) => ({
+      tradeId: `provider-history:${history.providerPositionHistoryId}`,
+      timestamp: history.openingTime,
+      symbol: history.symbol,
+      action: history.positionSide === "SHORT" ? "OPEN_SHORT" : "OPEN_LONG",
+      marginAllocationPct: "UNAVAILABLE",
+      marginAllocated: "UNAVAILABLE",
+      leverage: "UNAVAILABLE",
+      positionNotional: "UNAVAILABLE",
+      entry: history.avgEntryPrice ?? "UNAVAILABLE",
+      exit: history.avgExitPrice ?? "UNAVAILABLE",
+      realizedPnl: history.netProfit ?? "UNAVAILABLE",
+      status: "CLOSED",
+      thesis: "",
+      orderReference: "—",
+      positionSide: history.positionSide as TradeExperience["positionSide"],
+      openedAt: history.openingTime,
+      entryTime: history.openingTime,
+      closedAt: history.closingTime,
+      exitTime: history.closingTime,
+      financialSource: "PROVIDER_LEDGER",
+      origin: "DARWIN",
+      ...(history.providerPositionHistoryId ? { providerPositionHistoryId: history.providerPositionHistoryId } : {}),
+      quantity: history.closeTotalPos ?? history.openTotalPos ?? "UNAVAILABLE",
+      openQuantity: history.openTotalPos ?? "UNAVAILABLE",
+      closeQuantity: history.closeTotalPos ?? "UNAVAILABLE",
+      cumRealisedPnl: history.cumRealisedPnl ?? "UNAVAILABLE",
+      netProfit: history.netProfit ?? "UNAVAILABLE",
+      openFeeTotal: history.openFeeTotal ?? "UNAVAILABLE",
+      closeFeeTotal: history.closeFeeTotal ?? "UNAVAILABLE",
+      totalFunding: history.totalFunding ?? "UNAVAILABLE",
+      cashDividend: history.cashDividend ?? "UNAVAILABLE",
+    }));
+    const providerOnlyLiveTrades: DashboardSnapshot["trades"] = resolved.providerOnlyOpenPositions.map(({ position, providerOrderId }) => ({
+      tradeId: `provider-open:${providerOrderId}`,
+      timestamp: position.openedAt ?? "UNAVAILABLE",
+      symbol: position.symbol,
+      action: position.positionSide === "SHORT" ? "OPEN_SHORT" : "OPEN_LONG",
+      marginAllocationPct: "UNAVAILABLE",
+      marginAllocated: position.marginAllocated,
+      leverage: position.leverage,
+      positionNotional: position.notional,
+      entry: position.entryPrice,
+      exit: "UNAVAILABLE",
+      realizedPnl: "UNAVAILABLE",
+      status: "OPEN",
+      thesis: "",
+      orderReference: providerOrderId,
+      positionSide: position.positionSide,
+      openedAt: position.openedAt ?? "UNAVAILABLE",
+      entryTime: position.openedAt ?? "UNAVAILABLE",
+      financialSource: "PROVIDER_LIVE",
+      origin: "DARWIN",
+      quantity: position.quantity,
+      unrealizedPnl: position.unrealizedPnl,
+    }));
+    const trades = [...localTrades, ...providerOnlyTrades, ...providerOnlyLiveTrades].sort((left, right) => right.timestamp.localeCompare(left.timestamp)).slice(0, limit);
+    return json({ trades, financialSource: "PROVIDER_LEDGER_OR_LIVE", limit });
   }
 
   private getLearning(url: URL): Response {

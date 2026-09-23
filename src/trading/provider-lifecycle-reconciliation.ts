@@ -35,6 +35,8 @@ export interface ProviderLifecyclePosition {
   symbol: string;
   positionSide: string;
   quantity: string;
+  entryPrice?: string | null;
+  openedAt?: string | null;
 }
 
 export interface ProviderLifecycleOrder {
@@ -53,6 +55,7 @@ export interface ProviderLifecycleFill {
   positionSide: string | null;
   tradeSide: string | null;
   quantity: string;
+  execPrice: string;
   createdAt: string;
   origin: ProviderEvidenceOrigin;
 }
@@ -98,6 +101,43 @@ function orderForFill(fill: ProviderLifecycleFill, orders: readonly ProviderLife
     && order.origin === fill.origin);
 }
 
+function decimalParts(value: string): { coefficient: bigint; scale: number } {
+  const match = /^([+-]?)(\d+)(?:\.(\d+))?$/.exec(value);
+  if (!match?.[2]) throw new Error("INVALID_DECIMAL");
+  const fraction = match[3] ?? "";
+  return { coefficient: BigInt(`${match[1] === "-" ? "-" : ""}${match[2]}${fraction}`), scale: fraction.length };
+}
+
+function weightedEntryMatches(fills: readonly Pick<ProviderLifecycleFill, "quantity" | "execPrice">[], expectedPrice: string): boolean {
+  try {
+    if (!fills.length || !fills.every((fill) => isPositiveDecimal(fill.quantity) && isPositiveDecimal(fill.execPrice))) return false;
+    const quantities = fills.map((fill) => decimalParts(fill.quantity));
+    const prices = fills.map((fill) => decimalParts(fill.execPrice));
+    const quantityScale = Math.max(...quantities.map((part) => part.scale));
+    const priceScale = Math.max(...prices.map((part) => part.scale));
+    const totalQuantity = quantities.reduce((sum, part) => sum + part.coefficient * 10n ** BigInt(quantityScale - part.scale), 0n);
+    const weightedValue = quantities.reduce((sum, quantity, index) => {
+      const price = prices[index]!;
+      const q = quantity.coefficient * 10n ** BigInt(quantityScale - quantity.scale);
+      const p = price.coefficient * 10n ** BigInt(priceScale - price.scale);
+      return sum + q * p;
+    }, 0n);
+    const expected = decimalParts(expectedPrice);
+    // Provider history rounds weighted averages to the precision it returns.
+    const targetScale = expected.scale;
+    const numerator = weightedValue * 10n ** BigInt(targetScale);
+    const denominator = totalQuantity * 10n ** BigInt(priceScale);
+    const rounded = (numerator + denominator / 2n) / denominator;
+    return rounded === expected.coefficient * 10n ** BigInt(targetScale - expected.scale);
+  } catch {
+    return false;
+  }
+}
+
+export function providerWeightedEntryPriceMatches(fills: readonly Pick<ProviderLifecycleFill, "quantity" | "execPrice">[], expectedPrice: string): boolean {
+  return weightedEntryMatches(fills, expectedPrice);
+}
+
 const MAX_OPENING_CHRONOLOGY_SKEW_MS = 5_000;
 
 function isNearTimestamp(value: string, reference: string): boolean {
@@ -106,7 +146,7 @@ function isNearTimestamp(value: string, reference: string): boolean {
   return timestamp !== null && referenceTimestamp !== null && Math.abs(timestamp - referenceTimestamp) <= MAX_OPENING_CHRONOLOGY_SKEW_MS;
 }
 
-function openingIdentityIsProven(evidence: ProviderLifecycleEvidence, openingTime: string): boolean {
+function openingIdentityIsProven(evidence: ProviderLifecycleEvidence, openingTime: string, expectedQuantity: string, expectedEntryPrice: string): boolean {
   const { experience, entryIdentity } = evidence;
   if (!experience.positionSide || !entryIdentity || entryIdentity.entryDecisionId !== experience.entryDecisionId || !entryIdentity.clientOid || !entryIdentity.providerOrderId) return false;
   const orders = evidence.orders.filter((order) => order.providerOrderId === entryIdentity.providerOrderId
@@ -117,7 +157,9 @@ function openingIdentityIsProven(evidence: ProviderLifecycleEvidence, openingTim
     && fill.clientOid === entryIdentity.clientOid && fill.symbol === experience.symbol
     && fill.positionSide === experience.positionSide && fill.tradeSide === "open" && fill.origin === "DARWIN"
     && orderForFill(fill, orders));
-  return fills.length > 0 && fills.every((fill) => isNearTimestamp(fill.createdAt, openingTime));
+  if (!fills.length || fills.some((fill) => !isNearTimestamp(fill.createdAt, openingTime))) return false;
+  const opened = exactSum(fills.map((fill) => fill.quantity));
+  return opened !== null && compareDecimal(opened, expectedQuantity) === 0 && weightedEntryMatches(fills, expectedEntryPrice);
 }
 
 function currentPositionHasLedgerEvidence(evidence: ProviderLifecycleEvidence, position: ProviderLifecyclePosition): boolean {
@@ -137,7 +179,8 @@ export function classifyProviderLifecycle(evidence: ProviderLifecycleEvidence): 
   if (current.length > 1) return result("CONTRADICTORY", "MULTIPLE_CURRENT_PROVIDER_POSITIONS");
 
   if (!history) {
-    if (current.length === 1 && experience.outcomeStatus === "OPEN" && openingIdentityIsProven(evidence, experience.entryTime)) {
+    if (current.length === 1 && experience.outcomeStatus === "OPEN" && current[0]?.openedAt && current[0].entryPrice
+      && openingIdentityIsProven(evidence, current[0].openedAt, current[0].quantity, current[0].entryPrice)) {
       return result("MATCHED_OPEN", "CURRENT_PROVIDER_POSITION_AND_ENTRY_IDENTITY_MATCH");
     }
     if (current.length === 1 && currentPositionHasLedgerEvidence(evidence, current[0]!)) {
@@ -160,7 +203,7 @@ export function classifyProviderLifecycle(evidence: ProviderLifecycleEvidence): 
       && validTimestamp(history.closingTime) !== null) {
       return result("CONTRADICTORY", "CURRENT_PROVIDER_POSITION_CONTRADICTS_CLOSED_HISTORY");
     }
-    if (!openingIdentityIsProven(evidence, history.openingTime)) return result("UNRESOLVED", "CURRENT_POSITION_ENTRY_IDENTITY_UNPROVEN");
+    if (!history.openTotalPos || !history.avgEntryPrice || !openingIdentityIsProven(evidence, history.openingTime, history.openTotalPos, history.avgEntryPrice)) return result("UNRESOLVED", "CURRENT_POSITION_ENTRY_IDENTITY_UNPROVEN");
     return result("MATCHED_OPEN", "CURRENT_PROVIDER_POSITION_AND_ENTRY_IDENTITY_MATCH");
   }
   const openQuantity = history.openTotalPos;
@@ -175,8 +218,6 @@ export function classifyProviderLifecycle(evidence: ProviderLifecycleEvidence): 
 
   const identity = evidence.entryIdentity;
   if (!identity || identity.entryDecisionId !== experience.entryDecisionId || !identity.clientOid || !identity.providerOrderId) return result("UNRESOLVED", "ENTRY_DECISION_IDENTITY_UNPROVEN");
-  if (!isDecimal(experience.entryPrice) || !history.avgEntryPrice || compareDecimal(experience.entryPrice, history.avgEntryPrice) !== 0) return result("CONTRADICTORY", "LOCAL_ENTRY_DOES_NOT_MATCH_PROVIDER_HISTORY");
-  if (!isNearTimestamp(experience.entryTime, history.openingTime)) return result("CONTRADICTORY", "LOCAL_ENTRY_TIME_OUTSIDE_PROVIDER_OPENING_CHRONOLOGY");
   const openingOrders = evidence.orders.filter((order) => order.providerOrderId === identity.providerOrderId
     && order.clientOid === identity.clientOid
     && order.symbol === experience.symbol
@@ -194,6 +235,7 @@ export function classifyProviderLifecycle(evidence: ProviderLifecycleEvidence): 
   if (!openingFills.length || openingFills.some((fill) => !isNearTimestamp(fill.createdAt, history.openingTime))) return result("UNRESOLVED", "DARWIN_OPENING_FILL_IDENTITY_UNPROVEN");
   const opened = exactSum(openingFills.map((fill) => fill.quantity));
   if (!opened || !isDecimal(opened) || compareDecimal(opened, openQuantity) !== 0) return result("CONTRADICTORY", "OPENING_FILL_QUANTITY_RESIDUAL");
+  if (!history.avgEntryPrice || !weightedEntryMatches(openingFills, history.avgEntryPrice)) return result("CONTRADICTORY", "OPENING_FILL_WEIGHTED_PRICE_MISMATCH");
 
   const closingOrders = evidence.orders.filter((order) => order.tradeSide === "close"
     && order.symbol === experience.symbol

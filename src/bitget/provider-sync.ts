@@ -48,6 +48,7 @@ export interface ProviderLedgerSyncOptions {
   financialRecordsOnly?: boolean;
   now?: Date;
   initialLookbackMs?: number;
+  coverageStartAt?: string;
   recentWindowMs?: number;
   overlapMs?: number;
   maxPagesPerRun?: number;
@@ -176,6 +177,16 @@ export async function syncProviderLedger(
   const allResourcesCompleted = errors.length === 0 && Object.keys(resources).length === expectedResources;
   state.lastSuccessfulSyncAt = allResourcesCompleted ? observedAt : previous?.lastSuccessfulSyncAt ?? null;
   state.lastError = errors.length > 0 ? errors.join("; ") : null;
+  const financialResourceSucceeded = !errors.some((error) => error.startsWith("financialRecords:")) && Boolean(resources.financialRecords);
+  const priorCoverage = previous?.financialRecordCoverage ?? null;
+  if (financialResourceSucceeded) {
+    const coveredFrom = options.mode === "backfill" ? windows[0]!.startIso : priorCoverage?.coveredFrom;
+    state.financialRecordCoverage = coveredFrom
+      ? { coveredFrom, coveredThrough: observedAt, lastSuccessfulSyncAt: observedAt, lastError: null }
+      : priorCoverage;
+  } else {
+    state.financialRecordCoverage = priorCoverage ? { ...priorCoverage, lastError: state.lastError } : null;
+  }
   state.updatedAt = observedAt;
   saveProviderSyncState(executor, state);
 
@@ -238,7 +249,10 @@ function buildWindows(nowMs: number, options: ProviderLedgerSyncOptions, previou
     : Math.min(options.recentWindowMs ?? DEFAULT_RECENT_WINDOW_MS, MAX_PROVIDER_WINDOW_MS);
   const previousMs = previous?.lastSuccessfulSyncAt ? Date.parse(previous.lastSuccessfulSyncAt) : NaN;
   const historyFloorMs = nowMs - MAX_PROVIDER_HISTORY_MS + PROVIDER_HISTORY_SAFETY_MS;
-  const requestedStartMs = Number.isFinite(previousMs) && options.mode === "recent" ? previousMs - overlapMs : nowMs - lookbackMs;
+  const requestedCoverageStartMs = options.mode === "backfill" && options.coverageStartAt ? Date.parse(options.coverageStartAt) : NaN;
+  const requestedStartMs = Number.isFinite(requestedCoverageStartMs)
+    ? requestedCoverageStartMs
+    : Number.isFinite(previousMs) && options.mode === "recent" ? previousMs - overlapMs : nowMs - lookbackMs;
   const startMs = Math.max(0, historyFloorMs, requestedStartMs);
   const windows: Window[] = [];
   let cursor = startMs;

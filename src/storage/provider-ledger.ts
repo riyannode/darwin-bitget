@@ -29,6 +29,7 @@ export interface ProviderSyncState {
   lastReconciliationAt: string | null;
   lastError: string | null;
   updatedAt: string;
+  financialRecordCoverage?: { coveredFrom: string; coveredThrough: string; lastSuccessfulSyncAt: string | null; lastError: string | null } | null;
 }
 
 export interface ProviderLedgerDiagnostics {
@@ -306,19 +307,19 @@ export function loadProviderLifecycleEvidence(
   const fills = row && entryIdentity
     ? executor.sql<{
       provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null;
-      exec_qty: string; created_time: string; origin: ProviderEvidenceOrigin;
-    }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND ((provider_order_id = ${entryIdentity.providerOrderId} AND client_oid = ${entryIdentity.clientOid}) OR (created_time >= ${row.opening_time} AND created_time <= ${row.closing_time}))`
+      exec_qty: string; exec_price: string; created_time: string; origin: ProviderEvidenceOrigin;
+    }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, exec_price, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND ((provider_order_id = ${entryIdentity.providerOrderId} AND client_oid = ${entryIdentity.clientOid}) OR (created_time >= ${row.opening_time} AND created_time <= ${row.closing_time}))`
     : row
       ? executor.sql<{
         provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null;
-        exec_qty: string; created_time: string; origin: ProviderEvidenceOrigin;
-      }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND created_time >= ${row.opening_time} AND created_time <= ${row.closing_time}`
+        exec_qty: string; exec_price: string; created_time: string; origin: ProviderEvidenceOrigin;
+      }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, exec_price, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND created_time >= ${row.opening_time} AND created_time <= ${row.closing_time}`
       : executor.sql<{
         provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null;
-        exec_qty: string; created_time: string; origin: ProviderEvidenceOrigin;
-      }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} ORDER BY created_time DESC LIMIT 500`;
+        exec_qty: string; exec_price: string; created_time: string; origin: ProviderEvidenceOrigin;
+      }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, exec_price, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} ORDER BY created_time DESC LIMIT 500`;
   const mappedOrders = orders.map((order) => ({ providerOrderId: order.provider_order_id, clientOid: order.client_oid, symbol: order.symbol, positionSide: order.pos_side?.toUpperCase() ?? null, tradeSide: order.trade_side?.toLowerCase() ?? null, origin: order.origin }));
-  const mappedFills = fills.map((fill) => ({ providerOrderId: fill.provider_order_id, clientOid: fill.client_oid, symbol: fill.symbol, positionSide: fill.pos_side?.toUpperCase() ?? null, tradeSide: fill.trade_side?.toLowerCase() ?? null, quantity: fill.exec_qty, createdAt: fill.created_time, origin: fill.origin }));
+  const mappedFills = fills.map((fill) => ({ providerOrderId: fill.provider_order_id, clientOid: fill.client_oid, symbol: fill.symbol, positionSide: fill.pos_side?.toUpperCase() ?? null, tradeSide: fill.trade_side?.toLowerCase() ?? null, quantity: fill.exec_qty, execPrice: fill.exec_price, createdAt: fill.created_time, origin: fill.origin }));
   if (!row) return { experience, providerPositions, history: null, entryIdentity, orders: mappedOrders, fills: mappedFills };
 
   return {
@@ -353,9 +354,12 @@ export function loadProviderSyncState(executor: SqlExecutor, category: string): 
   const row = rows[0];
   if (!row) return null;
   try {
+    const parsed = JSON.parse(row.checkpoint_json) as ProviderSyncCheckpoints | { checkpoints?: ProviderSyncCheckpoints; financialRecordCoverage?: ProviderSyncState["financialRecordCoverage"] };
+    const wrapped = "checkpoints" in parsed;
     return {
       category: row.category,
-      checkpoints: JSON.parse(row.checkpoint_json) as ProviderSyncCheckpoints,
+      checkpoints: wrapped ? (parsed as { checkpoints?: ProviderSyncCheckpoints }).checkpoints ?? {} : parsed as ProviderSyncCheckpoints,
+      financialRecordCoverage: wrapped ? parsed.financialRecordCoverage ?? null : null,
       lastSuccessfulSyncAt: row.last_successful_sync_at,
       lastReconciliationAt: row.last_reconciliation_at,
       lastError: row.last_error,
@@ -372,7 +376,7 @@ export function saveProviderSyncState(executor: SqlExecutor, state: ProviderSync
       category, checkpoint_json, last_successful_sync_at, last_reconciliation_at,
       last_error, updated_at
     ) VALUES (
-      ${state.category}, ${JSON.stringify(state.checkpoints)}, ${state.lastSuccessfulSyncAt},
+      ${state.category}, ${JSON.stringify({ checkpoints: state.checkpoints, financialRecordCoverage: state.financialRecordCoverage ?? null })}, ${state.lastSuccessfulSyncAt},
       ${state.lastReconciliationAt}, ${state.lastError}, ${state.updatedAt}
     )
     ON CONFLICT(category) DO UPDATE SET
@@ -382,6 +386,10 @@ export function saveProviderSyncState(executor: SqlExecutor, state: ProviderSync
       last_error = excluded.last_error,
       updated_at = excluded.updated_at
   `;
+}
+
+export function loadProviderFinancialRecordsSince(executor: SqlExecutor, category: string, baselineAt: string): Array<{ type: string; amount: string | null; fee: string | null; coin: string | null }> {
+  return executor.sql<{ type: string; amount: string | null; fee: string | null; coin: string | null }>`SELECT type, amount, fee, coin FROM provider_financial_records WHERE category = ${category} AND provider_timestamp >= ${baselineAt} ORDER BY provider_timestamp, provider_record_key`;
 }
 
 export function providerLedgerDiagnostics(executor: SqlExecutor, category: string): ProviderLedgerDiagnostics {

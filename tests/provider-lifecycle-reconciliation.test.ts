@@ -63,7 +63,8 @@ const fixture = (): ProviderLifecycleEvidence => ({
     ...["close-1", "close-2", "close-3", "close-4", "close-5", "close-6"].map((id) => ({ providerOrderId: id, clientOid: `darwin-${id}`, symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "close", origin: "DARWIN" as const })),
   ],
   fills: [
-    { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", quantity: "7.51", createdAt: "2026-09-21T17:03:30.661Z", origin: "DARWIN" },
+    { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", quantity: "3.755", execPrice: "198.01", createdAt: "2026-09-21T17:03:30.660Z", origin: "DARWIN" },
+    { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", quantity: "3.755", execPrice: "198.03", createdAt: "2026-09-21T17:03:30.662Z", origin: "DARWIN" },
     ...["2.47", "1.66", "1.11", "1.13", "0.57", "0.57"].map((quantity, index) => ({
       providerOrderId: `close-${index + 1}`,
       clientOid: `darwin-close-${index + 1}`,
@@ -71,6 +72,7 @@ const fixture = (): ProviderLifecycleEvidence => ({
       positionSide: "LONG" as const,
       tradeSide: "close",
       quantity,
+      execPrice: "202.66",
       createdAt: `2026-09-21T${String(18 + index).padStart(2, "0")}:00:00.000Z`,
       origin: "DARWIN" as const,
     })),
@@ -80,7 +82,13 @@ const fixture = (): ProviderLifecycleEvidence => ({
 describe("provider/local lifecycle reconciliation", () => {
   it("classifies a provider/local open lifecycle only when current-position and entry identity evidence match", () => {
     const original = fixture();
-    const evidence = { ...original, history: null, providerPositions: [{ symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "7.51" }] };
+    const evidence = {
+      ...original,
+      experience: { ...experience, entryPrice: "92.45", entryTime: "2026-09-21T17:03:36.000Z" },
+      history: null,
+      providerPositions: [{ symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "7.51", entryPrice: "92.11", openedAt: "2026-09-21T17:03:30.661Z" }],
+      fills: original.fills.map((fill, index) => index < 2 ? { ...fill, execPrice: "92.11" } : fill),
+    };
     expect(classifyProviderLifecycle(evidence).classification).toBe("MATCHED_OPEN");
   });
 
@@ -130,9 +138,35 @@ describe("provider/local lifecycle reconciliation", () => {
     expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "LOCAL_OPEN_PROVIDER_CLOSED", closedQuantity: "7.51" });
   });
 
-  it("fails closed for entry chronology outside the bounded provider opening window", () => {
-    const evidence = { ...fixture(), experience: { ...experience, entryTime: "2026-09-21T17:03:36.000Z" } };
-    expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "CONTRADICTORY", reason: "LOCAL_ENTRY_TIME_OUTSIDE_PROVIDER_OPENING_CHRONOLOGY" });
+  it("does not let delayed local entryTime or conflicting local entryPrice override exact provider identity", () => {
+    const original = fixture();
+    const evidence = {
+      ...original,
+      experience: { ...experience, entryPrice: "92.45", entryTime: "2026-09-21T17:03:36.000Z" },
+      fills: original.fills.map((fill, index) => index === 0 ? { ...fill, createdAt: "2026-09-21T17:03:30.659Z" } : fill),
+    };
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "LOCAL_OPEN_PROVIDER_CLOSED", closedQuantity: "7.51" });
+  });
+
+  it("rejects provider opening fills whose weighted entry price does not round to position history precision", () => {
+    const original = fixture();
+    const evidence = {
+      ...original,
+      fills: original.fills.map((fill, index) => index < 2 ? { ...fill, execPrice: "198.04" } : fill),
+    };
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "CONTRADICTORY", reason: "OPENING_FILL_WEIGHTED_PRICE_MISMATCH" });
+  });
+
+  it("uses the provider 92.11 entry despite local 92.45 and delayed local readback time", () => {
+    const original = fixture();
+    const evidence = {
+      ...original,
+      experience: { ...experience, entryPrice: "92.45", entryTime: "2026-09-21T17:03:36.000Z" },
+      history: { ...original.history!, avgEntryPrice: "92.11" },
+      fills: original.fills.map((fill, index) => index < 2 ? { ...fill, execPrice: "92.11", createdAt: "2026-09-21T17:03:30.659Z" } : fill),
+    };
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "LOCAL_OPEN_PROVIDER_CLOSED", closedQuantity: "7.51" });
+    expect(evidence.history?.avgEntryPrice).toBe("92.11");
   });
 
   it("requires the exact opening-fill quantity after identity matching", () => {

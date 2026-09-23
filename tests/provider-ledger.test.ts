@@ -318,6 +318,53 @@ describe("provider ledger persistence and sync", () => {
     }
   });
 
+  it("backfills six-category financial coverage from the preserved baseline and retains coverage through recent sync", async () => {
+    const { executor } = memoryExecutor();
+    const baselineAt = "2026-08-01T00:00:00.000Z";
+    const now = new Date("2026-09-22T00:00:00.000Z");
+    const financialCalls: string[] = [];
+    const lifecycleCalls: string[] = [];
+    const client: ProviderLedgerReadClient = {
+      async getOrderHistoryRead(params) { lifecycleCalls.push(`orders:${params.category}`); return { list: [], cursor: null }; },
+      async getFillHistoryWindowRead(params) { lifecycleCalls.push(`fills:${params.category}`); return { list: [], cursor: null }; },
+      async getPositionHistoryRead(params) { lifecycleCalls.push(`positions:${params.category}`); return { list: [], cursor: null }; },
+      async getFinancialRecordsRead(params) { financialCalls.push(params.category); return { list: [financialFixture({ category: params.category })], cursor: null }; },
+    };
+
+    for (const syncCategory of PROVIDER_FINANCIAL_CATEGORIES) {
+      const result = await syncProviderLedger(client, executor, {
+        category: syncCategory,
+        mode: "backfill",
+        coverageStartAt: baselineAt,
+        financialRecordsOnly: syncCategory !== "USDT-FUTURES",
+        now,
+      });
+      expect(result.status).toBe("SUCCESS");
+    }
+
+    expect([...new Set(financialCalls)]).toEqual(PROVIDER_FINANCIAL_CATEGORIES);
+    expect(financialCalls).toHaveLength(PROVIDER_FINANCIAL_CATEGORIES.length * 2);
+    expect(lifecycleCalls.every((resource) => resource.endsWith(":USDT-FUTURES"))).toBe(true);
+    for (const syncCategory of PROVIDER_FINANCIAL_CATEGORIES) {
+      expect(loadProviderSyncState(executor, syncCategory)?.financialRecordCoverage).toEqual({
+        coveredFrom: baselineAt,
+        coveredThrough: now.toISOString(),
+        lastSuccessfulSyncAt: now.toISOString(),
+        lastError: null,
+      });
+    }
+
+    const recent = await syncProviderLedger(client, executor, {
+      category: "OTHER",
+      mode: "recent",
+      financialRecordsOnly: true,
+      now: new Date("2026-09-22T01:00:00.000Z"),
+      recentWindowMs: 60 * 60 * 1000,
+    });
+    expect(recent.status).toBe("SUCCESS");
+    expect(loadProviderSyncState(executor, "OTHER")?.financialRecordCoverage?.coveredFrom).toBe(baselineAt);
+  });
+
   it("uses bounded overlapping windows for backfill", async () => {
     const { executor } = memoryExecutor();
     const windows: Array<{ start: number; end: number }> = [];

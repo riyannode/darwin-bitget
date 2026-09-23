@@ -6,6 +6,7 @@ import { classifyProviderLifecycle } from "../src/trading/provider-lifecycle-rec
 import { hasEvent, loadAllEvents, loadAllExperiences, loadPositionContext, persistProviderLifecycleRepair, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
 import { TraderAgent, resolveProviderTradeFacts } from "../src/agent/agent.js";
 import { BitgetClient } from "../src/bitget/client.js";
+import { rebuildProviderPerformance } from "../src/trading/provider-performance.js";
 import type { PerformanceAggregate } from "../src/trading/performance.js";
 import type { PositionContext, TradeExperience, TradingJournal } from "../src/types.js";
 
@@ -63,7 +64,7 @@ function insertProviderEvidence(executor: SqlExecutor): void {
   run("INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES (?, ?, ?, ?, ?)", "darwin-entry-oid", "cycle-entry", ENTRY_DECISION_ID, "provider-entry-order", OPENED_AT);
   run("INSERT INTO provider_position_history (provider_position_history_key, provider_position_history_id, category, symbol, position_side, opening_time, closing_time, avg_entry_price, avg_exit_price, open_total_pos, close_total_pos, cum_realised_pnl, net_profit, closing_quantity, open_fee_total, close_fee_total, total_funding, cash_dividend, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "key-1", HISTORY_ID, "USDT-FUTURES", "SAMSUNGUSDT", "LONG", OPENED_AT, CLOSED_AT, "198.02", "202.66", "7.51", "7.51", "34.8487", "33.19485709", "7.51", "-0.89227812", "-0.91318734", "0.15162255", "0", "UNATTRIBUTED", "{}", CLOSED_AT, CLOSED_AT);
   const order = (id: string, oid: string, side: string, tradeSide: string, quantity: string, time: string) => run("INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", id, oid, "USDT-FUTURES", "SAMSUNGUSDT", side, "long", tradeSide, quantity, quantity, "filled", time, time, "DARWIN", "{}", time, time);
-  const fill = (id: string, oid: string, side: string, tradeSide: string, quantity: string, time: string) => run("INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", `fill-${id}`, id, oid, "USDT-FUTURES", "SAMSUNGUSDT", side, "long", tradeSide, quantity, "200", time, "DARWIN", "{}", time, time);
+  const fill = (id: string, oid: string, side: string, tradeSide: string, quantity: string, time: string) => run("INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", `fill-${id}`, id, oid, "USDT-FUTURES", "SAMSUNGUSDT", side, "long", tradeSide, quantity, "198.02", time, "DARWIN", "{}", time, time);
   order("provider-entry-order", "darwin-entry-oid", "buy", "open", "7.51", OPEN_FILL_AT);
   fill("provider-entry-order", "darwin-entry-oid", "buy", "open", "7.51", OPEN_FILL_AT);
   ["2.47", "1.66", "1.11", "1.13", "0.57", "0.57"].forEach((quantity, index) => {
@@ -121,7 +122,54 @@ async function invokeControl(agent: ReturnType<typeof fakeAgent>, authorized = t
 
 afterEach(() => vi.restoreAllMocks());
 
-describe("paused provider lifecycle repair", () => {
+describe("provider-first financial lifecycle resolution", () => {
+  it("keeps a provider-confirmed closed DARWIN lifecycle in performance and trade history without TradeExperience or PositionContext", async () => {
+    const { db, executor } = memoryExecutor();
+    insertProviderEvidence(executor);
+    const resolved = resolveProviderTradeFacts(executor, [], "USDT-FUTURES", []);
+    expect(resolved.lifecycles).toContainEqual({ lifecycleId: HISTORY_ID, origin: "DARWIN", status: "CLOSED", netProfit: "33.19485709", closedAt: CLOSED_AT });
+    expect(rebuildProviderPerformance(resolved.lifecycles)).toMatchObject({ closedTrades: 1, wins: 1, verifiedRealizedPnl: "33.19485709" });
+    expect(resolved.providerOnlyHistories).toHaveLength(1);
+    const agent = fakeAgent(executor, db, true);
+    const providerRead = vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const response = await agent.getTradeHistory.call(agent, new URL("https://example.test/trade-history?limit=25"));
+    const body = await response.json() as { trades: Array<Record<string, unknown>> };
+    expect(body.trades).toContainEqual(expect.objectContaining({ tradeId: `provider-history:${HISTORY_ID}`, status: "CLOSED", financialSource: "PROVIDER_LEDGER", origin: "DARWIN", realizedPnl: "33.19485709", entry: "198.02" }));
+    const providerOnly = body.trades.find((trade) => trade.tradeId === `provider-history:${HISTORY_ID}`)!;
+    expect(providerOnly).not.toHaveProperty("reasoningSource");
+    expect(providerOnly).not.toHaveProperty("entryReasoning");
+    expect(providerRead).toHaveBeenCalledTimes(1);
+    db.close();
+  });
+
+  it("keeps a provider-live open position as an open trade without local lifecycle or PositionContext", async () => {
+    const { db, executor } = memoryExecutor();
+    insertProviderEvidence(executor);
+    db.exec("DELETE FROM provider_position_history; DELETE FROM provider_fills WHERE trade_side = 'close'; DELETE FROM provider_orders WHERE trade_side = 'close';");
+    const providerPosition = { symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "7.51", entryPrice: "198.02", leverage: "4", marginAllocated: "371.28", notional: "1487.33", unrealizedPnl: "12.5", openedAt: OPENED_AT } as never;
+    const resolved = resolveProviderTradeFacts(executor, [], "USDT-FUTURES", [providerPosition]);
+    expect(rebuildProviderPerformance(resolved.lifecycles)).toMatchObject({ openTrades: 1, totalTrades: 1 });
+    const agent = fakeAgent(executor, db, true);
+    const providerRead = vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [providerPosition], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const response = await agent.getTradeHistory.call(agent, new URL("https://example.test/trade-history?limit=25"));
+    const body = await response.json() as { trades: Array<Record<string, unknown>> };
+    expect(body.trades).toContainEqual(expect.objectContaining({ tradeId: "provider-open:provider-entry-order", status: "OPEN", financialSource: "PROVIDER_LIVE", origin: "DARWIN", quantity: "7.51", entry: "198.02", leverage: "4", marginAllocated: "371.28", marginAllocationPct: "UNAVAILABLE", positionNotional: "1487.33", unrealizedPnl: "12.5", openedAt: OPENED_AT }));
+    expect(body.trades[0]).not.toHaveProperty("reasoningSource");
+    expect(providerRead).toHaveBeenCalledTimes(1);
+    db.close();
+  });
+
+  it("does not claim authoritative OPEN when provider financial facts cannot be resolved", async () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    const agent = fakeAgent(executor, db, true);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const response = await agent.getTradeHistory.call(agent, new URL("https://example.test/trade-history?limit=25"));
+    const body = await response.json() as { trades: Array<Record<string, unknown>> };
+    expect(body.trades).toContainEqual(expect.objectContaining({ tradeId: EXPERIENCE_ID, status: "UNRESOLVED", localLifecycleStatus: "PARTIALLY_REDUCED", financialSource: "UNRESOLVED", quantity: "UNAVAILABLE", entry: "UNAVAILABLE", openedAt: "UNAVAILABLE", entryTime: "UNAVAILABLE", legacyEntryTime: LOCAL_ENTRY_AT, legacyEntryPrice: "198.02", realizedPnl: "UNAVAILABLE" }));
+    db.close();
+  });
+
   it("requires owner authentication on the control action", async () => {
     const { db, executor } = memoryExecutor();
     const agent = fakeAgent(executor, db, true);
@@ -229,7 +277,7 @@ describe("paused provider lifecycle repair", () => {
     const liveSnapshot = await liveSnapshotResponse.json() as { portfolioFreshness: { source: string }; accountPerformance: { equitySource: string } };
     expect(liveSnapshot.portfolioFreshness.source).toBe("PROVIDER_LIVE");
     expect(liveSnapshot.accountPerformance.equitySource).toBe("PROVIDER_LIVE");
-    expect(providerRead).toHaveBeenCalledTimes(2);
+    expect(providerRead).toHaveBeenCalledTimes(3);
 
     const writesBeforeRetry = db.prepare("SELECT (SELECT COUNT(*) FROM events) + (SELECT COUNT(*) FROM experiences) + (SELECT COUNT(*) FROM position_context) AS count").get() as { count: number };
     providerRead.mockClear();

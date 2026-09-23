@@ -641,7 +641,7 @@ export interface DashboardSnapshot {
     netExternalInflows: string;
     netPnlSinceBaseline: string;
     financialRecordCoverage: "COMPLETE" | "PARTIAL" | "UNAVAILABLE";
-    financialRecordCategories: Array<{ category: string; status: "SUCCESS" | "PARTIAL" | "NOT_SYNCED"; lastSuccessfulSyncAt: string | null }>;
+    financialRecordCategories: Array<{ category: string; status: "SUCCESS" | "PARTIAL" | "NOT_SYNCED"; lastSuccessfulSyncAt: string | null; coveredFrom: string | null; coveredThrough: string | null; lastError: string | null }> ;
   };
   performanceAccounting: PerformanceAccountingReadModel;
   trades: TradeLogEntry[];
@@ -747,7 +747,15 @@ export interface TradeLogEntry {
   entry: string;
   exit: string;
   realizedPnl: string;
-  status: TradeLifecycleStatus;
+  status: TradeLifecycleStatus | "UNRESOLVED";
+  localLifecycleStatus?: TradeLifecycleStatus;
+  intendedMarginAllocated?: string;
+  intendedMarginAllocationPct?: string;
+  intendedLeverage?: string;
+  intendedPositionNotional?: string;
+  legacyEntryPrice?: string;
+  legacyEntryTime?: string;
+  unrealizedPnl?: string;
   thesis: string;
   orderReference: string;
   positionSide?: PositionSide | null;
