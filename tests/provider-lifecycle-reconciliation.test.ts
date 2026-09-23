@@ -79,7 +79,50 @@ const fixture = (): ProviderLifecycleEvidence => ({
   ],
 });
 
+const costBasisFixture = (entryPrice: string, increaseOrigin: ProviderLifecycleEvidence["fills"][number]["origin"] = "DARWIN"): ProviderLifecycleEvidence => {
+  const openedAt = "2026-09-21T17:03:30.661Z";
+  const increaseOrder = { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", origin: increaseOrigin } as const;
+  return {
+    experience,
+    providerPositions: [{ symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "10", entryPrice, openedAt }],
+    history: null,
+    entryIdentity: { entryDecisionId: experience.entryDecisionId, clientOid: "darwin-entry-oid", providerOrderId: "provider-entry-order" },
+    orders: [
+      { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", origin: "DARWIN" },
+      { providerOrderId: "reduce-1", clientOid: "darwin-reduce-1", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "close", origin: "DARWIN" },
+      increaseOrder,
+    ],
+    fills: [
+      { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", quantity: "10", execPrice: "100", createdAt: openedAt, origin: "DARWIN" },
+      { providerOrderId: "reduce-1", clientOid: "darwin-reduce-1", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "close", quantity: "5", execPrice: "105", createdAt: "2026-09-21T17:10:00.000Z", origin: "DARWIN" },
+      { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", quantity: "5", execPrice: "110", createdAt: "2026-09-21T17:15:00.000Z", origin: increaseOrigin },
+    ],
+  };
+};
+
 describe("provider/local lifecycle reconciliation", () => {
+  it("replays current cost basis across reduce then increase instead of averaging all historical opens", () => {
+    expect(classifyProviderLifecycle(costBasisFixture("105"))).toMatchObject({ classification: "MATCHED_OPEN" });
+  });
+
+  it("rejects a live avgPrice that matches gross opening-fill average but not current cost basis", () => {
+    expect(classifyProviderLifecycle(costBasisFixture("103.333333"))).toMatchObject({
+      classification: "CONTRADICTORY",
+      reason: "CURRENT_POSITION_COST_BASIS_MISMATCH",
+    });
+  });
+
+  it("does not classify an externally increased current position as fully DARWIN-owned", () => {
+    expect(classifyProviderLifecycle(costBasisFixture("105", "PROVIDER_EXTERNAL")).classification).toBe("PROVIDER_EXTERNAL");
+  });
+
+  it("fails closed when a current-position increase is unattributed", () => {
+    expect(classifyProviderLifecycle(costBasisFixture("105", "UNATTRIBUTED"))).toMatchObject({
+      classification: "UNRESOLVED",
+      reason: "LIFECYCLE_FILL_ORIGIN_UNATTRIBUTED",
+    });
+  });
+
   it("classifies a provider/local open lifecycle only when current-position and entry identity evidence match", () => {
     const original = fixture();
     const evidence = {

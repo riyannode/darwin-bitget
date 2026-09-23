@@ -139,6 +139,67 @@ export function providerWeightedEntryPriceMatches(fills: readonly Pick<ProviderL
   return weightedEntryMatches(fills, expectedPrice);
 }
 
+function greatestCommonDivisor(left: bigint, right: bigint): bigint {
+  let a = left < 0n ? -left : left;
+  let b = right < 0n ? -right : right;
+  while (b !== 0n) [a, b] = [b, a % b];
+  return a || 1n;
+}
+
+function currentPositionEntryMatches(fills: readonly ProviderLifecycleFill[], expectedQuantity: string, expectedPrice: string): boolean {
+  try {
+    if (!fills.length || !isPositiveDecimal(expectedQuantity) || !isPositiveDecimal(expectedPrice)
+      || !fills.every((fill) => isPositiveDecimal(fill.quantity) && isPositiveDecimal(fill.execPrice))) return false;
+    const ordered = [...fills].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+    for (let index = 1; index < ordered.length; index += 1) {
+      if (Date.parse(ordered[index - 1]!.createdAt) === Date.parse(ordered[index]!.createdAt)
+        && ordered[index - 1]!.tradeSide !== ordered[index]!.tradeSide) return false;
+    }
+    const quantities = ordered.map((fill) => decimalParts(fill.quantity));
+    const prices = ordered.map((fill) => decimalParts(fill.execPrice));
+    const quantityScale = Math.max(...quantities.map((part) => part.scale));
+    const priceScale = Math.max(...prices.map((part) => part.scale));
+    let currentQuantity = 0n;
+    let costNumerator = 0n;
+    let costDenominator = 1n;
+    for (let index = 0; index < ordered.length; index += 1) {
+      const fill = ordered[index]!;
+      const quantity = quantities[index]!.coefficient * 10n ** BigInt(quantityScale - quantities[index]!.scale);
+      if (fill.tradeSide === "open") {
+        const price = prices[index]!.coefficient * 10n ** BigInt(priceScale - prices[index]!.scale);
+        costNumerator += quantity * price * costDenominator;
+        const divisor = greatestCommonDivisor(costNumerator, costDenominator);
+        costNumerator /= divisor;
+        costDenominator /= divisor;
+        currentQuantity += quantity;
+      } else if (fill.tradeSide === "close") {
+        if (quantity > currentQuantity) return false;
+        const remainingQuantity = currentQuantity - quantity;
+        if (currentQuantity > 0n) {
+          costNumerator *= remainingQuantity;
+          costDenominator *= currentQuantity;
+          const divisor = greatestCommonDivisor(costNumerator, costDenominator);
+          costNumerator /= divisor;
+          costDenominator /= divisor;
+        }
+        currentQuantity = remainingQuantity;
+      } else return false;
+    }
+    const expectedQuantityParts = decimalParts(expectedQuantity);
+    const expectedQuantityUnits = expectedQuantityParts.coefficient * 10n ** BigInt(Math.max(quantityScale, expectedQuantityParts.scale) - expectedQuantityParts.scale);
+    const scaledCurrentQuantity = currentQuantity * 10n ** BigInt(Math.max(quantityScale, expectedQuantityParts.scale) - quantityScale);
+    if (scaledCurrentQuantity !== expectedQuantityUnits || currentQuantity === 0n) return false;
+
+    const expected = decimalParts(expectedPrice);
+    const numerator = costNumerator * 10n ** BigInt(expected.scale);
+    const denominator = costDenominator * currentQuantity * 10n ** BigInt(priceScale);
+    const rounded = (numerator + denominator / 2n) / denominator;
+    return rounded === expected.coefficient;
+  } catch {
+    return false;
+  }
+}
+
 const MAX_OPENING_CHRONOLOGY_SKEW_MS = 5_000;
 
 function isNearTimestamp(value: string, reference: string): boolean {
@@ -249,7 +310,9 @@ export function classifyProviderLifecycle(evidence: ProviderLifecycleEvidence): 
       if (!openingIdentityIsProven(evidence, position.openedAt)) return result("UNRESOLVED", "CURRENT_POSITION_ENTRY_IDENTITY_UNPROVEN");
       if (!position.entryPrice || !isPositiveDecimal(position.entryPrice)) return result("UNRESOLVED", "CURRENT_POSITION_ENTRY_PRICE_MISSING_OR_INVALID");
       if (compareDecimal(reconstruction.remainingQuantity, position.quantity) !== 0) return result("CONTRADICTORY", "CURRENT_POSITION_FILL_QUANTITY_RESIDUAL", reconstruction.remainingQuantity);
-      if (!weightedEntryMatches(reconstruction.openingFills, position.entryPrice)) return result("CONTRADICTORY", "OPENING_FILL_WEIGHTED_PRICE_MISMATCH");
+      if (!currentPositionEntryMatches([...reconstruction.openingFills, ...reconstruction.closingFills], position.quantity, position.entryPrice)) {
+        return result("CONTRADICTORY", "CURRENT_POSITION_COST_BASIS_MISMATCH");
+      }
       return result("MATCHED_OPEN", "CURRENT_PROVIDER_POSITION_AND_FULL_FILL_QUANTITY_MATCH");
     }
     return result("UNRESOLVED", "PROVIDER_POSITION_HISTORY_OR_ENTRY_IDENTITY_MISSING");
@@ -278,6 +341,12 @@ export function classifyProviderLifecycle(evidence: ProviderLifecycleEvidence): 
     if (!weightedEntryMatches(reconstruction.openingFills, history.avgEntryPrice)) return result("CONTRADICTORY", "OPENING_FILL_WEIGHTED_PRICE_MISMATCH");
     if (compareDecimal(reconstruction.remainingQuantity, current[0]!.quantity) !== 0) {
       return result("CONTRADICTORY", "CURRENT_PROVIDER_POSITION_FILL_QUANTITY_RESIDUAL", reconstruction.remainingQuantity);
+    }
+    if (!current[0]!.entryPrice || !isPositiveDecimal(current[0]!.entryPrice)) {
+      return result("UNRESOLVED", "CURRENT_POSITION_ENTRY_PRICE_MISSING_OR_INVALID");
+    }
+    if (!currentPositionEntryMatches([...reconstruction.openingFills, ...reconstruction.closingFills], current[0]!.quantity, current[0]!.entryPrice)) {
+      return result("CONTRADICTORY", "CURRENT_POSITION_COST_BASIS_MISMATCH");
     }
     return result("MATCHED_OPEN", "CURRENT_PROVIDER_POSITION_AND_FULL_FILL_QUANTITY_MATCH");
   }
