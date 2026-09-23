@@ -1,11 +1,12 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { loadProviderLifecycleEvidence } from "../src/storage/provider-ledger.js";
+import { loadProviderLifecycleEvidence, loadProviderSyncState, saveProviderSyncState } from "../src/storage/provider-ledger.js";
 import { classifyProviderLifecycle } from "../src/trading/provider-lifecycle-reconciliation.js";
 import { hasEvent, loadAllEvents, loadAllExperiences, loadPositionContext, persistProviderLifecycleRepair, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
 import { TraderAgent, resolveProviderTradeFacts } from "../src/agent/agent.js";
 import { BitgetClient } from "../src/bitget/client.js";
+import { PROVIDER_FINANCIAL_CATEGORIES } from "../src/bitget/provider-sync.js";
 import { rebuildProviderPerformance } from "../src/trading/provider-performance.js";
 import type { PerformanceAggregate } from "../src/trading/performance.js";
 import type { PositionContext, TradeExperience, TradingJournal } from "../src/types.js";
@@ -27,18 +28,21 @@ const LOCAL_ENTRY_AT = "2026-09-21T17:03:32.134Z";
 const CLOSED_AT = "2026-09-22T01:43:06.332Z";
 const OWNER_TOKEN = ["owner", "test", "token"].join("-");
 
-function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; executor: SqlExecutor } {
+function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; executor: SqlExecutor; queries: string[] } {
+  const queries: string[] = [];
   const executor: SqlExecutor = {
     sql<T>(strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[] {
       const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
+      queries.push(query);
       const params = values.map((value) => typeof value === "boolean" ? Number(value) : value) as (string | number | null)[];
-      if (query.trimStart().toUpperCase().startsWith("SELECT")) return db.prepare(query).all(...params) as T[];
+      const normalizedQuery = query.trimStart().toUpperCase();
+      if (normalizedQuery.startsWith("SELECT") || normalizedQuery.startsWith("WITH")) return db.prepare(query).all(...params) as T[];
       db.prepare(query).run(...params);
       return [];
     },
   };
   ensureStorage(executor);
-  return { db, executor };
+  return { db, executor, queries };
 }
 
 function openExperience(): TradeExperience {
@@ -136,9 +140,78 @@ describe("provider-first financial lifecycle resolution", () => {
     const body = await response.json() as { trades: Array<Record<string, unknown>> };
     expect(body.trades).toContainEqual(expect.objectContaining({ tradeId: `provider-history:${HISTORY_ID}`, status: "CLOSED", financialSource: "PROVIDER_LEDGER", origin: "DARWIN", realizedPnl: "33.19485709", entry: "198.02" }));
     const providerOnly = body.trades.find((trade) => trade.tradeId === `provider-history:${HISTORY_ID}`)!;
-    expect(providerOnly).not.toHaveProperty("reasoningSource");
+    expect(providerOnly.reasoningSource).toBe("UNATTRIBUTED");
     expect(providerOnly).not.toHaveProperty("entryReasoning");
     expect(providerRead).toHaveBeenCalledTimes(1);
+    db.close();
+  });
+
+  it("attaches only persisted journal reasoning to provider-only closed history when no experience exists", async () => {
+    const { db, executor } = memoryExecutor();
+    insertProviderEvidence(executor);
+    saveJournal(executor, {
+      ...journal,
+      cycleId: "cycle-provider-history-reasoning",
+      startedAt: OPENED_AT,
+      decision: {
+        decisionId: ENTRY_DECISION_ID,
+        cycleId: "cycle-provider-history-reasoning",
+        symbol: "SAMSUNGUSDT",
+        positionSide: "LONG",
+        action: "OPEN_LONG",
+        marginAllocationPct: "10",
+        leverage: "3",
+        reductionPct: null,
+        confidence: 0.8,
+        thesis: "journal-persisted entry rationale",
+        strategyThesis: "strategy rationale",
+        supportingFactors: ["provider-confirmed factor"],
+        riskFactors: [],
+        evidenceUsed: ["journal-evidence"],
+        lessonsUsed: [],
+        createdAt: OPENED_AT,
+      },
+      executionResult: { providerOrderId: "journal-provider-order", clientOrderId: "journal-client-order" } as never,
+    });
+    const agent = fakeAgent(executor, db, true);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const response = await agent.getTradeHistory.call(agent, new URL("https://example.test/trade-history?limit=25"));
+    const body = await response.json() as { trades: Array<Record<string, unknown>> };
+    const providerOnly = body.trades.find((trade) => trade.tradeId === `provider-history:${HISTORY_ID}`)!;
+    expect(providerOnly).toMatchObject({
+      reasoningSource: "DARWIN_PERSISTED",
+      entryReasoning: expect.objectContaining({ thesis: "journal-persisted entry rationale" }),
+      orderReference: "journal-provider-order",
+    });
+    db.close();
+  });
+
+  it("joins matching persisted position context for provider-only history without a local experience or journal", async () => {
+    const { db, executor } = memoryExecutor();
+    insertProviderEvidence(executor);
+    savePositionContext(executor, positionContext());
+    const agent = fakeAgent(executor, db, true);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const response = await agent.getTradeHistory.call(agent, new URL("https://example.test/trade-history?limit=25"));
+    const body = await response.json() as { trades: Array<Record<string, unknown>> };
+    const providerOnly = body.trades.find((trade) => trade.tradeId === `provider-history:${HISTORY_ID}`)!;
+    expect(providerOnly).toMatchObject({
+      reasoningSource: "DARWIN_PERSISTED",
+      entryReasoning: expect.objectContaining({ thesis: "preserve this thesis" }),
+      managementEvents: [expect.objectContaining({ thesis: "preserve this thesis" })],
+    });
+    db.close();
+  });
+
+  it("keeps same-symbol fills with unknown position side from being silently dropped by batch reads", () => {
+    const { db, executor } = memoryExecutor();
+    insertProviderEvidence(executor);
+    const run = (sql: string, ...values: (string | null)[]) => executor.sql(sql.split("?") as unknown as TemplateStringsArray, ...values);
+    run("INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "unknown-side-order", "manual-unknown-side", "USDT-FUTURES", "SAMSUNGUSDT", "buy", null, "open", "0.25", "0.25", "filled", "2026-09-21T17:15:00.000Z", "2026-09-21T17:15:00.000Z", "UNATTRIBUTED", "{}", OPENED_AT, OPENED_AT);
+    run("INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "unknown-side-fill", "unknown-side-order", "manual-unknown-side", "USDT-FUTURES", "SAMSUNGUSDT", "buy", null, "open", "0.25", "198.02", "2026-09-21T17:15:00.000Z", "UNATTRIBUTED", "{}", OPENED_AT, OPENED_AT);
+    const resolved = resolveProviderTradeFacts(executor, [], "USDT-FUTURES", []);
+    expect(resolved.lifecycles).toEqual([]);
+    expect(resolved.providerOnlyHistories).toEqual([]);
     db.close();
   });
 
@@ -154,8 +227,150 @@ describe("provider-first financial lifecycle resolution", () => {
     const response = await agent.getTradeHistory.call(agent, new URL("https://example.test/trade-history?limit=25"));
     const body = await response.json() as { trades: Array<Record<string, unknown>> };
     expect(body.trades).toContainEqual(expect.objectContaining({ tradeId: "provider-open:provider-entry-order", status: "OPEN", financialSource: "PROVIDER_LIVE", origin: "DARWIN", quantity: "7.51", entry: "198.02", leverage: "4", marginAllocated: "371.28", marginAllocationPct: "UNAVAILABLE", positionNotional: "1487.33", unrealizedPnl: "12.5", openedAt: OPENED_AT }));
-    expect(body.trades[0]).not.toHaveProperty("reasoningSource");
+    expect(body.trades[0]?.reasoningSource).toBe("UNATTRIBUTED");
     expect(providerRead).toHaveBeenCalledTimes(1);
+    db.close();
+  });
+
+  it("attaches provider-live journal reasoning only when the opening decision is persisted", async () => {
+    const { db, executor } = memoryExecutor();
+    insertProviderEvidence(executor);
+    db.exec("DELETE FROM provider_position_history; DELETE FROM provider_fills WHERE trade_side = 'close'; DELETE FROM provider_orders WHERE trade_side = 'close';");
+    saveJournal(executor, {
+      ...journal,
+      cycleId: "cycle-provider-live-reasoning",
+      startedAt: OPENED_AT,
+      decision: {
+        decisionId: ENTRY_DECISION_ID,
+        cycleId: "cycle-provider-live-reasoning",
+        symbol: "SAMSUNGUSDT",
+        positionSide: "LONG",
+        action: "OPEN_LONG",
+        marginAllocationPct: "10",
+        leverage: "3",
+        reductionPct: null,
+        confidence: 0.8,
+        thesis: "persisted live position thesis",
+        strategyThesis: "persisted strategy thesis",
+        supportingFactors: ["entry basis"],
+        riskFactors: [],
+        evidenceUsed: ["decision evidence"],
+        lessonsUsed: [],
+        createdAt: OPENED_AT,
+      },
+      executionResult: { providerOrderId: "provider-entry-order", clientOrderId: "darwin-entry-oid" } as never,
+    });
+    const providerPosition = { symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "7.51", entryPrice: "198.02", leverage: "4", marginAllocated: "371.28", notional: "1487.33", unrealizedPnl: "12.5", openedAt: OPENED_AT } as never;
+    const agent = fakeAgent(executor, db, true);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [providerPosition], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const response = await agent.getTradeHistory.call(agent, new URL("https://example.test/trade-history?limit=25"));
+    const body = await response.json() as { trades: Array<Record<string, unknown>> };
+    const liveTrade = body.trades.find((trade) => trade.tradeId === "provider-open:provider-entry-order")!;
+    expect(liveTrade).toMatchObject({
+      reasoningSource: "DARWIN_PERSISTED",
+      entryReasoning: expect.objectContaining({ thesis: "persisted live position thesis" }),
+      orderReference: "provider-entry-order",
+    });
+    db.close();
+  });
+
+  it("reconciles provider-live quantity across DARWIN opening increases and partial reductions", () => {
+    const { db, executor } = memoryExecutor();
+    insertProviderEvidence(executor);
+    db.exec("DELETE FROM provider_position_history; DELETE FROM provider_fills WHERE trade_side = 'close'; DELETE FROM provider_orders WHERE trade_side = 'close';");
+    const run = (sql: string, ...values: string[]) => executor.sql(sql.split("?") as unknown as TemplateStringsArray, ...values);
+    run("INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES (?, ?, ?, ?, ?)", "increase-oid", "cycle-increase", "increase-decision", "provider-increase", "2026-09-21T17:15:00.000Z");
+    run("INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "provider-increase", "increase-oid", "USDT-FUTURES", "SAMSUNGUSDT", "buy", "long", "open", "2", "2", "filled", "2026-09-21T17:15:00.000Z", "2026-09-21T17:15:00.000Z", "DARWIN", "{}", OPENED_AT, OPENED_AT);
+    run("INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "increase-fill", "provider-increase", "increase-oid", "USDT-FUTURES", "SAMSUNGUSDT", "buy", "long", "open", "2", "198.02", "2026-09-21T17:15:00.000Z", "DARWIN", "{}", OPENED_AT, OPENED_AT);
+    run("INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "provider-reduce", "reduce-oid", "USDT-FUTURES", "SAMSUNGUSDT", "sell", "long", "close", "0.5", "0.5", "filled", "2026-09-21T17:16:00.000Z", "2026-09-21T17:16:00.000Z", "DARWIN", "{}", OPENED_AT, OPENED_AT);
+    run("INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "reduce-fill", "provider-reduce", "reduce-oid", "USDT-FUTURES", "SAMSUNGUSDT", "sell", "long", "close", "0.5", "198.02", "2026-09-21T17:16:00.000Z", "DARWIN", "{}", OPENED_AT, OPENED_AT);
+    const providerPosition = { symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "9.01", entryPrice: "198.02", leverage: "4", marginAllocated: "445", notional: "1785", unrealizedPnl: "12.5", openedAt: OPENED_AT } as never;
+    const resolved = resolveProviderTradeFacts(executor, [], "USDT-FUTURES", [providerPosition]);
+    expect(resolved.providerOnlyOpenPositions).toEqual([{ position: providerPosition, providerOrderId: "provider-entry-order", decisionId: ENTRY_DECISION_ID }]);
+    expect(rebuildProviderPerformance(resolved.lifecycles)).toMatchObject({ openTrades: 1, totalTrades: 1 });
+    db.close();
+  });
+
+  it("does not attribute provider-live lifecycles containing external or unattributed increase fills to DARWIN", () => {
+    for (const origin of ["PROVIDER_EXTERNAL", "UNATTRIBUTED"] as const) {
+      const { db, executor } = memoryExecutor();
+      insertProviderEvidence(executor);
+      db.exec("DELETE FROM provider_position_history; DELETE FROM provider_fills WHERE trade_side = 'close'; DELETE FROM provider_orders WHERE trade_side = 'close';");
+      const run = (sql: string, ...values: string[]) => executor.sql(sql.split("?") as unknown as TemplateStringsArray, ...values);
+      run("INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "external-increase", "manual-increase", "USDT-FUTURES", "SAMSUNGUSDT", "buy", "long", "open", "2", "2", "filled", "2026-09-21T17:15:00.000Z", "2026-09-21T17:15:00.000Z", origin, "{}", OPENED_AT, OPENED_AT);
+      run("INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "external-increase-fill", "external-increase", "manual-increase", "USDT-FUTURES", "SAMSUNGUSDT", "buy", "long", "open", "2", "198.02", "2026-09-21T17:15:00.000Z", origin, "{}", OPENED_AT, OPENED_AT);
+      const providerPosition = { symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "9.51", entryPrice: "198.02", leverage: "4", marginAllocated: "470", notional: "1883", unrealizedPnl: "12.5", openedAt: OPENED_AT } as never;
+      const resolved = resolveProviderTradeFacts(executor, [], "USDT-FUTURES", [providerPosition]);
+      expect(resolved.providerOnlyOpenPositions).toEqual([]);
+      expect(rebuildProviderPerformance(resolved.lifecycles)).toMatchObject({ openTrades: 0, totalTrades: 0 });
+      db.close();
+    }
+  });
+
+  it("target-loads persisted experience, context, and journal reasoning for a provider lifecycle outside the initial history limit", async () => {
+    const { db, executor } = memoryExecutor();
+    insertProviderEvidence(executor);
+    saveExperience(executor, openExperience(), "2026-09-01T00:00:00.000Z");
+    savePositionContext(executor, positionContext());
+    saveJournal(executor, {
+      ...journal,
+      cycleId: "cycle-target-history",
+      startedAt: OPENED_AT,
+      decision: { decisionId: ENTRY_DECISION_ID, symbol: "SAMSUNGUSDT", positionSide: "LONG", action: "OPEN_LONG", createdAt: OPENED_AT } as never,
+      executionResult: { providerOrderId: "target-journal-order", clientOrderId: "target-client-order" } as never,
+    });
+    for (let index = 0; index < 25; index += 1) {
+      const recent = { ...openExperience(), experienceId: `recent-${index}`, entryDecisionId: `recent-decision-${index}`, symbol: `RECENT${index}USDT`, action: "HOLD" as const, entryTime: "2026-09-20T00:00:00.000Z" };
+      saveExperience(executor, recent, `2026-09-22T00:${String(index).padStart(2, "0")}:00.000Z`);
+    }
+    const agent = fakeAgent(executor, db, true);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const response = await agent.getTradeHistory.call(agent, new URL("https://example.test/trade-history?limit=1"));
+    const body = await response.json() as { trades: Array<Record<string, unknown>> };
+    expect(body.trades).toHaveLength(1);
+    expect(body.trades[0]).toMatchObject({
+      tradeId: EXPERIENCE_ID,
+      status: "CLOSED",
+      reasoningSource: "DARWIN_PERSISTED",
+      entryReasoning: expect.objectContaining({ thesis: "preserve this thesis" }),
+      orderReference: "target-journal-order",
+    });
+    db.close();
+  });
+
+  it("target-loads local reasoning for a provider-live lifecycle outside the initial history limit", async () => {
+    const { db, executor } = memoryExecutor();
+    insertProviderEvidence(executor);
+    db.exec("DELETE FROM provider_position_history; DELETE FROM provider_fills WHERE trade_side = 'close'; DELETE FROM provider_orders WHERE trade_side = 'close';");
+    saveExperience(executor, openExperience(), "2026-09-01T00:00:00.000Z");
+    savePositionContext(executor, positionContext());
+    saveJournal(executor, {
+      ...journal,
+      cycleId: "cycle-live-target-history",
+      startedAt: OPENED_AT,
+      decision: { decisionId: ENTRY_DECISION_ID, symbol: "SAMSUNGUSDT", positionSide: "LONG", action: "OPEN_LONG", createdAt: OPENED_AT } as never,
+      executionResult: { providerOrderId: "target-live-journal-order", clientOrderId: "target-live-client-order" } as never,
+    });
+    for (let index = 0; index < 25; index += 1) {
+      const recent = { ...openExperience(), experienceId: `live-recent-${index}`, entryDecisionId: `live-recent-decision-${index}`, symbol: `LIVE${index}USDT`, action: "HOLD" as const };
+      saveExperience(executor, recent, `2026-09-22T01:${String(index).padStart(2, "0")}:00.000Z`);
+    }
+    const agent = fakeAgent(executor, db, true);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({
+      positions: [{ symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "7.51", entryPrice: "198.02", leverage: "4", marginAllocated: "370", notional: "1490.13", unrealizedPnl: "12.5", openedAt: OPENED_AT }],
+      portfolioEquity: "1000", observedAt: CLOSED_AT,
+    } as never);
+    const response = await agent.getTradeHistory.call(agent, new URL("https://example.test/trade-history?limit=1"));
+    const body = await response.json() as { trades: Array<Record<string, unknown>> };
+    expect(body.trades).toHaveLength(1);
+    expect(body.trades[0]).toMatchObject({
+      tradeId: EXPERIENCE_ID,
+      status: "OPEN",
+      financialSource: "PROVIDER_LIVE",
+      reasoningSource: "DARWIN_PERSISTED",
+      entryReasoning: expect.objectContaining({ thesis: "preserve this thesis" }),
+      orderReference: "target-live-journal-order",
+    });
     db.close();
   });
 
@@ -207,6 +422,60 @@ describe("provider-first financial lifecycle resolution", () => {
     await expect(invokeRepair(agent)).rejects.toThrow("AGENT_MUST_BE_PAUSED");
     expect(loadAllExperiences(executor)[0]?.outcomeStatus).toBe("OPEN");
     expect(loadAllEvents(executor)).toHaveLength(0);
+    db.close();
+  });
+
+  it("reuses the persisted external-flow read model and invalidates it after a provider sync revision", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    insertProviderEvidence(executor);
+    const agent = fakeAgent(executor, db, true);
+    const observedAt = new Date().toISOString();
+    const coveredFrom = new Date(Date.now() - 60_000).toISOString();
+    for (const category of PROVIDER_FINANCIAL_CATEGORIES) {
+      saveProviderSyncState(executor, {
+        category,
+        checkpoints: {},
+        lastSuccessfulSyncAt: observedAt,
+        lastReconciliationAt: null,
+        lastError: null,
+        updatedAt: observedAt,
+        financialRecordCoverage: { coveredFrom, coveredThrough: observedAt, lastSuccessfulSyncAt: observedAt, lastError: null },
+      });
+    }
+    const insertFinancial = (key: string, type: string, amount: string) => executor.sql`
+      INSERT INTO provider_financial_records (provider_record_key, provider_record_id, category, symbol, type, coin, amount, fee, provider_timestamp, origin, raw_provider_json, first_seen_at, last_seen_at)
+      VALUES (${key}, ${key}, 'USDT-FUTURES', 'BTCUSDT', ${type}, 'USDT', ${amount}, '0', ${observedAt}, 'UNATTRIBUTED', '{}', ${observedAt}, ${observedAt})
+    `;
+    insertFinancial("snapshot-flow-in", "TRANSFER_IN", "5");
+    agent.persistPerformanceEquity.call(agent, "1000", observedAt);
+    const portfolio = { positions: [], portfolioEquity: "1000", observedAt } as never;
+    const recordReadCount = () => queries.filter((query) => query.includes("FROM provider_financial_records")).length;
+    const historyReadCount = () => queries.filter((query) => query.includes("FROM provider_position_history")).length;
+    const beforeFirst = recordReadCount();
+    const beforeFirstHistory = historyReadCount();
+    const first = await agent.getDashboardSnapshot.call(agent, portfolio);
+    expect(first.performance.closedTrades).toBe(1);
+    expect(first.accountPerformance).toMatchObject({ externalFlowStatus: "VERIFIED", netExternalInflows: "5" });
+    expect(recordReadCount() - beforeFirst).toBe(1);
+    expect(historyReadCount() - beforeFirstHistory).toBeGreaterThan(0);
+
+    const beforeRepeat = recordReadCount();
+    const beforeRepeatHistory = historyReadCount();
+    const nextAgentInstance = fakeAgent(executor, db, true);
+    const repeated = await nextAgentInstance.getDashboardSnapshot.call(nextAgentInstance, portfolio);
+    expect(repeated.performance.closedTrades).toBe(1);
+    expect(repeated.accountPerformance).toMatchObject({ externalFlowStatus: "VERIFIED", netExternalInflows: "5" });
+    expect(recordReadCount() - beforeRepeat).toBe(0);
+    expect(historyReadCount() - beforeRepeatHistory).toBe(0);
+
+    saveProviderSyncState(executor, loadProviderSyncState(executor, "USDT-FUTURES")!);
+    insertFinancial("snapshot-flow-out", "TRANSFER_OUT", "-2");
+    const beforeInvalidation = recordReadCount();
+    const beforeInvalidatedHistory = historyReadCount();
+    const invalidated = await agent.getDashboardSnapshot.call(agent, portfolio);
+    expect(invalidated.accountPerformance).toMatchObject({ externalFlowStatus: "VERIFIED", netExternalInflows: "3" });
+    expect(recordReadCount() - beforeInvalidation).toBe(1);
+    expect(historyReadCount() - beforeInvalidatedHistory).toBeGreaterThan(0);
     db.close();
   });
 

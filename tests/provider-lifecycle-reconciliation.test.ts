@@ -87,9 +87,79 @@ describe("provider/local lifecycle reconciliation", () => {
       experience: { ...experience, entryPrice: "92.45", entryTime: "2026-09-21T17:03:36.000Z" },
       history: null,
       providerPositions: [{ symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "7.51", entryPrice: "92.11", openedAt: "2026-09-21T17:03:30.661Z" }],
-      fills: original.fills.map((fill, index) => index < 2 ? { ...fill, execPrice: "92.11" } : fill),
+      orders: original.orders.filter((order) => order.tradeSide === "open"),
+      fills: original.fills.filter((fill) => fill.tradeSide === "open").map((fill) => ({ ...fill, execPrice: "92.11" })),
     };
     expect(classifyProviderLifecycle(evidence).classification).toBe("MATCHED_OPEN");
+  });
+
+  it("reconstructs a closed lifecycle across an opening increase and all closing fills", () => {
+    const original = fixture();
+    const increaseOrder = { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "open", origin: "DARWIN" as const };
+    const increaseFill = { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "open", quantity: "2", execPrice: "110", createdAt: "2026-09-21T17:10:00.000Z", origin: "DARWIN" as const };
+    const additionalCloseOrder = { providerOrderId: "close-extra", clientOid: "darwin-close-extra", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "close", origin: "DARWIN" as const };
+    const additionalCloseFill = { providerOrderId: "close-extra", clientOid: "darwin-close-extra", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "close", quantity: "2", execPrice: "202.66", createdAt: "2026-09-22T00:00:00.000Z", origin: "DARWIN" as const };
+    const evidence = {
+      ...original,
+      history: { ...original.history!, openTotalPos: "9.51", closeTotalPos: "9.51", avgEntryPrice: "102.10" },
+      orders: [...original.orders, increaseOrder, additionalCloseOrder],
+      fills: [...original.fills.map((fill) => fill.tradeSide === "open" ? { ...fill, execPrice: "100" } : fill), increaseFill, additionalCloseFill],
+    };
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "LOCAL_OPEN_PROVIDER_CLOSED", closedQuantity: "9.51" });
+  });
+
+  it("reconciles an open position after an increase and partial reduction using provider quantity", () => {
+    const original = fixture();
+    const evidence = {
+      ...original,
+      history: { ...original.history!, openTotalPos: "9.51", closeTotalPos: "2", avgEntryPrice: "102.10", closingTime: "2026-09-22T00:00:00.000Z" },
+      providerPositions: [{ symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "7.51", entryPrice: "102.10", openedAt: "2026-09-21T17:03:30.661Z" }],
+      orders: [
+        original.orders[0]!,
+        { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "open", origin: "DARWIN" as const },
+        { providerOrderId: "partial-close", clientOid: "darwin-partial-close", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "close", origin: "DARWIN" as const },
+      ],
+      fills: [
+        ...original.fills.filter((fill) => fill.tradeSide === "open").map((fill) => ({ ...fill, execPrice: "100" })),
+        { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "open", quantity: "2", execPrice: "110", createdAt: "2026-09-21T17:10:00.000Z", origin: "DARWIN" as const },
+        { providerOrderId: "partial-close", clientOid: "darwin-partial-close", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "close", quantity: "2", execPrice: "202.66", createdAt: "2026-09-22T00:00:00.000Z", origin: "DARWIN" as const },
+      ],
+    };
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "MATCHED_OPEN" });
+  });
+
+  it("does not attribute an externally increased position to DARWIN performance", () => {
+    const original = fixture();
+    const externalOrder = { providerOrderId: "external-increase", clientOid: "external-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "open", origin: "PROVIDER_EXTERNAL" as const };
+    const externalFill = { providerOrderId: "external-increase", clientOid: "external-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "open", quantity: "2", execPrice: "110", createdAt: "2026-09-21T17:10:00.000Z", origin: "PROVIDER_EXTERNAL" as const };
+    const extraCloseOrder = { providerOrderId: "close-extra", clientOid: "darwin-close-extra", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "close", origin: "DARWIN" as const };
+    const extraCloseFill = { providerOrderId: "close-extra", clientOid: "darwin-close-extra", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "close", quantity: "2", execPrice: "202.66", createdAt: "2026-09-22T00:00:00.000Z", origin: "DARWIN" as const };
+    const evidence = {
+      ...original,
+      history: { ...original.history!, openTotalPos: "9.51", closeTotalPos: "9.51", avgEntryPrice: "102.10" },
+      orders: [...original.orders, externalOrder, extraCloseOrder],
+      fills: [...original.fills.map((fill) => fill.tradeSide === "open" ? { ...fill, execPrice: "100" } : fill), externalFill, extraCloseFill],
+    };
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "PROVIDER_EXTERNAL" });
+  });
+
+  it("fails closed when a same-symbol quantity fill has no provider position side", () => {
+    const original = fixture();
+    const evidence = {
+      ...original,
+      fills: [...original.fills, {
+        providerOrderId: "unattributed-no-side",
+        clientOid: "manual-no-side",
+        symbol: "SAMSUNGUSDT",
+        positionSide: null,
+        tradeSide: "open" as const,
+        quantity: "0.25",
+        execPrice: "198.02",
+        createdAt: "2026-09-21T17:15:00.000Z",
+        origin: "UNATTRIBUTED" as const,
+      }],
+    };
+    expect(classifyProviderLifecycle(evidence).classification).toBe("UNRESOLVED");
   });
 
   it("distinguishes a provider position without an active local lifecycle", () => {

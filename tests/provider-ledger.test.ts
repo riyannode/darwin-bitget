@@ -11,7 +11,11 @@ import {
 } from "../src/bitget/provider-ledger.js";
 import { PROVIDER_FINANCIAL_CATEGORIES, syncProviderLedger, type ProviderLedgerReadClient } from "../src/bitget/provider-sync.js";
 import {
+  loadProviderFinancialRecordsSinceCategories,
+  loadProviderLifecycleEvidenceBatch,
+  loadProviderPositionHistoriesPage,
   loadProviderSyncState,
+  saveProviderSyncState,
   providerLedgerDiagnostics,
   resolveProviderOrigin,
   upsertProviderFill,
@@ -24,19 +28,21 @@ import { recordIdempotency, recordProviderOrderReference } from "../src/storage/
 
 type SqlValue = string | number | boolean | null;
 
-function memoryExecutor(): { db: DatabaseSync; executor: SqlExecutor } {
-  const db = new DatabaseSync(":memory:");
+function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; executor: SqlExecutor; queries: string[] } {
+  const queries: string[] = [];
   const executor: SqlExecutor = {
     sql<T>(strings: TemplateStringsArray, ...values: SqlValue[]): T[] {
       const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
+      queries.push(query);
       const sqliteValues = values.map((value) => typeof value === "boolean" ? (value ? 1 : 0) : value) as (string | number | null)[];
-      if (query.trimStart().toUpperCase().startsWith("SELECT")) return db.prepare(query).all(...sqliteValues) as T[];
+      const normalizedQuery = query.trimStart().toUpperCase();
+      if (normalizedQuery.startsWith("SELECT") || normalizedQuery.startsWith("WITH")) return db.prepare(query).all(...sqliteValues) as T[];
       db.prepare(query).run(...sqliteValues);
       return [];
     },
   };
   ensureStorage(executor);
-  return { db, executor };
+  return { db, executor, queries };
 }
 
 const observedAt = "2026-09-22T00:00:00.000Z";
@@ -182,6 +188,80 @@ describe("provider ledger normalization", () => {
 });
 
 describe("provider ledger persistence and sync", () => {
+  it("pages position histories with a stable keyset cursor", () => {
+    const { db, executor } = memoryExecutor();
+    const baseTime = Date.parse(observedAt);
+    for (let index = 0; index < 3; index += 1) {
+      const opening = new Date(baseTime + index * 1_000).toISOString();
+      const closing = new Date(baseTime + index * 1_000 + 500).toISOString();
+      const history = normalizeProviderPositionHistory(positionHistoryFixture({ positionId: `page-${index + 1}`, createdTime: opening, updatedTime: closing }), observedAt)!;
+      upsertProviderPositionHistory(executor, history, observedAt);
+    }
+    const first = loadProviderPositionHistoriesPage(executor, category, null, 2);
+    const second = loadProviderPositionHistoriesPage(executor, category, first.nextCursor, 2);
+    expect(first.histories.map((history) => history.providerPositionHistoryId)).toEqual(["page-1", "page-2"]);
+    expect(first.hasMore).toBe(true);
+    expect(second.histories.map((history) => history.providerPositionHistoryId)).toEqual(["page-3"]);
+    expect(second.hasMore).toBe(false);
+    db.close();
+  });
+
+  it("loads lifecycle evidence in bounded batches rather than one SQL round trip per candidate", () => {
+    const { db, executor, queries } = memoryExecutor();
+    const makeRequest = (index: number) => ({
+      requestId: `batch-${index}`,
+      history: null,
+      experience: { experienceId: `experience-${index}`, symbol: "CRCLUSDT", positionSide: "LONG", action: "OPEN_LONG", entryDecisionId: `decision-${index}` } as never,
+    });
+    const countEvidenceQueries = (count: number) => {
+      const before = queries.length;
+      const evidence = loadProviderLifecycleEvidenceBatch(executor, category, Array.from({ length: count }, (_, index) => makeRequest(index)));
+      expect(evidence.size).toBe(count);
+      expect([...evidence.values()].every((item) => item.evidenceComplete)).toBe(true);
+      return queries.slice(before).filter((query) => /^(SELECT|WITH)/i.test(query.trimStart())).length;
+    };
+    expect(countEvidenceQueries(1)).toBe(3);
+    expect(countEvidenceQueries(25)).toBe(6);
+    db.close();
+  });
+
+  it("increments a durable sync revision even when the provider timestamp is unchanged", () => {
+    const { db, executor } = memoryExecutor();
+    const state = { category: "SPOT", checkpoints: {}, lastSuccessfulSyncAt: observedAt, lastReconciliationAt: null, lastError: null, updatedAt: observedAt };
+    saveProviderSyncState(executor, state);
+    const firstRevision = loadProviderSyncState(executor, "SPOT")?.revision;
+    saveProviderSyncState(executor, state);
+    const secondRevision = loadProviderSyncState(executor, "SPOT")?.revision;
+    expect(firstRevision).toBe(1);
+    expect(secondRevision).toBe(2);
+    db.close();
+  });
+
+  it("bounds financial-record flow reads and reports truncation instead of trusting a partial sum", () => {
+    const { db, executor } = memoryExecutor();
+    const insert = db.prepare("INSERT INTO provider_financial_records (provider_record_key, provider_record_id, category, type, coin, amount, fee, provider_timestamp, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (let index = 1; index <= 2; index += 1) {
+      const timestamp = `2026-09-0${index}T00:00:00.000Z`;
+      insert.run(`flow-${index}`, `flow-${index}`, "USDT-FUTURES", "TRANSFER_IN", "USDT", "1", "0", timestamp, "UNATTRIBUTED", "{}", timestamp, timestamp);
+    }
+    const result = loadProviderFinancialRecordsSinceCategories(executor, PROVIDER_FINANCIAL_CATEGORIES, "2026-09-01T00:00:00.000Z", 1);
+    expect(result.records).toHaveLength(1);
+    expect(result.truncated).toBe(true);
+    db.close();
+  });
+
+  it("adds a sync revision to legacy provider-sync state without losing checkpoints", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("CREATE TABLE provider_sync_state (category TEXT PRIMARY KEY, checkpoint_json TEXT NOT NULL, last_successful_sync_at TEXT, last_reconciliation_at TEXT, last_error TEXT, updated_at TEXT NOT NULL)");
+    db.prepare("INSERT INTO provider_sync_state (category, checkpoint_json, last_successful_sync_at, last_reconciliation_at, last_error, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run("MARGIN", JSON.stringify({ financialRecords: { windowStart: observedAt, windowEnd: observedAt } }), observedAt, null, null, observedAt);
+    const executor = memoryExecutor(db).executor;
+    const legacy = loadProviderSyncState(executor, "MARGIN");
+    expect(legacy).toMatchObject({ category: "MARGIN", revision: 0, checkpoints: { financialRecords: { windowStart: observedAt, windowEnd: observedAt } } });
+    saveProviderSyncState(executor, legacy!);
+    expect(loadProviderSyncState(executor, "MARGIN")?.revision).toBe(1);
+    db.close();
+  });
+
   it("upserts duplicate provider records without creating duplicates", () => {
     const { db, executor } = memoryExecutor();
     const order = normalizeProviderOrder(orderFixture(), "DARWIN", observedAt)!;

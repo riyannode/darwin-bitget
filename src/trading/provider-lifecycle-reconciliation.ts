@@ -1,5 +1,5 @@
 import type { TradeExperience } from "../types.js";
-import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal } from "./decimal.js";
+import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal, subtractDecimal } from "./decimal.js";
 
 export type ProviderLifecycleClassification =
   | "MATCHED_OPEN"
@@ -67,6 +67,7 @@ export interface ProviderLifecycleEvidence {
   entryIdentity: { entryDecisionId: string; clientOid: string; providerOrderId: string } | null;
   orders: readonly ProviderLifecycleOrder[];
   fills: readonly ProviderLifecycleFill[];
+  evidenceComplete?: boolean;
 }
 
 export interface ProviderLifecycleResult {
@@ -146,7 +147,7 @@ function isNearTimestamp(value: string, reference: string): boolean {
   return timestamp !== null && referenceTimestamp !== null && Math.abs(timestamp - referenceTimestamp) <= MAX_OPENING_CHRONOLOGY_SKEW_MS;
 }
 
-function openingIdentityIsProven(evidence: ProviderLifecycleEvidence, openingTime: string, expectedQuantity: string, expectedEntryPrice: string): boolean {
+function openingIdentityIsProven(evidence: ProviderLifecycleEvidence, openingTime: string): boolean {
   const { experience, entryIdentity } = evidence;
   if (!experience.positionSide || !entryIdentity || entryIdentity.entryDecisionId !== experience.entryDecisionId || !entryIdentity.clientOid || !entryIdentity.providerOrderId) return false;
   const orders = evidence.orders.filter((order) => order.providerOrderId === entryIdentity.providerOrderId
@@ -157,14 +158,68 @@ function openingIdentityIsProven(evidence: ProviderLifecycleEvidence, openingTim
     && fill.clientOid === entryIdentity.clientOid && fill.symbol === experience.symbol
     && fill.positionSide === experience.positionSide && fill.tradeSide === "open" && fill.origin === "DARWIN"
     && orderForFill(fill, orders));
-  if (!fills.length || fills.some((fill) => !isNearTimestamp(fill.createdAt, openingTime))) return false;
-  const opened = exactSum(fills.map((fill) => fill.quantity));
-  return opened !== null && compareDecimal(opened, expectedQuantity) === 0 && weightedEntryMatches(fills, expectedEntryPrice);
+  return fills.length > 0 && fills.every((fill) => isPositiveDecimal(fill.quantity) && isNearTimestamp(fill.createdAt, openingTime));
 }
 
-function currentPositionHasLedgerEvidence(evidence: ProviderLifecycleEvidence, position: ProviderLifecyclePosition): boolean {
-  return evidence.fills.some((fill) => fill.symbol === position.symbol && fill.positionSide === position.positionSide
-    && isPositiveDecimal(fill.quantity) && orderForFill(fill, evidence.orders));
+type LifecycleFillReconstruction =
+  | { ok: true; openingFills: ProviderLifecycleFill[]; closingFills: ProviderLifecycleFill[]; openQuantity: string; closeQuantity: string; remainingQuantity: string }
+  | { ok: false; classification: "PROVIDER_EXTERNAL" | "UNRESOLVED" | "CONTRADICTORY"; reason: string };
+
+function reconstructProviderLifecycleFills(evidence: ProviderLifecycleEvidence, openingTime: string, closingTime?: string): LifecycleFillReconstruction {
+  if (evidence.evidenceComplete === false) return { ok: false, classification: "UNRESOLVED", reason: "PROVIDER_LIFECYCLE_EVIDENCE_TRUNCATED" };
+  const openingMs = validTimestamp(openingTime);
+  const closingMs = closingTime ? validTimestamp(closingTime) : null;
+  if (openingMs === null || (closingTime && closingMs === null)) return { ok: false, classification: "UNRESOLVED", reason: "PROVIDER_LIFECYCLE_TIME_INVALID" };
+  const side = evidence.experience.positionSide;
+  if (!side) return { ok: false, classification: "UNRESOLVED", reason: "LOCAL_POSITION_SIDE_MISSING" };
+  const sameSymbolFills = evidence.fills.filter((fill) => fill.symbol === evidence.experience.symbol);
+  if (sameSymbolFills.some((fill) => validTimestamp(fill.createdAt) === null)) return { ok: false, classification: "UNRESOLVED", reason: "PROVIDER_FILL_TIME_INVALID" };
+  const entryIdentity = evidence.entryIdentity;
+  const isInLifecycle = (fill: ProviderLifecycleFill): boolean => {
+    const timestamp = validTimestamp(fill.createdAt)!;
+    const isEntrySkew = fill.tradeSide === "open" && entryIdentity?.providerOrderId === fill.providerOrderId
+      && entryIdentity.clientOid === fill.clientOid && isNearTimestamp(fill.createdAt, openingTime);
+    const inLifecycle = timestamp >= openingMs && (closingMs === null || timestamp <= closingMs);
+    return isEntrySkew || inLifecycle;
+  };
+  if (sameSymbolFills.some((fill) => (fill.positionSide === null || (fill.positionSide !== "LONG" && fill.positionSide !== "SHORT")) && isInLifecycle(fill))) {
+    return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_FILL_POSITION_SIDE_MISSING" };
+  }
+  const samePositionFills = sameSymbolFills.filter((fill) => fill.positionSide === side);
+  const fills = samePositionFills.filter(isInLifecycle);
+  if (fills.some((fill) => fill.origin === "PROVIDER_EXTERNAL")) return { ok: false, classification: "PROVIDER_EXTERNAL", reason: "PROVIDER_EXTERNAL_QUANTITY_CHANGE_IN_LIFECYCLE" };
+  if (fills.some((fill) => fill.origin !== "DARWIN")) return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_FILL_ORIGIN_UNATTRIBUTED" };
+  if (fills.some((fill) => fill.tradeSide !== "open" && fill.tradeSide !== "close")) return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_FILL_TRADE_SIDE_UNKNOWN" };
+  if (fills.some((fill) => !isPositiveDecimal(fill.quantity))) return { ok: false, classification: "CONTRADICTORY", reason: "LIFECYCLE_FILL_QUANTITY_INVALID" };
+  if (fills.some((fill) => !orderForFill(fill, evidence.orders))) return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_FILL_ORDER_IDENTITY_UNPROVEN" };
+  const openingFills = fills.filter((fill) => fill.tradeSide === "open");
+  const closingFills = fills.filter((fill) => fill.tradeSide === "close");
+  if (!openingFills.length) return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_OPENING_FILLS_MISSING" };
+  const openQuantity = exactSum(openingFills.map((fill) => fill.quantity));
+  const closeQuantity = exactSum(closingFills.map((fill) => fill.quantity));
+  if (openQuantity === null || closeQuantity === null) return { ok: false, classification: "CONTRADICTORY", reason: "LIFECYCLE_FILL_QUANTITY_INVALID" };
+  let remainingQuantity: string;
+  try {
+    remainingQuantity = subtractDecimal(openQuantity, closeQuantity);
+  } catch {
+    return { ok: false, classification: "CONTRADICTORY", reason: "LIFECYCLE_FILL_QUANTITY_INVALID" };
+  }
+  if (compareDecimal(remainingQuantity, "0") < 0) return { ok: false, classification: "CONTRADICTORY", reason: "LIFECYCLE_CLOSE_EXCEEDS_OPEN_QUANTITY" };
+  return { ok: true, openingFills, closingFills, openQuantity, closeQuantity, remainingQuantity };
+}
+
+function verifyProviderQuantityTotals(
+  reconstruction: Extract<LifecycleFillReconstruction, { ok: true }>,
+  expectedOpenQuantity: string | null,
+  expectedCloseQuantity: string | null,
+): ProviderLifecycleResult | null {
+  if (expectedOpenQuantity !== null && (!isPositiveDecimal(expectedOpenQuantity) || compareDecimal(reconstruction.openQuantity, expectedOpenQuantity) !== 0)) {
+    return result("CONTRADICTORY", "OPENING_FILL_QUANTITY_RESIDUAL", reconstruction.openQuantity);
+  }
+  if (expectedCloseQuantity !== null && (!isDecimal(expectedCloseQuantity) || compareDecimal(expectedCloseQuantity, "0") < 0 || compareDecimal(reconstruction.closeQuantity, expectedCloseQuantity) !== 0)) {
+    return result("CONTRADICTORY", "CLOSING_FILL_QUANTITY_RESIDUAL", reconstruction.closeQuantity);
+  }
+  return null;
 }
 
 export function classifyProviderLifecycle(evidence: ProviderLifecycleEvidence): ProviderLifecycleResult {
@@ -179,14 +234,23 @@ export function classifyProviderLifecycle(evidence: ProviderLifecycleEvidence): 
   if (current.length > 1) return result("CONTRADICTORY", "MULTIPLE_CURRENT_PROVIDER_POSITIONS");
 
   if (!history) {
-    if (current.length === 1 && experience.outcomeStatus === "OPEN" && current[0]?.openedAt && current[0].entryPrice
-      && openingIdentityIsProven(evidence, current[0].openedAt, current[0].quantity, current[0].entryPrice)) {
-      return result("MATCHED_OPEN", "CURRENT_PROVIDER_POSITION_AND_ENTRY_IDENTITY_MATCH");
-    }
-    if (current.length === 1 && currentPositionHasLedgerEvidence(evidence, current[0]!)) {
-      const positionFills = evidence.fills.filter((fill) => fill.symbol === current[0]!.symbol && fill.positionSide === current[0]!.positionSide && orderForFill(fill, evidence.orders));
+    if (current.length === 1 && experience.outcomeStatus !== "OPEN") {
+      const positionFills = evidence.fills.filter((fill) => fill.symbol === current[0]!.symbol && fill.positionSide === current[0]!.positionSide);
       if (positionFills.some((fill) => fill.origin === "PROVIDER_EXTERNAL")) return result("PROVIDER_EXTERNAL", "CURRENT_POSITION_ATTRIBUTED_EXTERNAL");
-      if (experience.outcomeStatus !== "OPEN") return result("PROVIDER_POSITION_WITHOUT_LOCAL_LIFECYCLE", "CURRENT_POSITION_HAS_PROVIDER_LEDGER_IDENTITY");
+      if (positionFills.some((fill) => fill.origin === "DARWIN" && orderForFill(fill, evidence.orders))) {
+        return result("PROVIDER_POSITION_WITHOUT_LOCAL_LIFECYCLE", "CURRENT_POSITION_HAS_PROVIDER_LEDGER_IDENTITY");
+      }
+    }
+    if (current.length === 1 && experience.outcomeStatus === "OPEN") {
+      const position = current[0]!;
+      if (!position.openedAt) return result("UNRESOLVED", "CURRENT_POSITION_OPEN_TIME_MISSING");
+      const reconstruction = reconstructProviderLifecycleFills(evidence, position.openedAt);
+      if (!reconstruction.ok) return result(reconstruction.classification, reconstruction.reason);
+      if (!openingIdentityIsProven(evidence, position.openedAt)) return result("UNRESOLVED", "CURRENT_POSITION_ENTRY_IDENTITY_UNPROVEN");
+      if (!position.entryPrice || !isPositiveDecimal(position.entryPrice)) return result("UNRESOLVED", "CURRENT_POSITION_ENTRY_PRICE_MISSING_OR_INVALID");
+      if (compareDecimal(reconstruction.remainingQuantity, position.quantity) !== 0) return result("CONTRADICTORY", "CURRENT_POSITION_FILL_QUANTITY_RESIDUAL", reconstruction.remainingQuantity);
+      if (!weightedEntryMatches(reconstruction.openingFills, position.entryPrice)) return result("CONTRADICTORY", "OPENING_FILL_WEIGHTED_PRICE_MISMATCH");
+      return result("MATCHED_OPEN", "CURRENT_PROVIDER_POSITION_AND_FULL_FILL_QUANTITY_MATCH");
     }
     return result("UNRESOLVED", "PROVIDER_POSITION_HISTORY_OR_ENTRY_IDENTITY_MISSING");
   }
@@ -198,13 +262,24 @@ export function classifyProviderLifecycle(evidence: ProviderLifecycleEvidence): 
 
   if (current.length === 1) {
     if (experience.outcomeStatus !== "OPEN") return result("CONTRADICTORY", "CURRENT_PROVIDER_POSITION_CONTRADICTS_LOCAL_LIFECYCLE");
-    if (history.openTotalPos && history.closeTotalPos && isPositiveDecimal(history.closeTotalPos)
-      && compareDecimal(history.openTotalPos, history.closeTotalPos) === 0
-      && validTimestamp(history.closingTime) !== null) {
+    if (!history.openTotalPos || !history.avgEntryPrice) return result("UNRESOLVED", "CURRENT_POSITION_ENTRY_IDENTITY_UNPROVEN");
+    if (history.closeTotalPos !== null && (!isDecimal(history.closeTotalPos) || compareDecimal(history.closeTotalPos, "0") < 0)) {
+      return result("UNRESOLVED", "CURRENT_POSITION_CLOSE_QUANTITY_INVALID");
+    }
+    if (history.closeTotalPos && compareDecimal(history.openTotalPos, history.closeTotalPos) === 0
+      && isPositiveDecimal(history.closeTotalPos) && validTimestamp(history.closingTime) !== null) {
       return result("CONTRADICTORY", "CURRENT_PROVIDER_POSITION_CONTRADICTS_CLOSED_HISTORY");
     }
-    if (!history.openTotalPos || !history.avgEntryPrice || !openingIdentityIsProven(evidence, history.openingTime, history.openTotalPos, history.avgEntryPrice)) return result("UNRESOLVED", "CURRENT_POSITION_ENTRY_IDENTITY_UNPROVEN");
-    return result("MATCHED_OPEN", "CURRENT_PROVIDER_POSITION_AND_ENTRY_IDENTITY_MATCH");
+    const reconstruction = reconstructProviderLifecycleFills(evidence, history.openingTime);
+    if (!reconstruction.ok) return result(reconstruction.classification, reconstruction.reason);
+    if (!openingIdentityIsProven(evidence, history.openingTime)) return result("UNRESOLVED", "CURRENT_POSITION_ENTRY_IDENTITY_UNPROVEN");
+    const totalsError = verifyProviderQuantityTotals(reconstruction, history.openTotalPos, history.closeTotalPos);
+    if (totalsError) return totalsError;
+    if (!weightedEntryMatches(reconstruction.openingFills, history.avgEntryPrice)) return result("CONTRADICTORY", "OPENING_FILL_WEIGHTED_PRICE_MISMATCH");
+    if (compareDecimal(reconstruction.remainingQuantity, current[0]!.quantity) !== 0) {
+      return result("CONTRADICTORY", "CURRENT_PROVIDER_POSITION_FILL_QUANTITY_RESIDUAL", reconstruction.remainingQuantity);
+    }
+    return result("MATCHED_OPEN", "CURRENT_PROVIDER_POSITION_AND_FULL_FILL_QUANTITY_MATCH");
   }
   const openQuantity = history.openTotalPos;
   const closeQuantity = history.closeTotalPos;
@@ -215,46 +290,19 @@ export function classifyProviderLifecycle(evidence: ProviderLifecycleEvidence): 
   const openingMs = validTimestamp(history.openingTime);
   const closingMs = validTimestamp(history.closingTime);
   if (openingMs === null || closingMs === null || closingMs <= openingMs) return result("CONTRADICTORY", "POSITION_HISTORY_TIME_INVALID");
-
   const identity = evidence.entryIdentity;
   if (!identity || identity.entryDecisionId !== experience.entryDecisionId || !identity.clientOid || !identity.providerOrderId) return result("UNRESOLVED", "ENTRY_DECISION_IDENTITY_UNPROVEN");
-  const openingOrders = evidence.orders.filter((order) => order.providerOrderId === identity.providerOrderId
-    && order.clientOid === identity.clientOid
-    && order.symbol === experience.symbol
-    && order.positionSide === side
-    && order.tradeSide === "open"
-    && order.origin === "DARWIN");
-  if (openingOrders.length !== 1) return result("UNRESOLVED", "DARWIN_OPENING_ORDER_IDENTITY_UNPROVEN");
-  const openingFills = evidence.fills.filter((fill) => fill.providerOrderId === identity.providerOrderId
-    && fill.clientOid === identity.clientOid
-    && fill.symbol === experience.symbol
-    && fill.positionSide === side
-    && fill.tradeSide === "open"
-    && fill.origin === "DARWIN"
-    && orderForFill(fill, openingOrders));
-  if (!openingFills.length || openingFills.some((fill) => !isNearTimestamp(fill.createdAt, history.openingTime))) return result("UNRESOLVED", "DARWIN_OPENING_FILL_IDENTITY_UNPROVEN");
-  const opened = exactSum(openingFills.map((fill) => fill.quantity));
-  if (!opened || !isDecimal(opened) || compareDecimal(opened, openQuantity) !== 0) return result("CONTRADICTORY", "OPENING_FILL_QUANTITY_RESIDUAL");
-  if (!history.avgEntryPrice || !weightedEntryMatches(openingFills, history.avgEntryPrice)) return result("CONTRADICTORY", "OPENING_FILL_WEIGHTED_PRICE_MISMATCH");
 
-  const closingOrders = evidence.orders.filter((order) => order.tradeSide === "close"
-    && order.symbol === experience.symbol
-    && order.positionSide === side
-    && Boolean(order.clientOid)
-    && order.origin === "DARWIN");
-  const closeOrderIds = new Set(closingOrders.map((order) => order.providerOrderId));
-  const closeCandidates = evidence.fills.filter((fill) => {
-    const time = validTimestamp(fill.createdAt);
-    return time !== null && time >= openingMs && time <= closingMs
-      && (closeOrderIds.has(fill.providerOrderId) || (fill.symbol === experience.symbol && fill.tradeSide === "close"));
-  });
-  if (closeCandidates.some((fill) => fill.symbol !== experience.symbol || fill.positionSide !== side || fill.tradeSide !== "close" || fill.origin !== "DARWIN" || !orderForFill(fill, closingOrders))) {
-    return result("CONTRADICTORY", "CLOSING_FILL_IDENTITY_OR_ORIGIN_CONTRADICTORY");
+  const reconstruction = reconstructProviderLifecycleFills(evidence, history.openingTime, history.closingTime);
+  if (!reconstruction.ok) return result(reconstruction.classification, reconstruction.reason);
+  if (!openingIdentityIsProven(evidence, history.openingTime)) return result("UNRESOLVED", "DARWIN_OPENING_FILL_IDENTITY_UNPROVEN");
+  const totalsError = verifyProviderQuantityTotals(reconstruction, openQuantity, closeQuantity);
+  if (totalsError) return totalsError;
+  if (!reconstruction.closingFills.length) return result("UNRESOLVED", "DARWIN_CLOSING_FILLS_MISSING");
+  if (!history.avgEntryPrice || !weightedEntryMatches(reconstruction.openingFills, history.avgEntryPrice)) {
+    return result("CONTRADICTORY", "OPENING_FILL_WEIGHTED_PRICE_MISMATCH");
   }
-  if (!closeCandidates.length) return result("UNRESOLVED", "DARWIN_CLOSING_FILLS_MISSING");
-  if (closeCandidates.some((fill) => !isPositiveDecimal(fill.quantity))) return result("CONTRADICTORY", "CLOSING_FILL_QUANTITY_INVALID");
-  const closed = exactSum(closeCandidates.map((fill) => fill.quantity));
-  if (!closed || compareDecimal(closed, closeQuantity) !== 0) return result("CONTRADICTORY", "CLOSING_FILL_QUANTITY_RESIDUAL", closed ?? "0");
-  if (experience.outcomeStatus !== "OPEN") return result("MATCHED_CLOSED", "LOCAL_AND_PROVIDER_LIFECYCLES_CLOSED", closed);
-  return result("LOCAL_OPEN_PROVIDER_CLOSED", "PROVIDER_LEDGER_PROVES_FULL_DARWIN_CLOSE", closed);
+  if (compareDecimal(reconstruction.remainingQuantity, "0") !== 0) return result("CONTRADICTORY", "POSITION_HISTORY_OPEN_CLOSE_QUANTITY_MISMATCH");
+  if (experience.outcomeStatus !== "OPEN") return result("MATCHED_CLOSED", "LOCAL_AND_PROVIDER_LIFECYCLES_CLOSED", reconstruction.closeQuantity);
+  return result("LOCAL_OPEN_PROVIDER_CLOSED", "PROVIDER_LEDGER_PROVES_FULL_DARWIN_CLOSE", reconstruction.closeQuantity);
 }

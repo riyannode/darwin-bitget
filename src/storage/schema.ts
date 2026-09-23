@@ -6,6 +6,7 @@ export function ensureStorage(executor: SqlExecutor): void {
   executor.sql`CREATE TABLE IF NOT EXISTS cycles (cycle_id TEXT PRIMARY KEY, status TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT)`;
   executor.sql`CREATE TABLE IF NOT EXISTS journals (cycle_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS experiences (experience_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, outcome_status TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL)`;
+  executor.sql`CREATE TABLE IF NOT EXISTS journal_decision_lookup (cycle_id TEXT NOT NULL, decision_id TEXT NOT NULL, PRIMARY KEY (cycle_id, decision_id))`;
   executor.sql`CREATE TABLE IF NOT EXISTS risk_state (state_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS backtests (backtest_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS lessons (lesson_id TEXT PRIMARY KEY, symbol_scope TEXT NOT NULL, market_regime TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`;
@@ -115,8 +116,11 @@ export function ensureStorage(executor: SqlExecutor): void {
     last_successful_sync_at TEXT,
     last_reconciliation_at TEXT,
     last_error TEXT,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0
   )`;
+  const syncStateColumns = executor.sql<{ name: string }>`SELECT name FROM pragma_table_info('provider_sync_state')`;
+  if (!syncStateColumns.some((column) => column.name === "revision")) executor.sql`ALTER TABLE provider_sync_state ADD COLUMN revision INTEGER NOT NULL DEFAULT 0`;
   const positionHistoryColumns = executor.sql<{ name: string }>`SELECT name FROM pragma_table_info('provider_position_history')`;
   if (!positionHistoryColumns.some((column) => column.name === "open_total_pos")) executor.sql`ALTER TABLE provider_position_history ADD COLUMN open_total_pos TEXT`;
   if (!positionHistoryColumns.some((column) => column.name === "close_total_pos")) executor.sql`ALTER TABLE provider_position_history ADD COLUMN close_total_pos TEXT`;
@@ -129,6 +133,24 @@ export function ensureStorage(executor: SqlExecutor): void {
   executor.sql`DROP INDEX IF EXISTS provider_orders_category_client_oid_uq`;
   executor.sql`CREATE INDEX IF NOT EXISTS journals_created_at_idx ON journals(created_at DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS experiences_created_at_idx ON experiences(created_at DESC)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS experiences_entry_decision_idx ON experiences(CASE WHEN json_valid(payload) THEN json_extract(payload, '$.entryDecisionId') END)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS journal_decision_lookup_decision_idx ON journal_decision_lookup(decision_id, cycle_id)`;
+  executor.sql`CREATE TRIGGER IF NOT EXISTS journals_decision_lookup_insert AFTER INSERT ON journals BEGIN
+    INSERT OR IGNORE INTO journal_decision_lookup (cycle_id, decision_id)
+    SELECT DISTINCT NEW.cycle_id, decision.value FROM json_tree(NEW.payload) AS decision
+    WHERE decision.key = 'decisionId' AND decision.type = 'text' AND length(decision.value) BETWEEN 1 AND 256
+    LIMIT 500;
+  END`;
+  executor.sql`CREATE TRIGGER IF NOT EXISTS journals_decision_lookup_update AFTER UPDATE OF payload ON journals BEGIN
+    DELETE FROM journal_decision_lookup WHERE cycle_id = NEW.cycle_id;
+    INSERT OR IGNORE INTO journal_decision_lookup (cycle_id, decision_id)
+    SELECT DISTINCT NEW.cycle_id, decision.value FROM json_tree(NEW.payload) AS decision
+    WHERE decision.key = 'decisionId' AND decision.type = 'text' AND length(decision.value) BETWEEN 1 AND 256
+    LIMIT 500;
+  END`;
+  executor.sql`CREATE TRIGGER IF NOT EXISTS journals_decision_lookup_delete AFTER DELETE ON journals BEGIN
+    DELETE FROM journal_decision_lookup WHERE cycle_id = OLD.cycle_id;
+  END`;
   executor.sql`CREATE INDEX IF NOT EXISTS position_context_symbol_idx ON position_context(symbol, position_side)`;
   executor.sql`CREATE INDEX IF NOT EXISTS events_created_at_idx ON events(created_at DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS events_cycle_created_at_idx ON events(cycle_id, created_at DESC)`;
@@ -136,9 +158,12 @@ export function ensureStorage(executor: SqlExecutor): void {
   executor.sql`CREATE INDEX IF NOT EXISTS backtests_created_at_idx ON backtests(created_at DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS idempotency_decision_idx ON idempotency(decision_id)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_position_history_category_opening_idx ON provider_position_history(category, symbol, position_side, opening_time)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS provider_position_history_category_page_idx ON provider_position_history(category, opening_time, provider_position_history_key)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_orders_category_updated_idx ON provider_orders(category, updated_time DESC)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS provider_orders_lifecycle_window_idx ON provider_orders(category, symbol, created_time)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_orders_client_oid_idx ON provider_orders(client_oid)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_order_created_idx ON provider_fills(provider_order_id, created_time)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_lifecycle_window_idx ON provider_fills(category, symbol, created_time)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_category_created_idx ON provider_fills(category, created_time DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_client_oid_idx ON provider_fills(client_oid)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_position_history_category_closing_idx ON provider_position_history(category, closing_time DESC)`;
@@ -146,4 +171,12 @@ export function ensureStorage(executor: SqlExecutor): void {
   executor.sql`CREATE INDEX IF NOT EXISTS provider_financial_records_category_timestamp_idx ON provider_financial_records(category, provider_timestamp DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_financial_records_type_timestamp_idx ON provider_financial_records(type, provider_timestamp DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_sync_state_updated_idx ON provider_sync_state(updated_at DESC)`;
+  const journalLookupMigration = executor.sql<{ state_key: string }>`SELECT state_key FROM risk_state WHERE state_key = 'journal_decision_lookup_v1'`;
+  if (journalLookupMigration.length === 0) {
+    executor.sql`WITH valid_journals AS MATERIALIZED (SELECT cycle_id, payload FROM journals WHERE json_valid(payload))
+      INSERT OR IGNORE INTO journal_decision_lookup (cycle_id, decision_id)
+      SELECT j.cycle_id, decision.value FROM valid_journals AS j, json_tree(j.payload) AS decision
+      WHERE decision.key = 'decisionId' AND decision.type = 'text' AND length(decision.value) BETWEEN 1 AND 256`;
+    executor.sql`INSERT INTO risk_state (state_key, payload, updated_at) VALUES ('journal_decision_lookup_v1', '{}', '1970-01-01T00:00:00.000Z')`;
+  }
 }

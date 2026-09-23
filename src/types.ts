@@ -767,7 +767,7 @@ export interface TradeLogEntry {
   exitReasoning?: PositionReasoning;
   managementEvents?: PositionReasoning[];
   financialSource?: "PROVIDER_LEDGER" | "PROVIDER_LIVE" | "UNRESOLVED";
-  reasoningSource?: "DARWIN_PERSISTED";
+  reasoningSource?: "DARWIN_PERSISTED" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
   origin?: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
   providerPositionHistoryId?: string;
   quantity?: string;

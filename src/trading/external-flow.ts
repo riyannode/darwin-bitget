@@ -2,7 +2,7 @@ import { addDecimal, compareDecimal, isDecimal, subtractDecimal } from "./decima
 
 export type FinancialRecordClass = "EXTERNAL_INFLOW" | "EXTERNAL_OUTFLOW" | "TRADING_OR_PNL_COMPONENT" | "INTERNAL_NON_FLOW" | "UNKNOWN";
 
-const CLASSIFICATION: Readonly<Record<string, Exclude<FinancialRecordClass, "UNKNOWN">>> = Object.freeze({
+export const BITGET_UTA_FINANCIAL_RECORD_CLASSIFICATION: Readonly<Record<string, Exclude<FinancialRecordClass, "UNKNOWN">>> = Object.freeze({
   TRANSFER_IN: "EXTERNAL_INFLOW",
   TRANSFER_OUT: "EXTERNAL_OUTFLOW",
   CONVERSION_UPON_DELISTING: "INTERNAL_NON_FLOW",
@@ -108,6 +108,12 @@ const CLASSIFICATION: Readonly<Record<string, Exclude<FinancialRecordClass, "UNK
   FIXED_FORCE_SELL_SSM: "TRADING_OR_PNL_COMPONENT",
   FIXED_BURST_BUY_SSM: "TRADING_OR_PNL_COMPONENT",
   FIXED_BURST_SELL_SSM: "TRADING_OR_PNL_COMPONENT",
+  FIXED_DELIVERY_LONG: "TRADING_OR_PNL_COMPONENT",
+  FIXED_DELIVERY_SHORT: "TRADING_OR_PNL_COMPONENT",
+  DELIVERY_LONG: "TRADING_OR_PNL_COMPONENT",
+  DELIVERY_SHORT: "TRADING_OR_PNL_COMPONENT",
+  RISK_LIQ_DEFAULT_USER_IN: "TRADING_OR_PNL_COMPONENT",
+  FIXED_RISK_LIQ_DEFAULT_USER_IN: "TRADING_OR_PNL_COMPONENT",
   ON_CHAIN_TRANSFER_REFUND: "EXTERNAL_INFLOW",
   ON_CHAIN_TRANSFER_OUT: "EXTERNAL_OUTFLOW",
   MT5_TRANSFER_IN: "EXTERNAL_INFLOW",
@@ -126,6 +132,15 @@ const CLASSIFICATION: Readonly<Record<string, Exclude<FinancialRecordClass, "UNK
   BGPAY_REFUND_IN: "EXTERNAL_INFLOW",
   PAPTRADING_USER_IN: "EXTERNAL_INFLOW",
   PAPTRADING_USER_OUT: "EXTERNAL_OUTFLOW",
+  BONUS_GRANT_USER_IN: "EXTERNAL_INFLOW",
+  BONUS_EXPIRE_USER_OUT: "EXTERNAL_OUTFLOW",
+  BONUS_TRANSFER_USER_OUT: "EXTERNAL_OUTFLOW",
+  WITHDRAW_TRANSFER_OUT: "EXTERNAL_OUTFLOW",
+  WITHDRAW_TRANSFER_IN: "EXTERNAL_INFLOW",
+  REBASE_COIN_SPLIT_OUT: "INTERNAL_NON_FLOW",
+  REBASE_COIN_SPLIT_IN: "INTERNAL_NON_FLOW",
+  REBASE_COIN_MERGE_OUT: "INTERNAL_NON_FLOW",
+  REBASE_COIN_MERGE_IN: "INTERNAL_NON_FLOW",
   RWA_CROSS_SETTLE_FEE_USER_IN: "TRADING_OR_PNL_COMPONENT",
   RWA_CROSS_SETTLE_FEE_USER_OUT: "TRADING_OR_PNL_COMPONENT",
   RWA_CONTRACT_MAIN_SETTLE_FEE_SYSTEM_IN: "INTERNAL_NON_FLOW",
@@ -145,7 +160,7 @@ const CLASSIFICATION: Readonly<Record<string, Exclude<FinancialRecordClass, "UNK
 });
 
 export function classifyFinancialRecordType(type: string): FinancialRecordClass {
-  return CLASSIFICATION[type] ?? "UNKNOWN";
+  return BITGET_UTA_FINANCIAL_RECORD_CLASSIFICATION[type] ?? "UNKNOWN";
 }
 
 export interface FinancialRecordForFlow {
@@ -198,12 +213,18 @@ function absoluteDecimal(value: string): string {
   return value.startsWith("-") || value.startsWith("+") ? value.slice(1) : value;
 }
 
+export interface VerifiedExternalFlows {
+  status: "VERIFIED" | "UNVERIFIED";
+  netExternalInflows: string;
+  unknownTypes: string[];
+}
+
 export function calculateVerifiedExternalFlows(
   records: readonly FinancialRecordForFlow[],
   categories: readonly FinancialCoverageForFlow[],
   amountsValid = true,
   accountingCoin = "USDT",
-): { status: "VERIFIED" | "UNVERIFIED"; netExternalInflows: string; unknownTypes: string[] } {
+): VerifiedExternalFlows {
   const unknownTypes = [...new Set(records.filter((record) => classifyFinancialRecordType(record.type) === "UNKNOWN").map((record) => record.type))].sort();
   const requiredAmountsValid = amountsValid && records.every((record) => {
     const classification = classifyFinancialRecordType(record.type);

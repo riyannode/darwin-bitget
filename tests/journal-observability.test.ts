@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { loadAllEvents, loadExperiences, loadPerformanceAggregate, loadPositionContext, loadRecentJournals, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
+import { loadAllEvents, loadExperiences, loadJournalsForDecisionIds, loadPerformanceAggregate, loadPositionContext, loadRecentJournals, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
 import { buildPaperLogExport } from "../src/storage/paper-log.js";
 import type { AccountSnapshot, CycleDecisionPlan, DecisionContext, DecisionExecutionRecord, EvidenceBundle, Instrument, PositionContext, PositionManagementState, PositionReasoning, PositionSnapshot, TradeExperience, TradingJournal } from "../src/types.js";
 
@@ -53,8 +53,7 @@ const baseJournal: TradingJournal = {
   createdLessons: [],
 };
 
-function memoryExecutor(): { db: DatabaseSync; executor: SqlExecutor } {
-  const db = new DatabaseSync(":memory:");
+function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; executor: SqlExecutor } {
   const executor: SqlExecutor = {
     sql<T>(strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[] {
       const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
@@ -255,6 +254,20 @@ describe("journal observability persistence", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.clearAllMocks();
+  });
+
+  it("backfills the indexed decision lookup for legacy journal rows", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("CREATE TABLE journals (cycle_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)");
+    db.exec("CREATE TABLE risk_state (state_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)");
+    const legacyJournal = JSON.stringify({ cycleId: "legacy-cycle", decision: { decisionId: "legacy-entry-decision" } });
+    db.prepare("INSERT INTO journals (cycle_id, payload, created_at) VALUES (?, ?, ?)").run("legacy-cycle", legacyJournal, "2026-09-01T00:00:00.000Z");
+    const { executor } = memoryExecutor(db);
+    const result = loadJournalsForDecisionIds(executor, ["legacy-entry-decision"], 10);
+    expect(result).toHaveLength(1);
+    expect(result[0]?.cycleId).toBe("legacy-cycle");
+    expect(result[0]?.decision?.decisionId).toBe("legacy-entry-decision");
+    db.close();
   });
 
   it("round-trips the complete lifecycle state and prompt versions through journal JSON", async () => {
