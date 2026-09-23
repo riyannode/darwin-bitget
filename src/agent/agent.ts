@@ -102,7 +102,8 @@ interface AgentState {
 }
 
 const STALE_CYCLE_TIMEOUT_MS = 120_000;
-const USER_STORAGE_VERSION = 5;
+const USER_STORAGE_VERSION = 6;
+const LATEST_VALID_PLAN_MIGRATION_VERSION = 5;
 const SNAPSHOT_EVENT_LIMIT = 25;
 
 const MAX_FAILURE_DIAGNOSTIC_LENGTH = 240;
@@ -666,10 +667,19 @@ export class TraderAgent extends Agent<Env, AgentState> {
   };
 
   public override async onStart(): Promise<void> {
-    const needsLatestValidPlanMigration = (this.state.userStorageVersion ?? 0) < USER_STORAGE_VERSION;
-    if (needsLatestValidPlanMigration) {
+    const userStorageVersion = this.state.userStorageVersion ?? 0;
+    const needsLatestValidPlanMigration = userStorageVersion < LATEST_VALID_PLAN_MIGRATION_VERSION;
+    if (userStorageVersion < USER_STORAGE_VERSION) {
       ensureStorage(this);
-      this.setState({ ...this.state, userStorageVersion: USER_STORAGE_VERSION, temporaryScanIntervalExpiresAt: null, temporaryScanIntervalCompleted: false, temporaryScanIntervalDurationMs: 0 });
+      this.setState({
+        ...this.state,
+        userStorageVersion: USER_STORAGE_VERSION,
+        ...(needsLatestValidPlanMigration ? {
+          temporaryScanIntervalExpiresAt: null,
+          temporaryScanIntervalCompleted: false,
+          temporaryScanIntervalDurationMs: 0,
+        } : {}),
+      });
     }
     this.ensureReadModels(needsLatestValidPlanMigration);
     const policy = this.ensureActivePolicy();
