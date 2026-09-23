@@ -1,4 +1,5 @@
 export const CYCLE_INTERVAL_SECONDS = 300;
+export const PROVIDER_LEDGER_INTERVAL_SECONDS = 900;
 export const TEMPORARY_SCAN_INTERVAL_MINUTES = 3;
 export const TEMPORARY_SCAN_INTERVAL_DURATION_MS = 2 * 60 * 60 * 1000;
 
@@ -126,4 +127,15 @@ export async function scheduleTradingCycle(
   if (cycleSchedules.length === 1 && matchingSchedule) return matchingSchedule;
   for (const schedule of cycleSchedules) await scheduler.cancelSchedule(schedule.id);
   return scheduler.scheduleEvery(intervalSeconds, "runScheduledCycle", undefined, { _idempotent: true });
+}
+
+/** Keep read-only provider ingestion independent from the owner's trading schedule. */
+export async function reconcileProviderLedgerSchedule(scheduler: CycleScheduler): Promise<boolean> {
+  const providerSchedules = (await scheduler.listSchedules()).filter((entry) => entry.callback === "runScheduledProviderSync");
+  const matching = providerSchedules.filter((entry) => scheduleMatches(entry, PROVIDER_LEDGER_INTERVAL_SECONDS));
+  if (providerSchedules.length === 1 && matching.length === 1) return true;
+  for (const schedule of providerSchedules) await scheduler.cancelSchedule(schedule.id);
+  await scheduler.scheduleEvery(PROVIDER_LEDGER_INTERVAL_SECONDS, "runScheduledProviderSync", undefined, { _idempotent: true });
+  const verified = (await scheduler.listSchedules()).filter((entry) => entry.callback === "runScheduledProviderSync");
+  return verified.length === 1 && scheduleMatches(verified[0]!, PROVIDER_LEDGER_INTERVAL_SECONDS);
 }

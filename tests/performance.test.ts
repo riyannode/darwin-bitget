@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AccountSnapshot, Decision, DecisionExecutionRecord, ExecutionResult, ReconciliationResult, TradeExperience, TradingJournal } from "../src/types.js";
-import { bootstrapPerformance, buildPerformanceAccounting, emptyPerformance, performanceTotalPnl, recordVerifiedClose, recordVerifiedOpen, recordVerifiedPartial, updateEquity } from "../src/trading/performance.js";
+import { bootstrapPerformance, buildPerformanceAccounting, emptyPerformance, migratePerformanceEquityObservations, performanceTotalPnl, recordVerifiedClose, recordVerifiedOpen, recordVerifiedPartial, updateEquity } from "../src/trading/performance.js";
 
 const at = "2026-09-14T10:00:00.000Z";
 const account: AccountSnapshot = {
@@ -25,6 +25,24 @@ function experience(id: string, outcomeStatus: TradeExperience["outcomeStatus"],
 }
 
 describe("persisted performance aggregate", () => {
+  it("migrates only equity observations and discards stale local lifecycle authority", () => {
+    const migrated = migratePerformanceEquityObservations({
+      version: "performance-v2",
+      competitionBaselineEquity: "1000",
+      performanceBaselineAt: at,
+      latestEquity: "1050",
+      latestEquityObservedAt: "2026-09-15T10:00:00.000Z",
+      totalTrades: 8,
+      closedTrades: 7,
+      wins: 6,
+      totalPnl: "19.1364",
+      verifiedRealizedPnl: "19.1364",
+      dailyPnl: { "2026-09-15": { openingEquity: "1000", latestEquity: "1050", pnl: "50", dailyReturnPct: "5", trades: 1 } },
+    }, "2026-09-16T00:00:00.000Z");
+    expect(migrated).toMatchObject({ version: "performance-v3-provider-ledger", competitionBaselineEquity: "1000", performanceBaselineAt: at, latestEquity: "1050", latestEquityObservedAt: "2026-09-15T10:00:00.000Z", totalTrades: 0, closedTrades: 0, wins: 0, totalPnl: "UNAVAILABLE", externalFlowStatus: "UNVERIFIED", netExternalInflows: "UNAVAILABLE", dailyPnl: {} });
+    expect(JSON.stringify(migrated)).not.toContain("19.1364");
+  });
+
   it("counts verified opens as total/open trades but not outcomes", () => {
     let value = recordVerifiedOpen(emptyPerformance(at), "1000", at);
     expect(value).toMatchObject({ totalTrades: 1, openTrades: 1, closedTrades: 0, wins: 0, losses: 0, breakeven: 0, winRate: "UNAVAILABLE" });

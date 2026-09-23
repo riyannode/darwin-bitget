@@ -24,6 +24,9 @@ const MAX_PROVIDER_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PROVIDER_HISTORY_MS = 90 * 24 * 60 * 60 * 1000;
 const PROVIDER_HISTORY_SAFETY_MS = 60 * 1000;
 const DEFAULT_INITIAL_LOOKBACK_MS = MAX_PROVIDER_HISTORY_MS;
+export const PROVIDER_TRADE_LIFECYCLE_CATEGORY = "USDT-FUTURES" as const;
+export const PROVIDER_FINANCIAL_CATEGORIES = ["USDT-FUTURES", "OTHER", "SPOT", "MARGIN", "COIN-FUTURES", "USDC-FUTURES"] as const;
+
 const DEFAULT_RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_OVERLAP_MS = 15 * 60 * 1000;
 const MAX_PAGES_PER_WINDOW = 1000;
@@ -42,8 +45,10 @@ export interface ProviderLedgerReadClient {
 export interface ProviderLedgerSyncOptions {
   category: string;
   mode: "backfill" | "recent";
+  financialRecordsOnly?: boolean;
   now?: Date;
   initialLookbackMs?: number;
+  coverageStartAt?: string;
   recentWindowMs?: number;
   overlapMs?: number;
   maxPagesPerRun?: number;
@@ -137,27 +142,29 @@ export async function syncProviderLedger(
     }
   };
 
-  await run("historyOrders", client.getOrderHistoryRead.bind(client), (row) => {
-    const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid), "PROVIDER_EXTERNAL");
-    const record = normalizeProviderOrder(row, origin, observedAt);
-    if (!record) return false;
-    upsertProviderOrder(executor, record, observedAt);
-    return true;
-  });
-  await run("fills", client.getFillHistoryWindowRead.bind(client), (row) => {
-    const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid));
-    const record = normalizeProviderFill(row, origin, observedAt);
-    if (!record) return false;
-    upsertProviderFill(executor, record, observedAt);
-    return true;
-  });
-  await run("positionHistory", client.getPositionHistoryRead.bind(client), (row) => {
-    const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid));
-    const record = normalizeProviderPositionHistory(row, observedAt, origin);
-    if (!record) return false;
-    upsertProviderPositionHistory(executor, record, observedAt);
-    return true;
-  });
+  if (!options.financialRecordsOnly) {
+    await run("historyOrders", client.getOrderHistoryRead.bind(client), (row) => {
+      const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid), "PROVIDER_EXTERNAL");
+      const record = normalizeProviderOrder(row, origin, observedAt);
+      if (!record) return false;
+      upsertProviderOrder(executor, record, observedAt);
+      return true;
+    });
+    await run("fills", client.getFillHistoryWindowRead.bind(client), (row) => {
+      const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid));
+      const record = normalizeProviderFill(row, origin, observedAt);
+      if (!record) return false;
+      upsertProviderFill(executor, record, observedAt);
+      return true;
+    });
+    await run("positionHistory", client.getPositionHistoryRead.bind(client), (row) => {
+      const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid));
+      const record = normalizeProviderPositionHistory(row, observedAt, origin);
+      if (!record) return false;
+      upsertProviderPositionHistory(executor, record, observedAt);
+      return true;
+    });
+  }
   await run("financialRecords", client.getFinancialRecordsRead.bind(client), (row) => {
     const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid));
     const record = normalizeProviderFinancialRecord(row, observedAt, origin);
@@ -166,9 +173,20 @@ export async function syncProviderLedger(
     return true;
   });
 
-  const allResourcesCompleted = errors.length === 0 && Object.keys(resources).length === 4;
+  const expectedResources = options.financialRecordsOnly ? 1 : 4;
+  const allResourcesCompleted = errors.length === 0 && Object.keys(resources).length === expectedResources;
   state.lastSuccessfulSyncAt = allResourcesCompleted ? observedAt : previous?.lastSuccessfulSyncAt ?? null;
   state.lastError = errors.length > 0 ? errors.join("; ") : null;
+  const financialResourceSucceeded = !errors.some((error) => error.startsWith("financialRecords:")) && Boolean(resources.financialRecords);
+  const priorCoverage = previous?.financialRecordCoverage ?? null;
+  if (financialResourceSucceeded) {
+    const coveredFrom = options.mode === "backfill" ? windows[0]!.startIso : priorCoverage?.coveredFrom;
+    state.financialRecordCoverage = coveredFrom
+      ? { coveredFrom, coveredThrough: observedAt, lastSuccessfulSyncAt: observedAt, lastError: null }
+      : priorCoverage;
+  } else {
+    state.financialRecordCoverage = priorCoverage ? { ...priorCoverage, lastError: state.lastError } : null;
+  }
   state.updatedAt = observedAt;
   saveProviderSyncState(executor, state);
 
@@ -231,7 +249,10 @@ function buildWindows(nowMs: number, options: ProviderLedgerSyncOptions, previou
     : Math.min(options.recentWindowMs ?? DEFAULT_RECENT_WINDOW_MS, MAX_PROVIDER_WINDOW_MS);
   const previousMs = previous?.lastSuccessfulSyncAt ? Date.parse(previous.lastSuccessfulSyncAt) : NaN;
   const historyFloorMs = nowMs - MAX_PROVIDER_HISTORY_MS + PROVIDER_HISTORY_SAFETY_MS;
-  const requestedStartMs = Number.isFinite(previousMs) && options.mode === "recent" ? previousMs - overlapMs : nowMs - lookbackMs;
+  const requestedCoverageStartMs = options.mode === "backfill" && options.coverageStartAt ? Date.parse(options.coverageStartAt) : NaN;
+  const requestedStartMs = Number.isFinite(requestedCoverageStartMs)
+    ? requestedCoverageStartMs
+    : Number.isFinite(previousMs) && options.mode === "recent" ? previousMs - overlapMs : nowMs - lookbackMs;
   const startMs = Math.max(0, historyFloorMs, requestedStartMs);
   const windows: Window[] = [];
   let cursor = startMs;

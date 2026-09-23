@@ -4,6 +4,8 @@ import { parseLesson } from "../learning/lessons.js";
 import { parseDailyDrawdownState, type DailyDrawdownState } from "../trading/drawdown.js";
 import { parseOwnerPolicy } from "../trading/policy.js";
 import { normalizeCycleDecisions, journalHasPersistedPlan } from "./journal-normalizer.js";
+import type { VerifiedExternalFlows } from "../trading/external-flow.js";
+import type { ProviderPerformanceTotals } from "../trading/provider-performance.js";
 import type { SqlExecutor } from "./schema.js";
 
 interface LessonRow {
@@ -174,6 +176,28 @@ export function loadExperiences(executor: SqlExecutor, limit = MAX_HISTORY_LIMIT
   });
 }
 
+export function loadExperiencesForDecisionIds(executor: SqlExecutor, decisionIds: readonly string[], limit = MAX_HISTORY_LIMIT): TradeExperience[] {
+  const requested = [...new Set(decisionIds)].filter((id) => typeof id === "string" && id.trim().length > 0 && id.length <= MAX_TARGETED_DECISION_ID_LENGTH).slice(0, MAX_HISTORY_LIMIT);
+  if (requested.length === 0) return [];
+  const requestedSet = new Set(requested);
+  const rows = executor.sql<ExperienceRow>`
+    SELECT experience.payload
+    FROM experiences AS experience
+    JOIN json_each(${JSON.stringify(requested)}) AS requested
+      ON (CASE WHEN json_valid(experience.payload) THEN json_extract(experience.payload, '$.entryDecisionId') END) = requested.value
+    ORDER BY experience.created_at DESC, experience.experience_id ASC
+    LIMIT ${clampHistoryLimit(limit, MAX_HISTORY_LIMIT)}
+  `;
+  return rows.flatMap((row) => {
+    try {
+      const experience = parseExperience(JSON.parse(row.payload));
+      return requestedSet.has(experience.entryDecisionId) ? [experience] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
 export function loadOpenExperiences(executor: SqlExecutor, limit = MAX_HISTORY_LIMIT): TradeExperience[] {
   const rows = executor.sql<ExperienceRow>`SELECT payload FROM experiences WHERE outcome_status = 'OPEN' ORDER BY created_at DESC, experience_id ASC LIMIT ${clampHistoryLimit(limit, MAX_HISTORY_LIMIT)}`;
   return rows.flatMap((row) => {
@@ -187,21 +211,28 @@ export function loadOpenExperiences(executor: SqlExecutor, limit = MAX_HISTORY_L
 }
 
 export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: readonly string[], limit = MAX_HISTORY_LIMIT): TradingJournal[] {
+  const requested = [...new Set(decisionIds)].filter((id) => typeof id === "string" && id.trim().length > 0 && id.length <= MAX_TARGETED_DECISION_ID_LENGTH).slice(0, MAX_HISTORY_LIMIT);
+  if (requested.length === 0) return [];
+  const maxRows = Math.min(requested.length * 2, MAX_HISTORY_LIMIT * 2);
+  const rows = executor.sql<JournalRow>`
+    SELECT j.payload
+    FROM journals AS j
+    JOIN journal_decision_lookup AS indexed ON indexed.cycle_id = j.cycle_id
+    JOIN json_each(${JSON.stringify(requested)}) AS requested ON requested.value = indexed.decision_id
+    GROUP BY j.cycle_id
+    ORDER BY MAX(j.created_at) DESC, j.cycle_id
+    LIMIT ${maxRows}
+  `;
   const journals = new Map<string, TradingJournal>();
-  for (const decisionId of [...new Set(decisionIds)].slice(0, limit)) {
-    if (typeof decisionId !== "string" || decisionId.length === 0 || decisionId.length > MAX_TARGETED_DECISION_ID_LENGTH || decisionId.trim().length === 0) continue;
-    const marker = `"decisionId":${JSON.stringify(decisionId)}`;
-    const rows = executor.sql<JournalRow>`SELECT payload FROM journals WHERE instr(payload, ${marker}) > 0 ORDER BY created_at DESC LIMIT 2`;
-    for (const row of rows) {
-      try {
-        const journal = JSON.parse(row.payload) as TradingJournal;
-        journals.set(journal.cycleId, journal);
-      } catch {
-        // Ignore malformed historical journal rows during bounded bootstrap.
-      }
+  for (const row of rows) {
+    try {
+      const journal = JSON.parse(row.payload) as TradingJournal;
+      journals.set(journal.cycleId, journal);
+    } catch {
+      // Ignore malformed historical journal rows during bounded lookup.
     }
   }
-  return [...journals.values()];
+  return [...journals.values()].slice(0, clampHistoryLimit(limit, MAX_HISTORY_LIMIT) * 2);
 }
 
 export function loadAllExperiences(executor: SqlExecutor): TradeExperience[] {
@@ -220,6 +251,93 @@ export function saveExperience(executor: SqlExecutor, experience: TradeExperienc
     INSERT INTO experiences (experience_id, symbol, outcome_status, payload, created_at)
     VALUES (${experience.experienceId}, ${experience.symbol}, ${experience.outcomeStatus}, ${JSON.stringify(experience)}, ${createdAt})
     ON CONFLICT(experience_id) DO UPDATE SET payload = excluded.payload, outcome_status = excluded.outcome_status
+  `;
+}
+
+export interface ExternalFlowReadModelCache {
+  version: 1;
+  signature: string;
+  flows: VerifiedExternalFlows;
+  truncated: boolean;
+}
+
+const EXTERNAL_FLOW_READ_MODEL_STATE_KEY = "external_flow_read_model_v1";
+
+function isExternalFlowReadModelCache(value: unknown): value is ExternalFlowReadModelCache {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Partial<ExternalFlowReadModelCache>;
+  return candidate.version === 1
+    && typeof candidate.signature === "string"
+    && typeof candidate.truncated === "boolean"
+    && typeof candidate.flows === "object" && candidate.flows !== null
+    && (candidate.flows.status === "VERIFIED" || candidate.flows.status === "UNVERIFIED")
+    && typeof candidate.flows.netExternalInflows === "string"
+    && Array.isArray(candidate.flows.unknownTypes) && candidate.flows.unknownTypes.every((type) => typeof type === "string");
+}
+
+export function loadExternalFlowReadModelCache(executor: SqlExecutor): ExternalFlowReadModelCache | null {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${EXTERNAL_FLOW_READ_MODEL_STATE_KEY}`;
+  if (!rows[0]) return null;
+  try {
+    const value: unknown = JSON.parse(rows[0].payload);
+    return isExternalFlowReadModelCache(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveExternalFlowReadModelCache(executor: SqlExecutor, cache: ExternalFlowReadModelCache, updatedAt: string): void {
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${EXTERNAL_FLOW_READ_MODEL_STATE_KEY}, ${JSON.stringify(cache)}, ${updatedAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+}
+
+export interface ProviderLifecyclePerformanceReadModelCache {
+  version: 1;
+  signature: string;
+  totals: ProviderPerformanceTotals;
+}
+
+const PROVIDER_LIFECYCLE_PERFORMANCE_READ_MODEL_STATE_KEY = "provider_lifecycle_performance_v1";
+
+function isProviderLifecyclePerformanceCache(value: unknown): value is ProviderLifecyclePerformanceReadModelCache {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Partial<ProviderLifecyclePerformanceReadModelCache>;
+  const totals = candidate.totals;
+  return candidate.version === 1
+    && typeof candidate.signature === "string"
+    && typeof totals === "object" && totals !== null
+    && totals.source === "PROVIDER_LEDGER"
+    && Number.isInteger(totals.closedTrades) && totals.closedTrades >= 0
+    && Number.isInteger(totals.openTrades) && totals.openTrades >= 0
+    && Number.isInteger(totals.totalTrades) && totals.totalTrades >= 0
+    && Number.isInteger(totals.wins) && totals.wins >= 0
+    && Number.isInteger(totals.losses) && totals.losses >= 0
+    && Number.isInteger(totals.breakeven) && totals.breakeven >= 0
+    && Number.isInteger(totals.unresolvedClosedLifecycles) && totals.unresolvedClosedLifecycles >= 0
+    && typeof totals.closedEpisodeRealizedPnl === "string"
+    && typeof totals.verifiedRealizedPnl === "string"
+    && typeof totals.dailyPnl === "object" && totals.dailyPnl !== null;
+}
+
+export function loadProviderLifecyclePerformanceReadModelCache(executor: SqlExecutor): ProviderLifecyclePerformanceReadModelCache | null {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${PROVIDER_LIFECYCLE_PERFORMANCE_READ_MODEL_STATE_KEY}`;
+  if (!rows[0]) return null;
+  try {
+    const value: unknown = JSON.parse(rows[0].payload);
+    return isProviderLifecyclePerformanceCache(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveProviderLifecyclePerformanceReadModelCache(executor: SqlExecutor, cache: ProviderLifecyclePerformanceReadModelCache, updatedAt: string): void {
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${PROVIDER_LIFECYCLE_PERFORMANCE_READ_MODEL_STATE_KEY}, ${JSON.stringify(cache)}, ${updatedAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
   `;
 }
 
@@ -308,6 +426,26 @@ export function loadPositionContext(executor: SqlExecutor, symbol: string, posit
   } catch {
     return null;
   }
+}
+
+export function loadPositionContextsForKeys(executor: SqlExecutor, contextKeys: readonly string[], limit = MAX_HISTORY_LIMIT): Map<string, PositionContext> {
+  const maxContextKeys = MAX_HISTORY_LIMIT * 4;
+  const keys = [...new Set(contextKeys)].filter((key) => typeof key === "string" && key.trim().length > 0 && key.length <= 80).slice(0, maxContextKeys);
+  if (keys.length === 0) return new Map();
+  const rows = executor.sql<PositionContextRow & { context_key: string }>`
+    SELECT context_key, payload FROM position_context
+    WHERE context_key IN (SELECT value FROM json_each(${JSON.stringify(keys)}))
+    ORDER BY updated_at DESC LIMIT ${Math.min(Number.isInteger(limit) && limit > 0 ? limit : maxContextKeys, maxContextKeys)}
+  `;
+  const contexts = new Map<string, PositionContext>();
+  for (const row of rows) {
+    try {
+      contexts.set(row.context_key, JSON.parse(row.payload) as PositionContext);
+    } catch {
+      // Ignore malformed contexts while loading bounded history reasoning.
+    }
+  }
+  return contexts;
 }
 
 export function savePositionContext(executor: SqlExecutor, context: PositionContext): void {
@@ -447,6 +585,46 @@ export function saveEvent(executor: SqlExecutor, event: ActivityEvent): void {
     INSERT INTO events (event_id, event_type, cycle_id, payload, created_at)
     VALUES (${event.eventId}, ${event.type}, ${event.cycleId}, ${JSON.stringify(event)}, ${event.createdAt})
   `;
+}
+
+export function hasEvent(executor: SqlExecutor, eventId: string): boolean {
+  return executor.sql<{ event_id: string }>`SELECT event_id FROM events WHERE event_id = ${eventId} LIMIT 1`.length > 0;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const entries = Object.entries(value).filter(([, item]) => item !== undefined).sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+export function persistProviderLifecycleRepair(
+  executor: SqlExecutor,
+  transactionSync: <T>(closure: () => T) => T,
+  expectedExperience: TradeExperience,
+  expectedContext: PositionContext,
+  experience: TradeExperience,
+  context: PositionContext,
+  event: ActivityEvent,
+): boolean {
+  return transactionSync(() => {
+    if (hasEvent(executor, event.eventId)) return false;
+    const experienceRows = executor.sql<ExperienceRow>`SELECT payload FROM experiences WHERE experience_id = ${expectedExperience.experienceId}`;
+    const currentExperience = experienceRows[0] ? JSON.parse(experienceRows[0].payload) as TradeExperience : null;
+    if (experienceRows.length !== 1 || canonicalJson(currentExperience) !== canonicalJson(expectedExperience) || currentExperience?.outcomeStatus !== "OPEN") {
+      throw new Error("PROVIDER_LIFECYCLE_REPAIR_CONFLICT");
+    }
+    const contextKey = `${expectedContext.symbol}:${expectedContext.positionSide}`;
+    const contextRows = executor.sql<PositionContextRow>`SELECT payload FROM position_context WHERE context_key = ${contextKey}`;
+    const currentContext = contextRows[0] ? JSON.parse(contextRows[0].payload) as PositionContext : null;
+    if (contextRows.length !== 1 || canonicalJson(currentContext) !== canonicalJson(expectedContext)) throw new Error("POSITION_CONTEXT_CHANGED_DURING_REPAIR");
+    saveExperience(executor, experience, event.createdAt);
+    savePositionContext(executor, context);
+    saveEvent(executor, event);
+    return true;
+  });
 }
 
 export function loadRecentEvents(executor: SqlExecutor, limit = 25): ActivityEvent[] {

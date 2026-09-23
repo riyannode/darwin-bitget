@@ -140,6 +140,7 @@ describe("cycle status read model", () => {
       ensureActivePolicy: () => policy,
       activeScanIntervalMinutes: () => 15,
       getSchedulerDiagnostics: async () => ({ nextScanAt: null, nextScanStale: true, configuredIntervalMinutes: 15, matchingScheduleCount: 0, schedulerHealthy: true }),
+      isProviderSyncSchedulerHealthy: async () => true,
       sql: executor.sql,
     };
     const snapshot = await TraderAgent.prototype.getDashboardSnapshot.call(fake as never);

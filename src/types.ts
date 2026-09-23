@@ -263,6 +263,18 @@ export interface TradeExperience {
   fees?: string;
   funding?: string;
   realizedPnlVerified?: boolean;
+  financialSource?: "LOCAL" | "PROVIDER_LEDGER";
+  origin?: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
+  providerPositionHistoryId?: string;
+  closedQuantity?: string;
+  cumRealisedPnl?: string;
+  netProfit?: string;
+  openFeeTotal?: string;
+  closeFeeTotal?: string;
+  totalFunding?: string;
+  cashDividend?: string;
+  /** Prior local estimate retained as evidence when provider ledger replaces it. */
+  legacyLocalRealizedPnl?: string;
 }
 
 export interface BacktestMetric {
@@ -618,6 +630,18 @@ export interface DashboardSnapshot {
     latestEquity: string | null;
     performanceBaselineAt: string | null;
     dailyPnl: Record<string, { pnl: string; trades: number; dailyReturnPct?: string }>;
+    financialSource?: "PROVIDER_LEDGER";
+    scope?: "DARWIN_ATTRIBUTED";
+    unresolvedClosedLifecycles?: number;
+  };
+  accountPerformance: {
+    equitySource: "PROVIDER_LIVE" | "UNAVAILABLE";
+    currentEquity: string | null;
+    externalFlowStatus: "VERIFIED" | "UNVERIFIED";
+    netExternalInflows: string;
+    netPnlSinceBaseline: string;
+    financialRecordCoverage: "COMPLETE" | "PARTIAL" | "UNAVAILABLE";
+    financialRecordCategories: Array<{ category: string; status: "SUCCESS" | "PARTIAL" | "NOT_SYNCED"; lastSuccessfulSyncAt: string | null; coveredFrom: string | null; coveredThrough: string | null; lastError: string | null }> ;
   };
   performanceAccounting: PerformanceAccountingReadModel;
   trades: TradeLogEntry[];
@@ -666,6 +690,8 @@ export interface DashboardSnapshot {
     configuredIntervalMinutes: number;
     matchingScheduleCount: number;
     schedulerHealthy: boolean;
+    tradingSchedulerHealthy: boolean;
+    providerSyncSchedulerHealthy: boolean;
     schedulerErrorCode?: string;
   };
   learning: {
@@ -690,7 +716,7 @@ export interface PerformanceAccountingReadModel {
   currentEquityObservedAt: string | null;
   equityDeltaSinceBaseline: string;
   netExternalInflows: string;
-  externalFlowStatus: "VERIFIED" | "UNVERIFIED_ZERO_FLOW_INVARIANT";
+  externalFlowStatus: "VERIFIED" | "UNVERIFIED";
   netPnlSinceBaseline: string;
   closedEpisodeRealizedPnl: string;
   openEpisodePartialRealizedPnl: string;
@@ -721,15 +747,38 @@ export interface TradeLogEntry {
   entry: string;
   exit: string;
   realizedPnl: string;
-  status: TradeLifecycleStatus;
+  status: TradeLifecycleStatus | "UNRESOLVED";
+  localLifecycleStatus?: TradeLifecycleStatus;
+  intendedMarginAllocated?: string;
+  intendedMarginAllocationPct?: string;
+  intendedLeverage?: string;
+  intendedPositionNotional?: string;
+  legacyEntryPrice?: string;
+  legacyEntryTime?: string;
+  unrealizedPnl?: string;
   thesis: string;
   orderReference: string;
   positionSide?: PositionSide | null;
   openedAt?: string;
   closedAt?: string;
+  entryTime?: string;
+  exitTime?: string;
   entryReasoning?: PositionReasoning;
   exitReasoning?: PositionReasoning;
   managementEvents?: PositionReasoning[];
+  financialSource?: "PROVIDER_LEDGER" | "PROVIDER_LIVE" | "UNRESOLVED";
+  reasoningSource?: "DARWIN_PERSISTED" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
+  origin?: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
+  providerPositionHistoryId?: string;
+  quantity?: string;
+  openQuantity?: string;
+  closeQuantity?: string;
+  cumRealisedPnl?: string;
+  netProfit?: string;
+  openFeeTotal?: string;
+  closeFeeTotal?: string;
+  totalFunding?: string;
+  cashDividend?: string;
 }
 
 export interface PositionReasoning {
@@ -759,5 +808,8 @@ export interface PositionContext {
   entryReasoning?: PositionReasoning;
   latestManagement?: PositionReasoning;
   managementEvents: PositionReasoning[];
+  lifecycleStatus?: "OPEN" | "CLOSED";
+  closedAt?: string;
+  closedProviderPositionHistoryId?: string;
   updatedAt: string;
 }
