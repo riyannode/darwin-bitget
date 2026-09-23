@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { hasEvent, loadAllEvents, loadAllExperiences, loadPositionContext, persistProviderLifecycleRepair, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
+import { hasEvent, loadAllEvents, loadAllExperiences, loadPositionContext, persistProviderLifecycleRepair, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
 import { TraderAgent } from "../src/agent/agent.js";
 import { BitgetClient } from "../src/bitget/client.js";
 import type { PositionContext, TradeExperience, TradingJournal } from "../src/types.js";
@@ -18,6 +18,8 @@ const HISTORY_ID = "1485976014620573698";
 const EXPERIENCE_ID = "80432b47-8fa1-4f41-af10-63e6ac4c55f6";
 const ENTRY_DECISION_ID = "87a5c9bc-e24e-4b97-bcaf-c8417d0f6c11";
 const OPENED_AT = "2026-09-21T17:03:30.661Z";
+const OPEN_FILL_AT = "2026-09-21T17:03:30.659Z";
+const LOCAL_ENTRY_AT = "2026-09-21T17:03:32.134Z";
 const CLOSED_AT = "2026-09-22T01:43:06.332Z";
 const OWNER_TOKEN = ["owner", "test", "token"].join("-");
 
@@ -38,7 +40,7 @@ function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; 
 function openExperience(): TradeExperience {
   return {
     experienceId: EXPERIENCE_ID, symbol: "SAMSUNGUSDT", positionSide: "LONG", action: "OPEN_LONG", entryDecisionId: ENTRY_DECISION_ID,
-    entryPrice: "198.02", entryTime: OPENED_AT, exitDecisionId: "", exitPrice: "0", exitTime: "", selectedLeverage: "3",
+    entryPrice: "198.02", entryTime: LOCAL_ENTRY_AT, exitDecisionId: "", exitPrice: "0", exitTime: "", selectedLeverage: "3",
     marginAllocationPct: "10", marginAllocated: "100", positionNotional: "1490.13", realizedPnl: "19.1364", realizedPnlPct: "0",
     maximumFavorableExcursion: "0", maximumAdverseExcursion: "0", drawdownContribution: "0", liquidationDistance: "0",
     entryThesis: "preserve this thesis", exitThesis: "", evidenceAtEntry: ["entry-proof"], evidenceAtExit: [], lessonsUsed: ["lesson-1"],
@@ -47,7 +49,7 @@ function openExperience(): TradeExperience {
 }
 
 function positionContext(): PositionContext {
-  const reasoning = { action: "OPEN_LONG" as const, thesis: "preserve this thesis", strategyThesis: "strategy", supportingFactors: ["support"], riskFactors: ["risk"], evidenceUsed: ["evidence"], lessonsUsed: ["lesson-1"], confidence: 0.8, cycleId: "cycle-entry", decisionId: ENTRY_DECISION_ID, createdAt: OPENED_AT, entryPrice: "198.02", entryTime: OPENED_AT, experienceId: EXPERIENCE_ID };
+  const reasoning = { action: "OPEN_LONG" as const, thesis: "preserve this thesis", strategyThesis: "strategy", supportingFactors: ["support"], riskFactors: ["risk"], evidenceUsed: ["evidence"], lessonsUsed: ["lesson-1"], confidence: 0.8, cycleId: "cycle-entry", decisionId: ENTRY_DECISION_ID, createdAt: OPENED_AT, entryPrice: "198.02", entryTime: LOCAL_ENTRY_AT, experienceId: EXPERIENCE_ID };
   return { symbol: "SAMSUNGUSDT", positionSide: "LONG", experienceId: EXPERIENCE_ID, entryDecisionId: ENTRY_DECISION_ID, entryReasoning: reasoning, managementEvents: [{ ...reasoning, action: "REDUCE", decisionId: "management-1" }], updatedAt: OPENED_AT };
 }
 
@@ -59,8 +61,8 @@ function insertProviderEvidence(executor: SqlExecutor): void {
   run("INSERT INTO provider_position_history (provider_position_history_key, provider_position_history_id, category, symbol, position_side, opening_time, closing_time, avg_entry_price, avg_exit_price, open_total_pos, close_total_pos, cum_realised_pnl, net_profit, closing_quantity, open_fee_total, close_fee_total, total_funding, cash_dividend, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "key-1", HISTORY_ID, "USDT-FUTURES", "SAMSUNGUSDT", "LONG", OPENED_AT, CLOSED_AT, "198.02", "202.66", "7.51", "7.51", "34.8487", "33.19485709", "7.51", "-0.89227812", "-0.91318734", "0.15162255", "0", "UNATTRIBUTED", "{}", CLOSED_AT, CLOSED_AT);
   const order = (id: string, oid: string, side: string, tradeSide: string, quantity: string, time: string) => run("INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", id, oid, "USDT-FUTURES", "SAMSUNGUSDT", side, "long", tradeSide, quantity, quantity, "filled", time, time, "DARWIN", "{}", time, time);
   const fill = (id: string, oid: string, side: string, tradeSide: string, quantity: string, time: string) => run("INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", `fill-${id}`, id, oid, "USDT-FUTURES", "SAMSUNGUSDT", side, "long", tradeSide, quantity, "200", time, "DARWIN", "{}", time, time);
-  order("provider-entry-order", "darwin-entry-oid", "buy", "open", "7.51", OPENED_AT);
-  fill("provider-entry-order", "darwin-entry-oid", "buy", "open", "7.51", OPENED_AT);
+  order("provider-entry-order", "darwin-entry-oid", "buy", "open", "7.51", OPEN_FILL_AT);
+  fill("provider-entry-order", "darwin-entry-oid", "buy", "open", "7.51", OPEN_FILL_AT);
   ["2.47", "1.66", "1.11", "1.13", "0.57", "0.57"].forEach((quantity, index) => {
     const id = `provider-close-${index + 1}`;
     const oid = `darwin-close-${index + 1}`;
@@ -192,6 +194,33 @@ describe("paused provider lifecycle repair", () => {
     expect(loadAllEvents(executor).filter((item) => item.type === "PROVIDER_LIFECYCLE_REPAIRED")).toHaveLength(1);
     expect(hasEvent(executor, `provider-lifecycle-repair:${EXPERIENCE_ID}:${HISTORY_ID}`)).toBe(true);
     db.close();
+  });
+
+  it("rejects inconsistent already-reconciled derived state without provider reads or writes", async () => {
+    const variants = [
+      { name: "missing audit event", context: positionContext(), auditEvent: false },
+      { name: "missing context", context: null },
+      { name: "wrong experienceId", context: { ...positionContext(), experienceId: "other-experience" } },
+      { name: "wrong entryDecisionId", context: { ...positionContext(), entryDecisionId: "other-decision" } },
+      { name: "open context", context: { ...positionContext(), lifecycleStatus: "OPEN" as const } },
+      { name: "wrong closed history ID", context: { ...positionContext(), lifecycleStatus: "CLOSED" as const, closedProviderPositionHistoryId: "other-history" } },
+    ];
+    for (const variant of variants) {
+      const { db, executor } = memoryExecutor();
+      const repaired = { ...openExperience(), outcomeStatus: "PROFITABLE" as const, financialSource: "PROVIDER_LEDGER" as const, providerPositionHistoryId: HISTORY_ID };
+      saveExperience(executor, repaired, CLOSED_AT);
+      if (variant.context) savePositionContext(executor, variant.context);
+      if (variant.auditEvent !== false) saveEvent(executor, { eventId: `provider-lifecycle-repair:${EXPERIENCE_ID}:${HISTORY_ID}`, type: "PROVIDER_LIFECYCLE_REPAIRED", cycleId: "cycle-entry", createdAt: CLOSED_AT, metadata: { experienceId: EXPERIENCE_ID, entryDecisionId: ENTRY_DECISION_ID, providerPositionHistoryId: HISTORY_ID } });
+      const providerRead = vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+      const agent = fakeAgent(executor, db, true);
+      const before = db.prepare("SELECT (SELECT COUNT(*) FROM events) + (SELECT COUNT(*) FROM experiences) + (SELECT COUNT(*) FROM position_context) AS count").get() as { count: number };
+      await expect(invokeRepair(agent)).rejects.toThrow("PROVIDER_LIFECYCLE_REPAIR_STATE_INCONSISTENT");
+      const after = db.prepare("SELECT (SELECT COUNT(*) FROM events) + (SELECT COUNT(*) FROM experiences) + (SELECT COUNT(*) FROM position_context) AS count").get() as { count: number };
+      expect(after.count, variant.name).toBe(before.count);
+      expect(providerRead, variant.name).not.toHaveBeenCalled();
+      providerRead.mockRestore();
+      db.close();
+    }
   });
 
   it("rejects contradictory current provider positions without changing financial state", async () => {

@@ -98,6 +98,14 @@ function orderForFill(fill: ProviderLifecycleFill, orders: readonly ProviderLife
     && order.origin === fill.origin);
 }
 
+const MAX_OPENING_CHRONOLOGY_SKEW_MS = 5_000;
+
+function isNearTimestamp(value: string, reference: string): boolean {
+  const timestamp = validTimestamp(value);
+  const referenceTimestamp = validTimestamp(reference);
+  return timestamp !== null && referenceTimestamp !== null && Math.abs(timestamp - referenceTimestamp) <= MAX_OPENING_CHRONOLOGY_SKEW_MS;
+}
+
 function openingIdentityIsProven(evidence: ProviderLifecycleEvidence, openingTime: string): boolean {
   const { experience, entryIdentity } = evidence;
   if (!experience.positionSide || !entryIdentity || entryIdentity.entryDecisionId !== experience.entryDecisionId || !entryIdentity.clientOid || !entryIdentity.providerOrderId) return false;
@@ -109,7 +117,7 @@ function openingIdentityIsProven(evidence: ProviderLifecycleEvidence, openingTim
     && fill.clientOid === entryIdentity.clientOid && fill.symbol === experience.symbol
     && fill.positionSide === experience.positionSide && fill.tradeSide === "open" && fill.origin === "DARWIN"
     && orderForFill(fill, orders));
-  return fills.length > 0 && fills.every((fill) => validTimestamp(fill.createdAt) === validTimestamp(openingTime));
+  return fills.length > 0 && fills.every((fill) => isNearTimestamp(fill.createdAt, openingTime));
 }
 
 function currentPositionHasLedgerEvidence(evidence: ProviderLifecycleEvidence, position: ProviderLifecyclePosition): boolean {
@@ -168,7 +176,7 @@ export function classifyProviderLifecycle(evidence: ProviderLifecycleEvidence): 
   const identity = evidence.entryIdentity;
   if (!identity || identity.entryDecisionId !== experience.entryDecisionId || !identity.clientOid || !identity.providerOrderId) return result("UNRESOLVED", "ENTRY_DECISION_IDENTITY_UNPROVEN");
   if (!isDecimal(experience.entryPrice) || !history.avgEntryPrice || compareDecimal(experience.entryPrice, history.avgEntryPrice) !== 0) return result("CONTRADICTORY", "LOCAL_ENTRY_DOES_NOT_MATCH_PROVIDER_HISTORY");
-  if (experience.entryTime !== history.openingTime) return result("CONTRADICTORY", "LOCAL_ENTRY_DOES_NOT_MATCH_PROVIDER_HISTORY");
+  if (!isNearTimestamp(experience.entryTime, history.openingTime)) return result("CONTRADICTORY", "LOCAL_ENTRY_TIME_OUTSIDE_PROVIDER_OPENING_CHRONOLOGY");
   const openingOrders = evidence.orders.filter((order) => order.providerOrderId === identity.providerOrderId
     && order.clientOid === identity.clientOid
     && order.symbol === experience.symbol
@@ -183,7 +191,7 @@ export function classifyProviderLifecycle(evidence: ProviderLifecycleEvidence): 
     && fill.tradeSide === "open"
     && fill.origin === "DARWIN"
     && orderForFill(fill, openingOrders));
-  if (!openingFills.length || openingFills.some((fill) => validTimestamp(fill.createdAt) !== openingMs)) return result("UNRESOLVED", "DARWIN_OPENING_FILL_IDENTITY_UNPROVEN");
+  if (!openingFills.length || openingFills.some((fill) => !isNearTimestamp(fill.createdAt, history.openingTime))) return result("UNRESOLVED", "DARWIN_OPENING_FILL_IDENTITY_UNPROVEN");
   const opened = exactSum(openingFills.map((fill) => fill.quantity));
   if (!opened || !isDecimal(opened) || compareDecimal(opened, openQuantity) !== 0) return result("CONTRADICTORY", "OPENING_FILL_QUANTITY_RESIDUAL");
 

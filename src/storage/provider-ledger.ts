@@ -249,22 +249,31 @@ export function loadProviderLifecycleEvidence(
   const entryIdentity = identityPairs.length === 1 && identities.length === 1 && identities[0]?.provider_order_id
     ? { entryDecisionId: experience.entryDecisionId, clientOid: identities[0].client_order_id, providerOrderId: identities[0].provider_order_id }
     : null;
-  const orders = row
+  const orders = row && entryIdentity
     ? executor.sql<{
       provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null; origin: ProviderEvidenceOrigin;
-    }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} AND created_time >= ${row.opening_time} AND created_time <= ${row.closing_time}`
-    : executor.sql<{
-      provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null; origin: ProviderEvidenceOrigin;
-    }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} ORDER BY created_time DESC LIMIT 500`;
-  const fills = row
+    }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} AND ((provider_order_id = ${entryIdentity.providerOrderId} AND client_oid = ${entryIdentity.clientOid}) OR (created_time >= ${row.opening_time} AND created_time <= ${row.closing_time}))`
+    : row
+      ? executor.sql<{
+        provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null; origin: ProviderEvidenceOrigin;
+      }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} AND created_time >= ${row.opening_time} AND created_time <= ${row.closing_time}`
+      : executor.sql<{
+        provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null; origin: ProviderEvidenceOrigin;
+      }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} ORDER BY created_time DESC LIMIT 500`;
+  const fills = row && entryIdentity
     ? executor.sql<{
       provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null;
       exec_qty: string; created_time: string; origin: ProviderEvidenceOrigin;
-    }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND created_time >= ${row.opening_time} AND created_time <= ${row.closing_time}`
-    : executor.sql<{
-      provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null;
-      exec_qty: string; created_time: string; origin: ProviderEvidenceOrigin;
-    }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} ORDER BY created_time DESC LIMIT 500`;
+    }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND ((provider_order_id = ${entryIdentity.providerOrderId} AND client_oid = ${entryIdentity.clientOid}) OR (created_time >= ${row.opening_time} AND created_time <= ${row.closing_time}))`
+    : row
+      ? executor.sql<{
+        provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null;
+        exec_qty: string; created_time: string; origin: ProviderEvidenceOrigin;
+      }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND created_time >= ${row.opening_time} AND created_time <= ${row.closing_time}`
+      : executor.sql<{
+        provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null;
+        exec_qty: string; created_time: string; origin: ProviderEvidenceOrigin;
+      }>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} ORDER BY created_time DESC LIMIT 500`;
   const mappedOrders = orders.map((order) => ({ providerOrderId: order.provider_order_id, clientOid: order.client_oid, symbol: order.symbol, positionSide: order.pos_side?.toUpperCase() ?? null, tradeSide: order.trade_side?.toLowerCase() ?? null, origin: order.origin }));
   const mappedFills = fills.map((fill) => ({ providerOrderId: fill.provider_order_id, clientOid: fill.client_oid, symbol: fill.symbol, positionSide: fill.pos_side?.toUpperCase() ?? null, tradeSide: fill.trade_side?.toLowerCase() ?? null, quantity: fill.exec_qty, createdAt: fill.created_time, origin: fill.origin }));
   if (!row) return { experience, providerPositions, history: null, entryIdentity, orders: mappedOrders, fills: mappedFills };

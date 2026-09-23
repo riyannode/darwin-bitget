@@ -113,6 +113,34 @@ describe("provider/local lifecycle reconciliation", () => {
     expect(classifyProviderLifecycle(fixture()).classification).toBe("LOCAL_OPEN_PROVIDER_CLOSED");
   });
 
+  it("accepts the real provider opening-fill timestamp 2 ms before history while matching exact 7.51 quantity", () => {
+    const original = fixture();
+    const evidence = { ...original, fills: original.fills.map((fill, index) => index === 0 ? { ...fill, createdAt: "2026-09-21T17:03:30.659Z" } : fill) };
+    expect(evidence.history?.openingTime).toBe("2026-09-21T17:03:30.661Z");
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "LOCAL_OPEN_PROVIDER_CLOSED", closedQuantity: "7.51" });
+  });
+
+  it("uses proven provider entry identity rather than derived local entryTime", () => {
+    const original = fixture();
+    const evidence = {
+      ...original,
+      experience: { ...experience, entryTime: "2026-09-21T17:03:32.134Z" },
+      fills: original.fills.map((fill, index) => index === 0 ? { ...fill, createdAt: "2026-09-21T17:03:30.659Z" } : fill),
+    };
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "LOCAL_OPEN_PROVIDER_CLOSED", closedQuantity: "7.51" });
+  });
+
+  it("fails closed for entry chronology outside the bounded provider opening window", () => {
+    const evidence = { ...fixture(), experience: { ...experience, entryTime: "2026-09-21T17:03:36.000Z" } };
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "CONTRADICTORY", reason: "LOCAL_ENTRY_TIME_OUTSIDE_PROVIDER_OPENING_CHRONOLOGY" });
+  });
+
+  it("requires the exact opening-fill quantity after identity matching", () => {
+    const original = fixture();
+    const evidence = { ...original, fills: original.fills.map((fill, index) => index === 0 ? { ...fill, quantity: "7.50" } : fill) };
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "CONTRADICTORY", reason: "OPENING_FILL_QUANTITY_RESIDUAL" });
+  });
+
   it("reconciles all six DARWIN closing fills exactly to 7.51", () => {
     const result = classifyProviderLifecycle(fixture());
     expect(result.classification).toBe("LOCAL_OPEN_PROVIDER_CLOSED");
