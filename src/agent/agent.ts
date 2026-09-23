@@ -190,7 +190,7 @@ interface ResolvedProviderTradeFact {
   origin: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
 }
 
-function resolveProviderTradeFacts(
+export function resolveProviderTradeFacts(
   executor: SqlExecutor,
   experiences: readonly TradeExperience[],
   category: string,
@@ -208,7 +208,8 @@ function resolveProviderTradeFacts(
     const candidateHistoryIds = loadProviderLifecycleHistoryCandidateIds(executor, experience, category);
     const candidates: ProviderLifecycleHistory[] = [];
     for (const history of histories.filter((row) => row.providerPositionHistoryId && candidateHistoryIds.has(row.providerPositionHistoryId))) {
-      const evidence = loadProviderLifecycleEvidence(executor, experience, category, history.providerPositionHistoryId!, positions);
+      // Current position rows lack a lifecycle ID; they cannot disprove a fully joined historical lifecycle.
+      const evidence = loadProviderLifecycleEvidence(executor, experience, category, history.providerPositionHistoryId!, []);
       const classification = classifyProviderLifecycle(evidence).classification;
       if (classification === "MATCHED_CLOSED" || classification === "LOCAL_OPEN_PROVIDER_CLOSED") candidates.push(history);
     }

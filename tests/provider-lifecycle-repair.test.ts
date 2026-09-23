@@ -1,8 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
+import { loadProviderLifecycleEvidence } from "../src/storage/provider-ledger.js";
+import { classifyProviderLifecycle } from "../src/trading/provider-lifecycle-reconciliation.js";
 import { hasEvent, loadAllEvents, loadAllExperiences, loadPositionContext, persistProviderLifecycleRepair, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
-import { TraderAgent } from "../src/agent/agent.js";
+import { TraderAgent, resolveProviderTradeFacts } from "../src/agent/agent.js";
 import { BitgetClient } from "../src/bitget/client.js";
 import type { PerformanceAggregate } from "../src/trading/performance.js";
 import type { PositionContext, TradeExperience, TradingJournal } from "../src/types.js";
@@ -184,6 +186,11 @@ describe("paused provider lifecycle repair", () => {
     expect(repaired).toMatchObject({ experienceId: EXPERIENCE_ID, entryDecisionId: ENTRY_DECISION_ID, outcomeStatus: "PROFITABLE", financialSource: "PROVIDER_LEDGER", origin: "DARWIN", providerPositionHistoryId: HISTORY_ID, entryPrice: "198.02", exitPrice: "202.66", entryTime: OPENED_AT, exitTime: CLOSED_AT, closedQuantity: "7.51", cumRealisedPnl: "34.8487", netProfit: "33.19485709", realizedPnl: "33.19485709", openFeeTotal: "-0.89227812", closeFeeTotal: "-0.91318734", totalFunding: "0.15162255", cashDividend: "0", legacyLocalRealizedPnl: "19.1364", entryThesis: original.entryThesis, evidenceAtEntry: original.evidenceAtEntry, lessonsUsed: original.lessonsUsed });
     expect(context).toMatchObject({ lifecycleStatus: "CLOSED", closedAt: CLOSED_AT, closedProviderPositionHistoryId: HISTORY_ID, entryDecisionId: ENTRY_DECISION_ID, entryReasoning: oldContext.entryReasoning, managementEvents: oldContext.managementEvents });
     expect(journalBytesAfter.payload).toBe(journalBytesBefore.payload);
+    const repairedExperience = loadAllExperiences(executor).find((experience) => experience.experienceId === EXPERIENCE_ID)!;
+    const lifecycleClassification = classifyProviderLifecycle(loadProviderLifecycleEvidence(executor, repairedExperience, "USDT-FUTURES", HISTORY_ID, []));
+    expect(lifecycleClassification.classification).toBe("MATCHED_CLOSED");
+    const lifecycleReadModel = resolveProviderTradeFacts(executor, [repairedExperience], "USDT-FUTURES", [{ symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "0.5", notional: "99", marginAllocated: "10", leverage: "2", entryPrice: "198", unrealizedPnl: "0", realizedPnl: "0" }]);
+    expect(lifecycleReadModel.facts.get(EXPERIENCE_ID)).toMatchObject({ source: "PROVIDER_LEDGER", origin: "DARWIN", providerPositionHistoryId: HISTORY_ID });
     expect(event).toHaveLength(1);
     expect(event[0]?.metadata).toMatchObject({ origin: "DARWIN", providerPositionHistoryOrigin: "UNATTRIBUTED", providerPositionHistoryId: HISTORY_ID, closedQuantity: "7.51", netProfit: "33.19485709", legacyLocalRealizedPnl: "19.1364" });
     expect(providerRead).toHaveBeenCalledTimes(1);
