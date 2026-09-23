@@ -281,7 +281,9 @@ export function providerPage(value: unknown): ProviderPage {
         ? nested.list
         : Array.isArray(payload.data)
           ? payload.data
-          : null;
+          : payload.list === null || nested.list === null
+            ? []
+            : null;
   if (!source) throw new Error("INVALID_PROVIDER_PAGE");
   const hasExplicitCursor = "cursor" in payload || "cursor" in nested || "nextCursor" in payload || "nextCursor" in nested;
   const explicitCursor = payload.cursor ?? nested.cursor ?? payload.nextCursor ?? nested.nextCursor;

@@ -5,6 +5,7 @@ import {
   normalizeProviderFinancialRecord,
   normalizeProviderOrder,
   normalizeProviderPositionHistory,
+  providerPage,
   providerTimestampIso,
   stableProviderFingerprint,
 } from "../src/bitget/provider-ledger.js";
@@ -164,6 +165,10 @@ describe("provider ledger normalization", () => {
     expect(actualFieldNames).toMatchObject({ openingTime: "2024-10-29T05:57:48.493Z", closingQuantity: "8.5", openTotalPos: "8.5", closeTotalPos: "8.5", cumRealisedPnl: "16.575", netProfit: "16.575", maxPositionSize: "8.5" });
   });
 
+  it("treats a provider null list as an empty page", () => {
+    expect(providerPage({ data: { list: null, cursor: null } })).toEqual({ rows: [], cursor: null });
+  });
+
   it("rejects malformed provider rows and fingerprints rows without provider IDs", () => {
     expect(normalizeProviderOrder({ orderId: "", createdTime: "bad" }, "PROVIDER_EXTERNAL", observedAt)).toBeNull();
     expect(normalizeProviderFill({ execId: "", createdTime: "bad" }, "PROVIDER_EXTERNAL", observedAt)).toBeNull();
@@ -287,6 +292,21 @@ describe("provider ledger persistence and sync", () => {
     expect(windows.length).toBeGreaterThan(1);
     expect(windows.every((window) => window.end - window.start <= 30 * 24 * 60 * 60 * 1000)).toBe(true);
     expect(windows[1]?.start).toBeLessThan(windows[0]?.end ?? 0);
+  });
+
+  it("keeps a safety margin inside the provider's 90-day retention boundary", async () => {
+    const { executor } = memoryExecutor();
+    const starts: string[] = [];
+    const client: ProviderLedgerReadClient = {
+      async getOrderHistoryRead(params) { starts.push(params.startTime ?? ""); return { list: [], cursor: null }; },
+      async getFillHistoryWindowRead() { return { list: [], cursor: null }; },
+      async getPositionHistoryRead() { return { list: [], cursor: null }; },
+      async getFinancialRecordsRead() { return { list: [], cursor: null }; },
+    };
+    const now = new Date("2026-09-23T01:53:46.904Z");
+    await syncProviderLedger(client, executor, { category, mode: "backfill", now });
+
+    expect(starts[0]).toBe(String(now.getTime() - 90 * 24 * 60 * 60 * 1000 + 60_000));
   });
 
   it("retains completed resource checkpoints when a later resource fails", async () => {
