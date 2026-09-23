@@ -108,6 +108,7 @@ describe("bounded Durable Object read paths", () => {
     };
     const snapshot = await TraderAgent.prototype.getDashboardSnapshot.call(fake as never);
     expect(snapshot.portfolio).toBeNull();
+    expect(snapshot.journalDecisionLookupMigration?.status).toBe("PENDING");
     expect(snapshot.performance.totalTrades).toBeNull();
     expect(snapshot.scheduler).toMatchObject({ nextScanAt: null, nextScanStale: true, configuredIntervalMinutes: 15, matchingScheduleCount: 0, schedulerHealthy: true });
     expect(queries.filter((query) => query.includes("FROM events")).length).toBe(1);

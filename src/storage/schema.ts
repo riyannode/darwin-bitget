@@ -2,11 +2,48 @@ export interface SqlExecutor {
   sql<T>(strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[];
 }
 
+type JournalLookupSchemaVersionRow = { version: number };
+
+function ensureJournalDecisionLookupTriggers(executor: SqlExecutor): void {
+  executor.sql`CREATE TABLE IF NOT EXISTS journal_decision_lookup_schema_version (schema_key TEXT PRIMARY KEY, version INTEGER NOT NULL)`;
+  const [row] = executor.sql<JournalLookupSchemaVersionRow>`SELECT version FROM journal_decision_lookup_schema_version WHERE schema_key = 'journal_decision_lookup' LIMIT 1`;
+  if (Number(row?.version ?? 0) >= 2) return;
+
+  executor.sql`DROP TRIGGER IF EXISTS journals_decision_lookup_insert`;
+  executor.sql`DROP TRIGGER IF EXISTS journals_decision_lookup_update`;
+  executor.sql`DROP TRIGGER IF EXISTS journals_decision_lookup_delete`;
+  executor.sql`CREATE TRIGGER journals_decision_lookup_insert AFTER INSERT ON journals BEGIN
+    INSERT OR IGNORE INTO journal_decision_lookup (cycle_id, decision_id)
+    SELECT DISTINCT NEW.cycle_id, decision.value FROM json_tree(NEW.payload) AS decision
+    WHERE decision.key = 'decisionId' AND decision.type = 'text' AND length(decision.value) BETWEEN 1 AND 256;
+  END`;
+  executor.sql`CREATE TRIGGER journals_decision_lookup_update AFTER UPDATE OF payload ON journals BEGIN
+    DELETE FROM journal_decision_lookup WHERE cycle_id = NEW.cycle_id;
+    INSERT OR IGNORE INTO journal_decision_lookup (cycle_id, decision_id)
+    SELECT DISTINCT NEW.cycle_id, decision.value FROM json_tree(NEW.payload) AS decision
+    WHERE decision.key = 'decisionId' AND decision.type = 'text' AND length(decision.value) BETWEEN 1 AND 256;
+  END`;
+  executor.sql`CREATE TRIGGER journals_decision_lookup_delete AFTER DELETE ON journals BEGIN
+    DELETE FROM journal_decision_lookup WHERE cycle_id = OLD.cycle_id;
+  END`;
+  executor.sql`INSERT OR REPLACE INTO journal_decision_lookup_schema_version (schema_key, version) VALUES ('journal_decision_lookup', 2)`;
+}
+
 export function ensureStorage(executor: SqlExecutor): void {
   executor.sql`CREATE TABLE IF NOT EXISTS cycles (cycle_id TEXT PRIMARY KEY, status TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT)`;
   executor.sql`CREATE TABLE IF NOT EXISTS journals (cycle_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS experiences (experience_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, outcome_status TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS journal_decision_lookup (cycle_id TEXT NOT NULL, decision_id TEXT NOT NULL, PRIMARY KEY (cycle_id, decision_id))`;
+  executor.sql`CREATE TABLE IF NOT EXISTS journal_decision_lookup_migration (
+    migration_key TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETE', 'FAILED')),
+    last_created_at TEXT,
+    last_cycle_id TEXT,
+    processed_journal_count INTEGER NOT NULL DEFAULT 0,
+    indexed_decision_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at TEXT NOT NULL
+  )`;
   executor.sql`CREATE TABLE IF NOT EXISTS risk_state (state_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS backtests (backtest_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS lessons (lesson_id TEXT PRIMARY KEY, symbol_scope TEXT NOT NULL, market_regime TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`;
@@ -135,22 +172,7 @@ export function ensureStorage(executor: SqlExecutor): void {
   executor.sql`CREATE INDEX IF NOT EXISTS experiences_created_at_idx ON experiences(created_at DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS experiences_entry_decision_idx ON experiences(CASE WHEN json_valid(payload) THEN json_extract(payload, '$.entryDecisionId') END)`;
   executor.sql`CREATE INDEX IF NOT EXISTS journal_decision_lookup_decision_idx ON journal_decision_lookup(decision_id, cycle_id)`;
-  executor.sql`CREATE TRIGGER IF NOT EXISTS journals_decision_lookup_insert AFTER INSERT ON journals BEGIN
-    INSERT OR IGNORE INTO journal_decision_lookup (cycle_id, decision_id)
-    SELECT DISTINCT NEW.cycle_id, decision.value FROM json_tree(NEW.payload) AS decision
-    WHERE decision.key = 'decisionId' AND decision.type = 'text' AND length(decision.value) BETWEEN 1 AND 256
-    LIMIT 500;
-  END`;
-  executor.sql`CREATE TRIGGER IF NOT EXISTS journals_decision_lookup_update AFTER UPDATE OF payload ON journals BEGIN
-    DELETE FROM journal_decision_lookup WHERE cycle_id = NEW.cycle_id;
-    INSERT OR IGNORE INTO journal_decision_lookup (cycle_id, decision_id)
-    SELECT DISTINCT NEW.cycle_id, decision.value FROM json_tree(NEW.payload) AS decision
-    WHERE decision.key = 'decisionId' AND decision.type = 'text' AND length(decision.value) BETWEEN 1 AND 256
-    LIMIT 500;
-  END`;
-  executor.sql`CREATE TRIGGER IF NOT EXISTS journals_decision_lookup_delete AFTER DELETE ON journals BEGIN
-    DELETE FROM journal_decision_lookup WHERE cycle_id = OLD.cycle_id;
-  END`;
+  ensureJournalDecisionLookupTriggers(executor);
   executor.sql`CREATE INDEX IF NOT EXISTS position_context_symbol_idx ON position_context(symbol, position_side)`;
   executor.sql`CREATE INDEX IF NOT EXISTS events_created_at_idx ON events(created_at DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS events_cycle_created_at_idx ON events(cycle_id, created_at DESC)`;

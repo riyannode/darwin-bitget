@@ -613,6 +613,15 @@ export interface DashboardSnapshot {
     stale: boolean;
     errorCode?: string;
   };
+  journalDecisionLookupMigration?: {
+    status: "PENDING" | "RUNNING" | "COMPLETE" | "FAILED";
+    lastCreatedAt: string | null;
+    lastCycleId: string | null;
+    processedJournalCount: number;
+    indexedDecisionCount: number;
+    lastError: string | null;
+    updatedAt: string;
+  };
   performance: {
     totalPnl: string;
     winRate: string;

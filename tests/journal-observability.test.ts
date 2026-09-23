@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
+import { initializeJournalLookupMigrationState } from "../src/storage/journal-lookup-migration.js";
 import { loadAllEvents, loadExperiences, loadJournalsForDecisionIds, loadPerformanceAggregate, loadPositionContext, loadRecentJournals, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
 import { buildPaperLogExport } from "../src/storage/paper-log.js";
 import type { AccountSnapshot, CycleDecisionPlan, DecisionContext, DecisionExecutionRecord, EvidenceBundle, Instrument, PositionContext, PositionManagementState, PositionReasoning, PositionSnapshot, TradeExperience, TradingJournal } from "../src/types.js";
@@ -449,6 +450,8 @@ describe("journal observability persistence", () => {
     const record = openExecutionRecord("filled", "MISMATCH");
     const journal: TradingJournal = { ...baseJournal, cycleId: "cycle-runtime", executionRecords: [record] };
     saveJournal(executor, journal);
+    initializeJournalLookupMigrationState(executor);
+    executor.sql`UPDATE journal_decision_lookup_migration SET status = 'COMPLETE' WHERE migration_key = 'journal_decision_lookup_v1'`;
     saveExperience(executor, {
       ...unresolvedExperienceFixture(),
       experienceId: "unresolved-persisted",
@@ -527,6 +530,17 @@ describe("journal observability persistence", () => {
       sql: executor.sql,
     } as unknown as { state: { paused: boolean } };
     await expect((TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<unknown> }).reconcileLateExecution.call(fake, "cycle-runtime", "decision-open")).rejects.toThrow("AGENT_MUST_BE_PAUSED");
+    db.close();
+  });
+
+  it("fails closed for owner late reconciliation until historical lookup coverage is complete", async () => {
+    const { db, executor } = memoryExecutor();
+    ensureStorage(executor);
+    const fake = {
+      state: { paused: true },
+      sql: executor.sql,
+    } as unknown as { state: { paused: boolean } };
+    await expect((TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<unknown> }).reconcileLateExecution.call(fake, "cycle-runtime", "decision-open")).rejects.toThrow("JOURNAL_LOOKUP_MIGRATION_IN_PROGRESS");
     db.close();
   });
 
