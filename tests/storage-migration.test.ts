@@ -21,7 +21,7 @@ function sqliteExecutor(db: DatabaseSync): SqlExecutor {
     sql<T>(strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[] {
       const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
       const parameters = values.map((value) => typeof value === "boolean" ? (value ? 1 : 0) : value) as (string | number | null)[];
-      if (/^\s*SELECT\b/i.test(query)) return db.prepare(query).all(...parameters) as T[];
+      if (/^\s*(SELECT|WITH)\b/i.test(query)) return db.prepare(query).all(...parameters) as T[];
       if (parameters.length > 0) db.prepare(query).run(...parameters);
       else db.exec(query);
       return [];
@@ -193,9 +193,7 @@ describe("pre-PR #28 Durable Object storage migration", () => {
       temporaryScanIntervalDurationMs: 7_200_000,
     });
     expect(preservedRows(db)).toEqual(before);
-    expect(db.prepare("SELECT cycle_id, decision_id FROM journal_decision_lookup").all()).toEqual([
-      { cycle_id: "legacy-open-cycle", decision_id: "legacy-open-decision" },
-    ]);
+    expect(db.prepare("SELECT cycle_id, decision_id FROM journal_decision_lookup").all()).toEqual([]);
     expect(loadJournalsForDecisionIds(executor, ["legacy-open-decision"])).toMatchObject([
       { cycleId: "legacy-open-cycle", decision: { decisionId: "legacy-open-decision" } },
     ]);

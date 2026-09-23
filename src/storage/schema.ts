@@ -171,12 +171,4 @@ export function ensureStorage(executor: SqlExecutor): void {
   executor.sql`CREATE INDEX IF NOT EXISTS provider_financial_records_category_timestamp_idx ON provider_financial_records(category, provider_timestamp DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_financial_records_type_timestamp_idx ON provider_financial_records(type, provider_timestamp DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_sync_state_updated_idx ON provider_sync_state(updated_at DESC)`;
-  const journalLookupMigration = executor.sql<{ state_key: string }>`SELECT state_key FROM risk_state WHERE state_key = 'journal_decision_lookup_v1'`;
-  if (journalLookupMigration.length === 0) {
-    executor.sql`WITH valid_journals AS MATERIALIZED (SELECT cycle_id, payload FROM journals WHERE json_valid(payload))
-      INSERT OR IGNORE INTO journal_decision_lookup (cycle_id, decision_id)
-      SELECT j.cycle_id, decision.value FROM valid_journals AS j, json_tree(j.payload) AS decision
-      WHERE decision.key = 'decisionId' AND decision.type = 'text' AND length(decision.value) BETWEEN 1 AND 256`;
-    executor.sql`INSERT INTO risk_state (state_key, payload, updated_at) VALUES ('journal_decision_lookup_v1', '{}', '1970-01-01T00:00:00.000Z')`;
-  }
 }

@@ -210,6 +210,39 @@ export function loadOpenExperiences(executor: SqlExecutor, limit = MAX_HISTORY_L
   });
 }
 
+const MAX_FALLBACK_JOURNAL_ROWS = 25;
+const MAX_FALLBACK_JOURNAL_BYTES = 256 * 1024;
+const MAX_FALLBACK_JSON_NODES = 20_000;
+
+function journalContainsAnyDecisionId(payload: string, decisionIds: ReadonlySet<string>): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload) as unknown;
+  } catch {
+    return false;
+  }
+  const pending: unknown[] = [parsed];
+  let visited = 0;
+  while (pending.length > 0 && visited < MAX_FALLBACK_JSON_NODES) {
+    const value = pending.pop();
+    visited += 1;
+    if (Array.isArray(value)) {
+      for (let index = value.length - 1; index >= 0 && visited + pending.length < MAX_FALLBACK_JSON_NODES; index -= 1) pending.push(value[index]);
+      continue;
+    }
+    if (typeof value !== "object" || value === null) continue;
+    for (const key in value) {
+      if (visited + pending.length >= MAX_FALLBACK_JSON_NODES) break;
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      visited += 1;
+      const child = (value as Record<string, unknown>)[key];
+      if (key === "decisionId" && typeof child === "string" && decisionIds.has(child)) return true;
+      if (typeof child === "object" && child !== null) pending.push(child);
+    }
+  }
+  return false;
+}
+
 export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: readonly string[], limit = MAX_HISTORY_LIMIT): TradingJournal[] {
   const requested = [...new Set(decisionIds)].filter((id) => typeof id === "string" && id.trim().length > 0 && id.length <= MAX_TARGETED_DECISION_ID_LENGTH).slice(0, MAX_HISTORY_LIMIT);
   if (requested.length === 0) return [];
@@ -230,6 +263,25 @@ export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: r
       journals.set(journal.cycleId, journal);
     } catch {
       // Ignore malformed historical journal rows during bounded lookup.
+    }
+  }
+  const indexedIds = new Set<string>();
+  for (const journal of journals.values()) {
+    const normalized = normalizeCycleDecisions(journal);
+    for (const record of normalized.records) indexedIds.add(record.decision.decisionId);
+  }
+  const missingIds = requested.filter((id) => !indexedIds.has(id));
+  if (missingIds.length > 0) {
+    const fallbackRows = executor.sql<JournalRow>`WITH recent_journals AS MATERIALIZED (SELECT cycle_id FROM journals ORDER BY created_at DESC LIMIT ${MAX_FALLBACK_JOURNAL_ROWS}) SELECT journal.payload FROM recent_journals JOIN journals AS journal USING (cycle_id) WHERE length(CAST(journal.payload AS BLOB)) <= ${MAX_FALLBACK_JOURNAL_BYTES}`;
+    const missingSet = new Set(missingIds);
+    for (const row of fallbackRows) {
+      if (!journalContainsAnyDecisionId(row.payload, missingSet)) continue;
+      try {
+        const journal = JSON.parse(row.payload) as TradingJournal;
+        journals.set(journal.cycleId, journal);
+      } catch {
+        // Ignore malformed historical journal rows during bounded fallback.
+      }
     }
   }
   return [...journals.values()].slice(0, clampHistoryLimit(limit, MAX_HISTORY_LIMIT) * 2);

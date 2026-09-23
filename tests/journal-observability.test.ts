@@ -58,7 +58,7 @@ function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; 
     sql<T>(strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[] {
       const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
       const sqliteValues = values.map((value) => typeof value === "boolean" ? (value ? 1 : 0) : value) as (string | number | null)[];
-      if (query.trimStart().toUpperCase().startsWith("SELECT")) return db.prepare(query).all(...sqliteValues) as T[];
+      if (/^\s*(SELECT|WITH)\b/i.test(query)) return db.prepare(query).all(...sqliteValues) as T[];
       db.prepare(query).run(...sqliteValues);
       return [];
     },
@@ -256,7 +256,7 @@ describe("journal observability persistence", () => {
     vi.clearAllMocks();
   });
 
-  it("backfills the indexed decision lookup for legacy journal rows", () => {
+  it("uses a bounded fallback for a legacy journal decision", () => {
     const db = new DatabaseSync(":memory:");
     db.exec("CREATE TABLE journals (cycle_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)");
     db.exec("CREATE TABLE risk_state (state_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)");

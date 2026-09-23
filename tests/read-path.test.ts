@@ -111,7 +111,8 @@ describe("bounded Durable Object read paths", () => {
     expect(snapshot.performance.totalTrades).toBeNull();
     expect(snapshot.scheduler).toMatchObject({ nextScanAt: null, nextScanStale: true, configuredIntervalMinutes: 15, matchingScheduleCount: 0, schedulerHealthy: true });
     expect(queries.filter((query) => query.includes("FROM events")).length).toBe(1);
-    expect(queries.filter((query) => query.includes("FROM risk_state")).length).toBe(6);
+    expect(queries.filter((query) => query.includes("FROM risk_state")).length).toBe(5);
+    expect(queries.some((query) => /json_tree\s*\(/i.test(query) && /FROM\s+journals/i.test(query))).toBe(false);
     expect(queries.filter((query) => query.includes("FROM provider_financial_records")).length).toBe(0);
     expect(queries.some((query) => query.includes("FROM experiences"))).toBe(false);
     expect(queries.some((query) => query.includes("FROM lessons"))).toBe(false);
