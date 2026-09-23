@@ -22,6 +22,7 @@ import type { SqlExecutor } from "../storage/schema.js";
 
 const MAX_PROVIDER_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PROVIDER_HISTORY_MS = 90 * 24 * 60 * 60 * 1000;
+const PROVIDER_HISTORY_SAFETY_MS = 60 * 1000;
 const DEFAULT_INITIAL_LOOKBACK_MS = MAX_PROVIDER_HISTORY_MS;
 const DEFAULT_RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_OVERLAP_MS = 15 * 60 * 1000;
@@ -229,7 +230,7 @@ function buildWindows(nowMs: number, options: ProviderLedgerSyncOptions, previou
     ? Math.min(options.initialLookbackMs ?? DEFAULT_INITIAL_LOOKBACK_MS, MAX_PROVIDER_HISTORY_MS)
     : Math.min(options.recentWindowMs ?? DEFAULT_RECENT_WINDOW_MS, MAX_PROVIDER_WINDOW_MS);
   const previousMs = previous?.lastSuccessfulSyncAt ? Date.parse(previous.lastSuccessfulSyncAt) : NaN;
-  const historyFloorMs = nowMs - MAX_PROVIDER_HISTORY_MS;
+  const historyFloorMs = nowMs - MAX_PROVIDER_HISTORY_MS + PROVIDER_HISTORY_SAFETY_MS;
   const requestedStartMs = Number.isFinite(previousMs) && options.mode === "recent" ? previousMs - overlapMs : nowMs - lookbackMs;
   const startMs = Math.max(0, historyFloorMs, requestedStartMs);
   const windows: Window[] = [];
