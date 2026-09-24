@@ -265,7 +265,19 @@ describe("provider-first financial lifecycle resolution", () => {
     db.close();
   });
 
+  it("fails closed when a clientOid candidate is reused in another category", () => {
+    const { db, executor } = memoryExecutor();
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET provider_order_id = NULL WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at)
+      VALUES ('cross-category-order', 'darwin-entry-oid', 'COIN-FUTURES', 'SAMSUNGUSDT', 'buy', 'long', NULL, '7.51', '7.51', 'filled', ${OPENED_AT}, ${OPENED_AT}, 'DARWIN', '{}', ${OPENED_AT}, ${OPENED_AT})`;
+    const position = { symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "7.51", entryPrice: "198.02", openedAt: OPENED_AT };
+    expect(loadProviderLiveOpeningOrderIdentities(executor, "USDT-FUTURES", [position as never]).size).toBe(0);
+    db.close();
+  });
+
   it("resolves provider-live CRCL SHORT, META LONG, and TSLA LONG identities from exact UTA order/fill chains", () => {
+
     const { db, executor } = memoryExecutor();
     const positions = [
       { symbol: "CRCLUSDT", positionSide: "SHORT", quantity: "8.27", entryPrice: "92.89", openedAt: "2026-09-22T01:17:28.845Z", side: "sell", orderId: "live-crcl-order", clientOid: "live-crcl-client", decisionId: "live-crcl-decision" },
@@ -898,7 +910,185 @@ describe("provider-first financial lifecycle resolution", () => {
     db.close();
   });
 
+  it("shows exact close execution facts without claiming a full lifecycle or performance trade", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    const experience: TradeExperience = {
+      ...openExperience(),
+      experienceId: "execution-only-close",
+      action: "REDUCE",
+      lastAction: "REDUCE",
+      outcomeStatus: "EXECUTION_FAILURE",
+      entryDecisionId: "",
+      exitDecisionId: "close-execution-decision",
+      entryTime: CLOSED_AT,
+      exitTime: CLOSED_AT,
+    };
+    const clientOrderId = "paper-close-execution-client";
+    const providerOrderId = "provider-close-execution-order";
+    const fillTime = "2026-09-22T01:43:05.932Z";
+    saveExperience(executor, experience, CLOSED_AT);
+    executor.sql`INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at)
+      VALUES (${clientOrderId}, 'cycle-close-execution', 'close-execution-decision', NULL, ${CLOSED_AT})`;
+    executor.sql`INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at)
+      VALUES (${providerOrderId}, ${clientOrderId}, 'USDT-FUTURES', 'SAMSUNGUSDT', 'sell', 'long', NULL, '1.00', '1.00', 'filled', ${fillTime}, ${fillTime}, 'DARWIN', '{}', ${fillTime}, ${fillTime})`;
+    executor.sql`INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, fee_total, exec_pnl, created_time, origin, raw_provider_json, first_seen_at, last_seen_at)
+      VALUES ('close-execution-fill', ${providerOrderId}, ${clientOrderId}, 'USDT-FUTURES', 'SAMSUNGUSDT', 'sell', 'long', NULL, '0.75', '204.85', '-0.012', '0.45', ${fillTime}, 'DARWIN', '{}', ${fillTime}, ${fillTime})`;
+    const laterFillTime = '2026-09-22T01:43:30.000Z';
+    executor.sql`INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, fee_total, exec_pnl, created_time, origin, raw_provider_json, first_seen_at, last_seen_at)
+      VALUES ('close-execution-fill-2', ${providerOrderId}, ${clientOrderId}, 'USDT-FUTURES', 'SAMSUNGUSDT', 'sell', 'long', NULL, '0.25', '204.80', '-0.004', '0.10', ${laterFillTime}, 'DARWIN', '{}', ${laterFillTime}, ${laterFillTime})`;
+    const lifecycleCountBefore = resolveProviderTradeFacts(executor, [experience], 'USDT-FUTURES', []).lifecycles.length;
+    const queryOffset = queries.length;
+    const agent = fakeAgent(executor, db, true);
+    vi.spyOn(BitgetClient.prototype, 'getDashboardPortfolio').mockResolvedValue({ positions: [], portfolioEquity: '1000', observedAt: CLOSED_AT } as never);
+    const response = await agent.getTradeHistory.call(agent, new URL('https://example.test/trade-history?limit=25'));
+    const body = await response.json() as { trades: Array<Record<string, unknown>> };
+    const trade = body.trades.find((candidate) => candidate.tradeId === experience.experienceId)!;
+    expect(trade).toMatchObject({
+      status: 'EXECUTION_VERIFIED',
+      localLifecycleStatus: 'EXECUTION_FAILURE',
+      financialSource: 'PROVIDER_EXECUTION',
+      origin: 'DARWIN',
+      entry: 'UNAVAILABLE',
+      exit: 'UNAVAILABLE',
+      realizedPnl: 'UNAVAILABLE',
+      providerExecution: {
+        decisionId: 'close-execution-decision',
+        providerOrderId,
+        clientOrderId,
+        symbol: 'SAMSUNGUSDT',
+        positionSide: 'LONG',
+        side: 'sell',
+        tradeSide: 'CLOSE',
+        orderStatus: 'filled',
+        origin: 'DARWIN',
+        fills: [
+          { execId: 'close-execution-fill', quantity: '0.75', price: '204.85', filledAt: fillTime, fee: '-0.012' },
+          { execId: 'close-execution-fill-2', quantity: '0.25', price: '204.80', filledAt: laterFillTime, fee: '-0.004' },
+        ],
+      },
+    });
+    expect(trade.providerPositionHistoryId).toBeUndefined();
+    expect(resolveProviderTradeFacts(executor, [experience], 'USDT-FUTURES', []).lifecycles).toHaveLength(lifecycleCountBefore);
+    expect(queries.slice(queryOffset).filter((query) => /^(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(query.trim()))).toEqual([]);
+    db.close();
+  });
+
+  it("keeps close execution unattributed when the clientOid collides with an external order in another category", async () => {
+    const { db, executor } = memoryExecutor();
+    const experience: TradeExperience = {
+      ...openExperience(),
+      experienceId: "external-collision-close",
+      action: "CLOSE",
+      lastAction: "CLOSE",
+      outcomeStatus: "EXECUTION_FAILURE",
+      entryDecisionId: "",
+      exitDecisionId: "external-collision-decision",
+      entryTime: CLOSED_AT,
+      exitTime: CLOSED_AT,
+    };
+    const clientOrderId = "paper-external-collision-client";
+    const fillTime = "2026-09-22T01:43:05.932Z";
+    saveExperience(executor, experience, CLOSED_AT);
+    executor.sql`INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at)
+      VALUES (${clientOrderId}, 'cycle-external-collision', 'external-collision-decision', 'darwin-close-order', ${CLOSED_AT})`;
+    executor.sql`INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at)
+      VALUES ('darwin-close-order', ${clientOrderId}, 'USDT-FUTURES', 'SAMSUNGUSDT', 'sell', 'long', NULL, '0.75', '0.75', 'filled', ${fillTime}, ${fillTime}, 'DARWIN', '{}', ${fillTime}, ${fillTime})`;
+    executor.sql`INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, fee_total, exec_pnl, created_time, origin, raw_provider_json, first_seen_at, last_seen_at)
+      VALUES ('darwin-close-fill', 'darwin-close-order', ${clientOrderId}, 'USDT-FUTURES', 'SAMSUNGUSDT', 'sell', 'long', NULL, '0.75', '204.85', '-0.012', '0.45', ${fillTime}, 'DARWIN', '{}', ${fillTime}, ${fillTime})`;
+    executor.sql`INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at)
+      VALUES ('external-close-order', ${clientOrderId}, 'COIN-FUTURES', 'SAMSUNGUSDT', 'sell', 'long', NULL, '0.75', '0.75', 'filled', ${fillTime}, ${fillTime}, 'PROVIDER_EXTERNAL', '{}', ${fillTime}, ${fillTime})`;
+    executor.sql`INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, fee_total, exec_pnl, created_time, origin, raw_provider_json, first_seen_at, last_seen_at)
+      VALUES ('external-close-fill', 'external-close-order', ${clientOrderId}, 'COIN-FUTURES', 'SAMSUNGUSDT', 'sell', 'long', NULL, '0.75', '204.85', '-0.012', '0.45', ${fillTime}, 'PROVIDER_EXTERNAL', '{}', ${fillTime}, ${fillTime})`;
+    const agent = fakeAgent(executor, db, true);
+    vi.spyOn(BitgetClient.prototype, 'getDashboardPortfolio').mockResolvedValue({ positions: [], portfolioEquity: '1000', observedAt: CLOSED_AT } as never);
+    const response = await agent.getTradeHistory.call(agent, new URL('https://example.test/trade-history?limit=25'));
+    const body = await response.json() as { trades: Array<Record<string, unknown>> };
+    const trade = body.trades.find((candidate) => candidate.tradeId === experience.experienceId)!;
+    expect(trade).toMatchObject({ status: 'UNRESOLVED', financialSource: 'UNRESOLVED', origin: 'UNATTRIBUTED' });
+    expect(trade.providerExecution).toBeUndefined();
+    db.close();
+  });
+
+  it("does not use execution-only facts when a local entry decision exists", () => {
+    const { db, executor } = memoryExecutor();
+    const experience: TradeExperience = {
+      ...openExperience(),
+      experienceId: "close-with-local-entry",
+      action: "REDUCE",
+      lastAction: "REDUCE",
+      outcomeStatus: "EXECUTION_FAILURE",
+      entryDecisionId: ENTRY_DECISION_ID,
+      exitDecisionId: "close-with-local-entry-decision",
+      entryTime: CLOSED_AT,
+      exitTime: CLOSED_AT,
+    };
+    const clientOrderId = "paper-close-with-local-entry-client";
+    const providerOrderId = "provider-close-with-local-entry-order";
+    const fillTime = "2026-09-22T01:43:05.932Z";
+    executor.sql`INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at)
+      VALUES (${clientOrderId}, 'cycle-close-with-local-entry', 'close-with-local-entry-decision', NULL, ${CLOSED_AT})`;
+    executor.sql`INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at)
+      VALUES (${providerOrderId}, ${clientOrderId}, 'USDT-FUTURES', 'SAMSUNGUSDT', 'sell', 'long', NULL, '0.75', '0.75', 'filled', ${fillTime}, ${fillTime}, 'DARWIN', '{}', ${fillTime}, ${fillTime})`;
+    executor.sql`INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, fee_total, exec_pnl, created_time, origin, raw_provider_json, first_seen_at, last_seen_at)
+      VALUES ('close-with-local-entry-fill', ${providerOrderId}, ${clientOrderId}, 'USDT-FUTURES', 'SAMSUNGUSDT', 'sell', 'long', NULL, '0.75', '204.85', '-0.012', '0.45', ${fillTime}, 'DARWIN', '{}', ${fillTime}, ${fillTime})`;
+    const resolved = resolveProviderTradeFacts(executor, [experience], 'USDT-FUTURES', []);
+    expect(resolved.facts.get(experience.experienceId)?.source).toBe('UNRESOLVED');
+    expect(resolved.lifecycles).toEqual([]);
+    db.close();
+  });
+
+  it("does not verify a close execution from an order without linked fills", async () => {
+
+    const { db, executor } = memoryExecutor();
+    const experience: TradeExperience = {
+      ...openExperience(),
+      experienceId: "order-without-fill-close",
+      action: "CLOSE",
+      lastAction: "CLOSE",
+      outcomeStatus: "EXECUTION_FAILURE",
+      entryDecisionId: "",
+      exitDecisionId: "order-without-fill-decision",
+      entryTime: CLOSED_AT,
+      exitTime: CLOSED_AT,
+    };
+    const clientOrderId = "paper-close-without-fill-client";
+    const providerOrderId = "provider-close-without-fill-order";
+    saveExperience(executor, experience, CLOSED_AT);
+    executor.sql`INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at)
+      VALUES (${clientOrderId}, 'cycle-close-without-fill', 'order-without-fill-decision', NULL, ${CLOSED_AT})`;
+    executor.sql`INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at)
+      VALUES (${providerOrderId}, ${clientOrderId}, 'USDT-FUTURES', 'SAMSUNGUSDT', 'sell', 'long', NULL, '0.75', '0.75', 'filled', ${CLOSED_AT}, ${CLOSED_AT}, 'DARWIN', '{}', ${CLOSED_AT}, ${CLOSED_AT})`;
+    const agent = fakeAgent(executor, db, true);
+    vi.spyOn(BitgetClient.prototype, 'getDashboardPortfolio').mockResolvedValue({ positions: [], portfolioEquity: '1000', observedAt: CLOSED_AT } as never);
+    const response = await agent.getTradeHistory.call(agent, new URL('https://example.test/trade-history?limit=25'));
+    const body = await response.json() as { trades: Array<Record<string, unknown>> };
+    const trade = body.trades.find((candidate) => candidate.tradeId === experience.experienceId)!;
+    expect(trade).toMatchObject({ status: 'UNRESOLVED', financialSource: 'UNRESOLVED', origin: 'UNATTRIBUTED' });
+    expect(trade.providerExecution).toBeUndefined();
+    db.close();
+  });
+
+  it("does not use clientOid fallback for an empty provider order ID", () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET provider_order_id = '' WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    const evidence = loadProviderLifecycleEvidence(executor, openExperience(), "USDT-FUTURES", HISTORY_ID, [], undefined, true);
+    expect(evidence.entryIdentity).toBeNull();
+    expect(evidence.history).not.toBeNull();
+    expect(loadProviderPositionHistoryDecisionIds(executor, "USDT-FUTURES", [evidence.history!]).has(HISTORY_ID)).toBe(false);
+    const batched = loadProviderLifecycleEvidenceBatch(executor, "USDT-FUTURES", [{
+      requestId: "empty-provider-order-id",
+      experience: openExperience(),
+      history: null,
+      providerPosition: { symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "7.51", entryPrice: "198.02", openedAt: OPENED_AT },
+    }]).get("empty-provider-order-id");
+    expect(batched?.entryIdentity).toBeNull();
+    db.close();
+  });
+
   it("does not attribute a history through whitespace-padded provider order IDs", () => {
+
     const { db, executor } = memoryExecutor();
     saveExperience(executor, openExperience(), OPENED_AT);
     insertProviderEvidence(executor);

@@ -1,4 +1,4 @@
-import type { PositionSnapshot, TradeExperience } from "../types.js";
+import type { PositionSnapshot, ProviderExecutionFact, TradeExperience } from "../types.js";
 import type { ProviderLifecycleEvidence, ProviderLifecycleFill, ProviderLifecycleHistory, ProviderLifecycleOrder, ProviderLifecyclePosition, ProviderLifecycleCandidateFill, ProviderLifecycleCandidateOrder, ProviderEvidenceOrigin } from "../trading/provider-lifecycle-reconciliation.js";
 import type {
   ProviderFillRecord,
@@ -352,9 +352,9 @@ export function loadProviderPositionHistoryDecisionIds(
       JOIN idempotency AS i ON i.client_order_id = f.client_oid
         AND i.client_order_id <> '' AND i.client_order_id = TRIM(i.client_order_id)
         AND ((i.provider_order_id IS NOT NULL AND i.provider_order_id <> '' AND i.provider_order_id = TRIM(i.provider_order_id) AND i.provider_order_id = f.provider_order_id)
-          OR ((i.provider_order_id IS NULL OR i.provider_order_id = '')
+          OR ((i.provider_order_id IS NULL)
             AND (SELECT COUNT(DISTINCT candidate.provider_order_id) FROM provider_orders AS candidate
-              WHERE candidate.category = f.category AND candidate.client_oid = i.client_order_id) = 1))
+              WHERE candidate.client_oid = i.client_order_id) = 1))
       WHERE h.category = ${category} AND h.provider_position_history_id IS NOT NULL
       LIMIT ${maxRowsPerBatch + 1}
     `;
@@ -417,9 +417,9 @@ export function loadProviderLiveOpeningOrderIdentities(
       JOIN idempotency AS i ON i.client_order_id = o.client_oid
         AND i.client_order_id <> '' AND i.client_order_id = TRIM(i.client_order_id)
         AND ((i.provider_order_id IS NOT NULL AND i.provider_order_id <> '' AND i.provider_order_id = TRIM(i.provider_order_id) AND i.provider_order_id = o.provider_order_id)
-          OR ((i.provider_order_id IS NULL OR i.provider_order_id = '')
+          OR ((i.provider_order_id IS NULL)
             AND (SELECT COUNT(DISTINCT candidate.provider_order_id) FROM provider_orders AS candidate
-              WHERE candidate.category = o.category AND candidate.client_oid = i.client_order_id) = 1))
+              WHERE candidate.client_oid = i.client_order_id) = 1))
       LIMIT ${maxRowsPerBatch + 1}
     `;
     if (rows.length > maxRowsPerBatch) continue;
@@ -460,9 +460,9 @@ export function loadProviderLifecycleHistoryCandidateIds(executor: SqlExecutor, 
       AND i.client_order_id <> '' AND i.client_order_id = TRIM(i.client_order_id)
     JOIN provider_orders o ON o.category = h.category AND o.client_oid = i.client_order_id
       AND ((i.provider_order_id IS NOT NULL AND i.provider_order_id <> '' AND i.provider_order_id = TRIM(i.provider_order_id) AND o.provider_order_id = i.provider_order_id)
-        OR ((i.provider_order_id IS NULL OR i.provider_order_id = '')
+        OR ((i.provider_order_id IS NULL)
           AND (SELECT COUNT(DISTINCT candidate.provider_order_id) FROM provider_orders AS candidate
-            WHERE candidate.category = o.category AND candidate.client_oid = i.client_order_id) = 1))
+            WHERE candidate.client_oid = i.client_order_id) = 1))
     JOIN provider_fills f ON f.category = o.category AND f.provider_order_id = o.provider_order_id AND f.client_oid = o.client_oid
     WHERE h.category = ${category} AND h.provider_position_history_id IS NOT NULL
       AND h.symbol = ${experience.symbol} AND UPPER(h.position_side) = UPPER(${experience.positionSide?.toUpperCase() ?? ""})
@@ -495,6 +495,10 @@ export interface ProviderLifecycleEvidenceRequest {
 }
 
 const MAX_LIFECYCLE_EVIDENCE_ROWS = 2_000;
+
+function isCanonicalNonEmptyClientOrderId(value: string | null | undefined): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value === value.trim();
+}
 
 function isExactOptionalProviderOrderId(value: string | null | undefined): boolean {
   return value === null || (typeof value === "string" && value.length > 0 && value === value.trim());
@@ -534,13 +538,13 @@ export function loadProviderLifecycleEvidence(
     idempotencyClientOidPresent: identity ? Boolean(clientOid) : null,
     idempotencyClientOidMatchesDeterministic: identity && canonicalClientOid ? rawClientOid === canonicalClientOid : null,
     idempotencyProviderOrderIdPresent: identity ? Boolean(providerOrderId) : null,
-    idempotencyProviderOrderIdExact: identity ? rawProviderOrderId === providerOrderId : null,
+    idempotencyProviderOrderIdExact: identity ? Boolean(providerOrderId) && rawProviderOrderId === providerOrderId : null,
   };
   let entryIdentity = rawClientOid === clientOid && rawProviderOrderId === providerOrderId && clientOid && providerOrderId
     ? { entryDecisionId: experience.entryDecisionId, clientOid, providerOrderId }
     : null;
   let entryIdentitySource: ProviderLifecycleEvidence["entryIdentitySource"] = entryIdentity ? "IDEMPOTENCY" : null;
-  const recoverableClientOid = identity && rawClientOid && rawClientOid === clientOid && rawProviderOrderId === ""
+  const recoverableClientOid = identity && rawClientOid && rawClientOid === clientOid && identity.provider_order_id === null
     ? rawClientOid
     : identities.length === 0 ? canonicalClientOid : null;
   // Use a decision-linked idempotency client ID, or (only when no row exists) the deterministic context ID.
@@ -717,13 +721,13 @@ export function loadProviderLifecycleEvidenceBatch(
     const identitiesByDecision = new Map<string, Array<{ clientOrderId: string; providerOrderId: string | null }>>();
     for (const row of identityRows) {
       const identities = identitiesByDecision.get(row.decision_id) ?? [];
-      identities.push({ clientOrderId: row.client_order_id, providerOrderId: row.provider_order_id === "" ? null : row.provider_order_id });
+      identities.push({ clientOrderId: row.client_order_id, providerOrderId: row.provider_order_id });
       identitiesByDecision.set(row.decision_id, identities);
     }
     const queryRequests = batch.map((request) => {
       const identities = identitiesByDecision.get(request.experience.entryDecisionId) ?? [];
       const clientOrderId = identities[0]?.clientOrderId;
-      const identity = identityRows.length <= 5_000 && identities.length === 1 && clientOrderId && clientOrderId === clientOrderId.trim()
+      const identity = identityRows.length <= 5_000 && identities.length === 1 && isCanonicalNonEmptyClientOrderId(clientOrderId)
         && isExactOptionalProviderOrderId(identities[0]?.providerOrderId) ? identities[0] : null;
       const position = request.providerPosition;
       const rangeStart = request.history?.openingTime
@@ -785,7 +789,7 @@ export function loadProviderLifecycleEvidenceBatch(
     for (const request of batch) {
       const identities = identitiesByDecision.get(request.experience.entryDecisionId) ?? [];
       const clientOrderId = identities[0]?.clientOrderId;
-      const identity = identityRows.length <= 5_000 && identities.length === 1 && clientOrderId && clientOrderId === clientOrderId.trim()
+      const identity = identityRows.length <= 5_000 && identities.length === 1 && isCanonicalNonEmptyClientOrderId(clientOrderId)
         && isExactOptionalProviderOrderId(identities[0]?.providerOrderId) ? identities[0] : null;
       const historyId = request.history?.providerPositionHistoryId;
       const duplicateHistory = Boolean(historyId && historyIdCounts.get(historyId)! > 1);
@@ -828,6 +832,171 @@ export function loadProviderLifecycleEvidenceBatch(
     }
   }
   return result;
+}
+
+export function loadProviderExitExecutionFacts(
+  executor: SqlExecutor,
+  category: string,
+  experiences: readonly TradeExperience[],
+): Map<string, ProviderExecutionFact> {
+  const requests = experiences.flatMap((experience) => {
+    const action = experience.lastAction && experience.lastAction !== "HOLD" ? experience.lastAction : experience.action;
+    if ((action !== "CLOSE" && action !== "REDUCE") || experience.entryDecisionId !== ""
+      || !experience.exitDecisionId || experience.exitDecisionId.length > 256 || !experience.positionSide
+      || !experience.exitTime || !Number.isFinite(Date.parse(experience.exitTime))) return [];
+    return [{ requestId: experience.experienceId, experience }];
+  });
+  const facts = new Map<string, ProviderExecutionFact>();
+  if (requests.length === 0) return facts;
+
+  const requestIdCounts = new Map<string, number>();
+  const decisionIdCounts = new Map<string, number>();
+  for (const request of requests) {
+    requestIdCounts.set(request.requestId, (requestIdCounts.get(request.requestId) ?? 0) + 1);
+    decisionIdCounts.set(request.experience.exitDecisionId, (decisionIdCounts.get(request.experience.exitDecisionId) ?? 0) + 1);
+  }
+  const duplicateRequestIds = new Set([...requestIdCounts].filter(([, count]) => count > 1).map(([id]) => id));
+  const duplicateDecisionIds = new Set([...decisionIdCounts].filter(([, count]) => count > 1).map(([id]) => id));
+  const batchSize = 20;
+
+  for (let offset = 0; offset < requests.length; offset += batchSize) {
+    const batch = requests.slice(offset, offset + batchSize);
+    const decisionIds = [...new Set(batch.map((request) => request.experience.exitDecisionId))];
+    const identityRows = executor.sql<{ decision_id: string; client_order_id: string; provider_order_id: string | null }>`
+      SELECT i.decision_id, i.client_order_id, i.provider_order_id
+      FROM idempotency AS i
+      JOIN json_each(${JSON.stringify(decisionIds)}) AS requested ON requested.value = i.decision_id
+      ORDER BY i.decision_id, i.created_at, i.client_order_id
+      LIMIT 5_001
+    `;
+    const identitiesByDecision = new Map<string, Array<{ clientOrderId: string; providerOrderId: string | null }>>();
+    for (const row of identityRows) {
+      const identities = identitiesByDecision.get(row.decision_id) ?? [];
+      identities.push({ clientOrderId: row.client_order_id, providerOrderId: row.provider_order_id });
+      identitiesByDecision.set(row.decision_id, identities);
+    }
+    const queryRequests = batch.map((request) => {
+      const identities = identitiesByDecision.get(request.experience.exitDecisionId) ?? [];
+      const identity = identities.length === 1 ? identities[0] : null;
+      const clientOrderId = identity?.clientOrderId;
+      const identityValid = identityRows.length <= 5_000 && !duplicateRequestIds.has(request.requestId)
+        && !duplicateDecisionIds.has(request.experience.exitDecisionId)
+        && isCanonicalNonEmptyClientOrderId(clientOrderId)
+        && isExactOptionalProviderOrderId(identity?.providerOrderId);
+      return {
+        requestId: request.requestId,
+        symbol: request.experience.symbol,
+        positionSide: request.experience.positionSide?.toLowerCase() ?? "",
+        exitTime: request.experience.exitTime,
+        providerOrderId: identityValid ? identity?.providerOrderId ?? null : null,
+        clientOid: identityValid ? clientOrderId : null,
+      };
+    });
+    const requestJson = JSON.stringify(queryRequests);
+    type OrderRow = {
+      request_id: string; provider_order_id: string; client_oid: string | null; symbol: string;
+      side: string | null; pos_side: string | null; trade_side: string | null; order_status: string; origin: ProviderEvidenceOrigin;
+      row_number: number;
+    };
+    const orderRows = executor.sql<OrderRow>`
+      WITH candidates AS (
+        SELECT json_extract(r.value, '$.requestId') AS request_id, o.provider_order_id, o.client_oid, o.symbol, o.side, o.pos_side, o.trade_side, o.order_status, o.origin,
+          ROW_NUMBER() OVER (PARTITION BY json_extract(r.value, '$.requestId') ORDER BY o.created_time, o.provider_order_id) AS row_number
+        FROM json_each(${requestJson}) AS r
+        JOIN provider_orders AS o ON o.category = ${category}
+          AND (SELECT COUNT(DISTINCT candidate.provider_order_id) FROM provider_orders AS candidate
+            WHERE candidate.client_oid = json_extract(r.value, '$.clientOid')) = 1
+          AND ((json_extract(r.value, '$.providerOrderId') IS NOT NULL AND o.provider_order_id = json_extract(r.value, '$.providerOrderId') AND o.client_oid = json_extract(r.value, '$.clientOid'))
+            OR (json_extract(r.value, '$.providerOrderId') IS NULL AND json_extract(r.value, '$.clientOid') IS NOT NULL AND o.client_oid = json_extract(r.value, '$.clientOid')))
+      )
+      SELECT request_id, provider_order_id, client_oid, symbol, side, pos_side, trade_side, order_status, origin, row_number
+      FROM candidates WHERE row_number <= ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1} ORDER BY request_id, row_number
+    `;
+    const ordersByRequest = new Map<string, OrderRow[]>();
+    const orderCounts = new Map<string, number>();
+    for (const row of orderRows) {
+      const rows = ordersByRequest.get(row.request_id) ?? [];
+      rows.push(row);
+      ordersByRequest.set(row.request_id, rows);
+      orderCounts.set(row.request_id, (orderCounts.get(row.request_id) ?? 0) + 1);
+    }
+    const fillRequests = batch.flatMap((request) => {
+      const candidates = ordersByRequest.get(request.requestId) ?? [];
+      const candidate = candidates.length === 1 ? candidates[0] : null;
+      return candidate?.provider_order_id && candidate.client_oid
+        ? [{ requestId: request.requestId, providerOrderId: candidate.provider_order_id, clientOid: candidate.client_oid }]
+        : [];
+    });
+    const fillRows = fillRequests.length > 0 ? executor.sql<{
+      request_id: string; exec_id: string; provider_order_id: string; client_oid: string | null; symbol: string;
+      side: string | null; pos_side: string | null; trade_side: string | null; exec_qty: string; exec_price: string;
+      fee_total: string | null; created_time: string; origin: ProviderEvidenceOrigin; row_number: number;
+    }>`
+      WITH candidates AS (
+        SELECT json_extract(r.value, '$.requestId') AS request_id, f.exec_id, f.provider_order_id, f.client_oid, f.symbol, f.side, f.pos_side, f.trade_side, f.exec_qty, f.exec_price, f.fee_total, f.created_time, f.origin,
+          ROW_NUMBER() OVER (PARTITION BY json_extract(r.value, '$.requestId') ORDER BY f.created_time, f.exec_id) AS row_number
+        FROM json_each(${JSON.stringify(fillRequests)}) AS r
+        JOIN provider_fills AS f ON f.category = ${category}
+          AND f.provider_order_id = json_extract(r.value, '$.providerOrderId') AND f.client_oid = json_extract(r.value, '$.clientOid')
+      )
+      SELECT request_id, exec_id, provider_order_id, client_oid, symbol, side, pos_side, trade_side, exec_qty, exec_price, fee_total, created_time, origin, row_number
+      FROM candidates WHERE row_number <= ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1} ORDER BY request_id, row_number
+    ` : [];
+    const fillsByRequest = new Map<string, Array<(typeof fillRows)[number]>>();
+    const fillCounts = new Map<string, number>();
+    for (const row of fillRows) {
+      const rows = fillsByRequest.get(row.request_id) ?? [];
+      rows.push(row);
+      fillsByRequest.set(row.request_id, rows);
+      fillCounts.set(row.request_id, (fillCounts.get(row.request_id) ?? 0) + 1);
+    }
+    for (const request of batch) {
+      const identities = identitiesByDecision.get(request.experience.exitDecisionId) ?? [];
+      const identity = identities.length === 1 ? identities[0] : null;
+      const candidateOrders = ordersByRequest.get(request.requestId) ?? [];
+      const order = candidateOrders.length === 1 ? candidateOrders[0] : null;
+      const linkedFills = order ? fillsByRequest.get(request.requestId) ?? [] : [];
+      const evidenceComplete = identityRows.length <= 5_000 && !duplicateRequestIds.has(request.requestId)
+        && !duplicateDecisionIds.has(request.experience.exitDecisionId)
+        && candidateOrders.length === 1 && (orderCounts.get(request.requestId) ?? 0) <= MAX_LIFECYCLE_EVIDENCE_ROWS
+        && linkedFills.length > 0 && (fillCounts.get(request.requestId) ?? 0) <= MAX_LIFECYCLE_EVIDENCE_ROWS;
+      if (!evidenceComplete || !identity || !order || !order.client_oid || !order.provider_order_id
+        || order.client_oid !== identity.clientOrderId || order.symbol !== request.experience.symbol
+        || order.origin !== "DARWIN" || order.pos_side?.toUpperCase() !== request.experience.positionSide
+        || resolveProviderLifecycleSide(order.side, order.pos_side, order.trade_side) !== "CLOSE") continue;
+      const consistentFills = linkedFills.every((fill) => fill.provider_order_id === order.provider_order_id
+        && fill.client_oid === order.client_oid && fill.symbol === order.symbol
+        && fill.pos_side?.toUpperCase() === order.pos_side?.toUpperCase() && fill.origin === "DARWIN"
+        && resolveProviderLifecycleSide(fill.side, fill.pos_side, fill.trade_side) === "CLOSE");
+      const timedFills = linkedFills.filter((fill) => isProviderLifecycleTimestampNear(fill.created_time, request.experience.exitTime));
+      if (!consistentFills || timedFills.length === 0) continue;
+      facts.set(request.requestId, {
+        decisionId: request.experience.exitDecisionId,
+        clientOrderId: identity.clientOrderId,
+        providerOrderId: order.provider_order_id,
+        symbol: order.symbol,
+        positionSide: request.experience.positionSide,
+        side: order.side ?? "",
+        tradeSide: "CLOSE",
+        orderStatus: order.order_status,
+        origin: "DARWIN",
+        fills: linkedFills.map((fill) => ({ execId: fill.exec_id, quantity: fill.exec_qty, price: fill.exec_price, filledAt: fill.created_time, fee: fill.fee_total })),
+      });
+    }
+  }
+  const experiencesByProviderOrderId = new Map<string, Set<string>>();
+  for (const [experienceId, fact] of facts) {
+    const experiences = experiencesByProviderOrderId.get(fact.providerOrderId) ?? new Set<string>();
+    experiences.add(experienceId);
+    experiencesByProviderOrderId.set(fact.providerOrderId, experiences);
+  }
+  const ambiguousProviderOrderIds = new Set([...experiencesByProviderOrderId]
+    .filter(([, experienceIds]) => experienceIds.size > 1)
+    .map(([providerOrderId]) => providerOrderId));
+  for (const [experienceId, fact] of facts) {
+    if (ambiguousProviderOrderIds.has(fact.providerOrderId)) facts.delete(experienceId);
+  }
+  return facts;
 }
 
 function providerSyncStateFromRow(row: SyncStateRow): ProviderSyncState | null {

@@ -735,6 +735,27 @@ export interface PerformanceAccountingReadModel {
   source: "PROVIDER_LIVE" | "PERSISTED_LEDGER" | "UNAVAILABLE";
 }
 
+export interface ProviderExecutionFillFact {
+  execId: string;
+  quantity: string;
+  price: string;
+  filledAt: string;
+  fee: string | null;
+}
+
+export interface ProviderExecutionFact {
+  decisionId: string;
+  clientOrderId: string;
+  providerOrderId: string;
+  symbol: string;
+  positionSide: PositionSide;
+  side: string;
+  tradeSide: "CLOSE";
+  orderStatus: string;
+  origin: "DARWIN";
+  fills: ProviderExecutionFillFact[];
+}
+
 export interface TradeLogEntry {
   tradeId: string;
   timestamp: string;
@@ -747,7 +768,7 @@ export interface TradeLogEntry {
   entry: string;
   exit: string;
   realizedPnl: string;
-  status: TradeLifecycleStatus | "UNRESOLVED";
+  status: TradeLifecycleStatus | "UNRESOLVED" | "EXECUTION_VERIFIED";
   localLifecycleStatus?: TradeLifecycleStatus;
   intendedMarginAllocated?: string;
   intendedMarginAllocationPct?: string;
@@ -766,7 +787,7 @@ export interface TradeLogEntry {
   entryReasoning?: PositionReasoning;
   exitReasoning?: PositionReasoning;
   managementEvents?: PositionReasoning[];
-  financialSource?: "PROVIDER_LEDGER" | "PROVIDER_LIVE" | "UNRESOLVED";
+  financialSource?: "PROVIDER_LEDGER" | "PROVIDER_LIVE" | "PROVIDER_EXECUTION" | "UNRESOLVED";
   reasoningSource?: "DARWIN_PERSISTED" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
   origin?: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
   providerPositionHistoryId?: string;
@@ -779,6 +800,7 @@ export interface TradeLogEntry {
   closeFeeTotal?: string;
   totalFunding?: string;
   cashDividend?: string;
+  providerExecution?: ProviderExecutionFact;
 }
 
 export interface PositionReasoning {
