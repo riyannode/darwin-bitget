@@ -8,6 +8,10 @@ function providerSide(decision: Decision): "buy" | "sell" {
   return decision.positionSide === "LONG" ? "sell" : "buy";
 }
 
+export function buildExecutionClientOrderId(cycleId: string, decisionId: string): string {
+  return `paper-${cycleId.replaceAll("-", "").slice(0, 16)}-${decisionId.replaceAll("-", "").slice(0, 9)}`;
+}
+
 export function buildExecutionRequest(decision: Decision, bundle: EvidenceBundle, cycleId: string): ExecutionRequest {
   if (decision.action === "HOLD") throw new Error("HOLD_NOT_EXECUTABLE");
   if (decision.action === "REVERSE") throw new Error("REVERSE_NOT_EXPANDED");
@@ -25,7 +29,7 @@ export function buildExecutionRequest(decision: Decision, bundle: EvidenceBundle
     positionNotional: amounts.positionNotional,
     reductionPct: amounts.reductionPct,
     quantity: amounts.quantity,
-    clientOrderId: `paper-${cycleId.replaceAll("-", "").slice(0, 16)}-${decision.decisionId.replaceAll("-", "").slice(0, 9)}`,
+    clientOrderId: buildExecutionClientOrderId(cycleId, decision.decisionId),
   };
 }
 

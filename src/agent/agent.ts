@@ -64,7 +64,7 @@ import { cyclePlanDecisions, cycleReadModel, normalizeCycleDecisions } from "../
 import { evaluateRiskGate } from "../trading/risk-gate.js";
 import { evaluateDrawdown } from "../trading/drawdown.js";
 import { loadOwnerPolicy, updateOwnerPolicy } from "../trading/policy.js";
-import { buildExecutionRequest, executePaperOrder } from "../trading/execution.js";
+import { buildExecutionClientOrderId, buildExecutionRequest, executePaperOrder } from "../trading/execution.js";
 import { executeCyclePlan } from "../trading/execution-planner.js";
 import { reconcileExecution } from "../trading/reconcile.js";
 import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal } from "../trading/decimal.js";
@@ -1063,8 +1063,19 @@ export class TraderAgent extends Agent<Env, AgentState> {
       historyFound: boolean;
       providerPositionHistoryId: string | null;
       historyOrigin: string | null;
+      avgEntryPrice: string | null;
+      avgExitPrice: string | null;
+      cumRealisedPnl: string | null;
+      netProfit: string | null;
+      openFeeTotal: string | null;
+      closeFeeTotal: string | null;
+      totalFunding: string | null;
+      openingTime: string | null;
+      closingTime: string | null;
       entryIdentityFound: boolean;
-      entryDecisionId: string | null;
+      entryIdentitySource: "IDEMPOTENCY" | "DERIVED_DARWIN_CLIENT_OID" | null;
+      entryIdentityLookupCount: number;
+      entryDecisionId: string;
       entryClientOid: string | null;
       entryProviderOrderId: string | null;
       orderCount: number;
@@ -1092,7 +1103,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const portfolio = await new BitgetClient(config).getDashboardPortfolio();
     if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
 
-    const evidence = loadProviderLifecycleEvidence(this, experience, config.bitgetCategory, providerPositionHistoryId, portfolio.positions);
+    const evidence = loadProviderLifecycleEvidence(this, experience, config.bitgetCategory, providerPositionHistoryId, portfolio.positions, deterministicEntryIdentity(experience, context));
     const reconciliation = classifyProviderLifecycle(evidence);
     const quantities = summarizeProviderLifecycleFillQuantities(evidence);
     return {
@@ -1103,7 +1114,18 @@ export class TraderAgent extends Agent<Env, AgentState> {
         historyFound: Boolean(evidence.history),
         providerPositionHistoryId: evidence.history?.providerPositionHistoryId ?? null,
         historyOrigin: evidence.history?.origin ?? null,
+        avgEntryPrice: evidence.history?.avgEntryPrice ?? null,
+        avgExitPrice: evidence.history?.avgExitPrice ?? null,
+        cumRealisedPnl: evidence.history?.cumRealisedPnl ?? null,
+        netProfit: evidence.history?.netProfit ?? null,
+        openFeeTotal: evidence.history?.openFeeTotal ?? null,
+        closeFeeTotal: evidence.history?.closeFeeTotal ?? null,
+        totalFunding: evidence.history?.totalFunding ?? null,
+        openingTime: evidence.history?.openingTime ?? null,
+        closingTime: evidence.history?.closingTime ?? null,
         entryIdentityFound: Boolean(evidence.entryIdentity),
+        entryIdentitySource: evidence.entryIdentitySource ?? null,
+        entryIdentityLookupCount: evidence.entryIdentityLookupCount ?? 0,
         entryDecisionId: evidence.entryIdentity?.entryDecisionId ?? experience.entryDecisionId,
         entryClientOid: evidence.entryIdentity?.clientOid ?? null,
         entryProviderOrderId: evidence.entryIdentity?.providerOrderId ?? null,
@@ -1142,7 +1164,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const config = loadConfig(this.env, this.ensureActivePolicy());
     const portfolio = await new BitgetClient(config).getDashboardPortfolio();
     if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
-    const evidence = loadProviderLifecycleEvidence(this, experience, config.bitgetCategory, providerPositionHistoryId, portfolio.positions);
+    const evidence = loadProviderLifecycleEvidence(this, experience, config.bitgetCategory, providerPositionHistoryId, portfolio.positions, deterministicEntryIdentity(experience, context));
     const reconciliation = classifyProviderLifecycle(evidence);
     if (reconciliation.classification !== "LOCAL_OPEN_PROVIDER_CLOSED" || !evidence.history) {
       throw new ProviderLifecycleClassificationError(reconciliation.classification, reconciliation.reason);
@@ -2111,6 +2133,15 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (previous.scanIntervalMinutes !== next.scanIntervalMinutes && !this.state.paused && !next.emergencyStop) await this.reconcileScheduler(intervalMinutes, { ensureSchedule: true });
     return this.getDashboardSnapshot();
   }
+}
+
+function deterministicEntryIdentity(experience: TradeExperience, context: PositionContext): { entryDecisionId: string; clientOid: string } | undefined {
+  const reasoning = context.entryReasoning;
+  const expectedAction = experience.positionSide === "LONG" ? "OPEN_LONG" : experience.positionSide === "SHORT" ? "OPEN_SHORT" : null;
+  if (!expectedAction || context.experienceId !== experience.experienceId || context.entryDecisionId !== experience.entryDecisionId
+    || reasoning?.experienceId !== experience.experienceId || reasoning.decisionId !== experience.entryDecisionId
+    || reasoning.action !== expectedAction || !reasoning.cycleId) return undefined;
+  return { entryDecisionId: experience.entryDecisionId, clientOid: buildExecutionClientOrderId(reasoning.cycleId, experience.entryDecisionId) };
 }
 
 function providerLifecycleRepairEventId(experienceId: string, providerPositionHistoryId: string): string {

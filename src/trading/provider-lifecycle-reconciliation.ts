@@ -65,6 +65,8 @@ export interface ProviderLifecycleEvidence {
   providerPositions: readonly ProviderLifecyclePosition[];
   history: ProviderLifecycleHistory | null;
   entryIdentity: { entryDecisionId: string; clientOid: string; providerOrderId: string } | null;
+  entryIdentitySource?: "IDEMPOTENCY" | "DERIVED_DARWIN_CLIENT_OID" | null;
+  entryIdentityLookupCount?: number;
   orders: readonly ProviderLifecycleOrder[];
   fills: readonly ProviderLifecycleFill[];
   evidenceComplete?: boolean;

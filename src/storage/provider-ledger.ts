@@ -442,6 +442,7 @@ export function loadProviderLifecycleEvidence(
   category: string,
   providerPositionHistoryId: string,
   providerPositions: readonly ProviderLifecyclePosition[],
+  deterministicEntryIdentity?: { entryDecisionId: string; clientOid: string },
 ): ProviderLifecycleEvidence {
   const historyRows = executor.sql<{
     provider_position_history_id: string | null; symbol: string; position_side: string; open_total_pos: string | null; close_total_pos: string | null;
@@ -458,9 +459,34 @@ export function loadProviderLifecycleEvidence(
   const identity = identities.length === 1 ? identities[0] : null;
   const clientOid = typeof identity?.client_order_id === "string" ? identity.client_order_id.trim() : "";
   const providerOrderId = typeof identity?.provider_order_id === "string" ? identity.provider_order_id.trim() : "";
-  const entryIdentity = clientOid && providerOrderId
+  let entryIdentity = clientOid && providerOrderId
     ? { entryDecisionId: experience.entryDecisionId, clientOid, providerOrderId }
     : null;
+  let entryIdentitySource: ProviderLifecycleEvidence["entryIdentitySource"] = entryIdentity ? "IDEMPOTENCY" : null;
+  // Recover only a missing idempotency row from the canonical client ID and a unique, already-attributed opening order.
+  // Any present-but-malformed or duplicated idempotency rows remain fail-closed.
+  if (!entryIdentity && identities.length === 0 && row && deterministicEntryIdentity?.entryDecisionId === experience.entryDecisionId
+    && /^[A-Za-z0-9_-]{1,32}$/.test(deterministicEntryIdentity.clientOid)) {
+    type CandidateOrder = { provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null; origin: ProviderEvidenceOrigin; created_time: string };
+    const candidates = executor.sql<CandidateOrder>`
+      SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin, created_time
+      FROM provider_orders
+      WHERE category = ${category} AND symbol = ${experience.symbol}
+        AND client_oid = ${deterministicEntryIdentity.clientOid}
+        AND UPPER(pos_side) = ${experience.positionSide ?? ""} AND trade_side = 'open'
+      ORDER BY created_time LIMIT 2
+    `;
+    const candidate = candidates.length === 1 ? candidates[0] : null;
+    const candidateTime = candidate ? Date.parse(candidate.created_time) : Number.NaN;
+    const historyTime = Date.parse(row.opening_time);
+    if (candidate && candidate.provider_order_id && candidate.client_oid === deterministicEntryIdentity.clientOid
+      && candidate.symbol === experience.symbol && candidate.pos_side?.toUpperCase() === experience.positionSide
+      && candidate.trade_side?.toLowerCase() === "open" && candidate.origin === "DARWIN"
+      && Number.isFinite(candidateTime) && Number.isFinite(historyTime) && Math.abs(candidateTime - historyTime) <= 5_000) {
+      entryIdentity = { entryDecisionId: experience.entryDecisionId, clientOid: candidate.client_oid, providerOrderId: candidate.provider_order_id };
+      entryIdentitySource = "DERIVED_DARWIN_CLIENT_OID";
+    }
+  }
   const matchingPosition = providerPositions.find((position) => position.symbol === experience.symbol && position.positionSide === experience.positionSide);
   const livePositionStartAt = matchingPosition?.openedAt && Number.isFinite(Date.parse(matchingPosition.openedAt))
     ? new Date(Date.parse(matchingPosition.openedAt) - 5_000).toISOString()
@@ -488,7 +514,7 @@ export function loadProviderLifecycleEvidence(
   const evidenceComplete = orders.length <= MAX_LIFECYCLE_EVIDENCE_ROWS && fills.length <= MAX_LIFECYCLE_EVIDENCE_ROWS;
   const mappedOrders = orders.map((order) => ({ providerOrderId: order.provider_order_id, clientOid: order.client_oid, symbol: order.symbol, positionSide: order.pos_side?.toUpperCase() ?? null, tradeSide: order.trade_side?.toLowerCase() ?? null, origin: order.origin }));
   const mappedFills = fills.map((fill) => ({ providerOrderId: fill.provider_order_id, clientOid: fill.client_oid, symbol: fill.symbol, positionSide: fill.pos_side?.toUpperCase() ?? null, tradeSide: fill.trade_side?.toLowerCase() ?? null, quantity: fill.exec_qty, execPrice: fill.exec_price, createdAt: fill.created_time, origin: fill.origin }));
-  if (!row) return { experience, providerPositions, history: null, entryIdentity, orders: mappedOrders, fills: mappedFills, evidenceComplete };
+  if (!row) return { experience, providerPositions, history: null, entryIdentity, entryIdentitySource, entryIdentityLookupCount: Math.min(identities.length, 2), orders: mappedOrders, fills: mappedFills, evidenceComplete };
 
   return {
     experience,
@@ -512,6 +538,8 @@ export function loadProviderLifecycleEvidence(
       origin: row.origin,
     },
     entryIdentity,
+    entryIdentitySource,
+    entryIdentityLookupCount: Math.min(identities.length, 2),
     orders: mappedOrders,
     fills: mappedFills,
     evidenceComplete,

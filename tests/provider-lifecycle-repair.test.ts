@@ -418,7 +418,18 @@ describe("provider-first financial lifecycle resolution", () => {
         historyFound: true,
         providerPositionHistoryId: HISTORY_ID,
         historyOrigin: "UNATTRIBUTED",
+        avgEntryPrice: "198.02",
+        avgExitPrice: "202.66",
+        cumRealisedPnl: "34.8487",
+        netProfit: "33.19485709",
+        openFeeTotal: "-0.89227812",
+        closeFeeTotal: "-0.91318734",
+        totalFunding: "0.15162255",
+        openingTime: OPENED_AT,
+        closingTime: CLOSED_AT,
         entryIdentityFound: true,
+        entryIdentitySource: "IDEMPOTENCY",
+        entryIdentityLookupCount: 1,
         entryDecisionId: ENTRY_DECISION_ID,
         entryClientOid: "darwin-entry-oid",
         entryProviderOrderId: "provider-entry-order",
@@ -445,6 +456,112 @@ describe("provider-first financial lifecycle resolution", () => {
     expect(loadAllEvents(executor)).toEqual(before.events);
     expect(db.prepare("SELECT payload FROM journals WHERE cycle_id = ?").get("cycle-entry")).toEqual(before.journal);
     expect(db.prepare("SELECT state_key, payload, updated_at FROM risk_state ORDER BY state_key").all()).toEqual(before.performance);
+    db.close();
+  });
+
+  it("reconstructs the exact Samsung entry identity from its deterministic DARWIN client ID when idempotency is absent", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    const actualCycleId = "1dbada47-eb96-4c65-a865-99bd033588c9";
+    const expectedClientOid = "paper-1dbada47eb964c65-87a5c9bce";
+    saveExperience(executor, openExperience(), OPENED_AT);
+    const context = positionContext();
+    savePositionContext(executor, { ...context, entryReasoning: { ...context.entryReasoning!, cycleId: actualCycleId } });
+    insertProviderEvidence(executor);
+    executor.sql`DELETE FROM idempotency WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`UPDATE provider_orders SET client_oid = ${expectedClientOid} WHERE provider_order_id = 'provider-entry-order'`;
+    executor.sql`UPDATE provider_fills SET client_oid = ${expectedClientOid} WHERE provider_order_id = 'provider-entry-order'`;
+    const queryOffset = queries.length;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { dryRun?: boolean; classification?: string; reason?: string; evidence?: Record<string, unknown> };
+
+    expect(body).toMatchObject({
+      dryRun: true,
+      classification: "LOCAL_OPEN_PROVIDER_CLOSED",
+      reason: "PROVIDER_LEDGER_PROVES_FULL_DARWIN_CLOSE",
+      evidence: {
+        historyFound: true,
+        providerPositionHistoryId: HISTORY_ID,
+        avgEntryPrice: "198.02",
+        avgExitPrice: "202.66",
+        cumRealisedPnl: "34.8487",
+        netProfit: "33.19485709",
+        openFeeTotal: "-0.89227812",
+        closeFeeTotal: "-0.91318734",
+        totalFunding: "0.15162255",
+        openingTime: OPENED_AT,
+        closingTime: CLOSED_AT,
+        entryIdentityFound: true,
+        entryIdentitySource: "DERIVED_DARWIN_CLIENT_OID",
+        entryDecisionId: ENTRY_DECISION_ID,
+        entryClientOid: expectedClientOid,
+        entryProviderOrderId: "provider-entry-order",
+        openTotalPos: "7.51",
+        closeTotalPos: "7.51",
+        openingFillQuantity: "7.51",
+        closingFillQuantity: "7.51",
+      },
+    });
+    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(true);
+    expect(queries.slice(queryOffset).filter((query) => /^(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)\b/i.test(query.trim()))).toEqual([]);
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    expect(loadAllExperiences(executor)[0]?.outcomeStatus).toBe("OPEN");
+    expect(loadPositionContext(executor, "SAMSUNGUSDT", "LONG")?.lifecycleStatus).toBeUndefined();
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    db.close();
+  });
+
+  it("fails closed when persisted entry reasoning does not match the Samsung position side", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    const expectedClientOid = "paper-1dbada47eb964c65-87a5c9bce";
+    saveExperience(executor, openExperience(), OPENED_AT);
+    const context = positionContext();
+    savePositionContext(executor, { ...context, entryReasoning: { ...context.entryReasoning!, cycleId: "1dbada47-eb96-4c65-a865-99bd033588c9", action: "OPEN_SHORT" } });
+    insertProviderEvidence(executor);
+    executor.sql`DELETE FROM idempotency WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`UPDATE provider_orders SET client_oid = ${expectedClientOid} WHERE provider_order_id = 'provider-entry-order'`;
+    executor.sql`UPDATE provider_fills SET client_oid = ${expectedClientOid} WHERE provider_order_id = 'provider-entry-order'`;
+    const queryOffset = queries.length;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { classification?: string; reason?: string; evidence?: Record<string, unknown> };
+
+    expect(body).toMatchObject({
+      classification: "UNRESOLVED",
+      reason: "ENTRY_DECISION_IDENTITY_UNPROVEN",
+      evidence: { entryIdentityFound: false, entryIdentitySource: null, entryIdentityLookupCount: 0 },
+    });
+    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(false);
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    db.close();
+  });
+
+  it("fails closed when the exact deterministic client ID identifies multiple provider opening orders", async () => {
+    const { db, executor } = memoryExecutor();
+    const expectedClientOid = "paper-1dbada47eb964c65-87a5c9bce";
+    saveExperience(executor, openExperience(), OPENED_AT);
+    const context = positionContext();
+    savePositionContext(executor, { ...context, entryReasoning: { ...context.entryReasoning!, cycleId: "1dbada47-eb96-4c65-a865-99bd033588c9" } });
+    insertProviderEvidence(executor);
+    executor.sql`DELETE FROM idempotency WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`UPDATE provider_orders SET client_oid = ${expectedClientOid} WHERE provider_order_id = 'provider-entry-order'`;
+    executor.sql`UPDATE provider_fills SET client_oid = ${expectedClientOid} WHERE provider_order_id = 'provider-entry-order'`;
+    executor.sql`INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES ('duplicate-provider-entry-order', ${expectedClientOid}, 'USDT-FUTURES', 'SAMSUNGUSDT', 'buy', 'LONG', 'open', '7.51', '7.51', 'filled', ${OPEN_FILL_AT}, ${OPEN_FILL_AT}, 'DARWIN', '{}', ${OPEN_FILL_AT}, ${OPEN_FILL_AT})`;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { classification?: string; reason?: string; evidence?: Record<string, unknown> };
+
+    expect(body).toMatchObject({
+      classification: "UNRESOLVED",
+      reason: "ENTRY_DECISION_IDENTITY_UNPROVEN",
+      evidence: { entryIdentityFound: false, entryIdentitySource: null, entryIdentityLookupCount: 0, entryClientOid: null, entryProviderOrderId: null },
+    });
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    expect(loadAllEvents(executor)).toHaveLength(0);
     db.close();
   });
 
@@ -514,8 +631,11 @@ describe("provider-first financial lifecycle resolution", () => {
   it("fails closed when a decision has duplicate idempotency identities", async () => {
     const { db, executor, queries } = memoryExecutor();
     saveExperience(executor, openExperience(), OPENED_AT);
-    savePositionContext(executor, positionContext());
+    const context = positionContext();
+    savePositionContext(executor, { ...context, entryReasoning: { ...context.entryReasoning!, cycleId: "1dbada47-eb96-4c65-a865-99bd033588c9" } });
     insertProviderEvidence(executor);
+    executor.sql`UPDATE provider_orders SET client_oid = 'paper-1dbada47eb964c65-87a5c9bce' WHERE provider_order_id = 'provider-entry-order'`;
+    executor.sql`UPDATE provider_fills SET client_oid = 'paper-1dbada47eb964c65-87a5c9bce' WHERE provider_order_id = 'provider-entry-order'`;
     executor.sql`INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES ('ambiguous-entry-oid', 'cycle-entry', ${ENTRY_DECISION_ID}, 'ambiguous-provider-order', ${OPENED_AT})`;
     const queryOffset = queries.length;
     vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
@@ -526,9 +646,10 @@ describe("provider-first financial lifecycle resolution", () => {
     expect(body).toMatchObject({
       classification: "UNRESOLVED",
       reason: "ENTRY_DECISION_IDENTITY_UNPROVEN",
-      evidence: { historyFound: true, entryIdentityFound: false, entryClientOid: null, entryProviderOrderId: null },
+      evidence: { historyFound: true, entryIdentityFound: false, entryIdentityLookupCount: 2, entryClientOid: null, entryProviderOrderId: null },
     });
     expect(queries.slice(queryOffset).some((query) => /FROM idempotency WHERE decision_id = \? LIMIT 2/i.test(query))).toBe(true);
+    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(false);
     expect(loadAllEvents(executor)).toHaveLength(0);
     expect(executePaperOrder).not.toHaveBeenCalled();
     db.close();
