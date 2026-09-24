@@ -137,9 +137,7 @@ describe("provider-first financial lifecycle resolution", () => {
     const agent = fakeAgent(executor, db, true);
     const providerRead = vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
     const response = await agent.getTradeHistory.call(agent, new URL("https://example.test/trade-history?limit=25"));
-    const body = await response.json() as { trades: Array<Record<string, unknown>>; journalDecisionLookupMigration: { status: string }; journalReasoningCoverage: string };
-    expect(body.journalDecisionLookupMigration.status).toBe("PENDING");
-    expect(body.journalReasoningCoverage).toBe("PARTIAL");
+    const body = await response.json() as { trades: Array<Record<string, unknown>> };
     expect(body.trades).toContainEqual(expect.objectContaining({ tradeId: `provider-history:${HISTORY_ID}`, status: "CLOSED", financialSource: "PROVIDER_LEDGER", origin: "DARWIN", realizedPnl: "33.19485709", entry: "198.02" }));
     const providerOnly = body.trades.find((trade) => trade.tradeId === `provider-history:${HISTORY_ID}`)!;
     expect(providerOnly.reasoningSource).toBe("UNATTRIBUTED");

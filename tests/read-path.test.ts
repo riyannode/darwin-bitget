@@ -69,6 +69,10 @@ describe("provider live read path", () => {
 });
 
 describe("bounded Durable Object read paths", () => {
+  it("has no scheduled historical journal migration callback", () => {
+    expect(TraderAgent.prototype).not.toHaveProperty("runJournalLookupMigrationBatch");
+  });
+
   it("clamps all client limits to the safe maximum", async () => {
     expect(clampHistoryLimit(25)).toBe(25);
     expect(clampHistoryLimit(999999)).toBe(100);
@@ -107,13 +111,17 @@ describe("bounded Durable Object read paths", () => {
       },
     };
     const snapshot = await TraderAgent.prototype.getDashboardSnapshot.call(fake as never);
+    const repeatedSnapshot = await TraderAgent.prototype.getDashboardSnapshot.call(fake as never);
     expect(snapshot.portfolio).toBeNull();
-    expect(snapshot.journalDecisionLookupMigration?.status).toBe("PENDING");
+    expect(repeatedSnapshot.portfolio).toBeNull();
     expect(snapshot.performance.totalTrades).toBeNull();
     expect(snapshot.scheduler).toMatchObject({ nextScanAt: null, nextScanStale: true, configuredIntervalMinutes: 15, matchingScheduleCount: 0, schedulerHealthy: true });
-    expect(queries.filter((query) => query.includes("FROM events")).length).toBe(1);
-    expect(queries.filter((query) => query.includes("FROM risk_state")).length).toBe(5);
+    expect(queries.filter((query) => query.includes("FROM events")).length).toBe(2);
+    expect(queries.filter((query) => query.includes("FROM risk_state")).length).toBe(10);
     expect(queries.some((query) => /json_tree\s*\(/i.test(query) && /FROM\s+journals/i.test(query))).toBe(false);
+    expect(queries.some((query) => /journal_decision_lookup_migration/i.test(query))).toBe(false);
+    const journalReads = queries.filter((query) => /\bFROM\s+journals\b/i.test(query));
+    expect(journalReads.every((query) => /\bLIMIT\b/i.test(query) || /\bWHERE\s+cycle_id\s*=\s*\?/i.test(query))).toBe(true);
     expect(queries.filter((query) => query.includes("FROM provider_financial_records")).length).toBe(0);
     expect(queries.some((query) => query.includes("FROM experiences"))).toBe(false);
     expect(queries.some((query) => query.includes("FROM lessons"))).toBe(false);

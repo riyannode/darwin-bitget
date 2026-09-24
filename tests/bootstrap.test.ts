@@ -60,10 +60,15 @@ describe("bounded legacy bootstrap lookup", () => {
     const targetedQueries = queries.slice(queryStart);
     expect(found.map((journal) => journal.cycleId).sort()).toEqual(["normal", "quotes", "short", "wildcards"]);
     expect(queries.every((query) => !/\b(LIKE|GLOB)\b/i.test(query))).toBe(true);
-    expect(targetedQueries).toHaveLength(2);
+    expect(targetedQueries).toHaveLength(4);
     expect(targetedQueries[0]).toContain("journal_decision_lookup");
     expect(targetedQueries[0]).toContain("json_each(?)");
-    expect(targetedQueries[1]).toContain("LIMIT ?");
-    expect(targetedQueries[1]).not.toContain("json_tree");
+    expect(targetedQueries[1]).toContain("FROM idempotency");
+    expect(targetedQueries[1]).toContain("decision_id");
+    expect(targetedQueries[2]).toContain("FROM idempotency");
+    expect(targetedQueries[2]).toContain("cycle_id");
+    expect(targetedQueries[3]).toContain("WITH recent_journals AS MATERIALIZED");
+    expect(targetedQueries[3]).toContain("LIMIT ?");
+    expect(targetedQueries.every((query) => !query.includes("json_tree"))).toBe(true);
   });
 });

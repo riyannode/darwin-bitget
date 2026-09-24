@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { loadJournalsForDecisionIds } from "../src/storage/store.js";
+import { loadJournalForExactDecisionCycle, loadJournalsForDecisionIds } from "../src/storage/store.js";
 
 type JournalSeed = { cycleId: string; createdAt: string; payload: string };
 
@@ -62,12 +62,35 @@ describe("journal decision lookup without global backfill", () => {
     ensureStorage(executor);
 
     expect(queries.some((query) => /json_tree\s*\(/i.test(query) && /FROM\s+journals/i.test(query))).toBe(false);
+    expect(queries.some((query) => /^\s*(SELECT|WITH)\b/i.test(query) && /\bFROM\s+journals\b/i.test(query))).toBe(false);
     expect(db.prepare("SELECT * FROM journals").all()).toEqual(beforeJournal);
     expect(db.prepare("SELECT * FROM experiences").all()).toEqual(beforeExperience);
     expect(db.prepare("SELECT * FROM risk_state").all()).toEqual(beforePolicy);
     expect(db.prepare("SELECT COUNT(*) AS count FROM journals").get()).toEqual({ count: 1595 });
     expect(db.prepare("SELECT SUM(json_array_length(json_extract(payload, '$.decisions'))) AS count FROM journals").get()).toEqual({ count: 5770 });
     expect(db.prepare("SELECT COUNT(*) AS count FROM journal_decision_lookup").get()).toEqual({ count: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'journal_decision_lookup_migration'").get()).toEqual({ count: 0 });
+    db.close();
+  });
+
+  it("upgrades lookup triggers and indexes new journal writes without reindexing old rows", () => {
+    const db = createDatabase([]);
+    db.exec("CREATE TABLE journal_decision_lookup_schema_version (schema_key TEXT PRIMARY KEY, version INTEGER NOT NULL)");
+    db.exec("INSERT INTO journal_decision_lookup_schema_version VALUES ('journal_decision_lookup', 1)");
+    db.exec("CREATE TABLE journal_decision_lookup (cycle_id TEXT NOT NULL, decision_id TEXT NOT NULL, PRIMARY KEY (cycle_id, decision_id))");
+    db.exec("CREATE TRIGGER journals_decision_lookup_insert AFTER INSERT ON journals BEGIN SELECT 1; END");
+    const executor = sqliteExecutor(db);
+
+    ensureStorage(executor);
+    db.prepare("INSERT INTO journals (cycle_id, payload, created_at) VALUES (?, ?, ?)").run("new-cycle", JSON.stringify({ cycleId: "new-cycle", decisions: [{ decisionId: "new-decision" }] }), "2026-09-24T00:00:00.000Z");
+    expect(db.prepare("SELECT cycle_id, decision_id FROM journal_decision_lookup").all()).toEqual([{ cycle_id: "new-cycle", decision_id: "new-decision" }]);
+
+    db.prepare("UPDATE journals SET payload = ? WHERE cycle_id = ?").run(JSON.stringify({ cycleId: "new-cycle", decisions: [{ decisionId: "updated-decision" }] }), "new-cycle");
+    expect(db.prepare("SELECT cycle_id, decision_id FROM journal_decision_lookup").all()).toEqual([{ cycle_id: "new-cycle", decision_id: "updated-decision" }]);
+
+    db.prepare("DELETE FROM journals WHERE cycle_id = ?").run("new-cycle");
+    expect(db.prepare("SELECT cycle_id, decision_id FROM journal_decision_lookup").all()).toEqual([]);
+    expect(db.prepare("SELECT version FROM journal_decision_lookup_schema_version WHERE schema_key = 'journal_decision_lookup'").get()).toEqual({ version: 2 });
     db.close();
   });
 
@@ -110,13 +133,69 @@ describe("journal decision lookup without global backfill", () => {
     db.close();
   });
 
-  it("does not search older unindexed journals outside the 25-row fallback window", () => {
-    const rows = [historicalJournal("outside-window", "too-old-decision", "2026-09-01T00:00:00.000Z"), ...Array.from({ length: 25 }, (_, index) => historicalJournal(`recent-${index}`, `recent-decision-${index}`, new Date(Date.UTC(2026, 8, 2) + index * 60_000).toISOString()))];
+  it("resolves an executed decision outside the recent window through its exact idempotency cycle", () => {
+    const rows = [historicalJournal("executed-cycle", "executed-decision", "2020-01-01T00:00:00.000Z"), ...Array.from({ length: 30 }, (_, index) => historicalJournal(`newer-${index}`, `newer-decision-${index}`, new Date(Date.UTC(2026, 8, 1) + index * 60_000).toISOString()))];
+    const db = createDatabase(rows);
+    const queries: string[] = [];
+    const executor = sqliteExecutor(db, queries);
+    ensureStorage(executor);
+    const idempotencyPlan = db.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT cycle_id FROM idempotency WHERE decision_id IN (SELECT value FROM json_each(?))").all(JSON.stringify(["executed-decision"])) as Array<{ detail: string }>;
+    expect(idempotencyPlan.some((row) => row.detail.includes("SEARCH idempotency USING INDEX idempotency_decision_idx") && row.detail.includes("decision_id=?"))).toBe(true);
+    db.prepare("INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES (?, ?, ?, ?, ?)").run("client-executed", "executed-cycle", "executed-decision", "provider-executed", "2020-01-01T00:00:00.000Z");
+
+    const result = loadJournalsForDecisionIds(executor, ["executed-decision"]);
+
+    expect(result.map((journal) => journal.cycleId)).toEqual(["executed-cycle"]);
+    const exactIdsQuery = queries.find((query) => query.includes("FROM idempotency") && query.includes("decision_id"));
+    expect(exactIdsQuery).toContain("WHERE decision_id");
+    expect(exactIdsQuery).not.toContain("json_tree");
+    const exactJournalQuery = queries.find((query) => query.includes("FROM journals AS journal") && query.includes("cycle_id IN"));
+    expect(exactJournalQuery).toContain("cycle_id IN (SELECT value FROM json_each(?))");
+    expect(exactIdsQuery).not.toContain("json_tree");
+    expect(exactJournalQuery).not.toContain("json_tree");
+    expect(queries.some((query) => query.includes("WITH recent_journals AS MATERIALIZED"))).toBe(false);
+    db.close();
+  });
+
+  it("does not fall back to a recent unrelated journal when an idempotency row identifies an unverifiable execution", () => {
+    const rows = [historicalJournal("executed-cycle", "different-decision", "2020-01-01T00:00:00.000Z"), historicalJournal("recent-cycle", "executed-decision", "2026-09-24T00:00:00.000Z")];
+    const db = createDatabase(rows);
+    const queries: string[] = [];
+    const executor = sqliteExecutor(db, queries);
+    ensureStorage(executor);
+    const insertIdempotency = db.prepare("INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES (?, ?, ?, ?, ?)");
+    for (let index = 0; index < 200; index += 1) {
+      insertIdempotency.run(`client-idempotent-${index}`, `executed-cycle-${String(index).padStart(3, "0")}`, "other-executed-decision", `provider-idempotent-${index}`, "2020-01-01T00:00:00.000Z");
+    }
+    insertIdempotency.run("client-target", "zzzz-target-cycle", "executed-decision", "provider-target", "2020-01-01T00:00:00.000Z");
+
+    expect(loadJournalsForDecisionIds(executor, ["other-executed-decision", "executed-decision"])).toEqual([]);
+    expect(queries.some((query) => query.includes("WITH recent_journals AS MATERIALIZED"))).toBe(false);
+    db.close();
+  });
+
+  it("loads only the exact cycle journal and validates that the requested decision is present", () => {
+    const db = createDatabase([historicalJournal("old-executed-cycle", "old-executed-decision", "2020-01-01T00:00:00.000Z"), ...Array.from({ length: 35 }, (_, index) => historicalJournal(`newer-${index}`, `other-${index}`, new Date(Date.UTC(2026, 8, 1) + index * 60_000).toISOString()))]);
+    const queries: string[] = [];
+    const executor = sqliteExecutor(db, queries);
+    ensureStorage(executor);
+
+    expect(loadJournalForExactDecisionCycle(executor, "old-executed-cycle", "old-executed-decision")?.cycleId).toBe("old-executed-cycle");
+    expect(loadJournalForExactDecisionCycle(executor, "old-executed-cycle", "wrong-decision")).toBeNull();
+    const exactQuery = queries.filter((query) => /^\s*SELECT cycle_id, payload FROM journals/i.test(query)).at(-1);
+    expect(exactQuery).toContain("WHERE cycle_id = ?");
+    expect(exactQuery).not.toContain("ORDER BY created_at");
+    expect(exactQuery).not.toContain("json_tree");
+    db.close();
+  });
+
+  it("does not search older non-idempotent journals outside the 25-row fallback window", () => {
+    const rows = [historicalJournal("outside-window", "too-old-non-idempotent", "2026-09-01T00:00:00.000Z"), ...Array.from({ length: 25 }, (_, index) => historicalJournal(`recent-${index}`, `recent-decision-${index}`, new Date(Date.UTC(2026, 8, 2) + index * 60_000).toISOString()))];
     const db = createDatabase(rows);
     const executor = sqliteExecutor(db);
     ensureStorage(executor);
 
-    expect(loadJournalsForDecisionIds(executor, ["too-old-decision"])).toEqual([]);
+    expect(loadJournalsForDecisionIds(executor, ["too-old-non-idempotent"])).toEqual([]);
     db.close();
   });
 

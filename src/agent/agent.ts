@@ -13,7 +13,6 @@ import { retrieveLessons } from "../learning/lesson-retrieval.js";
 import { reflect, reflectWithQwen } from "../learning/reflection.js";
 import { backtestFailureMetadata, createBacktestLesson, runCooldownBacktestSafely } from "../learning/backtest.js";
 import { ensureStorage, type SqlExecutor } from "../storage/schema.js";
-import { initializeJournalLookupMigrationState, isCurrentJournalLookupMigrationSchedule, journalLookupMigrationSchedulePayload, loadJournalLookupMigrationState, markJournalLookupMigrationFailed, runJournalLookupMigrationBatch, JOURNAL_LOOKUP_MIGRATION_INTERVAL_MS, type JournalLookupMigrationSchedulePayload } from "../storage/journal-lookup-migration.js";
 import {
   loadLatestBacktest,
   loadLatestJournal,
@@ -28,6 +27,7 @@ import {
   loadRecentLessons,
   loadOpenExperiences,
   loadJournalsForDecisionIds,
+  loadJournalForExactDecisionCycle,
   loadUsableLessons,
   loadPerformanceAggregate,
   savePerformanceAggregate,
@@ -669,7 +669,6 @@ export class TraderAgent extends Agent<Env, AgentState> {
 
   public override async onStart(): Promise<void> {
     ensureStorage(this);
-    initializeJournalLookupMigrationState(this);
     const userStorageVersion = this.state.userStorageVersion ?? 0;
     const needsLatestValidPlanMigration = userStorageVersion < LATEST_VALID_PLAN_MIGRATION_VERSION;
     if (userStorageVersion < USER_STORAGE_VERSION) {
@@ -684,7 +683,6 @@ export class TraderAgent extends Agent<Env, AgentState> {
       });
     }
     this.ensureReadModels(needsLatestValidPlanMigration);
-    await this.scheduleJournalLookupMigrationIfNeeded();
     const policy = this.ensureActivePolicy();
     const config = loadConfig(this.env, policy);
     const activeCycle = this.state.lastStatus === "RUNNING";
@@ -695,34 +693,6 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (!healthy) this.recordEventBestEffort("PROVIDER_SYNC_SCHEDULE_UNHEALTHY", "CONTROL", { intervalSeconds: String(PROVIDER_LEDGER_INTERVAL_SECONDS) });
     } catch {
       this.recordEventBestEffort("PROVIDER_SYNC_SCHEDULE_UNHEALTHY", "CONTROL", { intervalSeconds: String(PROVIDER_LEDGER_INTERVAL_SECONDS), code: "SCHEDULE_RECONCILIATION_FAILED" });
-    }
-  }
-
-  private async scheduleJournalLookupMigrationIfNeeded(): Promise<void> {
-    const migration = loadJournalLookupMigrationState(this);
-    if (migration.status !== "PENDING" && migration.status !== "RUNNING") return;
-    try {
-      await this.schedule(new Date(Date.now() + JOURNAL_LOOKUP_MIGRATION_INTERVAL_MS), "runJournalLookupMigrationBatch", journalLookupMigrationSchedulePayload(migration), { idempotent: true });
-    } catch {
-      this.recordEventBestEffort("JOURNAL_LOOKUP_MIGRATION_SCHEDULE_FAILED", "CONTROL", { status: migration.status });
-    }
-  }
-
-  public async runJournalLookupMigrationBatch(payload?: JournalLookupMigrationSchedulePayload): Promise<void> {
-    ensureStorage(this);
-    initializeJournalLookupMigrationState(this);
-    const current = loadJournalLookupMigrationState(this);
-    if (payload && !isCurrentJournalLookupMigrationSchedule(payload, current)) return;
-    let migration;
-    try {
-      migration = runJournalLookupMigrationBatch(this, (callback) => this.ctx.storage.transactionSync(callback));
-    } catch (error) {
-      migration = markJournalLookupMigrationFailed(this, error);
-    }
-    if (migration.status === "RUNNING") {
-      await this.schedule(new Date(Date.now() + JOURNAL_LOOKUP_MIGRATION_INTERVAL_MS), "runJournalLookupMigrationBatch", journalLookupMigrationSchedulePayload(migration), { idempotent: true });
-    } else if (migration.status === "COMPLETE") {
-      this.ensureReadModels();
     }
   }
 
@@ -982,12 +952,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const initializedAt = new Date().toISOString();
     const performance = loadPerformanceAggregate<PerformanceAggregate>(this);
     const positionContextBootstrapped = loadPositionContextBootstrap(this);
-    const lookupComplete = loadJournalLookupMigrationState(this).status === "COMPLETE";
     if (migrateLatestValidPlan && !loadLatestValidCyclePlan(this)) {
       const historicalLatestPlan = loadLatestCompletedCyclePlanFromHistory(this);
       if (historicalLatestPlan) saveLatestValidCyclePlan(this, historicalLatestPlan);
     }
-    const needsPositionContextBootstrap = lookupComplete && positionContextBootstrapped?.version !== POSITION_CONTEXT_READ_MODEL_VERSION;
+    const needsPositionContextBootstrap = positionContextBootstrapped?.version !== POSITION_CONTEXT_READ_MODEL_VERSION;
     if (isPerformanceAggregate(performance) && !needsPositionContextBootstrap) return;
     if (!isPerformanceAggregate(performance)) savePerformanceAggregate(this, migratePerformanceEquityObservations(performance, initializedAt), initializedAt);
     if (needsPositionContextBootstrap) {
@@ -1142,9 +1111,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
 
   public async reconcileLateExecution(originalCycleId: string, decisionId: string): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string }> {
     if (!this.state.paused) throw new Error("AGENT_MUST_BE_PAUSED");
-    const lookupMigration = loadJournalLookupMigrationState(this);
-    if (lookupMigration.status !== "COMPLETE") throw new Error(lookupMigration.status === "FAILED" ? "JOURNAL_LOOKUP_MIGRATION_FAILED" : "JOURNAL_LOOKUP_MIGRATION_IN_PROGRESS");
-    const journal = loadJournalsForDecisionIds(this, [decisionId], 2).find((candidate) => candidate.cycleId === originalCycleId);
+    const journal = loadJournalForExactDecisionCycle(this, originalCycleId, decisionId);
     if (!journal) throw new Error("LATE_RECONCILIATION_CYCLE_NOT_FOUND");
     const record = normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === decisionId);
     if (!record || !isReadbackOnlyExecutionMismatch(record) || !record.executionResult) throw new Error("LATE_RECONCILIATION_RECORD_NOT_ELIGIBLE");
@@ -1361,7 +1328,6 @@ export class TraderAgent extends Agent<Env, AgentState> {
       },
       portfolio: livePortfolio ?? null,
       portfolioFreshness: livePortfolio ? { source: "PROVIDER_LIVE", observedAt: livePortfolio.observedAt, stale: false } : { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" },
-      journalDecisionLookupMigration: loadJournalLookupMigrationState(this),
       performance,
       accountPerformance,
       performanceAccounting: accounting,
@@ -1426,7 +1392,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const storedCycles = loadRecentStoredCycles(this, limit);
     const events = loadRecentEvents(this, limit);
     const cycles = journals.map((entry) => cycleReadModelWithStatus(entry, storedCycles, events));
-    return json({ journals, cycles, latestValidCyclePlan: loadLatestValidCyclePlan(this), decisions: journals.flatMap((entry) => cyclePlanDecisions(entry)), limit, journalDecisionLookupMigration: loadJournalLookupMigrationState(this) });
+    return json({ journals, cycles, latestValidCyclePlan: loadLatestValidCyclePlan(this), decisions: journals.flatMap((entry) => cyclePlanDecisions(entry)), limit });
   }
 
   private getPositionContext(url: URL): Response {
@@ -1434,12 +1400,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const symbol = url.searchParams.get("symbol")?.trim() ?? "";
     const positionSide = url.searchParams.get("positionSide");
     if (!/^[A-Z0-9_-]{1,40}$/.test(symbol) || (positionSide !== "LONG" && positionSide !== "SHORT")) return json({ error: "INVALID_POSITION_CONTEXT_KEY" }, 400);
-    return json({ source: "DARWIN_PERSISTED", context: loadPositionContext(this, symbol, positionSide), journalDecisionLookupMigration: loadJournalLookupMigrationState(this) });
+    return json({ source: "DARWIN_PERSISTED", context: loadPositionContext(this, symbol, positionSide) });
   }
 
   private async getTradeHistory(url: URL): Promise<Response> {
     ensureStorage(this);
-    const journalDecisionLookupMigration = loadJournalLookupMigrationState(this);
     const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
     const recentExperiences = loadExperiences(this, limit);
     const histories = loadProviderPositionHistories(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, limit);
@@ -1541,14 +1506,14 @@ export class TraderAgent extends Agent<Env, AgentState> {
       };
     });
     const trades = [...localTrades, ...providerOnlyTrades, ...providerOnlyLiveTrades].sort((left, right) => right.timestamp.localeCompare(left.timestamp)).slice(0, limit);
-    return json({ trades, financialSource: "PROVIDER_LEDGER_OR_LIVE", limit, journalDecisionLookupMigration, journalReasoningCoverage: journalDecisionLookupMigration.status === "COMPLETE" ? "COMPLETE" : "PARTIAL" });
+    return json({ trades, financialSource: "PROVIDER_LEDGER_OR_LIVE", limit });
   }
 
   private getLearning(url: URL): Response {
     ensureStorage(this);
     const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
     const journal = loadLatestJournal(this);
-    return json({ learning: { reflection: journal?.reflection ?? null, lessons: loadRecentLessons(this, limit), lessonsUsed: cyclePlanDecisions(journal).flatMap((decision) => decision.lessonsUsed), backtest: loadLatestBacktest(this), recentExperiences: loadExperiences(this, limit) }, limit, journalDecisionLookupMigration: loadJournalLookupMigrationState(this) });
+    return json({ learning: { reflection: journal?.reflection ?? null, lessons: loadRecentLessons(this, limit), lessonsUsed: cyclePlanDecisions(journal).flatMap((decision) => decision.lessonsUsed), backtest: loadLatestBacktest(this), recentExperiences: loadExperiences(this, limit) }, limit });
   }
 
   private getPolicyRead(): Response {
