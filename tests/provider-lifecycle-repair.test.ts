@@ -430,6 +430,13 @@ describe("provider-first financial lifecycle resolution", () => {
         entryIdentityFound: true,
         entryIdentitySource: "IDEMPOTENCY",
         entryIdentityLookupCount: 1,
+        entryIdentityCandidateLookupCount: null,
+        entryIdentityCandidateProviderOrderIdPresent: null,
+        entryIdentityCandidateSymbolMatch: null,
+        entryIdentityCandidatePositionSideMatch: null,
+        entryIdentityCandidateTradeSideOpen: null,
+        entryIdentityCandidateDarwinOrigin: null,
+        entryIdentityCandidateOpeningTimeMatch: null,
         idempotencyClientOidPresent: true,
         idempotencyClientOidMatchesDeterministic: false,
         idempotencyProviderOrderIdPresent: true,
@@ -507,7 +514,7 @@ describe("provider-first financial lifecycle resolution", () => {
         closingFillQuantity: "7.51",
       },
     });
-    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(true);
+    expect(queries.slice(queryOffset).some((query) => /FROM provider_orders\s+WHERE category = \?\s+AND client_oid = \?\s+LIMIT 2/i.test(query))).toBe(true);
     expect(queries.slice(queryOffset).filter((query) => /^(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)\b/i.test(query.trim()))).toEqual([]);
     expect(loadAllEvents(executor)).toHaveLength(0);
     expect(loadAllExperiences(executor)[0]?.outcomeStatus).toBe("OPEN");
@@ -546,6 +553,13 @@ describe("provider-first financial lifecycle resolution", () => {
         entryIdentityFound: true,
         entryIdentitySource: "IDEMPOTENCY_CLIENT_OID",
         entryIdentityLookupCount: 1,
+        entryIdentityCandidateLookupCount: 1,
+        entryIdentityCandidateProviderOrderIdPresent: true,
+        entryIdentityCandidateSymbolMatch: true,
+        entryIdentityCandidatePositionSideMatch: true,
+        entryIdentityCandidateTradeSideOpen: true,
+        entryIdentityCandidateDarwinOrigin: true,
+        entryIdentityCandidateOpeningTimeMatch: true,
         idempotencyClientOidPresent: true,
         idempotencyClientOidMatchesDeterministic: false,
         idempotencyProviderOrderIdPresent: false,
@@ -557,11 +571,45 @@ describe("provider-first financial lifecycle resolution", () => {
         closingFillQuantity: "7.51",
       },
     });
-    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(true);
+    expect(queries.slice(queryOffset).some((query) => /FROM provider_orders\s+WHERE category = \?\s+AND client_oid = \?\s+LIMIT 2/i.test(query))).toBe(true);
     expect(queries.slice(queryOffset).filter((query) => /^(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)\b/i.test(query.trim()))).toEqual([]);
     expect(loadAllEvents(executor)).toHaveLength(0);
     expect(loadAllExperiences(executor)[0]?.outcomeStatus).toBe("OPEN");
     expect(loadPositionContext(executor, "SAMSUNGUSDT", "LONG")?.lifecycleStatus).toBeUndefined();
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    db.close();
+  });
+
+  it("reports an unattributed exact client-OID candidate without accepting it", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    const context = positionContext();
+    savePositionContext(executor, { ...context, entryReasoning: { ...context.entryReasoning!, cycleId: "1dbada47-eb96-4c65-a865-99bd033588c9" } });
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET provider_order_id = NULL WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`UPDATE provider_orders SET origin = 'UNATTRIBUTED' WHERE provider_order_id = 'provider-entry-order'`;
+    const queryOffset = queries.length;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { classification?: string; reason?: string; evidence?: Record<string, unknown> };
+
+    expect(body).toMatchObject({
+      classification: "UNRESOLVED",
+      reason: "ENTRY_DECISION_IDENTITY_UNPROVEN",
+      evidence: {
+        entryIdentityFound: false,
+        entryIdentityCandidateLookupCount: 1,
+        entryIdentityCandidateProviderOrderIdPresent: true,
+        entryIdentityCandidateSymbolMatch: true,
+        entryIdentityCandidatePositionSideMatch: true,
+        entryIdentityCandidateTradeSideOpen: true,
+        entryIdentityCandidateDarwinOrigin: false,
+        entryIdentityCandidateOpeningTimeMatch: true,
+      },
+    });
+    expect(queries.slice(queryOffset).filter((query) => /^(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)\b/i.test(query.trim()))).toEqual([]);
+    expect(loadAllEvents(executor)).toHaveLength(0);
     expect(executePaperOrder).not.toHaveBeenCalled();
     db.close();
   });
@@ -591,7 +639,7 @@ describe("provider-first financial lifecycle resolution", () => {
         idempotencyProviderOrderIdExact: false,
       },
     });
-    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(false);
+    expect(queries.slice(queryOffset).some((query) => /FROM provider_orders\s+WHERE category = \?\s+AND client_oid = \?\s+LIMIT 2/i.test(query))).toBe(false);
     expect(executePaperOrder).not.toHaveBeenCalled();
     expect(loadAllEvents(executor)).toHaveLength(0);
     db.close();
@@ -622,7 +670,7 @@ describe("provider-first financial lifecycle resolution", () => {
         idempotencyProviderOrderIdExact: true,
       },
     });
-    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(false);
+    expect(queries.slice(queryOffset).some((query) => /FROM provider_orders\s+WHERE category = \?\s+AND client_oid = \?\s+LIMIT 2/i.test(query))).toBe(false);
     expect(executePaperOrder).not.toHaveBeenCalled();
     expect(loadAllEvents(executor)).toHaveLength(0);
     db.close();
@@ -652,7 +700,7 @@ describe("provider-first financial lifecycle resolution", () => {
         idempotencyProviderOrderIdPresent: false,
       },
     });
-    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(false);
+    expect(queries.slice(queryOffset).some((query) => /FROM provider_orders\s+WHERE category = \?\s+AND client_oid = \?\s+LIMIT 2/i.test(query))).toBe(false);
     expect(executePaperOrder).not.toHaveBeenCalled();
     expect(loadAllEvents(executor)).toHaveLength(0);
     db.close();
@@ -684,7 +732,7 @@ describe("provider-first financial lifecycle resolution", () => {
         idempotencyProviderOrderIdPresent: false,
       },
     });
-    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(true);
+    expect(queries.slice(queryOffset).some((query) => /FROM provider_orders\s+WHERE category = \?\s+AND client_oid = \?\s+LIMIT 2/i.test(query))).toBe(true);
     expect(executePaperOrder).not.toHaveBeenCalled();
     expect(loadAllEvents(executor)).toHaveLength(0);
     db.close();
@@ -711,7 +759,7 @@ describe("provider-first financial lifecycle resolution", () => {
       reason: "ENTRY_DECISION_IDENTITY_UNPROVEN",
       evidence: { entryIdentityFound: false, entryIdentityLookupCount: 0 },
     });
-    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(false);
+    expect(queries.slice(queryOffset).some((query) => /FROM provider_orders\s+WHERE category = \?\s+AND client_oid = \?\s+LIMIT 2/i.test(query))).toBe(false);
     expect(executePaperOrder).not.toHaveBeenCalled();
     expect(loadAllEvents(executor)).toHaveLength(0);
     db.close();
@@ -827,7 +875,7 @@ describe("provider-first financial lifecycle resolution", () => {
       evidence: { historyFound: true, entryIdentityFound: false, entryIdentityLookupCount: 2, entryClientOid: null, entryProviderOrderId: null },
     });
     expect(queries.slice(queryOffset).some((query) => /FROM idempotency WHERE decision_id = \? LIMIT 2/i.test(query))).toBe(true);
-    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(false);
+    expect(queries.slice(queryOffset).some((query) => /FROM provider_orders\s+WHERE category = \?\s+AND client_oid = \?\s+LIMIT 2/i.test(query))).toBe(false);
     expect(loadAllEvents(executor)).toHaveLength(0);
     expect(executePaperOrder).not.toHaveBeenCalled();
     db.close();

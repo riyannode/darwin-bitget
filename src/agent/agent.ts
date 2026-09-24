@@ -1079,6 +1079,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
       idempotencyClientOidMatchesDeterministic: boolean | null;
       idempotencyProviderOrderIdPresent: boolean | null;
       idempotencyProviderOrderIdExact: boolean | null;
+      entryIdentityCandidateLookupCount: number | null;
+      entryIdentityCandidateProviderOrderIdPresent: boolean | null;
+      entryIdentityCandidateSymbolMatch: boolean | null;
+      entryIdentityCandidatePositionSideMatch: boolean | null;
+      entryIdentityCandidateTradeSideOpen: boolean | null;
+      entryIdentityCandidateDarwinOrigin: boolean | null;
+      entryIdentityCandidateOpeningTimeMatch: boolean | null;
       entryDecisionId: string;
       entryClientOid: string | null;
       entryProviderOrderId: string | null;
@@ -1134,6 +1141,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
         idempotencyClientOidMatchesDeterministic: evidence.idempotencyClientOidMatchesDeterministic ?? null,
         idempotencyProviderOrderIdPresent: evidence.idempotencyProviderOrderIdPresent ?? null,
         idempotencyProviderOrderIdExact: evidence.idempotencyProviderOrderIdExact ?? null,
+        entryIdentityCandidateLookupCount: evidence.entryIdentityCandidateLookupCount ?? null,
+        entryIdentityCandidateProviderOrderIdPresent: evidence.entryIdentityCandidateProviderOrderIdPresent ?? null,
+        entryIdentityCandidateSymbolMatch: evidence.entryIdentityCandidateSymbolMatch ?? null,
+        entryIdentityCandidatePositionSideMatch: evidence.entryIdentityCandidatePositionSideMatch ?? null,
+        entryIdentityCandidateTradeSideOpen: evidence.entryIdentityCandidateTradeSideOpen ?? null,
+        entryIdentityCandidateDarwinOrigin: evidence.entryIdentityCandidateDarwinOrigin ?? null,
+        entryIdentityCandidateOpeningTimeMatch: evidence.entryIdentityCandidateOpeningTimeMatch ?? null,
         entryDecisionId: evidence.entryIdentity?.entryDecisionId ?? experience.entryDecisionId,
         entryClientOid: evidence.entryIdentity?.clientOid ?? null,
         entryProviderOrderId: evidence.entryIdentity?.providerOrderId ?? null,

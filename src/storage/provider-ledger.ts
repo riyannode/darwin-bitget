@@ -480,23 +480,50 @@ export function loadProviderLifecycleEvidence(
     : identities.length === 0 ? canonicalClientOid : null;
   // Use a decision-linked idempotency client ID, or (only when no row exists) the deterministic context ID.
   // Both paths still require one matching DARWIN opening order; duplicate identities and existing mismatched IDs fail closed.
+  const entryIdentityCandidateDiagnostics: Pick<ProviderLifecycleEvidence,
+    | "entryIdentityCandidateLookupCount"
+    | "entryIdentityCandidateProviderOrderIdPresent"
+    | "entryIdentityCandidateSymbolMatch"
+    | "entryIdentityCandidatePositionSideMatch"
+    | "entryIdentityCandidateTradeSideOpen"
+    | "entryIdentityCandidateDarwinOrigin"
+    | "entryIdentityCandidateOpeningTimeMatch"
+  > = {
+    entryIdentityCandidateLookupCount: null,
+    entryIdentityCandidateProviderOrderIdPresent: null,
+    entryIdentityCandidateSymbolMatch: null,
+    entryIdentityCandidatePositionSideMatch: null,
+    entryIdentityCandidateTradeSideOpen: null,
+    entryIdentityCandidateDarwinOrigin: null,
+    entryIdentityCandidateOpeningTimeMatch: null,
+  };
   if (!entryIdentity && row && recoverableClientOid) {
     type CandidateOrder = { provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null; origin: ProviderEvidenceOrigin; created_time: string };
+    // Only zero/one/many matters here; avoid sorting all rows before the ambiguity cap.
     const candidates = executor.sql<CandidateOrder>`
       SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin, created_time
       FROM provider_orders
-      WHERE category = ${category} AND symbol = ${experience.symbol}
-        AND client_oid = ${recoverableClientOid}
-        AND UPPER(pos_side) = ${experience.positionSide ?? ""} AND trade_side = 'open'
-      ORDER BY created_time LIMIT 2
+      WHERE category = ${category} AND client_oid = ${recoverableClientOid}
+      LIMIT 2
     `;
+    entryIdentityCandidateDiagnostics.entryIdentityCandidateLookupCount = Math.min(candidates.length, 2);
     const candidate = candidates.length === 1 ? candidates[0] : null;
     const candidateTime = candidate ? Date.parse(candidate.created_time) : Number.NaN;
     const historyTime = Date.parse(row.opening_time);
+    entryIdentityCandidateDiagnostics.entryIdentityCandidateProviderOrderIdPresent = candidate ? Boolean(candidate.provider_order_id) : null;
+    entryIdentityCandidateDiagnostics.entryIdentityCandidateSymbolMatch = candidate ? candidate.symbol === experience.symbol : null;
+    entryIdentityCandidateDiagnostics.entryIdentityCandidatePositionSideMatch = candidate ? candidate.pos_side?.toUpperCase() === experience.positionSide : null;
+    entryIdentityCandidateDiagnostics.entryIdentityCandidateTradeSideOpen = candidate ? candidate.trade_side === "open" : null;
+    entryIdentityCandidateDiagnostics.entryIdentityCandidateDarwinOrigin = candidate ? candidate.origin === "DARWIN" : null;
+    entryIdentityCandidateDiagnostics.entryIdentityCandidateOpeningTimeMatch = candidate
+      ? Number.isFinite(candidateTime) && Number.isFinite(historyTime) && Math.abs(candidateTime - historyTime) <= 5_000
+      : null;
     if (candidate && candidate.provider_order_id && candidate.client_oid === recoverableClientOid
-      && candidate.symbol === experience.symbol && candidate.pos_side?.toUpperCase() === experience.positionSide
-      && candidate.trade_side?.toLowerCase() === "open" && candidate.origin === "DARWIN"
-      && Number.isFinite(candidateTime) && Number.isFinite(historyTime) && Math.abs(candidateTime - historyTime) <= 5_000) {
+      && entryIdentityCandidateDiagnostics.entryIdentityCandidateSymbolMatch === true
+      && entryIdentityCandidateDiagnostics.entryIdentityCandidatePositionSideMatch === true
+      && entryIdentityCandidateDiagnostics.entryIdentityCandidateTradeSideOpen === true
+      && entryIdentityCandidateDiagnostics.entryIdentityCandidateDarwinOrigin === true
+      && entryIdentityCandidateDiagnostics.entryIdentityCandidateOpeningTimeMatch === true) {
       entryIdentity = { entryDecisionId: experience.entryDecisionId, clientOid: candidate.client_oid, providerOrderId: candidate.provider_order_id };
       entryIdentitySource = identity ? "IDEMPOTENCY_CLIENT_OID" : "DERIVED_DARWIN_CLIENT_OID";
     }
@@ -528,7 +555,7 @@ export function loadProviderLifecycleEvidence(
   const evidenceComplete = orders.length <= MAX_LIFECYCLE_EVIDENCE_ROWS && fills.length <= MAX_LIFECYCLE_EVIDENCE_ROWS;
   const mappedOrders = orders.map((order) => ({ providerOrderId: order.provider_order_id, clientOid: order.client_oid, symbol: order.symbol, positionSide: order.pos_side?.toUpperCase() ?? null, tradeSide: order.trade_side?.toLowerCase() ?? null, origin: order.origin }));
   const mappedFills = fills.map((fill) => ({ providerOrderId: fill.provider_order_id, clientOid: fill.client_oid, symbol: fill.symbol, positionSide: fill.pos_side?.toUpperCase() ?? null, tradeSide: fill.trade_side?.toLowerCase() ?? null, quantity: fill.exec_qty, execPrice: fill.exec_price, createdAt: fill.created_time, origin: fill.origin }));
-  if (!row) return { experience, providerPositions, history: null, entryIdentity, entryIdentitySource, entryIdentityLookupCount: Math.min(identities.length, 2), ...idempotencyIdentityDiagnostics, orders: mappedOrders, fills: mappedFills, evidenceComplete };
+  if (!row) return { experience, providerPositions, history: null, entryIdentity, entryIdentitySource, entryIdentityLookupCount: Math.min(identities.length, 2), ...idempotencyIdentityDiagnostics, ...entryIdentityCandidateDiagnostics, orders: mappedOrders, fills: mappedFills, evidenceComplete };
 
   return {
     experience,
@@ -555,6 +582,7 @@ export function loadProviderLifecycleEvidence(
     entryIdentitySource,
     entryIdentityLookupCount: Math.min(identities.length, 2),
     ...idempotencyIdentityDiagnostics,
+    ...entryIdentityCandidateDiagnostics,
     orders: mappedOrders,
     fills: mappedFills,
     evidenceComplete,
