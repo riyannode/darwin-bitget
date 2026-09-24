@@ -66,7 +66,7 @@ const journal: TradingJournal = { cycleId: "cycle-entry", agentVersion: "test", 
 function insertProviderEvidence(executor: SqlExecutor): void {
   const run = (sql: string, ...values: (string | null)[]) => executor.sql(sql.split("?") as unknown as TemplateStringsArray, ...values);
   run("INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES (?, ?, ?, ?, ?)", "darwin-entry-oid", "cycle-entry", ENTRY_DECISION_ID, "provider-entry-order", OPENED_AT);
-  run("INSERT INTO provider_position_history (provider_position_history_key, provider_position_history_id, category, symbol, position_side, opening_time, closing_time, avg_entry_price, avg_exit_price, open_total_pos, close_total_pos, cum_realised_pnl, net_profit, closing_quantity, open_fee_total, close_fee_total, total_funding, cash_dividend, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "key-1", HISTORY_ID, "USDT-FUTURES", "SAMSUNGUSDT", "LONG", OPENED_AT, CLOSED_AT, "198.02", "202.66", "7.51", "7.51", "34.8487", "33.19485709", "7.51", "-0.89227812", "-0.91318734", "0.15162255", "0", "UNATTRIBUTED", "{}", CLOSED_AT, CLOSED_AT);
+  run("INSERT INTO provider_position_history (provider_position_history_key, provider_position_history_id, category, symbol, position_side, opening_time, closing_time, avg_entry_price, avg_exit_price, open_total_pos, close_total_pos, cum_realised_pnl, net_profit, closing_quantity, open_fee_total, close_fee_total, total_funding, cash_dividend, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", HISTORY_ID, HISTORY_ID, "USDT-FUTURES", "SAMSUNGUSDT", "LONG", OPENED_AT, CLOSED_AT, "198.02", "202.66", "7.51", "7.51", "34.8487", "33.19485709", "7.51", "-0.89227812", "-0.91318734", "0.15162255", "0", "UNATTRIBUTED", "{}", CLOSED_AT, CLOSED_AT);
   const order = (id: string, oid: string, side: string, tradeSide: string, quantity: string, time: string) => run("INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", id, oid, "USDT-FUTURES", "SAMSUNGUSDT", side, "long", tradeSide, quantity, quantity, "filled", time, time, "DARWIN", "{}", time, time);
   const fill = (id: string, oid: string, side: string, tradeSide: string, quantity: string, time: string) => run("INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", `fill-${id}`, id, oid, "USDT-FUTURES", "SAMSUNGUSDT", side, "long", tradeSide, quantity, "198.02", time, "DARWIN", "{}", time, time);
   order("provider-entry-order", "darwin-entry-oid", "buy", "open", "7.51", OPEN_FILL_AT);
@@ -100,6 +100,7 @@ function fakeAgent(executor: SqlExecutor, db: DatabaseSync, paused: boolean) {
     ctx: { storage: { transactionSync: <T>(closure: () => T) => { db.exec("BEGIN IMMEDIATE"); try { const value = closure(); db.exec("COMMIT"); return value; } catch (error) { db.exec("ROLLBACK"); throw error; } } } },
     ensureActivePolicy: () => ({ paperOnly: true, maxSinglePositionMarginPct: "30", maxLeverage: "5", maxDailyDrawdownPct: "10", drawdownCooldownMinutes: 60, scanIntervalMinutes: 5, emergencyStop: false }),
     repairProviderClosedLifecycle: TraderAgent.prototype.repairProviderClosedLifecycle,
+    dryRunProviderClosedLifecycle: TraderAgent.prototype.dryRunProviderClosedLifecycle,
     getTradeHistory: (TraderAgent.prototype as unknown as { getTradeHistory: (url: URL) => Promise<Response> }).getTradeHistory,
     getDashboardSnapshot: TraderAgent.prototype.getDashboardSnapshot,
     getSchedulerDiagnostics: async () => ({ nextScanAt: null, nextScanStale: false, configuredIntervalMinutes: 5, matchingScheduleCount: 0, schedulerHealthy: true }),
@@ -114,13 +115,13 @@ async function invokeRepair(agent: ReturnType<typeof fakeAgent>) {
   return agent.repairProviderClosedLifecycle.call(agent, EXPERIENCE_ID, HISTORY_ID);
 }
 
-async function invokeControl(agent: ReturnType<typeof fakeAgent>, authorized = true) {
+async function invokeControl(agent: ReturnType<typeof fakeAgent>, authorized = true, dryRun?: boolean) {
   const headers = new Headers({ "content-type": "application/json" });
   if (authorized) headers.set("authorization", `Bearer ${OWNER_TOKEN}`);
   return agent.onRequest.call(agent, new Request("https://example.test/control", {
     method: "POST",
     headers,
-    body: JSON.stringify({ action: "REPAIR_PROVIDER_CLOSED_LIFECYCLE", experienceId: EXPERIENCE_ID, providerPositionHistoryId: HISTORY_ID }),
+    body: JSON.stringify({ action: "REPAIR_PROVIDER_CLOSED_LIFECYCLE", experienceId: EXPERIENCE_ID, providerPositionHistoryId: HISTORY_ID, ...(dryRun === undefined ? {} : { dryRun }) }),
   }));
 }
 
@@ -385,6 +386,213 @@ describe("provider-first financial lifecycle resolution", () => {
     db.close();
   });
 
+  it("dry-runs valid provider lifecycle evidence without mutating any persisted state", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    const original = openExperience();
+    const originalContext = positionContext();
+    saveExperience(executor, original, OPENED_AT);
+    saveExperience(executor, { ...original, experienceId: "unrelated-experience", symbol: "OTHERUSDT", entryDecisionId: "unrelated-decision" }, OPENED_AT);
+    savePositionContext(executor, originalContext);
+    saveJournal(executor, journal);
+    insertProviderEvidence(executor);
+    const before = {
+      experiences: loadAllExperiences(executor),
+      context: loadPositionContext(executor, "SAMSUNGUSDT", "LONG"),
+      events: loadAllEvents(executor),
+      journal: db.prepare("SELECT payload FROM journals WHERE cycle_id = ?").get("cycle-entry"),
+      performance: db.prepare("SELECT state_key, payload, updated_at FROM risk_state ORDER BY state_key").all(),
+    };
+    const queryOffset = queries.length;
+    const providerRead = vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const agent = fakeAgent(executor, db, true);
+
+    const response = await invokeControl(agent, true, true);
+    const body = await response.json() as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({
+      dryRun: true,
+      classification: "LOCAL_OPEN_PROVIDER_CLOSED",
+      reason: "PROVIDER_LEDGER_PROVES_FULL_DARWIN_CLOSE",
+      evidence: {
+        historyFound: true,
+        providerPositionHistoryId: HISTORY_ID,
+        historyOrigin: "UNATTRIBUTED",
+        entryIdentityFound: true,
+        entryDecisionId: ENTRY_DECISION_ID,
+        entryClientOid: "darwin-entry-oid",
+        entryProviderOrderId: "provider-entry-order",
+        orderCount: 7,
+        fillCount: 7,
+        evidenceComplete: true,
+        providerCurrentPositionPresent: false,
+        openTotalPos: "7.51",
+        closeTotalPos: "7.51",
+        openingFillQuantity: "7.51",
+        closingFillQuantity: "7.51",
+      },
+    });
+    expect(providerRead).toHaveBeenCalledTimes(1);
+    const diagnosticQueries = queries.slice(queryOffset);
+    expect(diagnosticQueries.some((query) => /FROM experiences\s+WHERE experience_id = \?\s+LIMIT 1/i.test(query))).toBe(true);
+    expect(diagnosticQueries.some((query) => /FROM experiences ORDER BY/i.test(query))).toBe(false);
+    expect(diagnosticQueries.some((query) => /FROM provider_position_history WHERE provider_position_history_key = \? AND category = \? LIMIT 1/i.test(query))).toBe(true);
+    expect(diagnosticQueries.some((query) => /FROM idempotency WHERE decision_id = \? LIMIT 2/i.test(query))).toBe(true);
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    expect(queries.slice(queryOffset).filter((query) => /^(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)\b/i.test(query.trim()))).toEqual([]);
+    expect(loadAllExperiences(executor)).toEqual(before.experiences);
+    expect(loadPositionContext(executor, "SAMSUNGUSDT", "LONG")).toEqual(before.context);
+    expect(loadAllEvents(executor)).toEqual(before.events);
+    expect(db.prepare("SELECT payload FROM journals WHERE cycle_id = ?").get("cycle-entry")).toEqual(before.journal);
+    expect(db.prepare("SELECT state_key, payload, updated_at FROM risk_state ORDER BY state_key").all()).toEqual(before.performance);
+    db.close();
+  });
+
+  it("dry-run returns the exact unresolved classifier reason and still makes no writes", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    savePositionContext(executor, positionContext());
+    insertProviderEvidence(executor);
+    executor.sql`DELETE FROM idempotency WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    const queryOffset = queries.length;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { dryRun?: boolean; classification?: string; reason?: string; evidence?: Record<string, unknown> };
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ dryRun: true, classification: "UNRESOLVED", reason: "ENTRY_DECISION_IDENTITY_UNPROVEN", evidence: { historyFound: true, entryIdentityFound: false, entryDecisionId: ENTRY_DECISION_ID, entryClientOid: null, entryProviderOrderId: null, openingFillQuantity: null, closingFillQuantity: null } });
+    expect(queries.slice(queryOffset).filter((query) => /^(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)\b/i.test(query.trim()))).toEqual([]);
+    expect(loadAllExperiences(executor)[0]?.outcomeStatus).toBe("OPEN");
+    expect(loadPositionContext(executor, "SAMSUNGUSDT", "LONG")?.lifecycleStatus).toBeUndefined();
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    db.close();
+  });
+
+  it("dry-run rejects a missing exact provider history row", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    savePositionContext(executor, positionContext());
+    insertProviderEvidence(executor);
+    executor.sql`DELETE FROM provider_position_history WHERE provider_position_history_key = ${HISTORY_ID}`;
+    const queryOffset = queries.length;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { classification?: string; reason?: string; evidence?: Record<string, unknown> };
+
+    expect(body).toMatchObject({
+      classification: "UNRESOLVED",
+      reason: "PROVIDER_POSITION_HISTORY_OR_ENTRY_IDENTITY_MISSING",
+      evidence: { historyFound: false, providerPositionHistoryId: null, evidenceComplete: true },
+    });
+    expect(queries.slice(queryOffset).some((query) => /FROM provider_position_history WHERE provider_position_history_key = \? AND category = \? LIMIT 1/i.test(query))).toBe(true);
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    db.close();
+  });
+
+  it("fails closed when the exact history key returns a different provider history ID", async () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    savePositionContext(executor, positionContext());
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE provider_position_history SET provider_position_history_id = 'different-history-id' WHERE provider_position_history_key = ${HISTORY_ID}`;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { classification?: string; reason?: string; evidence?: Record<string, unknown> };
+
+    expect(body).toMatchObject({
+      classification: "UNRESOLVED",
+      reason: "PROVIDER_POSITION_HISTORY_OR_ENTRY_IDENTITY_MISSING",
+      evidence: { historyFound: false, providerPositionHistoryId: null, evidenceComplete: false },
+    });
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    db.close();
+  });
+
+  it("fails closed when a decision has duplicate idempotency identities", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    savePositionContext(executor, positionContext());
+    insertProviderEvidence(executor);
+    executor.sql`INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES ('ambiguous-entry-oid', 'cycle-entry', ${ENTRY_DECISION_ID}, 'ambiguous-provider-order', ${OPENED_AT})`;
+    const queryOffset = queries.length;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { classification?: string; reason?: string; evidence?: Record<string, unknown> };
+
+    expect(body).toMatchObject({
+      classification: "UNRESOLVED",
+      reason: "ENTRY_DECISION_IDENTITY_UNPROVEN",
+      evidence: { historyFound: true, entryIdentityFound: false, entryClientOid: null, entryProviderOrderId: null },
+    });
+    expect(queries.slice(queryOffset).some((query) => /FROM idempotency WHERE decision_id = \? LIMIT 2/i.test(query))).toBe(true);
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    db.close();
+  });
+
+  it("fails closed when the sole idempotency identity has no client order ID", async () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    savePositionContext(executor, positionContext());
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET client_order_id = NULL WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { classification?: string; reason?: string; evidence?: Record<string, unknown> };
+
+    expect(body).toMatchObject({
+      classification: "UNRESOLVED",
+      reason: "ENTRY_DECISION_IDENTITY_UNPROVEN",
+      evidence: { historyFound: true, entryIdentityFound: false, entryClientOid: null, entryProviderOrderId: null },
+    });
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    db.close();
+  });
+
+  it("requires owner authentication for dry-run before any provider read", async () => {
+    const { db, executor } = memoryExecutor();
+    const providerRead = vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio");
+    const response = await invokeControl(fakeAgent(executor, db, true), false, true);
+    expect(response.status).toBe(401);
+    expect(providerRead).not.toHaveBeenCalled();
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    db.close();
+  });
+
+  it("rejects dry-run while ONLINE before any provider read or persistence", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    const queryOffset = queries.length;
+    const providerRead = vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio");
+    const response = await invokeControl(fakeAgent(executor, db, false), true, true);
+    const body = await response.json() as { error?: string };
+    expect(response.status).toBe(409);
+    expect(body).toEqual({ error: "AGENT_MUST_BE_PAUSED" });
+    expect(providerRead).not.toHaveBeenCalled();
+    expect(queries.slice(queryOffset).filter((query) => /^(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)\b/i.test(query.trim()))).toEqual([]);
+    db.close();
+  });
+
+  it("returns the safe classifier reason from a failed normal repair", async () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    savePositionContext(executor, positionContext());
+    insertProviderEvidence(executor);
+    executor.sql`DELETE FROM idempotency WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const response = await invokeControl(fakeAgent(executor, db, true));
+    const body = await response.json() as { error?: string; reason?: string };
+    expect(response.status).toBe(409);
+    expect(body).toEqual({ error: "PROVIDER_LIFECYCLE_UNRESOLVED", reason: "ENTRY_DECISION_IDENTITY_UNPROVEN" });
+    expect(loadAllExperiences(executor)[0]?.outcomeStatus).toBe("OPEN");
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    db.close();
+  });
+
   it("requires owner authentication on the control action", async () => {
     const { db, executor } = memoryExecutor();
     const agent = fakeAgent(executor, db, true);
@@ -479,8 +687,8 @@ describe("provider-first financial lifecycle resolution", () => {
     db.close();
   });
 
-  it("repairs from real SQLite provider evidence, preserves the journal, writes one audit, and is a write-free retry", async () => {
-    const { db, executor } = memoryExecutor();
+  it("repairs from the exact Samsung-shaped provider history row, preserves the journal, writes one audit, and is a write-free retry", async () => {
+    const { db, executor, queries } = memoryExecutor();
     const original = openExperience();
     const oldContext = positionContext();
     saveExperience(executor, original, OPENED_AT);
@@ -490,9 +698,13 @@ describe("provider-first financial lifecycle resolution", () => {
     const journalBytesBefore = db.prepare("SELECT payload FROM journals WHERE cycle_id = ?").get("cycle-entry") as { payload: string };
     const providerRead = vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
     const agent = fakeAgent(executor, db, true);
+    const queryOffset = queries.length;
 
     const response = await invokeControl(agent);
     const firstBody = await response.json() as { reconciliation: { status: string } };
+    const repairQueries = queries.slice(queryOffset);
+    expect(repairQueries.some((query) => /FROM experiences\s+WHERE experience_id = \?\s+LIMIT 1/i.test(query))).toBe(true);
+    expect(repairQueries.some((query) => /FROM experiences ORDER BY/i.test(query))).toBe(false);
     const first = firstBody.reconciliation;
     const repaired = loadAllExperiences(executor)[0]!;
     const context = loadPositionContext(executor, "SAMSUNGUSDT", "LONG")!;
@@ -550,8 +762,12 @@ describe("provider-first financial lifecycle resolution", () => {
 
     const writesBeforeRetry = db.prepare("SELECT (SELECT COUNT(*) FROM events) + (SELECT COUNT(*) FROM experiences) + (SELECT COUNT(*) FROM position_context) AS count").get() as { count: number };
     providerRead.mockClear();
-    const secondResponse = await invokeControl(agent);
+    const retryQueryOffset = queries.length;
+    const secondResponse = await invokeControl(agent, true, false);
     const secondBody = await secondResponse.json() as { reconciliation: { status: string } };
+    const retryQueries = queries.slice(retryQueryOffset);
+    expect(retryQueries.some((query) => /FROM events\s+WHERE event_id = \?\s+LIMIT 1/i.test(query))).toBe(true);
+    expect(retryQueries.some((query) => /FROM events ORDER BY/i.test(query))).toBe(false);
     const second = secondBody.reconciliation;
     const writesAfterRetry = db.prepare("SELECT (SELECT COUNT(*) FROM events) + (SELECT COUNT(*) FROM experiences) + (SELECT COUNT(*) FROM position_context) AS count").get() as { count: number };
     expect(second.status).toBe("ALREADY_RECONCILED");

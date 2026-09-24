@@ -448,14 +448,18 @@ export function loadProviderLifecycleEvidence(
     avg_entry_price: string | null; avg_exit_price: string | null; cum_realised_pnl: string | null; net_profit: string | null;
     open_fee_total: string | null; close_fee_total: string | null; total_funding: string | null; cash_dividend: string | null;
     opening_time: string; closing_time: string; origin: ProviderEvidenceOrigin;
-  }>`SELECT provider_position_history_id, symbol, position_side, open_total_pos, close_total_pos, avg_entry_price, avg_exit_price, cum_realised_pnl, net_profit, open_fee_total, close_fee_total, total_funding, cash_dividend, opening_time, closing_time, origin FROM provider_position_history WHERE category = ${category} AND provider_position_history_id = ${providerPositionHistoryId}`;
+  }>`SELECT provider_position_history_id, symbol, position_side, open_total_pos, close_total_pos, avg_entry_price, avg_exit_price, cum_realised_pnl, net_profit, open_fee_total, close_fee_total, total_funding, cash_dividend, opening_time, closing_time, origin FROM provider_position_history WHERE provider_position_history_key = ${providerPositionHistoryId} AND category = ${category} LIMIT 1`;
   const row = historyRows[0];
-  if (historyRows.length > 1) return { experience, providerPositions, history: null, entryIdentity: null, orders: [], fills: [], evidenceComplete: false };
+  if (row && row.provider_position_history_id !== providerPositionHistoryId) {
+    return { experience, providerPositions, history: null, entryIdentity: null, orders: [], fills: [], evidenceComplete: false };
+  }
 
-  const identities = executor.sql<{ client_order_id: string; provider_order_id: string | null }>`SELECT client_order_id, provider_order_id FROM idempotency WHERE decision_id = ${experience.entryDecisionId} ORDER BY created_at, client_order_id`;
-  const identityPairs = [...new Set(identities.filter((identity) => identity.provider_order_id).map((identity) => JSON.stringify([identity.client_order_id, identity.provider_order_id])))];
-  const entryIdentity = identityPairs.length === 1 && identities.length === 1 && identities[0]?.provider_order_id
-    ? { entryDecisionId: experience.entryDecisionId, clientOid: identities[0].client_order_id, providerOrderId: identities[0].provider_order_id }
+  const identities = executor.sql<{ client_order_id: string | null; provider_order_id: string | null }>`SELECT client_order_id, provider_order_id FROM idempotency WHERE decision_id = ${experience.entryDecisionId} LIMIT 2`;
+  const identity = identities.length === 1 ? identities[0] : null;
+  const clientOid = typeof identity?.client_order_id === "string" ? identity.client_order_id.trim() : "";
+  const providerOrderId = typeof identity?.provider_order_id === "string" ? identity.provider_order_id.trim() : "";
+  const entryIdentity = clientOid && providerOrderId
+    ? { entryDecisionId: experience.entryDecisionId, clientOid, providerOrderId }
     : null;
   const matchingPosition = providerPositions.find((position) => position.symbol === experience.symbol && position.positionSide === experience.positionSide);
   const livePositionStartAt = matchingPosition?.openedAt && Number.isFinite(Date.parse(matchingPosition.openedAt))
