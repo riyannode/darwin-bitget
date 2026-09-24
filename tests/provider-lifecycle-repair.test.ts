@@ -430,6 +430,10 @@ describe("provider-first financial lifecycle resolution", () => {
         entryIdentityFound: true,
         entryIdentitySource: "IDEMPOTENCY",
         entryIdentityLookupCount: 1,
+        idempotencyClientOidPresent: true,
+        idempotencyClientOidMatchesDeterministic: false,
+        idempotencyProviderOrderIdPresent: true,
+        idempotencyProviderOrderIdExact: true,
         entryDecisionId: ENTRY_DECISION_ID,
         entryClientOid: "darwin-entry-oid",
         entryProviderOrderId: "provider-entry-order",
@@ -512,6 +516,180 @@ describe("provider-first financial lifecycle resolution", () => {
     db.close();
   });
 
+  it("recovers a missing provider order ID from one exact decision-linked idempotency client ID", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    const expectedClientOid = "darwin-entry-oid";
+    saveExperience(executor, openExperience(), OPENED_AT);
+    const context = positionContext();
+    savePositionContext(executor, { ...context, entryReasoning: { ...context.entryReasoning!, cycleId: "1dbada47-eb96-4c65-a865-99bd033588c9" } });
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET provider_order_id = NULL WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    const queryOffset = queries.length;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { classification?: string; reason?: string; evidence?: Record<string, unknown> };
+
+    expect(body).toMatchObject({
+      classification: "LOCAL_OPEN_PROVIDER_CLOSED",
+      reason: "PROVIDER_LEDGER_PROVES_FULL_DARWIN_CLOSE",
+      evidence: {
+        historyFound: true,
+        providerPositionHistoryId: HISTORY_ID,
+        avgEntryPrice: "198.02",
+        avgExitPrice: "202.66",
+        cumRealisedPnl: "34.8487",
+        netProfit: "33.19485709",
+        openFeeTotal: "-0.89227812",
+        closeFeeTotal: "-0.91318734",
+        totalFunding: "0.15162255",
+        entryIdentityFound: true,
+        entryIdentitySource: "IDEMPOTENCY_CLIENT_OID",
+        entryIdentityLookupCount: 1,
+        idempotencyClientOidPresent: true,
+        idempotencyClientOidMatchesDeterministic: false,
+        idempotencyProviderOrderIdPresent: false,
+        entryClientOid: expectedClientOid,
+        entryProviderOrderId: "provider-entry-order",
+        openTotalPos: "7.51",
+        closeTotalPos: "7.51",
+        openingFillQuantity: "7.51",
+        closingFillQuantity: "7.51",
+      },
+    });
+    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(true);
+    expect(queries.slice(queryOffset).filter((query) => /^(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)\b/i.test(query.trim()))).toEqual([]);
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    expect(loadAllExperiences(executor)[0]?.outcomeStatus).toBe("OPEN");
+    expect(loadPositionContext(executor, "SAMSUNGUSDT", "LONG")?.lifecycleStatus).toBeUndefined();
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    db.close();
+  });
+
+  it("fails closed on whitespace-padded singleton idempotency provider IDs", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    const context = positionContext();
+    savePositionContext(executor, { ...context, entryReasoning: { ...context.entryReasoning!, cycleId: "1dbada47-eb96-4c65-a865-99bd033588c9" } });
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET provider_order_id = ' provider-entry-order ' WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    const queryOffset = queries.length;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { classification?: string; reason?: string; evidence?: Record<string, unknown> };
+
+    expect(body).toMatchObject({
+      classification: "UNRESOLVED",
+      reason: "ENTRY_DECISION_IDENTITY_UNPROVEN",
+      evidence: {
+        entryIdentityFound: false,
+        entryIdentityLookupCount: 1,
+        idempotencyClientOidPresent: true,
+        idempotencyClientOidMatchesDeterministic: false,
+        idempotencyProviderOrderIdPresent: true,
+        idempotencyProviderOrderIdExact: false,
+      },
+    });
+    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(false);
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    db.close();
+  });
+
+  it("fails closed on whitespace-padded singleton idempotency client IDs with a provider order ID", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    const context = positionContext();
+    savePositionContext(executor, { ...context, entryReasoning: { ...context.entryReasoning!, cycleId: "1dbada47-eb96-4c65-a865-99bd033588c9" } });
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET client_order_id = ' darwin-entry-oid ' WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    const queryOffset = queries.length;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { classification?: string; reason?: string; evidence?: Record<string, unknown> };
+
+    expect(body).toMatchObject({
+      classification: "UNRESOLVED",
+      reason: "ENTRY_DECISION_IDENTITY_UNPROVEN",
+      evidence: {
+        entryIdentityFound: false,
+        entryIdentityLookupCount: 1,
+        idempotencyClientOidPresent: true,
+        idempotencyClientOidMatchesDeterministic: false,
+        idempotencyProviderOrderIdPresent: true,
+        idempotencyProviderOrderIdExact: true,
+      },
+    });
+    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(false);
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    db.close();
+  });
+
+  it("fails closed on whitespace-padded singleton idempotency client IDs", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    const context = positionContext();
+    savePositionContext(executor, { ...context, entryReasoning: { ...context.entryReasoning!, cycleId: "1dbada47-eb96-4c65-a865-99bd033588c9" } });
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET client_order_id = ' darwin-entry-oid ', provider_order_id = NULL WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    const queryOffset = queries.length;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { classification?: string; reason?: string; evidence?: Record<string, unknown> };
+
+    expect(body).toMatchObject({
+      classification: "UNRESOLVED",
+      reason: "ENTRY_DECISION_IDENTITY_UNPROVEN",
+      evidence: {
+        entryIdentityFound: false,
+        entryIdentityLookupCount: 1,
+        idempotencyClientOidPresent: true,
+        idempotencyClientOidMatchesDeterministic: false,
+        idempotencyProviderOrderIdPresent: false,
+      },
+    });
+    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(false);
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    db.close();
+  });
+
+  it("fails closed when the singleton idempotency client ID has no matching Darwin opening order", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    const context = positionContext();
+    savePositionContext(executor, { ...context, entryReasoning: { ...context.entryReasoning!, cycleId: "1dbada47-eb96-4c65-a865-99bd033588c9" } });
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET provider_order_id = NULL WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`UPDATE provider_orders SET client_oid = 'unlinked-entry-oid' WHERE provider_order_id = 'provider-entry-order'`;
+    executor.sql`UPDATE provider_fills SET client_oid = 'unlinked-entry-oid' WHERE provider_order_id = 'provider-entry-order'`;
+    const queryOffset = queries.length;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { classification?: string; reason?: string; evidence?: Record<string, unknown> };
+
+    expect(body).toMatchObject({
+      classification: "UNRESOLVED",
+      reason: "ENTRY_DECISION_IDENTITY_UNPROVEN",
+      evidence: {
+        entryIdentityFound: false,
+        entryIdentityLookupCount: 1,
+        idempotencyClientOidPresent: true,
+        idempotencyClientOidMatchesDeterministic: false,
+        idempotencyProviderOrderIdPresent: false,
+      },
+    });
+    expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(true);
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    expect(loadAllEvents(executor)).toHaveLength(0);
+    db.close();
+  });
+
   it("fails closed when persisted entry reasoning does not match the Samsung position side", async () => {
     const { db, executor, queries } = memoryExecutor();
     const expectedClientOid = "paper-1dbada47eb964c65-87a5c9bce";
@@ -531,7 +709,7 @@ describe("provider-first financial lifecycle resolution", () => {
     expect(body).toMatchObject({
       classification: "UNRESOLVED",
       reason: "ENTRY_DECISION_IDENTITY_UNPROVEN",
-      evidence: { entryIdentityFound: false, entryIdentitySource: null, entryIdentityLookupCount: 0 },
+      evidence: { entryIdentityFound: false, entryIdentityLookupCount: 0 },
     });
     expect(queries.slice(queryOffset).some((query) => /AND\s+client_oid\s*=\s*\?\s+AND\s+UPPER\(pos_side\)/i.test(query))).toBe(false);
     expect(executePaperOrder).not.toHaveBeenCalled();
