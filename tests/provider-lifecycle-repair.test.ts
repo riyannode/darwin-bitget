@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { loadProviderLifecycleEvidence, loadProviderLifecycleHistoryCandidateIds, loadProviderPositionHistoryDecisionIds, loadProviderSyncState, saveProviderSyncState } from "../src/storage/provider-ledger.js";
+import { loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderLifecycleHistoryCandidateIds, loadProviderLiveOpeningOrderIdentities, loadProviderPositionHistoryDecisionIds, loadProviderSyncState, saveProviderSyncState } from "../src/storage/provider-ledger.js";
 import { classifyProviderLifecycle } from "../src/trading/provider-lifecycle-reconciliation.js";
 import { hasEvent, loadAllEvents, loadAllExperiences, loadPositionContext, persistProviderLifecycleRepair, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
 import { TraderAgent, resolveProviderTradeFacts } from "../src/agent/agent.js";
@@ -216,6 +216,55 @@ describe("provider-first financial lifecycle resolution", () => {
     db.close();
   });
 
+  it("does not recover batched entry identity from a clientOid order without a linked opening fill", () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET provider_order_id = NULL WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`DELETE FROM provider_fills WHERE provider_order_id = 'provider-entry-order'`;
+    const evidence = loadProviderLifecycleEvidenceBatch(executor, "USDT-FUTURES", [{
+      requestId: "missing-opening-fill",
+      experience: openExperience(),
+      history: null,
+      providerPosition: { symbol: "SAMSUNG", positionSide: "LONG", quantity: "7.51", entryPrice: "72.345", openedAt: OPENED_AT },
+    }]).get("missing-opening-fill");
+    expect(evidence?.entryIdentity).toBeNull();
+    db.close();
+  });
+
+  it("fails closed when a clientOid candidate is reused by another symbol or position", () => {
+    const { db, executor } = memoryExecutor();
+    insertProviderEvidence(executor);
+    const run = (sql: string, ...values: (string | null)[]) => executor.sql(sql.split("?") as unknown as TemplateStringsArray, ...values);
+    run("UPDATE idempotency SET provider_order_id = NULL WHERE decision_id = ?", ENTRY_DECISION_ID);
+    run("INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "duplicate-client-order", "darwin-entry-oid", "USDT-FUTURES", "METAUSDT", "buy", "long", null, "1", "1", "filled", OPENED_AT, OPENED_AT, "DARWIN", "{}", OPENED_AT, OPENED_AT);
+    run("INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "duplicate-client-fill", "duplicate-client-order", "darwin-entry-oid", "USDT-FUTURES", "METAUSDT", "buy", "long", null, "1", "740.63", OPENED_AT, "DARWIN", "{}", OPENED_AT, OPENED_AT);
+    const position = { symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "7.51", entryPrice: "72.345", openedAt: OPENED_AT };
+    expect(loadProviderLiveOpeningOrderIdentities(executor, "USDT-FUTURES", [position as never]).size).toBe(0);
+    db.close();
+  });
+
+  it("does not recover a fallback identity when the linked fill scan is truncated", () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET provider_order_id = NULL WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    for (let index = 0; index < 2_000; index += 1) {
+      const execId = `overflow-entry-fill-${index}`;
+      executor.sql`INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at)
+        VALUES (${execId}, 'provider-entry-order', 'darwin-entry-oid', 'USDT-FUTURES', 'SAMSUNGUSDT', 'buy', 'long', NULL, '0.001', '198.02', ${OPENED_AT}, 'DARWIN', '{}', ${OPENED_AT}, ${OPENED_AT})`;
+    }
+    const evidence = loadProviderLifecycleEvidenceBatch(executor, "USDT-FUTURES", [{
+      requestId: "truncated-opening-fills",
+      experience: openExperience(),
+      history: null,
+      providerPosition: { symbol: "SAMSUNG", positionSide: "LONG", quantity: "7.51", entryPrice: "72.345", openedAt: OPENED_AT },
+    }]).get("truncated-opening-fills");
+    expect(evidence?.evidenceComplete).toBe(false);
+    expect(evidence?.entryIdentity).toBeNull();
+    db.close();
+  });
+
   it("resolves provider-live CRCL SHORT, META LONG, and TSLA LONG identities from exact UTA order/fill chains", () => {
     const { db, executor } = memoryExecutor();
     const positions = [
@@ -225,7 +274,7 @@ describe("provider-first financial lifecycle resolution", () => {
     ] as const;
     const run = (sql: string, ...values: (string | null)[]) => executor.sql(sql.split("?") as unknown as TemplateStringsArray, ...values);
     for (const position of positions) {
-      run("INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES (?, ?, ?, ?, ?)", position.clientOid, `cycle-${position.symbol}`, position.decisionId, position.orderId, position.openedAt);
+      run("INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES (?, ?, ?, NULL, ?)", position.clientOid, `cycle-${position.symbol}`, position.decisionId, position.openedAt);
       run("INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", position.orderId, position.clientOid, "USDT-FUTURES", position.symbol, position.side, position.positionSide.toLowerCase(), null, position.quantity, position.quantity, "filled", position.openedAt, position.openedAt, "DARWIN", "{}", position.openedAt, position.openedAt);
       run("INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", `fill-${position.orderId}`, position.orderId, position.clientOid, "USDT-FUTURES", position.symbol, position.side, position.positionSide.toLowerCase(), null, position.quantity, position.entryPrice, position.openedAt, "DARWIN", "{}", position.openedAt, position.openedAt);
     }
@@ -818,12 +867,57 @@ describe("provider-first financial lifecycle resolution", () => {
     db.close();
   });
 
+  it("does not attribute a history through empty client order IDs", () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET client_order_id = '' WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`UPDATE provider_orders SET client_oid = '' WHERE provider_order_id = 'provider-entry-order'`;
+    executor.sql`UPDATE provider_fills SET client_oid = '' WHERE provider_order_id = 'provider-entry-order'`;
+    const evidence = loadProviderLifecycleEvidence(executor, openExperience(), "USDT-FUTURES", HISTORY_ID, [], undefined, true);
+    expect(evidence.history).not.toBeNull();
+    expect(loadProviderPositionHistoryDecisionIds(executor, "USDT-FUTURES", [evidence.history!]).has(HISTORY_ID)).toBe(false);
+    db.close();
+  });
+
+  it("rejects whitespace-padded provider order IDs in the batch evidence loader", () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    insertProviderEvidence(executor);
+    const paddedOrderId = " provider-entry-order ";
+    executor.sql`UPDATE idempotency SET provider_order_id = ${paddedOrderId} WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`UPDATE provider_orders SET provider_order_id = ${paddedOrderId} WHERE provider_order_id = 'provider-entry-order'`;
+    executor.sql`UPDATE provider_fills SET provider_order_id = ${paddedOrderId} WHERE provider_order_id = 'provider-entry-order'`;
+    const evidence = loadProviderLifecycleEvidenceBatch(executor, "USDT-FUTURES", [{
+      requestId: "padded-provider-order-id",
+      experience: openExperience(),
+      history: null,
+      providerPosition: { symbol: "SAMSUNG", positionSide: "LONG", quantity: "7.51", entryPrice: "72.345", openedAt: OPENED_AT },
+    }]).get("padded-provider-order-id");
+    expect(evidence?.entryIdentity).toBeNull();
+    db.close();
+  });
+
+  it("does not attribute a history through whitespace-padded provider order IDs", () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    insertProviderEvidence(executor);
+    const paddedOrderId = " provider-entry-order ";
+    executor.sql`UPDATE idempotency SET provider_order_id = ${paddedOrderId} WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`UPDATE provider_orders SET provider_order_id = ${paddedOrderId} WHERE provider_order_id = 'provider-entry-order'`;
+    executor.sql`UPDATE provider_fills SET provider_order_id = ${paddedOrderId} WHERE provider_order_id = 'provider-entry-order'`;
+    const evidence = loadProviderLifecycleEvidence(executor, openExperience(), "USDT-FUTURES", HISTORY_ID, [], undefined, true);
+    expect(evidence.history).not.toBeNull();
+    expect(loadProviderPositionHistoryDecisionIds(executor, "USDT-FUTURES", [evidence.history!]).has(HISTORY_ID)).toBe(false);
+    db.close();
+  });
+
   it("resolves Samsung UTA lifecycle and Trade History from exact provider identities when tradeSide is absent", async () => {
     const { db, executor } = memoryExecutor();
     saveExperience(executor, openExperience(), OPENED_AT);
     savePositionContext(executor, positionContext());
     insertProviderEvidence(executor);
-    executor.sql`UPDATE idempotency SET provider_order_id = '1485976014603796480' WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`UPDATE idempotency SET provider_order_id = NULL WHERE decision_id = ${ENTRY_DECISION_ID}`;
     executor.sql`UPDATE provider_orders SET provider_order_id = '1485976014603796480', trade_side = NULL WHERE provider_order_id = 'provider-entry-order'`;
     executor.sql`UPDATE provider_fills SET provider_order_id = '1485976014603796480', exec_id = '1485976014611001344', trade_side = NULL WHERE provider_order_id = 'provider-entry-order'`;
     executor.sql`UPDATE provider_orders SET trade_side = NULL`;

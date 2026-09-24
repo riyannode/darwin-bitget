@@ -8,7 +8,7 @@ import type {
   ProviderPositionHistoryRecord,
 } from "../bitget/provider-ledger.js";
 import type { SqlExecutor } from "./schema.js";
-import { resolveProviderLifecycleSide } from "../trading/provider-lifecycle-side.js";
+import { isProviderLifecycleTimestampNear, PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS, resolveProviderLifecycleSide } from "../trading/provider-lifecycle-side.js";
 
 export interface ProviderResourceCheckpoint {
   cursor?: string;
@@ -327,46 +327,55 @@ export function loadProviderPositionHistoryDecisionIds(
   histories: readonly ProviderLifecycleHistory[],
 ): Map<string, string> {
   const ids = [...new Set(histories.flatMap((history) => history.providerPositionHistoryId ? [history.providerPositionHistoryId] : []))];
-  const identitiesByHistory = new Map<string, Set<string>>();
+  const identitiesByHistory = new Map<string, Map<string, boolean>>();
   const batchSize = 100;
   const maxRowsPerBatch = 5_000;
   for (let offset = 0; offset < ids.length; offset += batchSize) {
     const batch = ids.slice(offset, offset + batchSize);
     const rows = executor.sql<{
       history_id: string; decision_id: string; provider_order_id: string; client_oid: string;
-      order_side: string | null; order_pos_side: string | null; order_trade_side: string | null;
+      order_side: string | null; order_pos_side: string | null; order_trade_side: string | null; order_origin: ProviderEvidenceOrigin;
       fill_side: string | null; fill_pos_side: string | null; fill_trade_side: string | null;
+      fill_origin: ProviderEvidenceOrigin;
     }>`
       SELECT DISTINCT h.provider_position_history_id AS history_id, i.decision_id, o.provider_order_id, o.client_oid,
-        o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side,
-        f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side
+        o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side, o.origin AS order_origin,
+        f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side, f.origin AS fill_origin
       FROM provider_position_history AS h
       JOIN json_each(${JSON.stringify(batch)}) AS requested ON requested.value = h.provider_position_history_id
       JOIN provider_fills AS f ON f.category = h.category AND f.symbol = h.symbol
         AND UPPER(f.pos_side) = UPPER(h.position_side)
-        AND ABS((julianday(f.created_time) - julianday(h.opening_time)) * 86400.0) <= 5
+        AND ABS((julianday(f.created_time) - julianday(h.opening_time)) * 86400.0) <= ${PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS / 1_000}
       JOIN provider_orders AS o ON o.category = f.category AND o.provider_order_id = f.provider_order_id
         AND o.client_oid = f.client_oid AND o.symbol = f.symbol
-        AND UPPER(o.pos_side) = UPPER(f.pos_side) AND o.origin = 'DARWIN'
-      JOIN idempotency AS i ON i.client_order_id = f.client_oid AND i.provider_order_id = f.provider_order_id
-      WHERE h.category = ${category} AND h.provider_position_history_id IS NOT NULL AND f.origin = 'DARWIN'
+        AND UPPER(o.pos_side) = UPPER(f.pos_side) AND o.origin = f.origin
+      JOIN idempotency AS i ON i.client_order_id = f.client_oid
+        AND i.client_order_id <> '' AND i.client_order_id = TRIM(i.client_order_id)
+        AND ((i.provider_order_id IS NOT NULL AND i.provider_order_id <> '' AND i.provider_order_id = TRIM(i.provider_order_id) AND i.provider_order_id = f.provider_order_id)
+          OR ((i.provider_order_id IS NULL OR i.provider_order_id = '')
+            AND (SELECT COUNT(DISTINCT candidate.provider_order_id) FROM provider_orders AS candidate
+              WHERE candidate.category = f.category AND candidate.client_oid = i.client_order_id) = 1))
+      WHERE h.category = ${category} AND h.provider_position_history_id IS NOT NULL
       LIMIT ${maxRowsPerBatch + 1}
     `;
     if (rows.length > maxRowsPerBatch) continue;
     for (const row of rows) {
-      if (resolveProviderLifecycleSide(row.order_side, row.order_pos_side, row.order_trade_side) !== "OPEN"
-        || resolveProviderLifecycleSide(row.fill_side, row.fill_pos_side, row.fill_trade_side) !== "OPEN") continue;
-      const candidate = JSON.stringify([row.decision_id, row.provider_order_id, row.client_oid]);
-      const identities = identitiesByHistory.get(row.history_id) ?? new Set<string>();
-      identities.add(candidate);
+      const candidate = JSON.stringify([row.decision_id, row.provider_order_id, row.client_oid, row.order_origin, row.fill_origin]);
+      const identities = identitiesByHistory.get(row.history_id) ?? new Map<string, boolean>();
+      const openDarwinIdentity = row.order_origin === "DARWIN" && row.fill_origin === "DARWIN"
+        && resolveProviderLifecycleSide(row.order_side, row.order_pos_side, row.order_trade_side) === "OPEN"
+        && resolveProviderLifecycleSide(row.fill_side, row.fill_pos_side, row.fill_trade_side) === "OPEN";
+      identities.set(candidate, identities.has(candidate) ? identities.get(candidate)! && openDarwinIdentity : openDarwinIdentity);
       identitiesByHistory.set(row.history_id, identities);
     }
   }
   const result = new Map<string, string>();
   for (const [historyId, candidates] of identitiesByHistory) {
     if (candidates.size !== 1) continue;
-    const identity = JSON.parse([...candidates][0]!) as [string, string, string];
-    result.set(historyId, identity[0]);
+    const [identity, valid] = [...candidates][0]!;
+    if (!valid) continue;
+    const decisionId = JSON.parse(identity) as [string, string, string, ProviderEvidenceOrigin, ProviderEvidenceOrigin];
+    result.set(historyId, decisionId[0]);
   }
   return result;
 }
@@ -385,44 +394,51 @@ export function loadProviderLiveOpeningOrderIdentities(
     const key = providerLivePositionLifecycleKey(position);
     return [[key, { key, symbol: position.symbol, positionSide: position.positionSide, openedAt: position.openedAt }]] as const;
   })).values()];
-  const candidatesByPosition = new Map<string, Set<string>>();
+  const candidatesByPosition = new Map<string, Map<string, boolean>>();
   const batchSize = 100;
   const maxRowsPerBatch = 5_000;
   for (let offset = 0; offset < requests.length; offset += batchSize) {
     const batch = requests.slice(offset, offset + batchSize);
     const rows = executor.sql<{
       position_key: string; provider_order_id: string; client_oid: string; decision_id: string;
-      order_side: string | null; order_pos_side: string | null; order_trade_side: string | null;
-      fill_side: string | null; fill_pos_side: string | null; fill_trade_side: string | null;
+      order_side: string | null; order_pos_side: string | null; order_trade_side: string | null; order_origin: ProviderEvidenceOrigin;
+      fill_side: string | null; fill_pos_side: string | null; fill_trade_side: string | null; fill_origin: ProviderEvidenceOrigin;
     }>`
       SELECT DISTINCT json_extract(requested.value, '$.key') AS position_key, o.provider_order_id, o.client_oid, i.decision_id,
-        o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side,
-        f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side
+        o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side, o.origin AS order_origin,
+        f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side, f.origin AS fill_origin
       FROM json_each(${JSON.stringify(batch)}) AS requested
       JOIN provider_orders AS o ON o.category = ${category} AND o.symbol = json_extract(requested.value, '$.symbol')
         AND UPPER(o.pos_side) = UPPER(json_extract(requested.value, '$.positionSide'))
-        AND o.origin = 'DARWIN'
       JOIN provider_fills AS f ON f.category = o.category AND f.provider_order_id = o.provider_order_id
         AND f.client_oid = o.client_oid AND f.symbol = o.symbol AND UPPER(f.pos_side) = UPPER(o.pos_side)
-        AND f.origin = 'DARWIN'
-        AND ABS((julianday(f.created_time) - julianday(json_extract(requested.value, '$.openedAt'))) * 86400.0) <= 5
-      JOIN idempotency AS i ON i.provider_order_id = o.provider_order_id AND i.client_order_id = o.client_oid
+        AND f.origin = o.origin
+        AND ABS((julianday(f.created_time) - julianday(json_extract(requested.value, '$.openedAt'))) * 86400.0) <= ${PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS / 1_000}
+      JOIN idempotency AS i ON i.client_order_id = o.client_oid
+        AND i.client_order_id <> '' AND i.client_order_id = TRIM(i.client_order_id)
+        AND ((i.provider_order_id IS NOT NULL AND i.provider_order_id <> '' AND i.provider_order_id = TRIM(i.provider_order_id) AND i.provider_order_id = o.provider_order_id)
+          OR ((i.provider_order_id IS NULL OR i.provider_order_id = '')
+            AND (SELECT COUNT(DISTINCT candidate.provider_order_id) FROM provider_orders AS candidate
+              WHERE candidate.category = o.category AND candidate.client_oid = i.client_order_id) = 1))
       LIMIT ${maxRowsPerBatch + 1}
     `;
     if (rows.length > maxRowsPerBatch) continue;
     for (const row of rows) {
-      if (resolveProviderLifecycleSide(row.order_side, row.order_pos_side, row.order_trade_side) !== "OPEN"
-        || resolveProviderLifecycleSide(row.fill_side, row.fill_pos_side, row.fill_trade_side) !== "OPEN") continue;
-      const identity = JSON.stringify([row.provider_order_id, row.client_oid, row.decision_id]);
-      const candidates = candidatesByPosition.get(row.position_key) ?? new Set<string>();
-      candidates.add(identity);
+      const identity = JSON.stringify([row.provider_order_id, row.client_oid, row.decision_id, row.order_origin, row.fill_origin]);
+      const candidates = candidatesByPosition.get(row.position_key) ?? new Map<string, boolean>();
+      const openDarwinIdentity = row.order_origin === "DARWIN" && row.fill_origin === "DARWIN"
+        && resolveProviderLifecycleSide(row.order_side, row.order_pos_side, row.order_trade_side) === "OPEN"
+        && resolveProviderLifecycleSide(row.fill_side, row.fill_pos_side, row.fill_trade_side) === "OPEN";
+      candidates.set(identity, candidates.has(identity) ? candidates.get(identity)! && openDarwinIdentity : openDarwinIdentity);
       candidatesByPosition.set(row.position_key, candidates);
     }
   }
   const identities = new Map<string, { providerOrderId: string; decisionId: string }>();
   for (const [positionKey, candidates] of candidatesByPosition) {
     if (candidates.size !== 1) continue;
-    const [providerOrderId, , decisionId] = JSON.parse([...candidates][0]!) as [string, string, string];
+    const [identity, valid] = [...candidates][0]!;
+    if (!valid) continue;
+    const [providerOrderId, , decisionId] = JSON.parse(identity) as [string, string, string, ProviderEvidenceOrigin, ProviderEvidenceOrigin];
     identities.set(positionKey, { providerOrderId, decisionId });
   }
   return identities;
@@ -431,25 +447,44 @@ export function loadProviderLiveOpeningOrderIdentities(
 export function loadProviderLifecycleHistoryCandidateIds(executor: SqlExecutor, experience: TradeExperience, category: string): Set<string> {
   const rows = executor.sql<{
     provider_position_history_id: string;
-    order_side: string | null; order_pos_side: string | null; order_trade_side: string | null;
-    fill_side: string | null; fill_pos_side: string | null; fill_trade_side: string | null;
+    provider_order_id: string;
+    client_oid: string;
+    order_side: string | null; order_pos_side: string | null; order_trade_side: string | null; order_origin: ProviderEvidenceOrigin;
+    fill_side: string | null; fill_pos_side: string | null; fill_trade_side: string | null; fill_origin: ProviderEvidenceOrigin;
   }>`
-    SELECT DISTINCT h.provider_position_history_id,
-      o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side,
-      f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side
+    SELECT DISTINCT h.provider_position_history_id, o.provider_order_id, o.client_oid,
+      o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side, o.origin AS order_origin,
+      f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side, f.origin AS fill_origin
     FROM provider_position_history h
     JOIN idempotency i ON i.decision_id = ${experience.entryDecisionId}
-    JOIN provider_orders o ON o.category = h.category AND o.provider_order_id = i.provider_order_id AND o.client_oid = i.client_order_id
+      AND i.client_order_id <> '' AND i.client_order_id = TRIM(i.client_order_id)
+    JOIN provider_orders o ON o.category = h.category AND o.client_oid = i.client_order_id
+      AND ((i.provider_order_id IS NOT NULL AND i.provider_order_id <> '' AND i.provider_order_id = TRIM(i.provider_order_id) AND o.provider_order_id = i.provider_order_id)
+        OR ((i.provider_order_id IS NULL OR i.provider_order_id = '')
+          AND (SELECT COUNT(DISTINCT candidate.provider_order_id) FROM provider_orders AS candidate
+            WHERE candidate.category = o.category AND candidate.client_oid = i.client_order_id) = 1))
     JOIN provider_fills f ON f.category = o.category AND f.provider_order_id = o.provider_order_id AND f.client_oid = o.client_oid
     WHERE h.category = ${category} AND h.provider_position_history_id IS NOT NULL
       AND h.symbol = ${experience.symbol} AND UPPER(h.position_side) = UPPER(${experience.positionSide?.toUpperCase() ?? ""})
-      AND o.symbol = h.symbol AND UPPER(o.pos_side) = UPPER(h.position_side) AND o.origin = 'DARWIN'
-      AND f.symbol = h.symbol AND UPPER(f.pos_side) = UPPER(h.position_side) AND f.origin = 'DARWIN'
-      AND ABS((julianday(f.created_time) - julianday(h.opening_time)) * 86400.0) <= 5
+      AND o.symbol = h.symbol AND UPPER(o.pos_side) = UPPER(h.position_side) AND o.origin = f.origin
+      AND f.symbol = h.symbol AND UPPER(f.pos_side) = UPPER(h.position_side)
+      AND ABS((julianday(f.created_time) - julianday(h.opening_time)) * 86400.0) <= ${PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS / 1_000}
+    LIMIT 5001
   `;
-  return new Set(rows.filter((row) => resolveProviderLifecycleSide(row.order_side, row.order_pos_side, row.order_trade_side) === "OPEN"
-    && resolveProviderLifecycleSide(row.fill_side, row.fill_pos_side, row.fill_trade_side) === "OPEN")
-    .map((row) => row.provider_position_history_id));
+  if (rows.length > 5_000) return new Set();
+  const candidatesByHistory = new Map<string, Map<string, boolean>>();
+  for (const row of rows) {
+    const identity = JSON.stringify([row.provider_order_id, row.client_oid, row.order_origin, row.fill_origin]);
+    const candidates = candidatesByHistory.get(row.provider_position_history_id) ?? new Map<string, boolean>();
+    const openDarwinIdentity = row.order_origin === "DARWIN" && row.fill_origin === "DARWIN"
+      && resolveProviderLifecycleSide(row.order_side, row.order_pos_side, row.order_trade_side) === "OPEN"
+      && resolveProviderLifecycleSide(row.fill_side, row.fill_pos_side, row.fill_trade_side) === "OPEN";
+    candidates.set(identity, candidates.has(identity) ? candidates.get(identity)! && openDarwinIdentity : openDarwinIdentity);
+    candidatesByHistory.set(row.provider_position_history_id, candidates);
+  }
+  return new Set([...candidatesByHistory]
+    .filter(([, candidates]) => candidates.size === 1 && [...candidates.values()][0] === true)
+    .map(([historyId]) => historyId));
 }
 
 export interface ProviderLifecycleEvidenceRequest {
@@ -460,6 +495,10 @@ export interface ProviderLifecycleEvidenceRequest {
 }
 
 const MAX_LIFECYCLE_EVIDENCE_ROWS = 2_000;
+
+function isExactOptionalProviderOrderId(value: string | null | undefined): boolean {
+  return value === null || (typeof value === "string" && value.length > 0 && value === value.trim());
+}
 
 export function loadProviderLifecycleEvidence(
   executor: SqlExecutor,
@@ -536,8 +575,6 @@ export function loadProviderLifecycleEvidence(
     `;
     entryIdentityCandidateDiagnostics.entryIdentityCandidateLookupCount = Math.min(candidates.length, 2);
     const candidate = candidates.length === 1 ? candidates[0] : null;
-    const candidateTime = candidate ? Date.parse(candidate.created_time) : Number.NaN;
-    const historyTime = Date.parse(row.opening_time);
     entryIdentityCandidateDiagnostics.entryIdentityCandidateProviderOrderIdPresent = candidate ? Boolean(candidate.provider_order_id) : null;
     entryIdentityCandidateDiagnostics.entryIdentityCandidateSymbolMatch = candidate ? candidate.symbol === experience.symbol : null;
     entryIdentityCandidateDiagnostics.entryIdentityCandidatePositionSideMatch = candidate ? candidate.pos_side?.toUpperCase() === experience.positionSide : null;
@@ -546,7 +583,7 @@ export function loadProviderLifecycleEvidence(
       : null;
     entryIdentityCandidateDiagnostics.entryIdentityCandidateDarwinOrigin = candidate ? candidate.origin === "DARWIN" : null;
     entryIdentityCandidateDiagnostics.entryIdentityCandidateOpeningTimeMatch = candidate
-      ? Number.isFinite(candidateTime) && Number.isFinite(historyTime) && Math.abs(candidateTime - historyTime) <= 5_000
+      ? isProviderLifecycleTimestampNear(candidate.created_time, row.opening_time)
       : null;
     if (includeIdentityDiagnostics && candidate) {
       candidateOrder = {
@@ -589,7 +626,7 @@ export function loadProviderLifecycleEvidence(
   }
   const matchingPosition = providerPositions.find((position) => position.symbol === experience.symbol && position.positionSide === experience.positionSide);
   const livePositionStartAt = matchingPosition?.openedAt && Number.isFinite(Date.parse(matchingPosition.openedAt))
-    ? new Date(Date.parse(matchingPosition.openedAt) - 5_000).toISOString()
+    ? new Date(Date.parse(matchingPosition.openedAt) - PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS).toISOString()
     : null;
   type ProviderOrderRow = { provider_order_id: string; client_oid: string | null; symbol: string; side: string | null; pos_side: string | null; trade_side: string | null; created_time: string; origin: ProviderEvidenceOrigin };
   type ProviderFillRow = ProviderOrderRow & { exec_qty: string; exec_price: string };
@@ -680,15 +717,17 @@ export function loadProviderLifecycleEvidenceBatch(
     const identitiesByDecision = new Map<string, Array<{ clientOrderId: string; providerOrderId: string | null }>>();
     for (const row of identityRows) {
       const identities = identitiesByDecision.get(row.decision_id) ?? [];
-      identities.push({ clientOrderId: row.client_order_id, providerOrderId: row.provider_order_id });
+      identities.push({ clientOrderId: row.client_order_id, providerOrderId: row.provider_order_id === "" ? null : row.provider_order_id });
       identitiesByDecision.set(row.decision_id, identities);
     }
     const queryRequests = batch.map((request) => {
       const identities = identitiesByDecision.get(request.experience.entryDecisionId) ?? [];
-      const identity = identityRows.length <= 5_000 && identities.length === 1 && identities[0]?.providerOrderId ? identities[0] : null;
+      const clientOrderId = identities[0]?.clientOrderId;
+      const identity = identityRows.length <= 5_000 && identities.length === 1 && clientOrderId && clientOrderId === clientOrderId.trim()
+        && isExactOptionalProviderOrderId(identities[0]?.providerOrderId) ? identities[0] : null;
       const position = request.providerPosition;
       const rangeStart = request.history?.openingTime
-        ?? (position?.openedAt && Number.isFinite(Date.parse(position.openedAt)) ? new Date(Date.parse(position.openedAt) - 5_000).toISOString() : null);
+        ?? (position?.openedAt && Number.isFinite(Date.parse(position.openedAt)) ? new Date(Date.parse(position.openedAt) - PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS).toISOString() : null);
       const rangeEnd = request.history && !position ? request.history.closingTime : null;
       return { requestId: request.requestId, symbol: request.experience.symbol, positionSide: request.experience.positionSide?.toLowerCase() ?? "", rangeStart, rangeEnd, entryProviderOrderId: identity?.providerOrderId ?? null, entryClientOid: identity?.clientOrderId ?? null };
     });
@@ -700,11 +739,12 @@ export function loadProviderLifecycleEvidenceBatch(
         SELECT json_extract(r.value, '$.requestId') AS request_id, o.provider_order_id, o.client_oid, o.symbol, o.side, o.pos_side, o.trade_side, o.created_time, o.origin,
           ROW_NUMBER() OVER (PARTITION BY json_extract(r.value, '$.requestId') ORDER BY o.created_time, o.provider_order_id) AS row_number
         FROM json_each(${requestJson}) AS r
-        JOIN provider_orders AS o ON o.category = ${category} AND o.symbol = json_extract(r.value, '$.symbol')
-          AND UPPER(o.pos_side) = UPPER(json_extract(r.value, '$.positionSide'))
-          AND ((json_extract(r.value, '$.entryProviderOrderId') IS NOT NULL AND o.provider_order_id = json_extract(r.value, '$.entryProviderOrderId') AND o.client_oid = json_extract(r.value, '$.entryClientOid'))
-            OR (json_extract(r.value, '$.rangeStart') IS NOT NULL AND o.created_time >= json_extract(r.value, '$.rangeStart')
-              AND (json_extract(r.value, '$.rangeEnd') IS NULL OR o.created_time <= json_extract(r.value, '$.rangeEnd'))))
+        JOIN provider_orders AS o ON o.category = ${category}
+          AND ((json_extract(r.value, '$.entryProviderOrderId') IS NULL AND json_extract(r.value, '$.entryClientOid') IS NOT NULL AND o.client_oid = json_extract(r.value, '$.entryClientOid'))
+            OR (o.symbol = json_extract(r.value, '$.symbol') AND UPPER(o.pos_side) = UPPER(json_extract(r.value, '$.positionSide'))
+              AND ((json_extract(r.value, '$.entryProviderOrderId') IS NOT NULL AND o.provider_order_id = json_extract(r.value, '$.entryProviderOrderId') AND o.client_oid = json_extract(r.value, '$.entryClientOid'))
+                OR (json_extract(r.value, '$.rangeStart') IS NOT NULL AND o.created_time >= json_extract(r.value, '$.rangeStart')
+                  AND (json_extract(r.value, '$.rangeEnd') IS NULL OR o.created_time <= json_extract(r.value, '$.rangeEnd'))))))
       )
       SELECT request_id, provider_order_id, client_oid, symbol, side, pos_side, trade_side, created_time, origin, row_number FROM candidates
       WHERE row_number <= ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1} ORDER BY request_id, row_number
@@ -715,11 +755,13 @@ export function loadProviderLifecycleEvidenceBatch(
           f.exec_qty, f.exec_price, f.created_time,
           ROW_NUMBER() OVER (PARTITION BY json_extract(r.value, '$.requestId') ORDER BY f.created_time, f.provider_order_id) AS row_number
         FROM json_each(${requestJson}) AS r
-        JOIN provider_fills AS f ON f.category = ${category} AND f.symbol = json_extract(r.value, '$.symbol')
-          AND (f.pos_side IS NULL OR UPPER(f.pos_side) NOT IN ('LONG', 'SHORT') OR UPPER(f.pos_side) = UPPER(json_extract(r.value, '$.positionSide')))
-          AND ((json_extract(r.value, '$.entryProviderOrderId') IS NOT NULL AND f.provider_order_id = json_extract(r.value, '$.entryProviderOrderId') AND f.client_oid = json_extract(r.value, '$.entryClientOid'))
-            OR (json_extract(r.value, '$.rangeStart') IS NOT NULL AND f.created_time >= json_extract(r.value, '$.rangeStart')
-              AND (json_extract(r.value, '$.rangeEnd') IS NULL OR f.created_time <= json_extract(r.value, '$.rangeEnd'))))
+        JOIN provider_fills AS f ON f.category = ${category}
+          AND ((json_extract(r.value, '$.entryProviderOrderId') IS NULL AND json_extract(r.value, '$.entryClientOid') IS NOT NULL AND f.client_oid = json_extract(r.value, '$.entryClientOid'))
+            OR (f.symbol = json_extract(r.value, '$.symbol')
+              AND (f.pos_side IS NULL OR UPPER(f.pos_side) NOT IN ('LONG', 'SHORT') OR UPPER(f.pos_side) = UPPER(json_extract(r.value, '$.positionSide')))
+              AND ((json_extract(r.value, '$.entryProviderOrderId') IS NOT NULL AND f.provider_order_id = json_extract(r.value, '$.entryProviderOrderId') AND f.client_oid = json_extract(r.value, '$.entryClientOid'))
+                OR (json_extract(r.value, '$.rangeStart') IS NOT NULL AND f.created_time >= json_extract(r.value, '$.rangeStart')
+                  AND (json_extract(r.value, '$.rangeEnd') IS NULL OR f.created_time <= json_extract(r.value, '$.rangeEnd'))))))
       )
       SELECT request_id, provider_order_id, client_oid, symbol, side, pos_side, trade_side, origin, exec_qty, exec_price, created_time, row_number FROM candidates
       WHERE row_number <= ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1} ORDER BY request_id, row_number
@@ -742,17 +784,43 @@ export function loadProviderLifecycleEvidenceBatch(
     }
     for (const request of batch) {
       const identities = identitiesByDecision.get(request.experience.entryDecisionId) ?? [];
-      const identity = identityRows.length <= 5_000 && identities.length === 1 && identities[0]?.providerOrderId ? identities[0] : null;
+      const clientOrderId = identities[0]?.clientOrderId;
+      const identity = identityRows.length <= 5_000 && identities.length === 1 && clientOrderId && clientOrderId === clientOrderId.trim()
+        && isExactOptionalProviderOrderId(identities[0]?.providerOrderId) ? identities[0] : null;
       const historyId = request.history?.providerPositionHistoryId;
       const duplicateHistory = Boolean(historyId && historyIdCounts.get(historyId)! > 1);
       const evidenceComplete = identityRows.length <= 5_000 && !duplicateHistory && !duplicateRequestIds.has(request.requestId)
         && (orderCounts.get(request.requestId) ?? 0) <= MAX_LIFECYCLE_EVIDENCE_ROWS
         && (fillCounts.get(request.requestId) ?? 0) <= MAX_LIFECYCLE_EVIDENCE_ROWS;
+      let entryIdentity: ProviderLifecycleEvidence["entryIdentity"] = identity?.providerOrderId
+        ? { entryDecisionId: request.experience.entryDecisionId, clientOid: identity.clientOrderId, providerOrderId: identity.providerOrderId }
+        : null;
+      if (evidenceComplete && !entryIdentity && identity?.providerOrderId === null) {
+        const candidates = (ordersByRequest.get(request.requestId) ?? []).filter((order) => order.clientOid === identity.clientOrderId);
+        const candidate = candidates.length === 1 ? candidates[0] : null;
+        const lifecycleOpeningTime = request.history?.openingTime ?? request.providerPosition?.openedAt ?? null;
+        const linkedCandidateFills = candidate
+          ? (fillsByRequest.get(request.requestId) ?? []).filter((fill) => fill.providerOrderId === candidate.providerOrderId && fill.clientOid === identity.clientOrderId)
+          : [];
+        const linkedOpeningFill = Boolean(candidate && lifecycleOpeningTime && linkedCandidateFills.some((fill) => fill.symbol === candidate.symbol
+          && fill.positionSide === candidate.positionSide && fill.origin === candidate.origin
+          && resolveProviderLifecycleSide(fill.side, fill.positionSide, fill.tradeSide) === "OPEN"
+          && isProviderLifecycleTimestampNear(fill.createdAt, lifecycleOpeningTime)));
+        const linkedFillsAreConsistent = Boolean(candidate && linkedCandidateFills.length > 0 && linkedCandidateFills.every((fill) => fill.symbol === candidate.symbol
+          && fill.positionSide === candidate.positionSide && fill.origin === candidate.origin
+          && resolveProviderLifecycleSide(fill.side, fill.positionSide, fill.tradeSide) === "OPEN"));
+        if (candidate?.origin === "DARWIN" && candidate.symbol === request.experience.symbol
+          && candidate.positionSide === request.experience.positionSide?.toUpperCase()
+          && resolveProviderLifecycleSide(candidate.side, candidate.positionSide, candidate.tradeSide) === "OPEN"
+          && candidate.providerOrderId && linkedOpeningFill && linkedFillsAreConsistent) {
+          entryIdentity = { entryDecisionId: request.experience.entryDecisionId, clientOid: identity.clientOrderId, providerOrderId: candidate.providerOrderId };
+        }
+      }
       result.set(request.requestId, {
         experience: request.experience,
         providerPositions: request.providerPosition ? [request.providerPosition] : [],
         history: request.history,
-        entryIdentity: identity ? { entryDecisionId: request.experience.entryDecisionId, clientOid: identity.clientOrderId, providerOrderId: identity.providerOrderId! } : null,
+        entryIdentity,
         orders: ordersByRequest.get(request.requestId) ?? [],
         fills: fillsByRequest.get(request.requestId) ?? [],
         evidenceComplete,

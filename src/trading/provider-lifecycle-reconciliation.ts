@@ -1,6 +1,6 @@
 import type { TradeExperience } from "../types.js";
 import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal, subtractDecimal } from "./decimal.js";
-import { resolveProviderLifecycleSide } from "./provider-lifecycle-side.js";
+import { isProviderLifecycleTimestampNear, resolveProviderLifecycleSide } from "./provider-lifecycle-side.js";
 
 export type ProviderLifecycleClassification =
   | "MATCHED_OPEN"
@@ -129,8 +129,6 @@ function validTimestamp(value: string): number | null {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
-const MAX_OPENING_CHRONOLOGY_SKEW_MS = 5_000;
-
 function exactSum(values: readonly string[]): string | null {
   try {
     return values.reduce((sum, value) => addDecimal(sum, value), "0");
@@ -251,9 +249,7 @@ function currentPositionEntryMatches(fills: readonly ProviderLifecycleFill[], ex
 }
 
 function isNearTimestamp(value: string, reference: string): boolean {
-  const timestamp = validTimestamp(value);
-  const referenceTimestamp = validTimestamp(reference);
-  return timestamp !== null && referenceTimestamp !== null && Math.abs(timestamp - referenceTimestamp) <= MAX_OPENING_CHRONOLOGY_SKEW_MS;
+  return isProviderLifecycleTimestampNear(value, reference);
 }
 
 function openingIdentityIsProven(evidence: ProviderLifecycleEvidence, openingTime: string): boolean {
