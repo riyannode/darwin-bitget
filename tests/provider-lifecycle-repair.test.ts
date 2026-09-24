@@ -444,6 +444,8 @@ describe("provider-first financial lifecycle resolution", () => {
         entryDecisionId: ENTRY_DECISION_ID,
         entryClientOid: "darwin-entry-oid",
         entryProviderOrderId: "provider-entry-order",
+        candidateOrder: null,
+        candidateFills: [],
         orderCount: 7,
         fillCount: 7,
         evidenceComplete: true,
@@ -791,23 +793,87 @@ describe("provider-first financial lifecycle resolution", () => {
     db.close();
   });
 
-  it("dry-run returns the exact unresolved classifier reason and still makes no writes", async () => {
+  it("dry-run returns the exact bounded candidate order and fill identity without mutating persisted state", async () => {
     const { db, executor, queries } = memoryExecutor();
     saveExperience(executor, openExperience(), OPENED_AT);
     savePositionContext(executor, positionContext());
     insertProviderEvidence(executor);
-    executor.sql`DELETE FROM idempotency WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`UPDATE idempotency SET provider_order_id = NULL WHERE decision_id = ${ENTRY_DECISION_ID}`;
     const queryOffset = queries.length;
     vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
     const response = await invokeControl(fakeAgent(executor, db, true), true, true);
     const body = await response.json() as { dryRun?: boolean; classification?: string; reason?: string; evidence?: Record<string, unknown> };
     expect(response.status).toBe(200);
-    expect(body).toMatchObject({ dryRun: true, classification: "UNRESOLVED", reason: "ENTRY_DECISION_IDENTITY_UNPROVEN", evidence: { historyFound: true, entryIdentityFound: false, entryDecisionId: ENTRY_DECISION_ID, entryClientOid: null, entryProviderOrderId: null, openingFillQuantity: null, closingFillQuantity: null } });
-    expect(queries.slice(queryOffset).filter((query) => /^(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)\b/i.test(query.trim()))).toEqual([]);
+    expect(body).toMatchObject({
+      dryRun: true,
+      classification: "LOCAL_OPEN_PROVIDER_CLOSED",
+      reason: "PROVIDER_LEDGER_PROVES_FULL_DARWIN_CLOSE",
+      evidence: {
+        entryIdentityFound: true,
+        entryIdentityCandidateLookupCount: 1,
+        candidateOrder: { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", side: "buy", posSide: "long", tradeSide: "open", reduceOnly: null, createdTime: OPEN_FILL_AT, origin: "DARWIN" },
+        candidateFills: [{ execId: "fill-provider-entry-order", providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", side: "buy", posSide: "long", tradeSide: "open", quantity: "7.51", createdTime: OPEN_FILL_AT, origin: "DARWIN" }],
+      },
+    });
+    const diagnosticQueries = queries.slice(queryOffset);
+    expect(diagnosticQueries.some((query) => query.includes("FROM provider_orders") && query.includes("WHERE category = ? AND client_oid = ?") && query.includes("LIMIT 2"))).toBe(true);
+    expect(diagnosticQueries.some((query) => query.includes("FROM provider_fills") && query.includes("WHERE category = ? AND provider_order_id = ? AND client_oid = ?") && query.includes("LIMIT 2"))).toBe(true);
+    expect(diagnosticQueries.filter((query) => /^(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)\b/i.test(query.trim()))).toEqual([]);
     expect(loadAllExperiences(executor)[0]?.outcomeStatus).toBe("OPEN");
     expect(loadPositionContext(executor, "SAMSUNGUSDT", "LONG")?.lifecycleStatus).toBeUndefined();
     expect(loadAllEvents(executor)).toHaveLength(0);
     expect(executePaperOrder).not.toHaveBeenCalled();
+    db.close();
+  });
+
+  it("caps candidate fill diagnostics at two deterministically ordered rows", async () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    savePositionContext(executor, positionContext());
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET provider_order_id = NULL WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES ('fill-candidate-extra-a', 'provider-entry-order', 'darwin-entry-oid', 'USDT-FUTURES', 'SAMSUNGUSDT', 'buy', 'long', 'open', '0.01', '198.02', '2026-09-21T17:03:30.661Z', 'DARWIN', '{}', '2026-09-21T17:03:30.661Z', '2026-09-21T17:03:30.661Z')`;
+    executor.sql`INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES ('fill-candidate-extra-b', 'provider-entry-order', 'darwin-entry-oid', 'USDT-FUTURES', 'SAMSUNGUSDT', 'buy', 'long', 'open', '0.01', '198.02', '2026-09-21T17:03:30.662Z', 'DARWIN', '{}', '2026-09-21T17:03:30.662Z', '2026-09-21T17:03:30.662Z')`;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { evidence?: { candidateFills?: Array<{ execId: string }> } };
+    expect(body.evidence?.candidateFills?.map((fill) => fill.execId)).toEqual([
+      "fill-provider-entry-order",
+      "fill-candidate-extra-a",
+    ]);
+    expect(body.evidence?.candidateFills).toHaveLength(2);
+    db.close();
+  });
+
+  it("keeps null provider tradeSide visible in dry-run diagnostics", async () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    savePositionContext(executor, positionContext());
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET provider_order_id = NULL WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`UPDATE provider_orders SET trade_side = NULL WHERE provider_order_id = 'provider-entry-order'`;
+    executor.sql`UPDATE provider_fills SET trade_side = NULL WHERE provider_order_id = 'provider-entry-order'`;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { evidence?: { candidateOrder?: Record<string, unknown> | null; candidateFills?: Array<Record<string, unknown>> } };
+    expect(body.evidence?.candidateOrder).toMatchObject({ providerOrderId: "provider-entry-order", tradeSide: null });
+    expect(body.evidence?.candidateFills).toEqual([expect.objectContaining({ execId: "fill-provider-entry-order", tradeSide: null })]);
+    db.close();
+  });
+
+  it("does not expose an arbitrary candidate identity when clientOid matches multiple orders", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    savePositionContext(executor, positionContext());
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET provider_order_id = NULL WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES ('duplicate-candidate', 'darwin-entry-oid', 'USDT-FUTURES', 'SAMSUNGUSDT', 'buy', 'long', 'open', '7.51', '7.51', 'filled', '2026-09-21T17:03:30.660Z', '2026-09-21T17:03:30.660Z', 'DARWIN', '{}', '2026-09-21T17:03:30.660Z', '2026-09-21T17:03:30.660Z')`;
+    const queryOffset = queries.length;
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const response = await invokeControl(fakeAgent(executor, db, true), true, true);
+    const body = await response.json() as { evidence?: { entryIdentityCandidateLookupCount?: number; candidateOrder?: Record<string, unknown> | null; candidateFills?: unknown[] } };
+    expect(body.evidence).toMatchObject({ entryIdentityCandidateLookupCount: 2, candidateOrder: null, candidateFills: [] });
+    expect(queries.slice(queryOffset).some((query) => query.includes("FROM provider_fills") && query.includes("WHERE category = ? AND provider_order_id = ? AND client_oid = ?") && query.includes("LIMIT 2"))).toBe(false);
     db.close();
   });
 

@@ -81,7 +81,7 @@ import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } fr
 import { providerLedgerDiagnostics, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadProviderPositionHistoriesPage, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, providerLivePositionLifecycleKey, loadProviderSyncStates, type ProviderLifecycleEvidenceRequest, type ProviderPositionHistoryCursor } from "../storage/provider-ledger.js";
 import { calculateNetPnlSinceBaseline, isFinancialRecordCoverageComplete } from "../trading/external-flow.js";
 import { resolveExternalFlowReadModel } from "../trading/external-flow-read-model.js";
-import { classifyProviderLifecycle, summarizeProviderLifecycleFillQuantities, type ProviderLifecycleClassification, type ProviderLifecycleHistory } from "../trading/provider-lifecycle-reconciliation.js";
+import { classifyProviderLifecycle, summarizeProviderLifecycleFillQuantities, type ProviderLifecycleClassification, type ProviderLifecycleHistory, type ProviderLifecycleCandidateOrder, type ProviderLifecycleCandidateFill } from "../trading/provider-lifecycle-reconciliation.js";
 import { rebuildProviderPerformance, type ProviderPerformanceLifecycle, type ProviderPerformanceTotals } from "../trading/provider-performance.js";
 import { resolveProviderPerformanceReadModel } from "../trading/provider-performance-read-model.js";
 
@@ -1089,6 +1089,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
       entryDecisionId: string;
       entryClientOid: string | null;
       entryProviderOrderId: string | null;
+      candidateOrder: ProviderLifecycleCandidateOrder | null;
+      candidateFills: readonly ProviderLifecycleCandidateFill[];
       orderCount: number;
       fillCount: number;
       evidenceComplete: boolean;
@@ -1114,7 +1116,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const portfolio = await new BitgetClient(config).getDashboardPortfolio();
     if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
 
-    const evidence = loadProviderLifecycleEvidence(this, experience, config.bitgetCategory, providerPositionHistoryId, portfolio.positions, deterministicEntryIdentity(experience, context));
+    const evidence = loadProviderLifecycleEvidence(this, experience, config.bitgetCategory, providerPositionHistoryId, portfolio.positions, deterministicEntryIdentity(experience, context), true);
     const reconciliation = classifyProviderLifecycle(evidence);
     const quantities = summarizeProviderLifecycleFillQuantities(evidence);
     return {
@@ -1151,6 +1153,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
         entryDecisionId: evidence.entryIdentity?.entryDecisionId ?? experience.entryDecisionId,
         entryClientOid: evidence.entryIdentity?.clientOid ?? null,
         entryProviderOrderId: evidence.entryIdentity?.providerOrderId ?? null,
+        candidateOrder: evidence.candidateOrder ?? null,
+        candidateFills: evidence.candidateFills ?? [],
         orderCount: evidence.orders.length,
         fillCount: evidence.fills.length,
         evidenceComplete: evidence.evidenceComplete === true,

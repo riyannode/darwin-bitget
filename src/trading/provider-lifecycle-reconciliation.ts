@@ -60,11 +60,38 @@ export interface ProviderLifecycleFill {
   origin: ProviderEvidenceOrigin;
 }
 
+export interface ProviderLifecycleCandidateOrder {
+  providerOrderId: string;
+  clientOid: string | null;
+  symbol: string;
+  side: string;
+  posSide: string | null;
+  tradeSide: string | null;
+  reduceOnly: string | null;
+  createdTime: string;
+  origin: ProviderEvidenceOrigin;
+}
+
+export interface ProviderLifecycleCandidateFill {
+  execId: string;
+  providerOrderId: string;
+  clientOid: string | null;
+  symbol: string;
+  side: string;
+  posSide: string | null;
+  tradeSide: string | null;
+  quantity: string;
+  createdTime: string;
+  origin: ProviderEvidenceOrigin;
+}
+
 export interface ProviderLifecycleEvidence {
   experience: TradeExperience;
   providerPositions: readonly ProviderLifecyclePosition[];
   history: ProviderLifecycleHistory | null;
   entryIdentity: { entryDecisionId: string; clientOid: string; providerOrderId: string } | null;
+  candidateOrder?: ProviderLifecycleCandidateOrder | null;
+  candidateFills?: readonly ProviderLifecycleCandidateFill[];
   entryIdentitySource?: "IDEMPOTENCY" | "IDEMPOTENCY_CLIENT_OID" | "DERIVED_DARWIN_CLIENT_OID" | null;
   entryIdentityLookupCount?: number;
   idempotencyClientOidPresent?: boolean | null;
