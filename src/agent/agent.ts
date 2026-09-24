@@ -27,6 +27,7 @@ import {
   loadRecentLessons,
   loadOpenExperiences,
   loadJournalsForDecisionIds,
+  loadJournalForExactDecisionCycle,
   loadUsableLessons,
   loadPerformanceAggregate,
   savePerformanceAggregate,
@@ -667,10 +668,10 @@ export class TraderAgent extends Agent<Env, AgentState> {
   };
 
   public override async onStart(): Promise<void> {
+    ensureStorage(this);
     const userStorageVersion = this.state.userStorageVersion ?? 0;
     const needsLatestValidPlanMigration = userStorageVersion < LATEST_VALID_PLAN_MIGRATION_VERSION;
     if (userStorageVersion < USER_STORAGE_VERSION) {
-      ensureStorage(this);
       this.setState({
         ...this.state,
         userStorageVersion: USER_STORAGE_VERSION,
@@ -955,10 +956,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const historicalLatestPlan = loadLatestCompletedCyclePlanFromHistory(this);
       if (historicalLatestPlan) saveLatestValidCyclePlan(this, historicalLatestPlan);
     }
-    if (isPerformanceAggregate(performance) && positionContextBootstrapped?.version === POSITION_CONTEXT_READ_MODEL_VERSION) return;
-    const history = this.readBootstrapHistory();
+    const needsPositionContextBootstrap = positionContextBootstrapped?.version !== POSITION_CONTEXT_READ_MODEL_VERSION;
+    if (isPerformanceAggregate(performance) && !needsPositionContextBootstrap) return;
     if (!isPerformanceAggregate(performance)) savePerformanceAggregate(this, migratePerformanceEquityObservations(performance, initializedAt), initializedAt);
-    if (positionContextBootstrapped?.version !== POSITION_CONTEXT_READ_MODEL_VERSION) {
+    if (needsPositionContextBootstrap) {
+      const history = this.readBootstrapHistory();
       for (const context of bootstrapPositionContexts(history.journals, history.experiences, initializedAt)) savePositionContext(this, context);
       savePositionContextBootstrap(this, POSITION_CONTEXT_READ_MODEL_VERSION, initializedAt);
     }
@@ -1109,7 +1111,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
 
   public async reconcileLateExecution(originalCycleId: string, decisionId: string): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string }> {
     if (!this.state.paused) throw new Error("AGENT_MUST_BE_PAUSED");
-    const journal = loadJournalsForDecisionIds(this, [decisionId], 2).find((candidate) => candidate.cycleId === originalCycleId);
+    const journal = loadJournalForExactDecisionCycle(this, originalCycleId, decisionId);
     if (!journal) throw new Error("LATE_RECONCILIATION_CYCLE_NOT_FOUND");
     const record = normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === decisionId);
     if (!record || !isReadbackOnlyExecutionMismatch(record) || !record.executionResult) throw new Error("LATE_RECONCILIATION_RECORD_NOT_ELIGIBLE");
@@ -1384,6 +1386,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   private getAgentJournal(url: URL): Response {
+    ensureStorage(this);
     const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
     const journals = loadRecentJournals(this, limit);
     const storedCycles = loadRecentStoredCycles(this, limit);
@@ -1393,6 +1396,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   private getPositionContext(url: URL): Response {
+    ensureStorage(this);
     const symbol = url.searchParams.get("symbol")?.trim() ?? "";
     const positionSide = url.searchParams.get("positionSide");
     if (!/^[A-Z0-9_-]{1,40}$/.test(symbol) || (positionSide !== "LONG" && positionSide !== "SHORT")) return json({ error: "INVALID_POSITION_CONTEXT_KEY" }, 400);
@@ -1506,6 +1510,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   private getLearning(url: URL): Response {
+    ensureStorage(this);
     const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
     const journal = loadLatestJournal(this);
     return json({ learning: { reflection: journal?.reflection ?? null, lessons: loadRecentLessons(this, limit), lessonsUsed: cyclePlanDecisions(journal).flatMap((decision) => decision.lessonsUsed), backtest: loadLatestBacktest(this), recentExperiences: loadExperiences(this, limit) }, limit });

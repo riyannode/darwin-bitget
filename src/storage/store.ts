@@ -3,7 +3,7 @@ import { parseExperience } from "../learning/experiences.js";
 import { parseLesson } from "../learning/lessons.js";
 import { parseDailyDrawdownState, type DailyDrawdownState } from "../trading/drawdown.js";
 import { parseOwnerPolicy } from "../trading/policy.js";
-import { normalizeCycleDecisions, journalHasPersistedPlan } from "./journal-normalizer.js";
+import { normalizeCycleDecisions, cyclePlanDecisions, journalHasPersistedPlan } from "./journal-normalizer.js";
 import type { VerifiedExternalFlows } from "../trading/external-flow.js";
 import type { ProviderPerformanceTotals } from "../trading/provider-performance.js";
 import type { SqlExecutor } from "./schema.js";
@@ -14,6 +14,14 @@ interface LessonRow {
 
 interface IdempotencyRow {
   client_order_id: string;
+}
+
+interface IdempotencyDecisionRow {
+  decision_id: string;
+}
+
+interface IdempotencyDecisionCycleRow {
+  cycle_id: string;
 }
 
 interface ExperienceRow {
@@ -30,6 +38,10 @@ interface PositionContextRow {
 
 interface JournalRow {
   payload: string;
+}
+
+interface ExactJournalRow extends JournalRow {
+  cycle_id: string;
 }
 
 interface CompletedCyclePlanRow {
@@ -210,6 +222,39 @@ export function loadOpenExperiences(executor: SqlExecutor, limit = MAX_HISTORY_L
   });
 }
 
+const MAX_FALLBACK_JOURNAL_ROWS = 25;
+const MAX_LOOKUP_JOURNAL_BYTES = 256 * 1024;
+const MAX_FALLBACK_JSON_NODES = 20_000;
+
+function journalContainsAnyDecisionId(payload: string, decisionIds: ReadonlySet<string>): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload) as unknown;
+  } catch {
+    return false;
+  }
+  const pending: unknown[] = [parsed];
+  let visited = 0;
+  while (pending.length > 0 && visited < MAX_FALLBACK_JSON_NODES) {
+    const value = pending.pop();
+    visited += 1;
+    if (Array.isArray(value)) {
+      for (let index = value.length - 1; index >= 0 && visited + pending.length < MAX_FALLBACK_JSON_NODES; index -= 1) pending.push(value[index]);
+      continue;
+    }
+    if (typeof value !== "object" || value === null) continue;
+    for (const key in value) {
+      if (visited + pending.length >= MAX_FALLBACK_JSON_NODES) break;
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      visited += 1;
+      const child = (value as Record<string, unknown>)[key];
+      if (key === "decisionId" && typeof child === "string" && decisionIds.has(child)) return true;
+      if (typeof child === "object" && child !== null) pending.push(child);
+    }
+  }
+  return false;
+}
+
 export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: readonly string[], limit = MAX_HISTORY_LIMIT): TradingJournal[] {
   const requested = [...new Set(decisionIds)].filter((id) => typeof id === "string" && id.trim().length > 0 && id.length <= MAX_TARGETED_DECISION_ID_LENGTH).slice(0, MAX_HISTORY_LIMIT);
   if (requested.length === 0) return [];
@@ -219,6 +264,7 @@ export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: r
     FROM journals AS j
     JOIN journal_decision_lookup AS indexed ON indexed.cycle_id = j.cycle_id
     JOIN json_each(${JSON.stringify(requested)}) AS requested ON requested.value = indexed.decision_id
+    WHERE length(CAST(j.payload AS BLOB)) <= ${MAX_LOOKUP_JOURNAL_BYTES}
     GROUP BY j.cycle_id
     ORDER BY MAX(j.created_at) DESC, j.cycle_id
     LIMIT ${maxRows}
@@ -232,7 +278,97 @@ export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: r
       // Ignore malformed historical journal rows during bounded lookup.
     }
   }
+  const resolvedIds = new Set<string>();
+  const collectVerified = (journal: TradingJournal, wanted: ReadonlySet<string>): void => {
+    for (const decision of cyclePlanDecisions(journal)) {
+      if (wanted.has(decision.decisionId)) resolvedIds.add(decision.decisionId);
+    }
+    for (const record of normalizeCycleDecisions(journal).records) {
+      const id = record.decision.decisionId;
+      if (wanted.has(id)) resolvedIds.add(id);
+    }
+  };
+  for (const journal of journals.values()) collectVerified(journal, new Set(requested));
+
+  let missingIds = requested.filter((id) => !resolvedIds.has(id));
+  const idempotentIds = new Set<string>();
+  if (missingIds.length > 0) {
+    const missingSet = new Set(missingIds);
+    const exactDecisionRows = executor.sql<IdempotencyDecisionRow>`
+      SELECT DISTINCT decision_id FROM idempotency
+      WHERE decision_id IN (SELECT value FROM json_each(${JSON.stringify(missingIds)}))
+      LIMIT ${MAX_HISTORY_LIMIT}
+    `;
+    for (const row of exactDecisionRows) {
+      if (missingSet.has(row.decision_id)) idempotentIds.add(row.decision_id);
+    }
+    const exactCycleRows = executor.sql<IdempotencyDecisionCycleRow>`
+      SELECT DISTINCT cycle_id FROM idempotency
+      WHERE decision_id IN (SELECT value FROM json_each(${JSON.stringify(missingIds)}))
+      ORDER BY cycle_id ASC
+      LIMIT ${MAX_HISTORY_LIMIT * 2}
+    `;
+    const exactCycleIds = [...new Set(exactCycleRows.map((row) => row.cycle_id).filter((cycleId) => typeof cycleId === "string" && cycleId.length > 0))];
+    if (exactCycleIds.length > 0) {
+      const exactJournalRows = executor.sql<ExactJournalRow>`
+        SELECT journal.cycle_id, journal.payload FROM journals AS journal
+        WHERE journal.cycle_id IN (SELECT value FROM json_each(${JSON.stringify(exactCycleIds)}))
+          AND length(CAST(journal.payload AS BLOB)) <= ${MAX_LOOKUP_JOURNAL_BYTES}
+        ORDER BY journal.cycle_id ASC
+        LIMIT ${MAX_HISTORY_LIMIT * 2}
+      `;
+      for (const row of exactJournalRows) {
+        try {
+          const journal = JSON.parse(row.payload) as TradingJournal;
+          if (journal.cycleId !== row.cycle_id) continue;
+          const beforeCount = resolvedIds.size;
+          collectVerified(journal, missingSet);
+          if (resolvedIds.size > beforeCount) journals.set(journal.cycleId, journal);
+        } catch {
+          // Ignore malformed historical journal rows during exact lookup.
+        }
+      }
+    }
+  }
+
+  missingIds = requested.filter((id) => !resolvedIds.has(id) && !idempotentIds.has(id));
+  if (missingIds.length > 0) {
+    const missingSet = new Set(missingIds);
+    const fallbackRows = executor.sql<JournalRow>`WITH recent_journals AS MATERIALIZED (SELECT cycle_id FROM journals ORDER BY created_at DESC LIMIT ${MAX_FALLBACK_JOURNAL_ROWS}) SELECT journal.payload FROM recent_journals JOIN journals AS journal USING (cycle_id) WHERE length(CAST(journal.payload AS BLOB)) <= ${MAX_LOOKUP_JOURNAL_BYTES}`;
+    for (const row of fallbackRows) {
+      if (!journalContainsAnyDecisionId(row.payload, missingSet)) continue;
+      try {
+        const journal = JSON.parse(row.payload) as TradingJournal;
+        const beforeCount = resolvedIds.size;
+        collectVerified(journal, missingSet);
+        if (resolvedIds.size > beforeCount) journals.set(journal.cycleId, journal);
+      } catch {
+        // Ignore malformed historical journal rows during bounded fallback.
+      }
+    }
+  }
   return [...journals.values()].slice(0, clampHistoryLimit(limit, MAX_HISTORY_LIMIT) * 2);
+}
+
+export function loadJournalForExactDecisionCycle(executor: SqlExecutor, cycleId: string, decisionId: string): TradingJournal | null {
+  if (!cycleId.trim() || cycleId.length > 256 || !decisionId.trim() || decisionId.length > MAX_TARGETED_DECISION_ID_LENGTH) return null;
+  const rows = executor.sql<ExactJournalRow>`
+    SELECT cycle_id, payload FROM journals
+    WHERE cycle_id = ${cycleId}
+      AND length(CAST(payload AS BLOB)) <= ${MAX_LOOKUP_JOURNAL_BYTES}
+    LIMIT 1
+  `;
+  const row = rows[0];
+  if (!row) return null;
+  try {
+    const journal = JSON.parse(row.payload) as TradingJournal;
+    if (journal.cycleId !== cycleId || row.cycle_id !== cycleId) return null;
+    const hasDecision = cyclePlanDecisions(journal).some((decision) => decision.decisionId === decisionId)
+      || normalizeCycleDecisions(journal).records.some((record) => record.decision.decisionId === decisionId);
+    return hasDecision ? journal : null;
+  } catch {
+    return null;
+  }
 }
 
 export function loadAllExperiences(executor: SqlExecutor): TradeExperience[] {
