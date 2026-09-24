@@ -1,5 +1,6 @@
 import type { TradeExperience } from "../types.js";
 import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal, subtractDecimal } from "./decimal.js";
+import { resolveProviderLifecycleSide } from "./provider-lifecycle-side.js";
 
 export type ProviderLifecycleClassification =
   | "MATCHED_OPEN"
@@ -43,8 +44,10 @@ export interface ProviderLifecycleOrder {
   providerOrderId: string;
   clientOid: string | null;
   symbol: string;
+  side: string | null;
   positionSide: string | null;
   tradeSide: string | null;
+  createdAt?: string;
   origin: ProviderEvidenceOrigin;
 }
 
@@ -52,6 +55,7 @@ export interface ProviderLifecycleFill {
   providerOrderId: string;
   clientOid: string | null;
   symbol: string;
+  side: string | null;
   positionSide: string | null;
   tradeSide: string | null;
   quantity: string;
@@ -125,6 +129,8 @@ function validTimestamp(value: string): number | null {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
+const MAX_OPENING_CHRONOLOGY_SKEW_MS = 5_000;
+
 function exactSum(values: readonly string[]): string | null {
   try {
     return values.reduce((sum, value) => addDecimal(sum, value), "0");
@@ -134,11 +140,13 @@ function exactSum(values: readonly string[]): string | null {
 }
 
 function orderForFill(fill: ProviderLifecycleFill, orders: readonly ProviderLifecycleOrder[]): ProviderLifecycleOrder | undefined {
+  const fillSide = resolveProviderLifecycleSide(fill.side, fill.positionSide, fill.tradeSide);
+  if (fillSide === "UNRESOLVED" || fillSide === "CONTRADICTORY") return undefined;
   return orders.find((order) => order.providerOrderId === fill.providerOrderId
     && order.clientOid === fill.clientOid
     && order.symbol === fill.symbol
     && order.positionSide === fill.positionSide
-    && order.tradeSide === fill.tradeSide
+    && resolveProviderLifecycleSide(order.side, order.positionSide, order.tradeSide) === fillSide
     && order.origin === fill.origin);
 }
 
@@ -191,9 +199,11 @@ function currentPositionEntryMatches(fills: readonly ProviderLifecycleFill[], ex
     if (!fills.length || !isPositiveDecimal(expectedQuantity) || !isPositiveDecimal(expectedPrice)
       || !fills.every((fill) => isPositiveDecimal(fill.quantity) && isPositiveDecimal(fill.execPrice))) return false;
     const ordered = [...fills].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+    const lifecycleSides = ordered.map((fill) => resolveProviderLifecycleSide(fill.side, fill.positionSide, fill.tradeSide));
+    if (lifecycleSides.some((lifecycleSide) => lifecycleSide === "UNRESOLVED" || lifecycleSide === "CONTRADICTORY")) return false;
     for (let index = 1; index < ordered.length; index += 1) {
       if (Date.parse(ordered[index - 1]!.createdAt) === Date.parse(ordered[index]!.createdAt)
-        && ordered[index - 1]!.tradeSide !== ordered[index]!.tradeSide) return false;
+        && lifecycleSides[index - 1] !== lifecycleSides[index]) return false;
     }
     const quantities = ordered.map((fill) => decimalParts(fill.quantity));
     const prices = ordered.map((fill) => decimalParts(fill.execPrice));
@@ -205,14 +215,14 @@ function currentPositionEntryMatches(fills: readonly ProviderLifecycleFill[], ex
     for (let index = 0; index < ordered.length; index += 1) {
       const fill = ordered[index]!;
       const quantity = quantities[index]!.coefficient * 10n ** BigInt(quantityScale - quantities[index]!.scale);
-      if (fill.tradeSide === "open") {
+      if (lifecycleSides[index] === "OPEN") {
         const price = prices[index]!.coefficient * 10n ** BigInt(priceScale - prices[index]!.scale);
         costNumerator += quantity * price * costDenominator;
         const divisor = greatestCommonDivisor(costNumerator, costDenominator);
         costNumerator /= divisor;
         costDenominator /= divisor;
         currentQuantity += quantity;
-      } else if (fill.tradeSide === "close") {
+      } else if (lifecycleSides[index] === "CLOSE") {
         if (quantity > currentQuantity) return false;
         const remainingQuantity = currentQuantity - quantity;
         if (currentQuantity > 0n) {
@@ -240,8 +250,6 @@ function currentPositionEntryMatches(fills: readonly ProviderLifecycleFill[], ex
   }
 }
 
-const MAX_OPENING_CHRONOLOGY_SKEW_MS = 5_000;
-
 function isNearTimestamp(value: string, reference: string): boolean {
   const timestamp = validTimestamp(value);
   const referenceTimestamp = validTimestamp(reference);
@@ -253,11 +261,14 @@ function openingIdentityIsProven(evidence: ProviderLifecycleEvidence, openingTim
   if (!experience.positionSide || !entryIdentity || entryIdentity.entryDecisionId !== experience.entryDecisionId || !entryIdentity.clientOid || !entryIdentity.providerOrderId) return false;
   const orders = evidence.orders.filter((order) => order.providerOrderId === entryIdentity.providerOrderId
     && order.clientOid === entryIdentity.clientOid && order.symbol === experience.symbol
-    && order.positionSide === experience.positionSide && order.tradeSide === "open" && order.origin === "DARWIN");
+    && order.positionSide === experience.positionSide
+    && resolveProviderLifecycleSide(order.side, order.positionSide, order.tradeSide) === "OPEN"
+    && order.origin === "DARWIN");
   if (orders.length !== 1) return false;
   const fills = evidence.fills.filter((fill) => fill.providerOrderId === entryIdentity.providerOrderId
     && fill.clientOid === entryIdentity.clientOid && fill.symbol === experience.symbol
-    && fill.positionSide === experience.positionSide && fill.tradeSide === "open" && fill.origin === "DARWIN"
+    && fill.positionSide === experience.positionSide
+    && resolveProviderLifecycleSide(fill.side, fill.positionSide, fill.tradeSide) === "OPEN" && fill.origin === "DARWIN"
     && orderForFill(fill, orders));
   return fills.length > 0 && fills.every((fill) => isPositiveDecimal(fill.quantity) && isNearTimestamp(fill.createdAt, openingTime));
 }
@@ -278,7 +289,7 @@ function reconstructProviderLifecycleFills(evidence: ProviderLifecycleEvidence, 
   const entryIdentity = evidence.entryIdentity;
   const isInLifecycle = (fill: ProviderLifecycleFill): boolean => {
     const timestamp = validTimestamp(fill.createdAt)!;
-    const isEntrySkew = fill.tradeSide === "open" && entryIdentity?.providerOrderId === fill.providerOrderId
+    const isEntrySkew = entryIdentity?.providerOrderId === fill.providerOrderId
       && entryIdentity.clientOid === fill.clientOid && isNearTimestamp(fill.createdAt, openingTime);
     const inLifecycle = timestamp >= openingMs && (closingMs === null || timestamp <= closingMs);
     return isEntrySkew || inLifecycle;
@@ -290,11 +301,13 @@ function reconstructProviderLifecycleFills(evidence: ProviderLifecycleEvidence, 
   const fills = samePositionFills.filter(isInLifecycle);
   if (fills.some((fill) => fill.origin === "PROVIDER_EXTERNAL")) return { ok: false, classification: "PROVIDER_EXTERNAL", reason: "PROVIDER_EXTERNAL_QUANTITY_CHANGE_IN_LIFECYCLE" };
   if (fills.some((fill) => fill.origin !== "DARWIN")) return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_FILL_ORIGIN_UNATTRIBUTED" };
-  if (fills.some((fill) => fill.tradeSide !== "open" && fill.tradeSide !== "close")) return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_FILL_TRADE_SIDE_UNKNOWN" };
+  const lifecycleSideByFill = new Map(fills.map((fill) => [fill, resolveProviderLifecycleSide(fill.side, fill.positionSide, fill.tradeSide)]));
+  if ([...lifecycleSideByFill.values()].includes("CONTRADICTORY")) return { ok: false, classification: "CONTRADICTORY", reason: "LIFECYCLE_FILL_SIDE_CONTRADICTORY" };
+  if ([...lifecycleSideByFill.values()].includes("UNRESOLVED")) return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_FILL_TRADE_SIDE_UNKNOWN" };
   if (fills.some((fill) => !isPositiveDecimal(fill.quantity))) return { ok: false, classification: "CONTRADICTORY", reason: "LIFECYCLE_FILL_QUANTITY_INVALID" };
   if (fills.some((fill) => !orderForFill(fill, evidence.orders))) return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_FILL_ORDER_IDENTITY_UNPROVEN" };
-  const openingFills = fills.filter((fill) => fill.tradeSide === "open");
-  const closingFills = fills.filter((fill) => fill.tradeSide === "close");
+  const openingFills = fills.filter((fill) => lifecycleSideByFill.get(fill) === "OPEN");
+  const closingFills = fills.filter((fill) => lifecycleSideByFill.get(fill) === "CLOSE");
   if (!openingFills.length) return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_OPENING_FILLS_MISSING" };
   const openQuantity = exactSum(openingFills.map((fill) => fill.quantity));
   const closeQuantity = exactSum(closingFills.map((fill) => fill.quantity));
