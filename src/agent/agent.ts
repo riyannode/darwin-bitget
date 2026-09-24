@@ -18,6 +18,7 @@ import {
   loadLatestJournal,
   loadAllAutonomousJournals,
   loadAllEvents,
+  loadEventById,
   loadAllExperiences,
   loadExperiencesForDecisionIds,
   loadAllStoredCycles,
@@ -41,6 +42,7 @@ import {
   savePositionContextBootstrap,
   loadDailyDrawdownState,
   loadExperiences,
+  loadExperienceById,
   loadActiveOwnerPolicy,
   clampHistoryLimit,
   recordIdempotency,
@@ -1076,7 +1078,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     };
   }> {
     if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
-    const experience = loadAllExperiences(this).find((candidate) => candidate.experienceId === experienceId);
+    const experience = loadExperienceById(this, experienceId);
     if (!experience) throw new Error("EXPERIENCE_NOT_FOUND");
     if (!experience.positionSide) throw new Error("LOCAL_POSITION_SIDE_MISSING");
 
@@ -1120,12 +1122,12 @@ export class TraderAgent extends Agent<Env, AgentState> {
   public async repairProviderClosedLifecycle(experienceId: string, providerPositionHistoryId: string): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string; providerPositionHistoryId: string }> {
     if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
     ensureStorage(this);
-    const experience = loadAllExperiences(this).find((candidate) => candidate.experienceId === experienceId);
+    const experience = loadExperienceById(this, experienceId);
     if (!experience) throw new Error("EXPERIENCE_NOT_FOUND");
     const eventId = providerLifecycleRepairEventId(experienceId, providerPositionHistoryId);
     if (experience.financialSource === "PROVIDER_LEDGER" && experience.providerPositionHistoryId === providerPositionHistoryId && experience.outcomeStatus !== "OPEN") {
       const context = experience.positionSide ? loadPositionContext(this, experience.symbol, experience.positionSide) : null;
-      const auditEvent = loadAllEvents(this).find((event) => event.eventId === eventId);
+      const auditEvent = loadEventById(this, eventId);
       if (!repairedLifecycleStateIsConsistent(experience, context, auditEvent, experienceId, providerPositionHistoryId)) {
         throw new Error("PROVIDER_LIFECYCLE_REPAIR_STATE_INCONSISTENT");
       }
@@ -1176,10 +1178,10 @@ export class TraderAgent extends Agent<Env, AgentState> {
     };
     const written = persistProviderLifecycleRepair(this, (closure) => this.ctx.storage.transactionSync(closure), experience, context, closedExperience, closedContext, event);
     if (!written) {
-      const latest = loadAllExperiences(this).find((candidate) => candidate.experienceId === experienceId);
+      const latest = loadExperienceById(this, experienceId);
       const latestContext = latest?.positionSide ? loadPositionContext(this, latest.symbol, latest.positionSide) : null;
-      const auditEvent = loadAllEvents(this).find((candidate) => candidate.eventId === eventId);
-      if (!repairedLifecycleStateIsConsistent(latest, latestContext, auditEvent, experienceId, providerPositionHistoryId)) {
+      const auditEvent = loadEventById(this, eventId);
+      if (!repairedLifecycleStateIsConsistent(latest ?? undefined, latestContext, auditEvent, experienceId, providerPositionHistoryId)) {
         throw new Error("PROVIDER_LIFECYCLE_REPAIR_STATE_INCONSISTENT");
       }
       return { status: "ALREADY_RECONCILED", experienceId, providerPositionHistoryId };

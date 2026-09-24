@@ -382,6 +382,23 @@ export function loadAllExperiences(executor: SqlExecutor): TradeExperience[] {
   });
 }
 
+export function loadExperienceById(executor: SqlExecutor, experienceId: string): TradeExperience | null {
+  if (!experienceId || experienceId.length > 256) return null;
+  const rows = executor.sql<{ experience_id: string; payload: string }>`
+    SELECT experience_id, payload FROM experiences
+    WHERE experience_id = ${experienceId}
+    LIMIT 1
+  `;
+  const row = rows[0];
+  if (!row || row.experience_id !== experienceId) return null;
+  try {
+    const experience = parseExperience(JSON.parse(row.payload));
+    return experience.experienceId === experienceId ? experience : null;
+  } catch {
+    return null;
+  }
+}
+
 export function saveExperience(executor: SqlExecutor, experience: TradeExperience, createdAt: string): void {
   executor.sql`
     INSERT INTO experiences (experience_id, symbol, outcome_status, payload, created_at)
@@ -779,6 +796,30 @@ export function loadRecentEvents(executor: SqlExecutor, limit = 25): ActivityEve
       return [];
     }
   });
+}
+
+export function loadEventById(executor: SqlExecutor, eventId: string): ActivityEvent | undefined {
+  if (!eventId || eventId.length > 512) return undefined;
+  const rows = executor.sql<EventRow>`
+    SELECT event_id, event_type, cycle_id, payload, created_at FROM events
+    WHERE event_id = ${eventId}
+    LIMIT 1
+  `;
+  const row = rows[0];
+  if (!row || row.event_id !== eventId) return undefined;
+  try {
+    const event = JSON.parse(row.payload) as ActivityEvent;
+    const result = {
+      eventId: event.eventId || row.event_id,
+      type: event.type || row.event_type,
+      cycleId: event.cycleId || row.cycle_id,
+      createdAt: event.createdAt || row.created_at,
+      ...(event.metadata ? { metadata: event.metadata } : {}),
+    };
+    return result.eventId === eventId ? result : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function loadAllEvents(executor: SqlExecutor): ActivityEvent[] {
