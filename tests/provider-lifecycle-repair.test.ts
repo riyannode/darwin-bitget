@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { loadProviderLifecycleEvidence, loadProviderSyncState, saveProviderSyncState } from "../src/storage/provider-ledger.js";
+import { loadProviderLifecycleEvidence, loadProviderLifecycleHistoryCandidateIds, loadProviderPositionHistoryDecisionIds, loadProviderSyncState, saveProviderSyncState } from "../src/storage/provider-ledger.js";
 import { classifyProviderLifecycle } from "../src/trading/provider-lifecycle-reconciliation.js";
 import { hasEvent, loadAllEvents, loadAllExperiences, loadPositionContext, persistProviderLifecycleRepair, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
 import { TraderAgent, resolveProviderTradeFacts } from "../src/agent/agent.js";
@@ -213,6 +213,31 @@ describe("provider-first financial lifecycle resolution", () => {
     const resolved = resolveProviderTradeFacts(executor, [], "USDT-FUTURES", []);
     expect(resolved.lifecycles).toEqual([]);
     expect(resolved.providerOnlyHistories).toEqual([]);
+    db.close();
+  });
+
+  it("resolves provider-live CRCL SHORT, META LONG, and TSLA LONG identities from exact UTA order/fill chains", () => {
+    const { db, executor } = memoryExecutor();
+    const positions = [
+      { symbol: "CRCLUSDT", positionSide: "SHORT", quantity: "8.27", entryPrice: "92.89", openedAt: "2026-09-22T01:17:28.845Z", side: "sell", orderId: "live-crcl-order", clientOid: "live-crcl-client", decisionId: "live-crcl-decision" },
+      { symbol: "METAUSDT", positionSide: "LONG", quantity: "1.02", entryPrice: "740.63", openedAt: "2026-09-22T00:53:26.526Z", side: "buy", orderId: "live-meta-order", clientOid: "live-meta-client", decisionId: "live-meta-decision" },
+      { symbol: "TSLAUSDT", positionSide: "LONG", quantity: "4.04", entryPrice: "375.75", openedAt: "2026-09-22T00:22:31.326Z", side: "buy", orderId: "live-tsla-order", clientOid: "live-tsla-client", decisionId: "live-tsla-decision" },
+    ] as const;
+    const run = (sql: string, ...values: (string | null)[]) => executor.sql(sql.split("?") as unknown as TemplateStringsArray, ...values);
+    for (const position of positions) {
+      run("INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES (?, ?, ?, ?, ?)", position.clientOid, `cycle-${position.symbol}`, position.decisionId, position.orderId, position.openedAt);
+      run("INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", position.orderId, position.clientOid, "USDT-FUTURES", position.symbol, position.side, position.positionSide.toLowerCase(), null, position.quantity, position.quantity, "filled", position.openedAt, position.openedAt, "DARWIN", "{}", position.openedAt, position.openedAt);
+      run("INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", `fill-${position.orderId}`, position.orderId, position.clientOid, "USDT-FUTURES", position.symbol, position.side, position.positionSide.toLowerCase(), null, position.quantity, position.entryPrice, position.openedAt, "DARWIN", "{}", position.openedAt, position.openedAt);
+    }
+
+    const result = resolveProviderTradeFacts(executor, [], "USDT-FUTURES", positions as never);
+    expect(result.providerOnlyOpenPositions.map(({ position, providerOrderId, decisionId }) => ({ symbol: position.symbol, positionSide: position.positionSide, providerOrderId, decisionId }))).toEqual([
+      { symbol: "CRCLUSDT", positionSide: "SHORT", providerOrderId: "live-crcl-order", decisionId: "live-crcl-decision" },
+      { symbol: "METAUSDT", positionSide: "LONG", providerOrderId: "live-meta-order", decisionId: "live-meta-decision" },
+      { symbol: "TSLAUSDT", positionSide: "LONG", providerOrderId: "live-tsla-order", decisionId: "live-tsla-decision" },
+    ]);
+    expect(result.lifecycles).toHaveLength(3);
+    expect(result.lifecycles.every((lifecycle) => lifecycle.status === "OPEN" && lifecycle.origin === "DARWIN")).toBe(true);
     db.close();
   });
 
@@ -790,6 +815,29 @@ describe("provider-first financial lifecycle resolution", () => {
     });
     expect(executePaperOrder).not.toHaveBeenCalled();
     expect(loadAllEvents(executor)).toHaveLength(0);
+    db.close();
+  });
+
+  it("resolves Samsung UTA lifecycle and Trade History from exact provider identities when tradeSide is absent", async () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, openExperience(), OPENED_AT);
+    savePositionContext(executor, positionContext());
+    insertProviderEvidence(executor);
+    executor.sql`UPDATE idempotency SET provider_order_id = '1485976014603796480' WHERE decision_id = ${ENTRY_DECISION_ID}`;
+    executor.sql`UPDATE provider_orders SET provider_order_id = '1485976014603796480', trade_side = NULL WHERE provider_order_id = 'provider-entry-order'`;
+    executor.sql`UPDATE provider_fills SET provider_order_id = '1485976014603796480', exec_id = '1485976014611001344', trade_side = NULL WHERE provider_order_id = 'provider-entry-order'`;
+    executor.sql`UPDATE provider_orders SET trade_side = NULL`;
+    executor.sql`UPDATE provider_fills SET trade_side = NULL`;
+
+    const evidence = loadProviderLifecycleEvidence(executor, openExperience(), "USDT-FUTURES", HISTORY_ID, [], undefined, true);
+    const classification = classifyProviderLifecycle(evidence);
+    const resolved = resolveProviderTradeFacts(executor, [openExperience()], "USDT-FUTURES", []);
+
+    expect(loadProviderPositionHistoryDecisionIds(executor, "USDT-FUTURES", evidence.history ? [evidence.history] : []).get(HISTORY_ID)).toBe(ENTRY_DECISION_ID);
+    expect(loadProviderLifecycleHistoryCandidateIds(executor, openExperience(), "USDT-FUTURES")).toEqual(new Set([HISTORY_ID]));
+    expect(classification).toMatchObject({ classification: "LOCAL_OPEN_PROVIDER_CLOSED", reason: "PROVIDER_LEDGER_PROVES_FULL_DARWIN_CLOSE" });
+    expect(resolved.lifecycles).toContainEqual(expect.objectContaining({ lifecycleId: HISTORY_ID, origin: "DARWIN", status: "CLOSED" }));
+    expect(resolved.facts.get(EXPERIENCE_ID)).toMatchObject({ source: "PROVIDER_LEDGER", origin: "DARWIN", providerPositionHistoryId: HISTORY_ID });
     db.close();
   });
 

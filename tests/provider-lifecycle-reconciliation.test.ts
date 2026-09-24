@@ -59,16 +59,17 @@ const fixture = (): ProviderLifecycleEvidence => ({
     providerOrderId: "provider-entry-order",
   },
   orders: [
-    { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", origin: "DARWIN" },
-    ...["close-1", "close-2", "close-3", "close-4", "close-5", "close-6"].map((id) => ({ providerOrderId: id, clientOid: `darwin-${id}`, symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "close", origin: "DARWIN" as const })),
+    { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG", tradeSide: "open", createdAt: "2026-09-21T17:03:30.661Z", origin: "DARWIN" },
+    ...["close-1", "close-2", "close-3", "close-4", "close-5", "close-6"].map((id, index) => ({ providerOrderId: id, clientOid: `darwin-${id}`, symbol: "SAMSUNGUSDT", side: "sell", positionSide: "LONG", tradeSide: "close", createdAt: `2026-09-21T${String(18 + index).padStart(2, "0")}:00:00.000Z`, origin: "DARWIN" as const })),
   ],
   fills: [
-    { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", quantity: "3.755", execPrice: "198.01", createdAt: "2026-09-21T17:03:30.660Z", origin: "DARWIN" },
-    { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", quantity: "3.755", execPrice: "198.03", createdAt: "2026-09-21T17:03:30.662Z", origin: "DARWIN" },
+    { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG", tradeSide: "open", quantity: "3.755", execPrice: "198.01", createdAt: "2026-09-21T17:03:30.660Z", origin: "DARWIN" },
+    { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG", tradeSide: "open", quantity: "3.755", execPrice: "198.03", createdAt: "2026-09-21T17:03:30.662Z", origin: "DARWIN" },
     ...["2.47", "1.66", "1.11", "1.13", "0.57", "0.57"].map((quantity, index) => ({
       providerOrderId: `close-${index + 1}`,
       clientOid: `darwin-close-${index + 1}`,
       symbol: "SAMSUNGUSDT",
+      side: "sell" as const,
       positionSide: "LONG" as const,
       tradeSide: "close",
       quantity,
@@ -81,21 +82,21 @@ const fixture = (): ProviderLifecycleEvidence => ({
 
 const costBasisFixture = (entryPrice: string, increaseOrigin: ProviderLifecycleEvidence["fills"][number]["origin"] = "DARWIN"): ProviderLifecycleEvidence => {
   const openedAt = "2026-09-21T17:03:30.661Z";
-  const increaseOrder = { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", origin: increaseOrigin } as const;
+  const increaseOrder = { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG", tradeSide: "open", createdAt: "2026-09-21T17:15:00.000Z", origin: increaseOrigin } as const;
   return {
     experience,
     providerPositions: [{ symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "10", entryPrice, openedAt }],
     history: null,
     entryIdentity: { entryDecisionId: experience.entryDecisionId, clientOid: "darwin-entry-oid", providerOrderId: "provider-entry-order" },
     orders: [
-      { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", origin: "DARWIN" },
-      { providerOrderId: "reduce-1", clientOid: "darwin-reduce-1", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "close", origin: "DARWIN" },
+      { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG", tradeSide: "open", createdAt: openedAt, origin: "DARWIN" },
+      { providerOrderId: "reduce-1", clientOid: "darwin-reduce-1", symbol: "SAMSUNGUSDT", side: "sell", positionSide: "LONG", tradeSide: "close", createdAt: "2026-09-21T17:10:00.000Z", origin: "DARWIN" },
       increaseOrder,
     ],
     fills: [
-      { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", quantity: "10", execPrice: "100", createdAt: openedAt, origin: "DARWIN" },
-      { providerOrderId: "reduce-1", clientOid: "darwin-reduce-1", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "close", quantity: "5", execPrice: "105", createdAt: "2026-09-21T17:10:00.000Z", origin: "DARWIN" },
-      { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", positionSide: "LONG", tradeSide: "open", quantity: "5", execPrice: "110", createdAt: "2026-09-21T17:15:00.000Z", origin: increaseOrigin },
+      { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG", tradeSide: "open", quantity: "10", execPrice: "100", createdAt: openedAt, origin: "DARWIN" },
+      { providerOrderId: "reduce-1", clientOid: "darwin-reduce-1", symbol: "SAMSUNGUSDT", side: "sell", positionSide: "LONG", tradeSide: "close", quantity: "5", execPrice: "105", createdAt: "2026-09-21T17:10:00.000Z", origin: "DARWIN" },
+      { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG", tradeSide: "open", quantity: "5", execPrice: "110", createdAt: "2026-09-21T17:15:00.000Z", origin: increaseOrigin },
     ],
   };
 };
@@ -138,10 +139,10 @@ describe("provider/local lifecycle reconciliation", () => {
 
   it("reconstructs a closed lifecycle across an opening increase and all closing fills", () => {
     const original = fixture();
-    const increaseOrder = { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "open", origin: "DARWIN" as const };
-    const increaseFill = { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "open", quantity: "2", execPrice: "110", createdAt: "2026-09-21T17:10:00.000Z", origin: "DARWIN" as const };
-    const additionalCloseOrder = { providerOrderId: "close-extra", clientOid: "darwin-close-extra", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "close", origin: "DARWIN" as const };
-    const additionalCloseFill = { providerOrderId: "close-extra", clientOid: "darwin-close-extra", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "close", quantity: "2", execPrice: "202.66", createdAt: "2026-09-22T00:00:00.000Z", origin: "DARWIN" as const };
+    const increaseOrder = { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG" as const, tradeSide: "open", createdAt: "2026-09-21T17:10:00.000Z", origin: "DARWIN" as const };
+    const increaseFill = { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG" as const, tradeSide: "open", quantity: "2", execPrice: "110", createdAt: "2026-09-21T17:10:00.000Z", origin: "DARWIN" as const };
+    const additionalCloseOrder = { providerOrderId: "close-extra", clientOid: "darwin-close-extra", symbol: "SAMSUNGUSDT", side: "sell", positionSide: "LONG" as const, tradeSide: "close", createdAt: "2026-09-22T00:00:00.000Z", origin: "DARWIN" as const };
+    const additionalCloseFill = { providerOrderId: "close-extra", clientOid: "darwin-close-extra", symbol: "SAMSUNGUSDT", side: "sell", positionSide: "LONG" as const, tradeSide: "close", quantity: "2", execPrice: "202.66", createdAt: "2026-09-22T00:00:00.000Z", origin: "DARWIN" as const };
     const evidence = {
       ...original,
       history: { ...original.history!, openTotalPos: "9.51", closeTotalPos: "9.51", avgEntryPrice: "102.10" },
@@ -159,13 +160,13 @@ describe("provider/local lifecycle reconciliation", () => {
       providerPositions: [{ symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "7.51", entryPrice: "102.10", openedAt: "2026-09-21T17:03:30.661Z" }],
       orders: [
         original.orders[0]!,
-        { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "open", origin: "DARWIN" as const },
-        { providerOrderId: "partial-close", clientOid: "darwin-partial-close", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "close", origin: "DARWIN" as const },
+        { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG" as const, tradeSide: "open", createdAt: "2026-09-21T17:10:00.000Z", origin: "DARWIN" as const },
+        { providerOrderId: "partial-close", clientOid: "darwin-partial-close", symbol: "SAMSUNGUSDT", side: "sell", positionSide: "LONG" as const, tradeSide: "close", createdAt: "2026-09-22T00:00:00.000Z", origin: "DARWIN" as const },
       ],
       fills: [
         ...original.fills.filter((fill) => fill.tradeSide === "open").map((fill) => ({ ...fill, execPrice: "100" })),
-        { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "open", quantity: "2", execPrice: "110", createdAt: "2026-09-21T17:10:00.000Z", origin: "DARWIN" as const },
-        { providerOrderId: "partial-close", clientOid: "darwin-partial-close", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "close", quantity: "2", execPrice: "202.66", createdAt: "2026-09-22T00:00:00.000Z", origin: "DARWIN" as const },
+        { providerOrderId: "increase-1", clientOid: "darwin-increase-1", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG" as const, tradeSide: "open", quantity: "2", execPrice: "110", createdAt: "2026-09-21T17:10:00.000Z", origin: "DARWIN" as const },
+        { providerOrderId: "partial-close", clientOid: "darwin-partial-close", symbol: "SAMSUNGUSDT", side: "sell", positionSide: "LONG" as const, tradeSide: "close", quantity: "2", execPrice: "202.66", createdAt: "2026-09-22T00:00:00.000Z", origin: "DARWIN" as const },
       ],
     };
     expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "MATCHED_OPEN" });
@@ -173,10 +174,10 @@ describe("provider/local lifecycle reconciliation", () => {
 
   it("does not attribute an externally increased position to DARWIN performance", () => {
     const original = fixture();
-    const externalOrder = { providerOrderId: "external-increase", clientOid: "external-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "open", origin: "PROVIDER_EXTERNAL" as const };
-    const externalFill = { providerOrderId: "external-increase", clientOid: "external-oid", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "open", quantity: "2", execPrice: "110", createdAt: "2026-09-21T17:10:00.000Z", origin: "PROVIDER_EXTERNAL" as const };
-    const extraCloseOrder = { providerOrderId: "close-extra", clientOid: "darwin-close-extra", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "close", origin: "DARWIN" as const };
-    const extraCloseFill = { providerOrderId: "close-extra", clientOid: "darwin-close-extra", symbol: "SAMSUNGUSDT", positionSide: "LONG" as const, tradeSide: "close", quantity: "2", execPrice: "202.66", createdAt: "2026-09-22T00:00:00.000Z", origin: "DARWIN" as const };
+    const externalOrder = { providerOrderId: "external-increase", clientOid: "external-oid", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG" as const, tradeSide: "open", createdAt: "2026-09-21T17:10:00.000Z", origin: "PROVIDER_EXTERNAL" as const };
+    const externalFill = { providerOrderId: "external-increase", clientOid: "external-oid", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG" as const, tradeSide: "open", quantity: "2", execPrice: "110", createdAt: "2026-09-21T17:10:00.000Z", origin: "PROVIDER_EXTERNAL" as const };
+    const extraCloseOrder = { providerOrderId: "close-extra", clientOid: "darwin-close-extra", symbol: "SAMSUNGUSDT", side: "sell", positionSide: "LONG" as const, tradeSide: "close", createdAt: "2026-09-22T00:00:00.000Z", origin: "DARWIN" as const };
+    const extraCloseFill = { providerOrderId: "close-extra", clientOid: "darwin-close-extra", symbol: "SAMSUNGUSDT", side: "sell", positionSide: "LONG" as const, tradeSide: "close", quantity: "2", execPrice: "202.66", createdAt: "2026-09-22T00:00:00.000Z", origin: "DARWIN" as const };
     const evidence = {
       ...original,
       history: { ...original.history!, openTotalPos: "9.51", closeTotalPos: "9.51", avgEntryPrice: "102.10" },
@@ -194,6 +195,7 @@ describe("provider/local lifecycle reconciliation", () => {
         providerOrderId: "unattributed-no-side",
         clientOid: "manual-no-side",
         symbol: "SAMSUNGUSDT",
+        side: null,
         positionSide: null,
         tradeSide: "open" as const,
         quantity: "0.25",
@@ -228,6 +230,43 @@ describe("provider/local lifecycle reconciliation", () => {
     const fills = original.fills.map((fill) => fill.providerOrderId === "close-1" ? { ...fill, origin: "PROVIDER_EXTERNAL" as const } : fill);
     const evidence = { ...original, history: null, experience: { ...experience, outcomeStatus: "CLOSED_UNCLASSIFIED" as const }, providerPositions: [{ symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "1" }], orders, fills };
     expect(classifyProviderLifecycle(evidence).classification).toBe("PROVIDER_EXTERNAL");
+  });
+
+  it("derives all UTA open and close directions from side plus positionSide when tradeSide is absent", () => {
+    const cases = [
+      { label: "LONG opening", positionSide: "LONG", openSide: "buy", closeSide: "sell", close: false },
+      { label: "SHORT opening", positionSide: "SHORT", openSide: "sell", closeSide: "buy", close: false },
+      { label: "LONG close", positionSide: "LONG", openSide: "buy", closeSide: "sell", close: true },
+      { label: "SHORT close", positionSide: "SHORT", openSide: "sell", closeSide: "buy", close: true },
+    ] as const;
+
+    for (const example of cases) {
+      const positionSide = example.positionSide;
+      const openOrder = { providerOrderId: "open-order", clientOid: "open-oid", symbol: "SAMSUNGUSDT", side: example.openSide, positionSide, tradeSide: null, createdAt: "2026-09-21T17:03:30.661Z", origin: "DARWIN" };
+      const closeOrder = { providerOrderId: "close-order", clientOid: "close-oid", symbol: "SAMSUNGUSDT", side: example.closeSide, positionSide, tradeSide: null, createdAt: "2026-09-21T17:04:30.661Z", origin: "DARWIN" };
+      const openFill = { providerOrderId: "open-order", clientOid: "open-oid", symbol: "SAMSUNGUSDT", side: example.openSide, positionSide, tradeSide: null, quantity: "1", execPrice: "100", createdAt: "2026-09-21T17:03:30.661Z", origin: "DARWIN" };
+      const closeFill = { providerOrderId: "close-order", clientOid: "close-oid", symbol: "SAMSUNGUSDT", side: example.closeSide, positionSide, tradeSide: null, quantity: "0.5", execPrice: "110", createdAt: "2026-09-21T17:04:30.661Z", origin: "DARWIN" };
+      const evidence = {
+        experience: { ...experience, positionSide, action: positionSide === "SHORT" ? "OPEN_SHORT" : "OPEN_LONG" },
+        providerPositions: [{ symbol: "SAMSUNGUSDT", positionSide, quantity: example.close ? "0.5" : "1", entryPrice: "100", openedAt: "2026-09-21T17:03:30.661Z" }],
+        history: null,
+        entryIdentity: { entryDecisionId: experience.entryDecisionId, clientOid: "open-oid", providerOrderId: "open-order" },
+        orders: example.close ? [openOrder, closeOrder] : [openOrder],
+        fills: example.close ? [openFill, closeFill] : [openFill],
+      } as unknown as ProviderLifecycleEvidence;
+      expect(classifyProviderLifecycle(evidence), example.label).toMatchObject({ classification: "MATCHED_OPEN" });
+    }
+  });
+
+  it("fails closed when explicit tradeSide conflicts with authoritative side and positionSide", () => {
+    const evidence = {
+      ...fixture(),
+      history: null,
+      providerPositions: [{ symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "1", entryPrice: "100", openedAt: "2026-09-21T17:03:30.661Z" }],
+      orders: [{ providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG", tradeSide: "close", createdAt: "2026-09-21T17:03:30.661Z", origin: "DARWIN" }],
+      fills: [{ providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG", tradeSide: "close", quantity: "1", execPrice: "100", createdAt: "2026-09-21T17:03:30.661Z", origin: "DARWIN" }],
+    } as unknown as ProviderLifecycleEvidence;
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "CONTRADICTORY", reason: "LIFECYCLE_FILL_SIDE_CONTRADICTORY" });
   });
 
   it("classifies the exact SAMSUNG fixture as LOCAL_OPEN_PROVIDER_CLOSED", () => {

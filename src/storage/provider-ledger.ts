@@ -8,6 +8,7 @@ import type {
   ProviderPositionHistoryRecord,
 } from "../bitget/provider-ledger.js";
 import type { SqlExecutor } from "./schema.js";
+import { resolveProviderLifecycleSide } from "../trading/provider-lifecycle-side.js";
 
 export interface ProviderResourceCheckpoint {
   cursor?: string;
@@ -331,22 +332,30 @@ export function loadProviderPositionHistoryDecisionIds(
   const maxRowsPerBatch = 5_000;
   for (let offset = 0; offset < ids.length; offset += batchSize) {
     const batch = ids.slice(offset, offset + batchSize);
-    const rows = executor.sql<{ history_id: string; decision_id: string; provider_order_id: string; client_oid: string }>`
-      SELECT DISTINCT h.provider_position_history_id AS history_id, i.decision_id, o.provider_order_id, o.client_oid
+    const rows = executor.sql<{
+      history_id: string; decision_id: string; provider_order_id: string; client_oid: string;
+      order_side: string | null; order_pos_side: string | null; order_trade_side: string | null;
+      fill_side: string | null; fill_pos_side: string | null; fill_trade_side: string | null;
+    }>`
+      SELECT DISTINCT h.provider_position_history_id AS history_id, i.decision_id, o.provider_order_id, o.client_oid,
+        o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side,
+        f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side
       FROM provider_position_history AS h
       JOIN json_each(${JSON.stringify(batch)}) AS requested ON requested.value = h.provider_position_history_id
       JOIN provider_fills AS f ON f.category = h.category AND f.symbol = h.symbol
-        AND UPPER(f.pos_side) = UPPER(h.position_side) AND LOWER(f.trade_side) = 'open'
+        AND UPPER(f.pos_side) = UPPER(h.position_side)
         AND ABS((julianday(f.created_time) - julianday(h.opening_time)) * 86400.0) <= 5
       JOIN provider_orders AS o ON o.category = f.category AND o.provider_order_id = f.provider_order_id
         AND o.client_oid = f.client_oid AND o.symbol = f.symbol
-        AND UPPER(o.pos_side) = UPPER(f.pos_side) AND LOWER(o.trade_side) = 'open' AND o.origin = 'DARWIN'
+        AND UPPER(o.pos_side) = UPPER(f.pos_side) AND o.origin = 'DARWIN'
       JOIN idempotency AS i ON i.client_order_id = f.client_oid AND i.provider_order_id = f.provider_order_id
       WHERE h.category = ${category} AND h.provider_position_history_id IS NOT NULL AND f.origin = 'DARWIN'
       LIMIT ${maxRowsPerBatch + 1}
     `;
     if (rows.length > maxRowsPerBatch) continue;
     for (const row of rows) {
+      if (resolveProviderLifecycleSide(row.order_side, row.order_pos_side, row.order_trade_side) !== "OPEN"
+        || resolveProviderLifecycleSide(row.fill_side, row.fill_pos_side, row.fill_trade_side) !== "OPEN") continue;
       const candidate = JSON.stringify([row.decision_id, row.provider_order_id, row.client_oid]);
       const identities = identitiesByHistory.get(row.history_id) ?? new Set<string>();
       identities.add(candidate);
@@ -381,21 +390,29 @@ export function loadProviderLiveOpeningOrderIdentities(
   const maxRowsPerBatch = 5_000;
   for (let offset = 0; offset < requests.length; offset += batchSize) {
     const batch = requests.slice(offset, offset + batchSize);
-    const rows = executor.sql<{ position_key: string; provider_order_id: string; client_oid: string; decision_id: string }>`
-      SELECT DISTINCT json_extract(requested.value, '$.key') AS position_key, o.provider_order_id, o.client_oid, i.decision_id
+    const rows = executor.sql<{
+      position_key: string; provider_order_id: string; client_oid: string; decision_id: string;
+      order_side: string | null; order_pos_side: string | null; order_trade_side: string | null;
+      fill_side: string | null; fill_pos_side: string | null; fill_trade_side: string | null;
+    }>`
+      SELECT DISTINCT json_extract(requested.value, '$.key') AS position_key, o.provider_order_id, o.client_oid, i.decision_id,
+        o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side,
+        f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side
       FROM json_each(${JSON.stringify(batch)}) AS requested
       JOIN provider_orders AS o ON o.category = ${category} AND o.symbol = json_extract(requested.value, '$.symbol')
         AND UPPER(o.pos_side) = UPPER(json_extract(requested.value, '$.positionSide'))
-        AND LOWER(o.trade_side) = 'open' AND o.origin = 'DARWIN'
+        AND o.origin = 'DARWIN'
       JOIN provider_fills AS f ON f.category = o.category AND f.provider_order_id = o.provider_order_id
         AND f.client_oid = o.client_oid AND f.symbol = o.symbol AND UPPER(f.pos_side) = UPPER(o.pos_side)
-        AND LOWER(f.trade_side) = 'open' AND f.origin = 'DARWIN'
+        AND f.origin = 'DARWIN'
         AND ABS((julianday(f.created_time) - julianday(json_extract(requested.value, '$.openedAt'))) * 86400.0) <= 5
       JOIN idempotency AS i ON i.provider_order_id = o.provider_order_id AND i.client_order_id = o.client_oid
       LIMIT ${maxRowsPerBatch + 1}
     `;
     if (rows.length > maxRowsPerBatch) continue;
     for (const row of rows) {
+      if (resolveProviderLifecycleSide(row.order_side, row.order_pos_side, row.order_trade_side) !== "OPEN"
+        || resolveProviderLifecycleSide(row.fill_side, row.fill_pos_side, row.fill_trade_side) !== "OPEN") continue;
       const identity = JSON.stringify([row.provider_order_id, row.client_oid, row.decision_id]);
       const candidates = candidatesByPosition.get(row.position_key) ?? new Set<string>();
       candidates.add(identity);
@@ -412,19 +429,27 @@ export function loadProviderLiveOpeningOrderIdentities(
 }
 
 export function loadProviderLifecycleHistoryCandidateIds(executor: SqlExecutor, experience: TradeExperience, category: string): Set<string> {
-  const rows = executor.sql<{ provider_position_history_id: string }>`
-    SELECT DISTINCT h.provider_position_history_id
+  const rows = executor.sql<{
+    provider_position_history_id: string;
+    order_side: string | null; order_pos_side: string | null; order_trade_side: string | null;
+    fill_side: string | null; fill_pos_side: string | null; fill_trade_side: string | null;
+  }>`
+    SELECT DISTINCT h.provider_position_history_id,
+      o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side,
+      f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side
     FROM provider_position_history h
     JOIN idempotency i ON i.decision_id = ${experience.entryDecisionId}
     JOIN provider_orders o ON o.category = h.category AND o.provider_order_id = i.provider_order_id AND o.client_oid = i.client_order_id
     JOIN provider_fills f ON f.category = o.category AND f.provider_order_id = o.provider_order_id AND f.client_oid = o.client_oid
     WHERE h.category = ${category} AND h.provider_position_history_id IS NOT NULL
-      AND h.symbol = ${experience.symbol} AND UPPER(h.position_side) = ${experience.positionSide?.toUpperCase() ?? ""}
-      AND o.symbol = h.symbol AND UPPER(o.pos_side) = UPPER(h.position_side) AND LOWER(o.trade_side) = 'open' AND o.origin = 'DARWIN'
-      AND f.symbol = h.symbol AND UPPER(f.pos_side) = UPPER(h.position_side) AND LOWER(f.trade_side) = 'open' AND f.origin = 'DARWIN'
+      AND h.symbol = ${experience.symbol} AND UPPER(h.position_side) = UPPER(${experience.positionSide?.toUpperCase() ?? ""})
+      AND o.symbol = h.symbol AND UPPER(o.pos_side) = UPPER(h.position_side) AND o.origin = 'DARWIN'
+      AND f.symbol = h.symbol AND UPPER(f.pos_side) = UPPER(h.position_side) AND f.origin = 'DARWIN'
       AND ABS((julianday(f.created_time) - julianday(h.opening_time)) * 86400.0) <= 5
   `;
-  return new Set(rows.map((row) => row.provider_position_history_id));
+  return new Set(rows.filter((row) => resolveProviderLifecycleSide(row.order_side, row.order_pos_side, row.order_trade_side) === "OPEN"
+    && resolveProviderLifecycleSide(row.fill_side, row.fill_pos_side, row.fill_trade_side) === "OPEN")
+    .map((row) => row.provider_position_history_id));
 }
 
 export interface ProviderLifecycleEvidenceRequest {
@@ -516,7 +541,9 @@ export function loadProviderLifecycleEvidence(
     entryIdentityCandidateDiagnostics.entryIdentityCandidateProviderOrderIdPresent = candidate ? Boolean(candidate.provider_order_id) : null;
     entryIdentityCandidateDiagnostics.entryIdentityCandidateSymbolMatch = candidate ? candidate.symbol === experience.symbol : null;
     entryIdentityCandidateDiagnostics.entryIdentityCandidatePositionSideMatch = candidate ? candidate.pos_side?.toUpperCase() === experience.positionSide : null;
-    entryIdentityCandidateDiagnostics.entryIdentityCandidateTradeSideOpen = candidate ? candidate.trade_side === "open" : null;
+    entryIdentityCandidateDiagnostics.entryIdentityCandidateTradeSideOpen = candidate
+      ? resolveProviderLifecycleSide(candidate.side, candidate.pos_side, candidate.trade_side) === "OPEN"
+      : null;
     entryIdentityCandidateDiagnostics.entryIdentityCandidateDarwinOrigin = candidate ? candidate.origin === "DARWIN" : null;
     entryIdentityCandidateDiagnostics.entryIdentityCandidateOpeningTimeMatch = candidate
       ? Number.isFinite(candidateTime) && Number.isFinite(historyTime) && Math.abs(candidateTime - historyTime) <= 5_000
@@ -564,29 +591,29 @@ export function loadProviderLifecycleEvidence(
   const livePositionStartAt = matchingPosition?.openedAt && Number.isFinite(Date.parse(matchingPosition.openedAt))
     ? new Date(Date.parse(matchingPosition.openedAt) - 5_000).toISOString()
     : null;
-  type ProviderOrderRow = { provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null; origin: ProviderEvidenceOrigin };
-  type ProviderFillRow = ProviderOrderRow & { exec_qty: string; exec_price: string; created_time: string };
+  type ProviderOrderRow = { provider_order_id: string; client_oid: string | null; symbol: string; side: string | null; pos_side: string | null; trade_side: string | null; created_time: string; origin: ProviderEvidenceOrigin };
+  type ProviderFillRow = ProviderOrderRow & { exec_qty: string; exec_price: string };
   const orders = row
-    ? executor.sql<ProviderOrderRow>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} AND ((provider_order_id = ${entryIdentity?.providerOrderId ?? ""} AND client_oid = ${entryIdentity?.clientOid ?? ""}) OR (created_time >= ${row.opening_time} AND (${matchingPosition ? 1 : 0} = 1 OR created_time <= ${row.closing_time}))) ORDER BY created_time LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
+    ? executor.sql<ProviderOrderRow>`SELECT provider_order_id, client_oid, symbol, side, pos_side, trade_side, created_time, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} AND ((provider_order_id = ${entryIdentity?.providerOrderId ?? ""} AND client_oid = ${entryIdentity?.clientOid ?? ""}) OR (created_time >= ${row.opening_time} AND (${matchingPosition ? 1 : 0} = 1 OR created_time <= ${row.closing_time}))) ORDER BY created_time LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
     : livePositionStartAt && entryIdentity
-      ? executor.sql<ProviderOrderRow>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} AND ((provider_order_id = ${entryIdentity.providerOrderId} AND client_oid = ${entryIdentity.clientOid}) OR created_time >= ${livePositionStartAt}) ORDER BY created_time LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
+      ? executor.sql<ProviderOrderRow>`SELECT provider_order_id, client_oid, symbol, side, pos_side, trade_side, created_time, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} AND ((provider_order_id = ${entryIdentity.providerOrderId} AND client_oid = ${entryIdentity.clientOid}) OR created_time >= ${livePositionStartAt}) ORDER BY created_time LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
       : livePositionStartAt
-        ? executor.sql<ProviderOrderRow>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} AND created_time >= ${livePositionStartAt} ORDER BY created_time LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
+        ? executor.sql<ProviderOrderRow>`SELECT provider_order_id, client_oid, symbol, side, pos_side, trade_side, created_time, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} AND created_time >= ${livePositionStartAt} ORDER BY created_time LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
         : entryIdentity
-          ? executor.sql<ProviderOrderRow>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} AND provider_order_id = ${entryIdentity.providerOrderId} AND client_oid = ${entryIdentity.clientOid} LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
+          ? executor.sql<ProviderOrderRow>`SELECT provider_order_id, client_oid, symbol, side, pos_side, trade_side, created_time, origin FROM provider_orders WHERE category = ${category} AND symbol = ${experience.symbol} AND provider_order_id = ${entryIdentity.providerOrderId} AND client_oid = ${entryIdentity.clientOid} LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
           : [];
   const fills = row
-    ? executor.sql<ProviderFillRow>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, exec_price, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND ((provider_order_id = ${entryIdentity?.providerOrderId ?? ""} AND client_oid = ${entryIdentity?.clientOid ?? ""}) OR (created_time >= ${row.opening_time} AND (${matchingPosition ? 1 : 0} = 1 OR created_time <= ${row.closing_time}))) ORDER BY created_time LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
+    ? executor.sql<ProviderFillRow>`SELECT provider_order_id, client_oid, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND ((provider_order_id = ${entryIdentity?.providerOrderId ?? ""} AND client_oid = ${entryIdentity?.clientOid ?? ""}) OR (created_time >= ${row.opening_time} AND (${matchingPosition ? 1 : 0} = 1 OR created_time <= ${row.closing_time}))) ORDER BY created_time LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
     : livePositionStartAt && entryIdentity
-      ? executor.sql<ProviderFillRow>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, exec_price, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND ((provider_order_id = ${entryIdentity.providerOrderId} AND client_oid = ${entryIdentity.clientOid}) OR created_time >= ${livePositionStartAt}) ORDER BY created_time LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
+      ? executor.sql<ProviderFillRow>`SELECT provider_order_id, client_oid, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND ((provider_order_id = ${entryIdentity.providerOrderId} AND client_oid = ${entryIdentity.clientOid}) OR created_time >= ${livePositionStartAt}) ORDER BY created_time LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
       : livePositionStartAt
-        ? executor.sql<ProviderFillRow>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, exec_price, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND created_time >= ${livePositionStartAt} ORDER BY created_time LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
+        ? executor.sql<ProviderFillRow>`SELECT provider_order_id, client_oid, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND created_time >= ${livePositionStartAt} ORDER BY created_time LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
         : entryIdentity
-          ? executor.sql<ProviderFillRow>`SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, exec_qty, exec_price, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND provider_order_id = ${entryIdentity.providerOrderId} AND client_oid = ${entryIdentity.clientOid} LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
+          ? executor.sql<ProviderFillRow>`SELECT provider_order_id, client_oid, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin FROM provider_fills WHERE category = ${category} AND symbol = ${experience.symbol} AND provider_order_id = ${entryIdentity.providerOrderId} AND client_oid = ${entryIdentity.clientOid} LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}`
           : [];
   const evidenceComplete = orders.length <= MAX_LIFECYCLE_EVIDENCE_ROWS && fills.length <= MAX_LIFECYCLE_EVIDENCE_ROWS;
-  const mappedOrders = orders.map((order) => ({ providerOrderId: order.provider_order_id, clientOid: order.client_oid, symbol: order.symbol, positionSide: order.pos_side?.toUpperCase() ?? null, tradeSide: order.trade_side?.toLowerCase() ?? null, origin: order.origin }));
-  const mappedFills = fills.map((fill) => ({ providerOrderId: fill.provider_order_id, clientOid: fill.client_oid, symbol: fill.symbol, positionSide: fill.pos_side?.toUpperCase() ?? null, tradeSide: fill.trade_side?.toLowerCase() ?? null, quantity: fill.exec_qty, execPrice: fill.exec_price, createdAt: fill.created_time, origin: fill.origin }));
+  const mappedOrders = orders.map((order) => ({ providerOrderId: order.provider_order_id, clientOid: order.client_oid, symbol: order.symbol, side: order.side, positionSide: order.pos_side?.toUpperCase() ?? null, tradeSide: order.trade_side?.trim().toLowerCase() ?? null, createdAt: order.created_time, origin: order.origin }));
+  const mappedFills = fills.map((fill) => ({ providerOrderId: fill.provider_order_id, clientOid: fill.client_oid, symbol: fill.symbol, side: fill.side, positionSide: fill.pos_side?.toUpperCase() ?? null, tradeSide: fill.trade_side?.trim().toLowerCase() ?? null, quantity: fill.exec_qty, execPrice: fill.exec_price, createdAt: fill.created_time, origin: fill.origin }));
   if (!row) return { experience, providerPositions, history: null, entryIdentity, ...(includeIdentityDiagnostics ? { candidateOrder, candidateFills } : {}), entryIdentitySource, entryIdentityLookupCount: Math.min(identities.length, 2), ...idempotencyIdentityDiagnostics, ...entryIdentityCandidateDiagnostics, orders: mappedOrders, fills: mappedFills, evidenceComplete };
 
   return {
@@ -666,11 +693,11 @@ export function loadProviderLifecycleEvidenceBatch(
       return { requestId: request.requestId, symbol: request.experience.symbol, positionSide: request.experience.positionSide?.toLowerCase() ?? "", rangeStart, rangeEnd, entryProviderOrderId: identity?.providerOrderId ?? null, entryClientOid: identity?.clientOrderId ?? null };
     });
     const requestJson = JSON.stringify(queryRequests);
-    type OrderRow = { request_id: string; provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null; origin: ProviderEvidenceOrigin; row_number: number };
+    type OrderRow = { request_id: string; provider_order_id: string; client_oid: string | null; symbol: string; side: string | null; pos_side: string | null; trade_side: string | null; created_time: string; origin: ProviderEvidenceOrigin; row_number: number };
     type FillRow = OrderRow & { exec_qty: string; exec_price: string; created_time: string };
     const orders = executor.sql<OrderRow>`
       WITH candidates AS (
-        SELECT json_extract(r.value, '$.requestId') AS request_id, o.provider_order_id, o.client_oid, o.symbol, o.pos_side, o.trade_side, o.origin,
+        SELECT json_extract(r.value, '$.requestId') AS request_id, o.provider_order_id, o.client_oid, o.symbol, o.side, o.pos_side, o.trade_side, o.created_time, o.origin,
           ROW_NUMBER() OVER (PARTITION BY json_extract(r.value, '$.requestId') ORDER BY o.created_time, o.provider_order_id) AS row_number
         FROM json_each(${requestJson}) AS r
         JOIN provider_orders AS o ON o.category = ${category} AND o.symbol = json_extract(r.value, '$.symbol')
@@ -679,12 +706,12 @@ export function loadProviderLifecycleEvidenceBatch(
             OR (json_extract(r.value, '$.rangeStart') IS NOT NULL AND o.created_time >= json_extract(r.value, '$.rangeStart')
               AND (json_extract(r.value, '$.rangeEnd') IS NULL OR o.created_time <= json_extract(r.value, '$.rangeEnd'))))
       )
-      SELECT request_id, provider_order_id, client_oid, symbol, pos_side, trade_side, origin, row_number FROM candidates
+      SELECT request_id, provider_order_id, client_oid, symbol, side, pos_side, trade_side, created_time, origin, row_number FROM candidates
       WHERE row_number <= ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1} ORDER BY request_id, row_number
     `;
     const fills = executor.sql<FillRow>`
       WITH candidates AS (
-        SELECT json_extract(r.value, '$.requestId') AS request_id, f.provider_order_id, f.client_oid, f.symbol, f.pos_side, f.trade_side, f.origin,
+        SELECT json_extract(r.value, '$.requestId') AS request_id, f.provider_order_id, f.client_oid, f.symbol, f.side, f.pos_side, f.trade_side, f.origin,
           f.exec_qty, f.exec_price, f.created_time,
           ROW_NUMBER() OVER (PARTITION BY json_extract(r.value, '$.requestId') ORDER BY f.created_time, f.provider_order_id) AS row_number
         FROM json_each(${requestJson}) AS r
@@ -694,7 +721,7 @@ export function loadProviderLifecycleEvidenceBatch(
             OR (json_extract(r.value, '$.rangeStart') IS NOT NULL AND f.created_time >= json_extract(r.value, '$.rangeStart')
               AND (json_extract(r.value, '$.rangeEnd') IS NULL OR f.created_time <= json_extract(r.value, '$.rangeEnd'))))
       )
-      SELECT request_id, provider_order_id, client_oid, symbol, pos_side, trade_side, origin, exec_qty, exec_price, created_time, row_number FROM candidates
+      SELECT request_id, provider_order_id, client_oid, symbol, side, pos_side, trade_side, origin, exec_qty, exec_price, created_time, row_number FROM candidates
       WHERE row_number <= ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1} ORDER BY request_id, row_number
     `;
     const ordersByRequest = new Map<string, ProviderLifecycleOrder[]>();
@@ -703,13 +730,13 @@ export function loadProviderLifecycleEvidenceBatch(
     const fillCounts = new Map<string, number>();
     for (const row of orders) {
       const values = ordersByRequest.get(row.request_id) ?? [];
-      values.push({ providerOrderId: row.provider_order_id, clientOid: row.client_oid, symbol: row.symbol, positionSide: row.pos_side?.toUpperCase() ?? null, tradeSide: row.trade_side?.toLowerCase() ?? null, origin: row.origin });
+      values.push({ providerOrderId: row.provider_order_id, clientOid: row.client_oid, symbol: row.symbol, side: row.side, positionSide: row.pos_side?.toUpperCase() ?? null, tradeSide: row.trade_side?.trim().toLowerCase() ?? null, createdAt: row.created_time, origin: row.origin });
       ordersByRequest.set(row.request_id, values);
       orderCounts.set(row.request_id, (orderCounts.get(row.request_id) ?? 0) + 1);
     }
     for (const row of fills) {
       const values = fillsByRequest.get(row.request_id) ?? [];
-      values.push({ providerOrderId: row.provider_order_id, clientOid: row.client_oid, symbol: row.symbol, positionSide: row.pos_side?.toUpperCase() ?? null, tradeSide: row.trade_side?.toLowerCase() ?? null, quantity: row.exec_qty, execPrice: row.exec_price, createdAt: row.created_time, origin: row.origin });
+      values.push({ providerOrderId: row.provider_order_id, clientOid: row.client_oid, symbol: row.symbol, side: row.side, positionSide: row.pos_side?.toUpperCase() ?? null, tradeSide: row.trade_side?.trim().toLowerCase() ?? null, quantity: row.exec_qty, execPrice: row.exec_price, createdAt: row.created_time, origin: row.origin });
       fillsByRequest.set(row.request_id, values);
       fillCounts.set(row.request_id, (fillCounts.get(row.request_id) ?? 0) + 1);
     }
