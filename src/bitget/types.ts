@@ -1,4 +1,5 @@
 import type { AccountSnapshot, HistoricalBar, Instrument, MarketSnapshot, PositionSide, PositionSnapshot } from "../types.js";
+import { providerTimestampIso } from "./provider-ledger.js";
 
 export function record(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("INVALID_PROVIDER_RESPONSE");
@@ -80,6 +81,7 @@ export function parseAccount(value: unknown, instrument: Instrument, market: Mar
       const side = text(entry.posSide, text(entry.positionSide, text(entry.holdSide, "LONG"))).toUpperCase() === "SHORT" ? "SHORT" : "LONG";
       const quantity = text(entry.total, text(entry.available, text(entry.quantity, text(entry.size, "0"))));
       const notional = text(entry.notional, symbol === instrument.symbol ? multiplyDecimal(quantity, market.lastPrice) : "0");
+      const openedAt = firstTimestamp(entry, ["ctime", "openTime"]);
       return {
         symbol,
         positionSide: side,
@@ -92,7 +94,7 @@ export function parseAccount(value: unknown, instrument: Instrument, market: Mar
         realizedPnl: text(entry.realizedPnl, text(entry.realizedPL, text(entry.achievedProfits))),
         ...(text(entry.funding, text(entry.fundingFee, text(entry.totalFunding))) ? { funding: text(entry.funding, text(entry.fundingFee, text(entry.totalFunding))) } : {}),
         ...(text(entry.fees, text(entry.fee, text(entry.feeAmount))) ? { fees: text(entry.fees, text(entry.fee, text(entry.feeAmount))) } : {}),
-        ...(text(entry.ctime, text(entry.openTime)) ? { openedAt: text(entry.ctime, text(entry.openTime)) } : {}),
+        ...(openedAt ? { openedAt } : {}),
         ...(text(entry.liquidationPrice) ? { liquidationPrice: text(entry.liquidationPrice) } : {}),
       };
     });
@@ -205,6 +207,7 @@ function parseDashboardPosition(entry: Record<string, unknown>): PositionSnapsho
   const quantity = firstText(entry, ["total", "available", "quantity", "size"]);
   const markPrice = firstText(entry, ["markPrice", "markPx", "marketPrice", "currentPrice", "lastPrice"]);
   const unrealizedPnlPct = parseProviderProfitRate(entry);
+  const openedAt = firstTimestamp(entry, ["ctime", "cTime", "createdTime", "openTime"]);
   const position: PositionSnapshot = {
     symbol: text(entry.symbol),
     positionSide: parsePositionSide(firstText(entry, ["posSide", "positionSide", "holdSide"], "LONG")),
@@ -220,7 +223,7 @@ function parseDashboardPosition(entry: Record<string, unknown>): PositionSnapsho
     ...(providerFees(entry) ? { fees: providerFees(entry) } : {}),
     ...(firstText(entry, ["cashDividend"]) ? { cashDividend: firstText(entry, ["cashDividend"]) } : {}),
     ...(markPrice ? { markPrice } : {}),
-    ...(firstText(entry, ["ctime", "cTime", "createdTime", "openTime"]) ? { openedAt: firstText(entry, ["ctime", "cTime", "createdTime", "openTime"]) } : {}),
+    ...(openedAt ? { openedAt } : {}),
     ...(firstText(entry, ["utime", "uTime", "updatedTime"]) ? { updatedAt: firstText(entry, ["utime", "uTime", "updatedTime"]) } : {}),
     ...(firstText(entry, ["liquidationPrice", "liqPrice"]) ? { liquidationPrice: firstText(entry, ["liquidationPrice", "liqPrice"]) } : {}),
   };
@@ -238,6 +241,14 @@ function parseProviderProfitRate(entry: Record<string, unknown>): string | undef
   const percentage = firstText(entry, ["unrealizedPnlPct", "unrealizedPnlPercent"]);
   if (percentage) return percentage;
   return normalizeProviderProfitRate(firstText(entry, ["unrealizedPLRatio", "unrealizedPLR", "uplRatio", "profitRate"]) || undefined);
+}
+
+function firstTimestamp(entry: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const timestamp = providerTimestampIso(entry[key]);
+    if (timestamp) return timestamp;
+  }
+  return undefined;
 }
 
 function firstText(entry: Record<string, unknown>, keys: string[], fallback = ""): string {
