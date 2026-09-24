@@ -10,8 +10,8 @@ describe("Bitget provider readback", () => {
   it("preserves the provider short side and quantity fields", () => {
     const instrument = { symbol: "BTCUSDT", category: "USDT-FUTURES", baseCoin: "BTC", quoteCoin: "USDT", marginCoin: "USDT", symbolType: "crypto", isRwa: "NO", status: "online", minOrderQty: "0.001", maxOrderQty: "100", minOrderAmount: "10", pricePrecision: 2, quantityPrecision: 3, quantityStep: "0.001", leverageMin: "1", leverageMax: "5" } satisfies Instrument;
     const market = { symbol: "BTCUSDT", lastPrice: "100", bidPrice: "99.9", askPrice: "100.1", priceChange24h: "0", volume24h: "100", observedAt: "2026-09-12T00:00:00.000Z" } satisfies MarketSnapshot;
-    const account = parseAccount({ account: { totalEquity: "1000", available: "900" }, positions: [{ symbol: "BTCUSDT", holdSide: "short", total: "0.5", marginSize: "50", openPriceAvg: "100" }] }, instrument, market, market.observedAt);
-    expect(account.positions[0]).toMatchObject({ positionSide: "SHORT", quantity: "0.5", marginAllocated: "50" });
+    const account = parseAccount({ account: { totalEquity: "1000", available: "900" }, positions: [{ symbol: "BTCUSDT", holdSide: "short", total: "0.5", marginSize: "50", openPriceAvg: "100", ctime: "1730181468493" }] }, instrument, market, market.observedAt);
+    expect(account.positions[0]).toMatchObject({ positionSide: "SHORT", quantity: "0.5", marginAllocated: "50", openedAt: "2024-10-29T05:57:48.493Z" });
   });
 
   it("reads UTA equity and effective margin fields", () => {
@@ -35,6 +35,33 @@ describe("Bitget provider readback", () => {
 
     expect(portfolio).toMatchObject({ portfolioEquity: "50000", availableMargin: "47000", marginUsage: "3000", openOrders: 1, unrealizedPnl: "-0.9807" });
     expect(portfolio.positions[0]).toMatchObject({ symbol: "CRCLUSDT", positionSide: "LONG", quantity: "32.69", entryPrice: "91.7", markPrice: "91.82", marginAllocated: "998.78", leverage: "3", notional: "2996.3654", unrealizedPnl: "-0.9807", unrealizedPnlPct: "-0.09", liquidationPrice: "44.2" });
+  });
+
+  it("normalizes provider epoch-millisecond position open times to ISO timestamps", () => {
+    const portfolio = parseDashboardPortfolio(
+      { usdtEquity: "50000", availableMargin: "47000" },
+      [{ symbol: "CRCLUSDT", posSide: "short", total: "8.27", ctime: "1730181468493" }],
+      { list: [] },
+      "2026-09-22T00:00:00.000Z",
+    );
+
+    expect(portfolio.positions[0]?.openedAt).toBe("2024-10-29T05:57:48.493Z");
+    expect(Date.parse(portfolio.positions[0]!.openedAt!)).toBe(1730181468493);
+  });
+
+  it("uses valid fallback position time fields and omits invalid timestamps", () => {
+    const portfolio = parseDashboardPortfolio(
+      { usdtEquity: "50000", availableMargin: "47000" },
+      [
+        { symbol: "CRCLUSDT", posSide: "long", total: "1", ctime: "not-a-timestamp", openTime: "2026-09-22T00:00:00.000Z" },
+        { symbol: "TSLAUSDT", posSide: "long", total: "1", ctime: "999999999999999999999" },
+      ],
+      { list: [] },
+      "2026-09-22T00:00:00.000Z",
+    );
+
+    expect(portfolio.positions[0]?.openedAt).toBe("2026-09-22T00:00:00.000Z");
+    expect(portfolio.positions[1]?.openedAt).toBeUndefined();
   });
 
   it("falls back to the same position mark for a single position without notional", () => {
@@ -162,11 +189,11 @@ describe("Bitget provider readback", () => {
     expect(normalizeProviderProfitRate(undefined)).toBeUndefined();
   });
 
-  it("preserves provider position timestamps without presenting them as the snapshot time", () => {
+  it("normalizes provider position open time without presenting it as the snapshot time", () => {
     const observedAt = "2026-09-12T17:00:00.000Z";
     const portfolio = parseDashboardPortfolio({ usdtEquity: "1000" }, [{ symbol: "CRCLUSDT", posSide: "long", total: "1", positionValue: "100", createdTime: "1729928018076", updatedTime: "1729929656321" }], { list: [] }, observedAt);
     expect(portfolio.observedAt).toBe(observedAt);
-    expect(portfolio.positions[0]).toMatchObject({ openedAt: "1729928018076", updatedAt: "1729929656321" });
+    expect(portfolio.positions[0]).toMatchObject({ openedAt: "2024-10-26T07:33:38.076Z", updatedAt: "1729929656321" });
     expect(portfolio.positions[0]?.updatedAt).not.toBe(portfolio.observedAt);
   });
 
