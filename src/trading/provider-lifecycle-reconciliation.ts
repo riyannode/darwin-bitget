@@ -71,6 +71,13 @@ export interface ProviderLifecycleEvidence {
   idempotencyClientOidMatchesDeterministic?: boolean | null;
   idempotencyProviderOrderIdPresent?: boolean | null;
   idempotencyProviderOrderIdExact?: boolean | null;
+  entryIdentityCandidateLookupCount?: number | null;
+  entryIdentityCandidateProviderOrderIdPresent?: boolean | null;
+  entryIdentityCandidateSymbolMatch?: boolean | null;
+  entryIdentityCandidatePositionSideMatch?: boolean | null;
+  entryIdentityCandidateTradeSideOpen?: boolean | null;
+  entryIdentityCandidateDarwinOrigin?: boolean | null;
+  entryIdentityCandidateOpeningTimeMatch?: boolean | null;
   orders: readonly ProviderLifecycleOrder[];
   fills: readonly ProviderLifecycleFill[];
   evidenceComplete?: boolean;
