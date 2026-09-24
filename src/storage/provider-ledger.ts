@@ -1,5 +1,5 @@
 import type { PositionSnapshot, TradeExperience } from "../types.js";
-import type { ProviderLifecycleEvidence, ProviderLifecycleFill, ProviderLifecycleHistory, ProviderLifecycleOrder, ProviderLifecyclePosition, ProviderEvidenceOrigin } from "../trading/provider-lifecycle-reconciliation.js";
+import type { ProviderLifecycleEvidence, ProviderLifecycleFill, ProviderLifecycleHistory, ProviderLifecycleOrder, ProviderLifecyclePosition, ProviderLifecycleCandidateFill, ProviderLifecycleCandidateOrder, ProviderEvidenceOrigin } from "../trading/provider-lifecycle-reconciliation.js";
 import type {
   ProviderFillRecord,
   ProviderFinancialRecord,
@@ -443,6 +443,7 @@ export function loadProviderLifecycleEvidence(
   providerPositionHistoryId: string,
   providerPositions: readonly ProviderLifecyclePosition[],
   deterministicEntryIdentity?: { entryDecisionId: string; clientOid: string },
+  includeIdentityDiagnostics = false,
 ): ProviderLifecycleEvidence {
   const historyRows = executor.sql<{
     provider_position_history_id: string | null; symbol: string; position_side: string; open_total_pos: string | null; close_total_pos: string | null;
@@ -497,11 +498,13 @@ export function loadProviderLifecycleEvidence(
     entryIdentityCandidateDarwinOrigin: null,
     entryIdentityCandidateOpeningTimeMatch: null,
   };
+  let candidateOrder: ProviderLifecycleCandidateOrder | null = null;
+  let candidateFills: ProviderLifecycleCandidateFill[] = [];
   if (!entryIdentity && row && recoverableClientOid) {
-    type CandidateOrder = { provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null; origin: ProviderEvidenceOrigin; created_time: string };
+    type CandidateOrder = { provider_order_id: string; client_oid: string | null; symbol: string; side: string; pos_side: string | null; trade_side: string | null; reduce_only: string | null; origin: ProviderEvidenceOrigin; created_time: string };
     // Only zero/one/many matters here; avoid sorting all rows before the ambiguity cap.
     const candidates = executor.sql<CandidateOrder>`
-      SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin, created_time
+      SELECT provider_order_id, client_oid, symbol, side, pos_side, trade_side, reduce_only, origin, created_time
       FROM provider_orders
       WHERE category = ${category} AND client_oid = ${recoverableClientOid}
       LIMIT 2
@@ -518,6 +521,35 @@ export function loadProviderLifecycleEvidence(
     entryIdentityCandidateDiagnostics.entryIdentityCandidateOpeningTimeMatch = candidate
       ? Number.isFinite(candidateTime) && Number.isFinite(historyTime) && Math.abs(candidateTime - historyTime) <= 5_000
       : null;
+    if (includeIdentityDiagnostics && candidate) {
+      candidateOrder = {
+        providerOrderId: candidate.provider_order_id,
+        clientOid: candidate.client_oid,
+        symbol: candidate.symbol,
+        side: candidate.side,
+        posSide: candidate.pos_side,
+        tradeSide: candidate.trade_side,
+        reduceOnly: candidate.reduce_only,
+        createdTime: candidate.created_time,
+        origin: candidate.origin,
+      };
+      const candidateFillRows = executor.sql<{
+        exec_id: string; provider_order_id: string; client_oid: string | null; symbol: string; side: string;
+        pos_side: string | null; trade_side: string | null; exec_qty: string; created_time: string; origin: ProviderEvidenceOrigin;
+      }>`SELECT exec_id, provider_order_id, client_oid, symbol, side, pos_side, trade_side, exec_qty, created_time, origin FROM provider_fills WHERE category = ${category} AND provider_order_id = ${candidate.provider_order_id} AND client_oid = ${candidate.client_oid} ORDER BY created_time, exec_id LIMIT 2`;
+      candidateFills = candidateFillRows.map((fill) => ({
+        execId: fill.exec_id,
+        providerOrderId: fill.provider_order_id,
+        clientOid: fill.client_oid,
+        symbol: fill.symbol,
+        side: fill.side,
+        posSide: fill.pos_side,
+        tradeSide: fill.trade_side,
+        quantity: fill.exec_qty,
+        createdTime: fill.created_time,
+        origin: fill.origin,
+      }));
+    }
     if (candidate && candidate.provider_order_id && candidate.client_oid === recoverableClientOid
       && entryIdentityCandidateDiagnostics.entryIdentityCandidateSymbolMatch === true
       && entryIdentityCandidateDiagnostics.entryIdentityCandidatePositionSideMatch === true
@@ -555,11 +587,12 @@ export function loadProviderLifecycleEvidence(
   const evidenceComplete = orders.length <= MAX_LIFECYCLE_EVIDENCE_ROWS && fills.length <= MAX_LIFECYCLE_EVIDENCE_ROWS;
   const mappedOrders = orders.map((order) => ({ providerOrderId: order.provider_order_id, clientOid: order.client_oid, symbol: order.symbol, positionSide: order.pos_side?.toUpperCase() ?? null, tradeSide: order.trade_side?.toLowerCase() ?? null, origin: order.origin }));
   const mappedFills = fills.map((fill) => ({ providerOrderId: fill.provider_order_id, clientOid: fill.client_oid, symbol: fill.symbol, positionSide: fill.pos_side?.toUpperCase() ?? null, tradeSide: fill.trade_side?.toLowerCase() ?? null, quantity: fill.exec_qty, execPrice: fill.exec_price, createdAt: fill.created_time, origin: fill.origin }));
-  if (!row) return { experience, providerPositions, history: null, entryIdentity, entryIdentitySource, entryIdentityLookupCount: Math.min(identities.length, 2), ...idempotencyIdentityDiagnostics, ...entryIdentityCandidateDiagnostics, orders: mappedOrders, fills: mappedFills, evidenceComplete };
+  if (!row) return { experience, providerPositions, history: null, entryIdentity, ...(includeIdentityDiagnostics ? { candidateOrder, candidateFills } : {}), entryIdentitySource, entryIdentityLookupCount: Math.min(identities.length, 2), ...idempotencyIdentityDiagnostics, ...entryIdentityCandidateDiagnostics, orders: mappedOrders, fills: mappedFills, evidenceComplete };
 
   return {
     experience,
     providerPositions,
+    ...(includeIdentityDiagnostics ? { candidateOrder, candidateFills } : {}),
     history: {
       providerPositionHistoryId: row.provider_position_history_id,
       symbol: row.symbol,
