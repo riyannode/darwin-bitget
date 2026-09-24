@@ -4,7 +4,7 @@ import { parseInstruments } from "../src/bitget/types.js";
 import { loadConfig } from "../src/config.js";
 
 const config = loadConfig({ TRADING_MODE: "PAPER", PAPER_ONLY: "true", AGENT_MODE: "AUTONOMOUS" });
-const row = (symbol: string) => ({ symbol, category: "USDT-FUTURES", status: "online", symbolType: "stock", isRwa: "NO", minOrderQty: "0.01", minOrderAmount: "5", maxLeverage: "25", quantityMultiplier: "0.01" });
+const row = (symbol: string) => ({ symbol, category: "USDT-FUTURES", status: "online", symbolType: "stock", isRwa: "NO", minOrderQty: "0.01", maxMarketOrderQty: "1000", minOrderAmount: "5", minLeverage: "1", maxLeverage: "25", pricePrecision: 3, quantityPrecision: 2, quantityMultiplier: "0.01" });
 const publicRows = ["SOXLUSDT", "SNXXUSDT", "KORUUSDT", "NVDAUSDT"].map(row);
 const demoRows = ["KORUUSDT", "NVDAUSDT"].map(row);
 
@@ -18,6 +18,20 @@ describe("Demo executable universe", () => {
   it("requires online stock metadata in both catalogs and uses Demo limits", () => {
     const demo = parseInstruments([{ ...row("NVDAUSDT"), maxLeverage: "5" }, { ...row("KORUUSDT"), status: "offline" }]);
     expect(executableIntersection(parseInstruments(publicRows), demo, "USDT-FUTURES")).toMatchObject([{ symbol: "NVDAUSDT", leverageMax: "5", quantityStep: "0.01" }]);
+  });
+
+  it("rejects online stock rows whose execution metadata is missing or non-positive", () => {
+    const valid = { ...row("VALIDUSDT"), maxMarketOrderQty: "100", minLeverage: "1", pricePrecision: 2, quantityPrecision: 2 };
+    const invalid = [
+      { ...row("BAD-MINUSDT"), minOrderQty: "0" },
+      { ...row("BAD-AMOUNTUSDT"), minOrderAmount: "not-a-number" },
+      { ...row("BAD-STEPUSDT"), quantityMultiplier: "0" },
+      { ...row("BAD-MISSING-STEPUSDT"), quantityMultiplier: undefined },
+      { ...row("BAD-LEVERAGEUSDT"), minLeverage: "6", maxLeverage: "5" },
+      { ...row("BAD-MAXUSDT"), maxMarketOrderQty: "" },
+    ];
+    const eligible = executableIntersection(parseInstruments([valid, ...invalid]), parseInstruments([valid, ...invalid]), "USDT-FUTURES");
+    expect(eligible.map((instrument) => instrument.symbol)).toEqual(["VALIDUSDT"]);
   });
 
   it("fetches full Demo catalog by GET without a symbol filter or financial operation", async () => {

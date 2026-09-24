@@ -31,19 +31,19 @@ export function parseInstruments(value: unknown): Instrument[] {
     isRwa: text(entry.isRwa),
     status: text(entry.status),
     minOrderQty: text(entry.minOrderQty),
-    maxOrderQty: text(entry.maxMarketOrderQty, text(entry.maxOrderQty)),
+    maxOrderQty: text(entry.maxMarketOrderQty),
     minOrderAmount: text(entry.minOrderAmount),
-    pricePrecision: integer(entry.pricePrecision),
-    quantityPrecision: integer(entry.quantityPrecision),
-    quantityStep: text(entry.quantityMultiplier, text(entry.sizeMultiplier, text(entry.quantityStep, text(entry.minOrderQty, "0")))),
-    leverageMin: text(entry.minLeverage, text(entry.leverageMin, "1")),
-    leverageMax: text(entry.maxLeverage, text(entry.leverageMax, "1")),
+    pricePrecision: integer(entry.pricePrecision, -1),
+    quantityPrecision: integer(entry.quantityPrecision, -1),
+    quantityStep: text(entry.quantityMultiplier, text(entry.sizeMultiplier, text(entry.quantityStep))),
+    leverageMin: text(entry.minLeverage, text(entry.leverageMin)),
+    leverageMax: text(entry.maxLeverage, text(entry.leverageMax)),
   }));
 }
 
 export function parseTicker(value: unknown, symbol: string, observedAt: string): MarketSnapshot {
   const rows = Array.isArray(value) ? records(value) : [record(value)];
-  const entry = rows.find((candidate) => text(candidate.symbol) === symbol) ?? rows[0];
+  const entry = rows.find((candidate) => text(candidate.symbol) === symbol);
   if (!entry) throw new Error("MISSING_TICKER");
   return {
     symbol,
@@ -99,10 +99,13 @@ export function parseAccount(value: unknown, instrument: Instrument, market: Mar
       };
     });
   const totalPositionNotional = positions.reduce((total, position) => addDecimal(total, position.notional), "0");
-  const accountEquity = Array.isArray(value) ? "" : firstDecimal(account, ["usdtEquity", "accountEquity", "totalEquity", "equity", "balance"]);
-  const equity = accountEquity || sumAssetValues(assetRows, ["usdValue", "equity", "balance"]);
-  const accountAvailable = Array.isArray(value) ? "" : firstDecimal(account, ["effEquity", "available", "availableMargin", "availableBalance"]);
-  const availableMargin = accountAvailable || sumAssetValues(assetRows, ["available", "equity", "balance"]) || equity;
+  const accountEquity = Array.isArray(value) ? "" : firstDecimal(account, ["usdtEquity", "accountEquity", "totalEquity", "equity"]);
+  const usdtAssets = assetRows.filter((row) => text(row.coin).toUpperCase() === "USDT");
+  const usdtAsset = usdtAssets.length === 1 ? usdtAssets[0] : undefined;
+  const equity = accountEquity || firstDecimal(usdtAsset ?? {}, ["equity"]) || sumAssetValues(assetRows, ["usdValue"]);
+  const accountAvailable = Array.isArray(value) ? "" : firstDecimal(account, ["effEquity", "availableMargin"]);
+  const availableBalance = firstText(account, ["availableBalance", "available"]) || firstText(usdtAsset ?? {}, ["available"]);
+  const availableMargin = accountAvailable;
   if (!equity || equity === "0") throw new Error(`INVALID_PORTFOLIO_EQUITY_${Object.keys(account).sort().join("_") || "EMPTY"}`);
   const openOrderPayload = overview.openOrders;
   const openOrders = Array.isArray(openOrderPayload) ? records(openOrderPayload) : openOrderPayload && typeof openOrderPayload === "object" && !Array.isArray(openOrderPayload) && Array.isArray((openOrderPayload as Record<string, unknown>).list) ? records((openOrderPayload as Record<string, unknown>).list) : [];
@@ -111,10 +114,10 @@ export function parseAccount(value: unknown, instrument: Instrument, market: Mar
   const positionRealizedPnl = positions.map((position) => position.realizedPnl).filter(isSignedDecimal);
   const realizedPnl = accountRealizedPnl || (positionRealizedPnl.length ? sumSignedDecimals(positionRealizedPnl) : "");
   return {
-    balance: text(account.balance, equity),
-    availableBalance: availableMargin,
+    balance: firstText(account, ["balance", "usdtBalance"]) || firstText(usdtAsset ?? {}, ["balance"]),
+    availableBalance,
     availableMargin,
-    marginUsage: subtractDecimal(equity, availableMargin),
+    marginUsage: availableMargin ? subtractDecimal(equity, availableMargin) : "",
     positionNotional: instrumentPosition?.notional ?? "0",
     totalPositionNotional,
     positionQuantity: instrumentPosition?.quantity ?? "0",
@@ -141,13 +144,19 @@ export function parseDashboardPortfolio(accountValue: unknown, positionsValue: u
     .map(parseDashboardPosition)
     .filter((position) => hasPositionQuantity(position.quantity));
   const orders = providerRows(openOrdersValue);
-  const accountEquity = firstDecimal(account, ["usdtEquity", "accountEquity", "totalEquity", "equity", "balance"]) || sumAssetValues(assetRows, ["usdValue", "equity", "balance"]);
+  const accountEquity = firstDecimal(account, ["usdtEquity", "accountEquity", "totalEquity", "equity"]) || sumAssetValues(assetRows, ["usdValue"]);
   if (!accountEquity || accountEquity === "0") throw new Error(`INVALID_PORTFOLIO_EQUITY_${Object.keys(account).sort().join("_") || "EMPTY"}`);
-  const availableMargin = firstDecimal(account, ["availableMargin", "availableBalance", "available", "effEquity"]) || sumAssetValues(assetRows, ["available", "equity", "balance"]);
+  const usdtAssets = assetRows.filter((row) => text(row.coin).toUpperCase() === "USDT");
+  const usdtAsset = usdtAssets.length === 1 ? usdtAssets[0] : undefined;
+  const availableBalance = firstText(account, ["availableBalance", "available"]) || firstText(usdtAsset ?? {}, ["available"]);
+  const availableMargin = firstDecimal(account, ["availableMargin", "effEquity"]);
   const accountMarginUsed = firstDecimal(account, ["marginUsed", "usedMargin", "occupiedMargin", "occupiedMarginAmount", "totalMargin"]);
   // UTA documents `imr` as an initial-margin amount, not a generic used-margin field.
   const initialMargin = firstDecimal(account, ["imr"]);
-  const positionMarginUsage = positions.map((position) => position.marginAllocated).filter(Boolean).reduce((total, margin) => addDecimal(total, margin), "0");
+  const positionMargins = positions.map((position) => position.marginAllocated);
+  const positionMarginUsage = positions.length > 0 && positionMargins.every(isNonNegativeDecimalText)
+    ? positionMargins.reduce((total, margin) => addDecimal(total, margin), "0")
+    : "";
   const marginUsage = accountMarginUsed;
   const providerPositionValue = firstDecimal(account, ["positionValue"]);
   const normalizedPositions: PositionSnapshot[] = positions.map((position) => {
@@ -156,25 +165,31 @@ export function parseDashboardPortfolio(accountValue: unknown, positionsValue: u
     if (position.quantity && position.markPrice) return { ...position, notional: multiplyDecimal(position.quantity, position.markPrice) };
     return position;
   });
-  const notionalValues = normalizedPositions.map((position) => position.notional).filter(Boolean);
-  const totalPositionNotional = notionalValues.reduce((total, notional) => addDecimal(total, notional), "0");
-  const pnlValues = normalizedPositions.map((position) => position.unrealizedPnl).filter(Boolean);
-  const unrealizedPnl = pnlValues.length ? sumSignedDecimals(pnlValues) : normalizedPositions.length ? "" : "0";
+  const hasCompletePositionNotional = normalizedPositions.length === 0 || normalizedPositions.every((position) => isPositiveDecimalText(position.notional));
+  const totalPositionNotional = normalizedPositions.length === 0 ? "0" : hasCompletePositionNotional
+    ? normalizedPositions.reduce((total, position) => addDecimal(total, position.notional), "0")
+    : "";
+  const hasCompleteUnrealizedPnl = normalizedPositions.length === 0 || normalizedPositions.every((position) => isSignedDecimal(position.unrealizedPnl));
+  const unrealizedPnl = normalizedPositions.length === 0 ? "0" : hasCompleteUnrealizedPnl
+    ? sumSignedDecimals(normalizedPositions.map((position) => position.unrealizedPnl))
+    : "";
   return {
-    balance: firstText(account, ["balance", "usdtBalance"], accountEquity),
-    availableBalance: availableMargin,
+    balance: firstText(account, ["balance", "usdtBalance"]) || firstText(usdtAsset ?? {}, ["balance"]),
+    availableBalance,
     availableMargin,
     marginUsage,
     ...(accountMarginUsed ? { accountMarginUsed } : {}),
     ...(initialMargin ? { initialMargin } : {}),
-    ...(positionMarginUsage ? { positionMargin: positionMarginUsage } : {}),
+    ...(positionMarginUsage !== "" ? { positionMargin: positionMarginUsage } : {}),
     positionNotional: totalPositionNotional,
     totalPositionNotional,
     positionQuantity: normalizedPositions.reduce((total, position) => addDecimal(total, position.quantity), "0"),
     portfolioEquity: accountEquity,
     positions: normalizedPositions,
     ...(firstSignedText(account, ["realizedPnl", "realizedPL"]) ? { realizedPnl: firstSignedText(account, ["realizedPnl", "realizedPL"]), realizedPnlSource: "ACCOUNT" as const } : { realizedPnl: "" }),
-    ...(normalizedPositions.map((position) => position.realizedPnl).filter(isSignedDecimal).length ? { positionRealizedPnl: sumSignedDecimals(normalizedPositions.map((position) => position.realizedPnl).filter(isSignedDecimal)) } : {}),
+    ...(normalizedPositions.length > 0 && normalizedPositions.every((position) => isSignedDecimal(position.realizedPnl))
+      ? { positionRealizedPnl: sumSignedDecimals(normalizedPositions.map((position) => position.realizedPnl)) }
+      : {}),
     unrealizedPnl: firstSignedText(account, ["usdtUnrealisedPnl", "unrealisedPnl", "unrealizedPnl", "unrealizedPL", "totalUnrealizedPL"]) || unrealizedPnl,
     unrealizedPnlSource: firstSignedText(account, ["usdtUnrealisedPnl", "unrealisedPnl", "unrealizedPnl", "unrealizedPL", "totalUnrealizedPL"]) ? "ACCOUNT" : "POSITIONS",
     ...(firstSignedText(account, ["funding", "fundingFee", "totalFunding"]) ? { funding: firstSignedText(account, ["funding", "fundingFee", "totalFunding"]) } : {}),
@@ -204,17 +219,22 @@ function providerRows(value: unknown): Record<string, unknown>[] {
 }
 
 function parseDashboardPosition(entry: Record<string, unknown>): PositionSnapshot {
+  const symbol = firstText(entry, ["symbol"]);
+  const side = firstText(entry, ["posSide", "positionSide", "holdSide"]).toUpperCase();
   const quantity = firstText(entry, ["total", "available", "quantity", "size"]);
+  if (side !== "LONG" && side !== "SHORT") throw new Error("PROVIDER_POSITION_SIDE_UNAVAILABLE");
+  if (!symbol) throw new Error("PROVIDER_POSITION_SYMBOL_UNAVAILABLE");
+  if (!quantity) throw new Error("PROVIDER_POSITION_QUANTITY_UNAVAILABLE");
   const markPrice = firstText(entry, ["markPrice", "markPx", "marketPrice", "currentPrice", "lastPrice"]);
   const unrealizedPnlPct = parseProviderProfitRate(entry);
   const openedAt = firstTimestamp(entry, ["ctime", "cTime", "createdTime", "openTime"]);
   const position: PositionSnapshot = {
-    symbol: text(entry.symbol),
-    positionSide: parsePositionSide(firstText(entry, ["posSide", "positionSide", "holdSide"], "LONG")),
+    symbol,
+    positionSide: side,
     quantity,
     notional: firstText(entry, ["notional", "positionNotional", "positionValue", "value"]),
     marginAllocated: firstText(entry, ["marginSize", "margin", "marginAllocated", "isolatedMargin", "positionMargin", "positionBalance"]),
-    leverage: firstText(entry, ["leverage"], "1"),
+    leverage: firstText(entry, ["leverage"]),
     entryPrice: firstText(entry, ["openPriceAvg", "avgPrice", "averageOpenPrice", "entryPrice"]),
     unrealizedPnl: firstText(entry, ["unrealisedPnl", "unrealizedPnl", "unrealizedPL", "upl", "unrealizedProfit"]),
     realizedPnl: firstText(entry, ["curRealisedPnl", "realizedPnl", "realizedPL", "achievedProfits"]),
@@ -277,6 +297,15 @@ function isSignedDecimal(value: string | undefined): value is string {
   return typeof value === "string" && /^[-+]?\d+(?:\.\d+)?$/.test(value.trim());
 }
 
+function isNonNegativeDecimalText(value: string): boolean {
+  return /^\+?\d+(?:\.\d+)?$/.test(value.trim());
+}
+
+function isPositiveDecimalText(value: string): boolean {
+  if (!/^\d+(?:\.\d+)?$/.test(value.trim())) return false;
+  return decimalParts(value).integer > 0n;
+}
+
 function hasPositionQuantity(value: string): boolean {
   if (!value) return false;
   try {
@@ -316,24 +345,27 @@ export function parseFillSummary(value: unknown): FillSummary {
   const container = Array.isArray(payload.list) ? payload.list : Array.isArray(payload.fillList) ? payload.fillList : [];
   const rows = records(container);
   if (rows.length === 0) return {};
-  const prices = rows.map((entry) => text(entry.execPrice, text(entry.price))).filter(Boolean);
-  const quantities = rows.map((entry) => text(entry.execQty, text(entry.baseVolume))).filter(Boolean);
-  const pnl = rows.map((entry) => text(entry.execPnl, text(entry.profit, text(entry.realizedPnl)))).filter(Boolean);
-  const fees = rows.flatMap((entry) => {
+  const prices = rows.map((entry) => text(entry.execPrice, text(entry.price)));
+  const quantities = rows.map((entry) => text(entry.execQty, text(entry.baseVolume)));
+  const completePrices = prices.every(isPositiveDecimalText);
+  const completeQuantities = quantities.every(isPositiveDecimalText);
+  const pnl = rows.map((entry) => text(entry.execPnl, text(entry.profit, text(entry.realizedPnl))));
+  const feesByFill = rows.map((entry) => {
     const details = Array.isArray(entry.feeDetail) ? entry.feeDetail : [];
     const detailFees = details.flatMap((detail) => {
       if (typeof detail !== "object" || detail === null || Array.isArray(detail)) return [];
-      const value = detail as Record<string, unknown>;
-      return [text(value.fee, text(value.totalFee, text(value.totalDeductionFee)))].filter(Boolean);
+      const item = detail as Record<string, unknown>;
+      return [text(item.fee, text(item.totalFee, text(item.totalDeductionFee)))].filter(isSignedDecimal);
     });
-    return detailFees.length > 0 ? detailFees : [text(entry.fee)].filter(Boolean);
+    return detailFees.length > 0 ? detailFees : [text(entry.fee)].filter(isSignedDecimal);
   });
-  const averageFillPrice = prices.length === quantities.length && prices.length > 0 ? weightedAverage(prices, quantities) : prices[0];
+  const completeFees = feesByFill.every((fillFees) => fillFees.length > 0);
+  const averageFillPrice = completePrices && completeQuantities ? weightedAverage(prices, quantities) : undefined;
   return {
     ...(averageFillPrice ? { averageFillPrice } : {}),
-    ...(quantities.length > 0 ? { executedQuantity: sumSignedDecimals(quantities) } : {}),
-    ...(pnl.length > 0 ? { realizedPnl: sumSignedDecimals(pnl), realizedPnlSource: "FILL" as const, realizedPnlIncludesCosts: false } : {}),
-    ...(fees.length > 0 ? { fees: sumSignedDecimals(fees) } : {}),
+    ...(completeQuantities ? { executedQuantity: sumSignedDecimals(quantities) } : {}),
+    ...(pnl.every(isSignedDecimal) ? { realizedPnl: sumSignedDecimals(pnl), realizedPnlSource: "FILL" as const, realizedPnlIncludesCosts: false } : {}),
+    ...(completeFees ? { fees: sumSignedDecimals(feesByFill.flat()) } : {}),
   };
 }
 
@@ -387,7 +419,10 @@ function firstDecimal(entry: Record<string, unknown>, keys: string[]): string {
 }
 
 function sumAssetValues(rows: readonly Record<string, unknown>[], keys: string[]): string {
-  return rows.reduce((total, row) => addDecimal(total, firstDecimal(row, keys) || "0"), "0");
+  if (rows.length === 0) return "";
+  const values = rows.map((row) => firstDecimal(row, keys));
+  if (values.some((value) => value === "")) return "";
+  return values.reduce((total, value) => addDecimal(total, value), "0");
 }
 
 function decimalParts(value: string): { integer: bigint; scale: number } {

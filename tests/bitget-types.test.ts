@@ -1,10 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { accountForEvidenceSymbol, normalizeProviderProfitRate, parseAccount, parseDashboardPortfolio, parseFillSummary, parseInstruments, parsePositionHistorySummary } from "../src/bitget/types.js";
+import { accountForEvidenceSymbol, normalizeProviderProfitRate, parseAccount, parseDashboardPortfolio, parseFillSummary, parseInstruments, parsePositionHistorySummary, parseTicker } from "../src/bitget/types.js";
 import type { Instrument, MarketSnapshot } from "../src/types.js";
 
 describe("Bitget provider readback", () => {
   it("preserves tokenized stock metadata from the instrument catalog", () => {
     expect(parseInstruments([{ symbol: "NVDAUSDT", category: "USDT-FUTURES", symbolType: "stock", isRwa: "YES", status: "online", minOrderQty: "0.01", minOrderAmount: "5", maxOrderQty: "500", maxMarketOrderQty: "100", pricePrecision: "2", quantityPrecision: "2", sizeMultiplier: "0.01", minLeverage: "1", maxLeverage: "100" }])[0]).toMatchObject({ symbol: "NVDAUSDT", symbolType: "stock", isRwa: "YES", status: "online", minOrderQty: "0.01", maxOrderQty: "100", minOrderAmount: "5", leverageMin: "1", leverageMax: "100" });
+  });
+
+  it("does not substitute a limit-order cap when the provider market-order cap is blank", () => {
+    expect(parseInstruments([{ symbol: "NVDAUSDT", category: "USDT-FUTURES", status: "online", symbolType: "stock", minOrderQty: "0.01", maxMarketOrderQty: "", maxOrderQty: "500", minOrderAmount: "5", minLeverage: "1", maxLeverage: "5", pricePrecision: "2", quantityPrecision: "2", sizeMultiplier: "0.01" }])[0]?.maxOrderQty).toBe("");
+  });
+
+  it("fails closed when a full-universe ticker response omits the requested symbol", () => {
+    expect(() => parseTicker([{ symbol: "MSTRUSDT", lastPrice: "100" }], "METAUSDT", "2026-09-25T00:00:00.000Z"))
+      .toThrow("MISSING_TICKER");
   });
 
   it("preserves the provider short side and quantity fields", () => {
@@ -22,7 +31,7 @@ describe("Bitget provider readback", () => {
     const assetRows = parseAccount([{ coin: "USDT", equity: "100", available: "90" }], instrument, market, market.observedAt);
 
     expect(account).toMatchObject({ portfolioEquity: "11.13921165", availableMargin: "6.19299777" });
-    expect(assetRows).toMatchObject({ portfolioEquity: "100", availableMargin: "90" });
+    expect(assetRows).toMatchObject({ portfolioEquity: "100", availableBalance: "90", availableMargin: "" });
   });
 
   it("preserves provider live position values for the dashboard", () => {
@@ -189,6 +198,69 @@ describe("Bitget provider readback", () => {
     expect(normalizeProviderProfitRate(undefined)).toBeUndefined();
   });
 
+  it("does not publish partial cross-position margin, notional, or PnL aggregates", () => {
+    const portfolio = parseDashboardPortfolio({ usdtEquity: "1000" }, [
+      { symbol: "AAAUSDT", posSide: "long", total: "1", positionValue: "101", marginSize: "10", unrealisedPnl: "1", curRealisedPnl: "0" },
+      { symbol: "BBBUSDT", posSide: "short", total: "2" },
+    ], { list: [] }, "2026-09-12T17:00:00.000Z");
+    expect(portfolio.positionNotional).toBe("");
+    expect(portfolio.totalPositionNotional).toBe("");
+    expect(portfolio.positionMargin).toBeUndefined();
+    expect(portfolio.unrealizedPnl).toBe("");
+    expect(portfolio.positionRealizedPnl).toBeUndefined();
+    expect(portfolio.positionQuantity).toBe("3");
+  });
+
+  it("does not sum native asset balances or treat balance as account equity without provider USD valuation", () => {
+    expect(() => parseDashboardPortfolio({ assets: [
+      { coin: "BTC", balance: "0.1" },
+      { coin: "USDT", balance: "300" },
+    ] }, [], { list: [] }, "2026-09-12T17:00:00.000Z")).toThrow("INVALID_PORTFOLIO_EQUITY");
+    expect(() => parseDashboardPortfolio({ balance: "300" }, [], { list: [] }, "2026-09-12T17:00:00.000Z")).toThrow("INVALID_PORTFOLIO_EQUITY");
+  });
+
+  it("keeps UTA USDT balance, available balance, and effective margin distinct", () => {
+    const portfolio = parseDashboardPortfolio({
+      accountEquity: "2350",
+      usdtEquity: "1000",
+      effEquity: "600",
+      assets: [
+        { coin: "BTC", balance: "0.1", available: "0.09", usdValue: "2000" },
+        { coin: "USDT", balance: "350", available: "300", usdValue: "350" },
+      ],
+    }, [], { list: [] }, "2026-09-12T17:00:00.000Z");
+    expect(portfolio).toMatchObject({ balance: "350", availableBalance: "300", availableMargin: "600", portfolioEquity: "1000" });
+  });
+
+  it("does not sum available balances across UTA asset denominations to invent margin", () => {
+    const portfolio = parseDashboardPortfolio({
+      usdtEquity: "1000",
+      assets: [
+        { coin: "BTC", balance: "0.1", available: "0.09" },
+        { coin: "USDT", balance: "350", available: "300" },
+      ],
+    }, [], { list: [] }, "2026-09-12T17:00:00.000Z");
+    expect(portfolio.availableBalance).toBe("300");
+    expect(portfolio.availableMargin).toBe("");
+  });
+
+  it("keeps provider balance, available margin, and leverage unavailable when the provider omits them", () => {
+
+    const portfolio = parseDashboardPortfolio({ usdtEquity: "1000" }, [
+      { symbol: "CRCLUSDT", posSide: "short", total: "1", avgPrice: "100", markPrice: "101" },
+    ], { list: [] }, "2026-09-12T17:00:00.000Z");
+    expect(portfolio.balance).toBe("");
+    expect(portfolio.availableMargin).toBe("");
+    expect(portfolio.positions[0]?.leverage).toBe("");
+    expect(portfolio.positions[0]?.positionSide).toBe("SHORT");
+  });
+
+  it("fails closed instead of assuming a missing live position side is LONG", () => {
+    expect(() => parseDashboardPortfolio({ usdtEquity: "1000" }, [
+      { symbol: "CRCLUSDT", total: "1", avgPrice: "100", markPrice: "101" },
+    ], { list: [] }, "2026-09-12T17:00:00.000Z")).toThrow("PROVIDER_POSITION_SIDE_UNAVAILABLE");
+  });
+
   it("normalizes provider position open time without presenting it as the snapshot time", () => {
     const observedAt = "2026-09-12T17:00:00.000Z";
     const portfolio = parseDashboardPortfolio({ usdtEquity: "1000" }, [{ symbol: "CRCLUSDT", posSide: "long", total: "1", positionValue: "100", createdTime: "1729928018076", updatedTime: "1729929656321" }], { list: [] }, observedAt);
@@ -207,6 +279,11 @@ describe("Bitget provider readback", () => {
   it("sums fill PnL and fees without inventing values", () => {
     const result = parseFillSummary({ list: [{ execPrice: "100", execQty: "1", execPnl: "-0.25", feeDetail: [{ fee: "-0.1" }] }, { execPrice: "101", execQty: "0.5", execPnl: "0.05", feeDetail: [{ fee: "-0.05" }] }] });
     expect(result).toMatchObject({ averageFillPrice: "100.33333333", executedQuantity: "1.5", realizedPnl: "-0.2", fees: "-0.15" });
+  });
+
+  it("does not derive an average price or executed quantity from an incomplete provider fill set", () => {
+    expect(parseFillSummary({ list: [{ execPrice: "100", execQty: "1" }, { execPrice: "101", execQty: "" }] })).toEqual({});
+    expect(parseFillSummary({ list: [{ execPrice: "100", execQty: "1" }, { execPrice: "", execQty: "2" }] })).toEqual({ executedQuantity: "3" });
   });
 
   it("reads historical position PnL, funding, and fees", () => {
