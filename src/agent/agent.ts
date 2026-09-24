@@ -79,9 +79,16 @@ import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } fr
 import { providerLedgerDiagnostics, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadProviderPositionHistoriesPage, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, providerLivePositionLifecycleKey, loadProviderSyncStates, type ProviderLifecycleEvidenceRequest, type ProviderPositionHistoryCursor } from "../storage/provider-ledger.js";
 import { calculateNetPnlSinceBaseline, isFinancialRecordCoverageComplete } from "../trading/external-flow.js";
 import { resolveExternalFlowReadModel } from "../trading/external-flow-read-model.js";
-import { classifyProviderLifecycle, type ProviderLifecycleHistory } from "../trading/provider-lifecycle-reconciliation.js";
+import { classifyProviderLifecycle, summarizeProviderLifecycleFillQuantities, type ProviderLifecycleClassification, type ProviderLifecycleHistory } from "../trading/provider-lifecycle-reconciliation.js";
 import { rebuildProviderPerformance, type ProviderPerformanceLifecycle, type ProviderPerformanceTotals } from "../trading/provider-performance.js";
 import { resolveProviderPerformanceReadModel } from "../trading/provider-performance-read-model.js";
+
+class ProviderLifecycleClassificationError extends Error {
+  public constructor(readonly classification: ProviderLifecycleClassification, readonly reason: string) {
+    super(`PROVIDER_LIFECYCLE_${classification}:${reason}`);
+  }
+}
+
 
 
 interface AgentState {
@@ -766,9 +773,16 @@ export class TraderAgent extends Agent<Env, AgentState> {
       }
       if (body.action === "REPAIR_PROVIDER_CLOSED_LIFECYCLE") {
         try {
+          if (body.dryRun === true) {
+            return json(await this.dryRunProviderClosedLifecycle(body.experienceId, body.providerPositionHistoryId));
+          }
           return json({ reconciliation: await this.repairProviderClosedLifecycle(body.experienceId, body.providerPositionHistoryId) });
         } catch (error) {
-          return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "PROVIDER_LIFECYCLE_REPAIR_FAILED" : "PROVIDER_LIFECYCLE_REPAIR_FAILED" }, 409);
+          if (error instanceof ProviderLifecycleClassificationError) {
+            return json({ error: `PROVIDER_LIFECYCLE_${error.classification}`, reason: error.reason }, 409);
+          }
+          const message = error instanceof Error ? error.message : "PROVIDER_LIFECYCLE_REPAIR_FAILED";
+          return json({ error: message.split(":", 1)[0] ?? "PROVIDER_LIFECYCLE_REPAIR_FAILED" }, 409);
         }
       }
       return json(await this.getDashboardSnapshot());
@@ -1039,6 +1053,70 @@ export class TraderAgent extends Agent<Env, AgentState> {
     return states;
   }
 
+  public async dryRunProviderClosedLifecycle(experienceId: string, providerPositionHistoryId: string): Promise<{
+    dryRun: true;
+    classification: ReturnType<typeof classifyProviderLifecycle>["classification"];
+    reason: string;
+    evidence: {
+      historyFound: boolean;
+      providerPositionHistoryId: string | null;
+      historyOrigin: string | null;
+      entryIdentityFound: boolean;
+      entryDecisionId: string | null;
+      entryClientOid: string | null;
+      entryProviderOrderId: string | null;
+      orderCount: number;
+      fillCount: number;
+      evidenceComplete: boolean;
+      providerCurrentPositionPresent: boolean;
+      openTotalPos: string | null;
+      closeTotalPos: string | null;
+      openingFillQuantity: string | null;
+      closingFillQuantity: string | null;
+    };
+  }> {
+    if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
+    const experience = loadAllExperiences(this).find((candidate) => candidate.experienceId === experienceId);
+    if (!experience) throw new Error("EXPERIENCE_NOT_FOUND");
+    if (!experience.positionSide) throw new Error("LOCAL_POSITION_SIDE_MISSING");
+
+    const context = loadPositionContext(this, experience.symbol, experience.positionSide);
+    if (!context || context.entryDecisionId !== experience.entryDecisionId || (context.experienceId && context.experienceId !== experience.experienceId)) {
+      throw new Error("POSITION_CONTEXT_IDENTITY_MISMATCH");
+    }
+
+    const policy = loadActiveOwnerPolicy(this) ?? loadOwnerPolicy(this.env);
+    const config = loadConfig(this.env, policy);
+    const portfolio = await new BitgetClient(config).getDashboardPortfolio();
+    if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
+
+    const evidence = loadProviderLifecycleEvidence(this, experience, config.bitgetCategory, providerPositionHistoryId, portfolio.positions);
+    const reconciliation = classifyProviderLifecycle(evidence);
+    const quantities = summarizeProviderLifecycleFillQuantities(evidence);
+    return {
+      dryRun: true,
+      classification: reconciliation.classification,
+      reason: reconciliation.reason,
+      evidence: {
+        historyFound: Boolean(evidence.history),
+        providerPositionHistoryId: evidence.history?.providerPositionHistoryId ?? null,
+        historyOrigin: evidence.history?.origin ?? null,
+        entryIdentityFound: Boolean(evidence.entryIdentity),
+        entryDecisionId: evidence.entryIdentity?.entryDecisionId ?? experience.entryDecisionId,
+        entryClientOid: evidence.entryIdentity?.clientOid ?? null,
+        entryProviderOrderId: evidence.entryIdentity?.providerOrderId ?? null,
+        orderCount: evidence.orders.length,
+        fillCount: evidence.fills.length,
+        evidenceComplete: evidence.evidenceComplete === true,
+        providerCurrentPositionPresent: evidence.providerPositions.some((position) => position.symbol === experience.symbol && position.positionSide === experience.positionSide),
+        openTotalPos: evidence.history?.openTotalPos ?? null,
+        closeTotalPos: evidence.history?.closeTotalPos ?? null,
+        openingFillQuantity: quantities.openingFillQuantity,
+        closingFillQuantity: quantities.closingFillQuantity,
+      },
+    };
+  }
+
   public async repairProviderClosedLifecycle(experienceId: string, providerPositionHistoryId: string): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string; providerPositionHistoryId: string }> {
     if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
     ensureStorage(this);
@@ -1065,7 +1143,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const evidence = loadProviderLifecycleEvidence(this, experience, config.bitgetCategory, providerPositionHistoryId, portfolio.positions);
     const reconciliation = classifyProviderLifecycle(evidence);
     if (reconciliation.classification !== "LOCAL_OPEN_PROVIDER_CLOSED" || !evidence.history) {
-      throw new Error(`PROVIDER_LIFECYCLE_${reconciliation.classification}:${reconciliation.reason}`);
+      throw new ProviderLifecycleClassificationError(reconciliation.classification, reconciliation.reason);
     }
     const history = evidence.history;
     const closedExperience = providerClosedExperience(experience, history, reconciliation.closedQuantity ?? "");
@@ -2084,10 +2162,10 @@ function calculateDrawdownPct(baseline: string, current: string): string {
   return (((equity - base) / base) * 100).toFixed(2);
 }
 
-function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string } | { action: "REPAIR_PROVIDER_CLOSED_LIFECYCLE"; experienceId: string; providerPositionHistoryId: string } {
+function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string } | { action: "REPAIR_PROVIDER_CLOSED_LIFECYCLE"; experienceId: string; providerPositionHistoryId: string; dryRun?: boolean } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const body = value as { action?: unknown; cycleId?: unknown; decisionId?: unknown; experienceId?: unknown; providerPositionHistoryId?: unknown };
-  if (body.action === "REPAIR_PROVIDER_CLOSED_LIFECYCLE") return typeof body.experienceId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.experienceId) && typeof body.providerPositionHistoryId === "string" && /^[A-Za-z0-9:_-]{1,128}$/.test(body.providerPositionHistoryId);
+  const body = value as { action?: unknown; cycleId?: unknown; decisionId?: unknown; experienceId?: unknown; providerPositionHistoryId?: unknown; dryRun?: unknown };
+  if (body.action === "REPAIR_PROVIDER_CLOSED_LIFECYCLE") return typeof body.experienceId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.experienceId) && typeof body.providerPositionHistoryId === "string" && /^[A-Za-z0-9:_-]{1,128}$/.test(body.providerPositionHistoryId) && (body.dryRun === undefined || typeof body.dryRun === "boolean");
   if (body.action === "RECONCILE_LATE_EXECUTION") return typeof body.cycleId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.cycleId) && typeof body.decisionId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.decisionId);
   return body.action === "START" || body.action === "PAUSE" || body.action === "RESUME" || body.action === "EMERGENCY_STOP";
 }

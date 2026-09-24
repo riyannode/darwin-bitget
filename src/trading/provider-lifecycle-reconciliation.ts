@@ -283,6 +283,19 @@ function verifyProviderQuantityTotals(
   return null;
 }
 
+export interface ProviderLifecycleFillQuantities {
+  openingFillQuantity: string | null;
+  closingFillQuantity: string | null;
+}
+
+export function summarizeProviderLifecycleFillQuantities(evidence: ProviderLifecycleEvidence): ProviderLifecycleFillQuantities {
+  const history = evidence.history;
+  if (!history) return { openingFillQuantity: null, closingFillQuantity: null };
+  const reconstruction = reconstructProviderLifecycleFills(evidence, history.openingTime, history.closingTime);
+  if (!reconstruction.ok) return { openingFillQuantity: null, closingFillQuantity: null };
+  return { openingFillQuantity: reconstruction.openQuantity, closingFillQuantity: reconstruction.closeQuantity };
+}
+
 export function classifyProviderLifecycle(evidence: ProviderLifecycleEvidence): ProviderLifecycleResult {
   const { experience, history } = evidence;
   const side = experience.positionSide;
