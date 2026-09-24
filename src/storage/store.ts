@@ -449,6 +449,7 @@ export function saveExternalFlowReadModelCache(executor: SqlExecutor, cache: Ext
 
 export interface ProviderLifecyclePerformanceReadModelCache {
   version: 1;
+  semanticVersion: number;
   signature: string;
   totals: ProviderPerformanceTotals;
 }
@@ -460,6 +461,7 @@ function isProviderLifecyclePerformanceCache(value: unknown): value is ProviderL
   const candidate = value as Partial<ProviderLifecyclePerformanceReadModelCache>;
   const totals = candidate.totals;
   return candidate.version === 1
+    && Number.isInteger(candidate.semanticVersion)
     && typeof candidate.signature === "string"
     && typeof totals === "object" && totals !== null
     && totals.source === "PROVIDER_LEDGER"

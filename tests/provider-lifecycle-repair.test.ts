@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
 import { loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderLifecycleHistoryCandidateIds, loadProviderLiveOpeningOrderIdentities, loadProviderPositionHistoryDecisionIds, loadProviderSyncState, saveProviderSyncState } from "../src/storage/provider-ledger.js";
 import { classifyProviderLifecycle } from "../src/trading/provider-lifecycle-reconciliation.js";
-import { hasEvent, loadAllEvents, loadAllExperiences, loadPositionContext, persistProviderLifecycleRepair, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
+import { hasEvent, loadAllEvents, loadAllExperiences, loadPositionContext, persistProviderLifecycleRepair, saveEvent, saveExperience, saveJournal, savePositionContext, saveProviderLifecyclePerformanceReadModelCache } from "../src/storage/store.js";
 import { TraderAgent, resolveProviderTradeFacts } from "../src/agent/agent.js";
 import { BitgetClient } from "../src/bitget/client.js";
 import { PROVIDER_FINANCIAL_CATEGORIES } from "../src/bitget/provider-sync.js";
@@ -1375,6 +1375,19 @@ describe("provider-first financial lifecycle resolution", () => {
     await expect(invokeRepair(agent)).rejects.toThrow("AGENT_MUST_BE_PAUSED");
     expect(loadAllExperiences(executor)[0]?.outcomeStatus).toBe("OPEN");
     expect(loadAllEvents(executor)).toHaveLength(0);
+    db.close();
+  });
+
+  it("invalidates a stale zero-closed-trade lifecycle cache when verified provider history exists", async () => {
+    const { db, executor } = memoryExecutor();
+    insertProviderEvidence(executor);
+    const sync = loadProviderSyncState(executor, "USDT-FUTURES");
+    const signature = JSON.stringify({ version: 1, category: "USDT-FUTURES", revision: sync?.revision ?? null, updatedAt: sync?.updatedAt ?? null, lastSuccessfulSyncAt: sync?.lastSuccessfulSyncAt ?? null, lastError: sync?.lastError ?? null, checkpoints: sync?.checkpoints ?? {} });
+    const updatedAt = OPENED_AT;
+    saveProviderLifecyclePerformanceReadModelCache(executor, { version: 1, semanticVersion: 1, signature, totals: rebuildProviderPerformance([]) }, updatedAt);
+    const agent = fakeAgent(executor, db, true);
+    const snapshot = await agent.getDashboardSnapshot.call(agent, { positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    expect(snapshot.performance).toMatchObject({ financialSource: "PROVIDER_LEDGER", closedTrades: 1, totalTrades: 1, verifiedRealizedPnl: "33.19485709" });
     db.close();
   });
 
