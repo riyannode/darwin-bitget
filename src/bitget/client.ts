@@ -31,11 +31,19 @@ function compactProviderReadParams(params: ProviderLedgerReadParams): Record<str
   return Object.fromEntries(Object.entries(params).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
 }
 
+function positiveDecimal(value: string): boolean {
+  return /^\d+(?:\.\d+)?$/.test(value) && Number.isFinite(Number(value)) && Number(value) > 0;
+}
+
 export function executableIntersection(publicInstruments: readonly Instrument[], demoInstruments: readonly Instrument[], category: string): Instrument[] {
-  const valid = (instrument: Instrument) => instrument.category === category && instrument.status === "online" && instrument.symbolType === "stock";
+  const valid = (instrument: Instrument) => instrument.category === category && instrument.status === "online" && instrument.symbolType === "stock"
+    && positiveDecimal(instrument.minOrderQty) && positiveDecimal(instrument.minOrderAmount) && positiveDecimal(instrument.maxOrderQty)
+    && positiveDecimal(instrument.quantityStep) && positiveDecimal(instrument.leverageMin) && positiveDecimal(instrument.leverageMax)
+    && Number(instrument.leverageMin) <= Number(instrument.leverageMax)
+    && Number.isInteger(instrument.pricePrecision) && instrument.pricePrecision >= 0
+    && Number.isInteger(instrument.quantityPrecision) && instrument.quantityPrecision >= 0;
   const publicSymbols = new Set(publicInstruments.filter(valid).map((instrument) => instrument.symbol));
-  return demoInstruments.filter((instrument) => valid(instrument) && publicSymbols.has(instrument.symbol)
-    && instrument.minOrderQty !== "" && instrument.minOrderAmount !== "" && instrument.leverageMax !== "");
+  return demoInstruments.filter((instrument) => valid(instrument) && publicSymbols.has(instrument.symbol));
 }
 
 export type BitgetHoldingMode = "hedge_mode" | "one_way_mode";

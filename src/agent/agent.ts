@@ -5,7 +5,7 @@ import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { syncProviderLedger, PROVIDER_FINANCIAL_CATEGORIES, PROVIDER_TRADE_LIFECYCLE_CATEGORY } from "../bitget/provider-sync.js";
 import { MANDATE_VERSION, PROMPT_VERSIONS, TRADING_MANDATE } from "./mandate.js";
-import { assertOpenPositionCountWithinPlanLimit, buildEvidenceSymbols, calculateActionCapacity, decide, rankMarketCandidates, selectEntryCandidates } from "./decision.js";
+import { assertOpenPositionCountWithinPlanLimit, buildEvidenceSymbols, calculateActionCapacity, countOpenPositionLifecycles, decide, filterNewEntryMarketCandidates, rankMarketCandidates, selectEntryCandidates } from "./decision.js";
 import { QwenJsonError } from "./qwen.js";
 import { reconcileTradingSchedule, reconcileProviderLedgerSchedule, PROVIDER_LEDGER_INTERVAL_SECONDS, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES, type SchedulerReconciliationResult } from "./scheduler.js";
 import { authorizeOwner } from "./owner-auth.js";
@@ -81,7 +81,7 @@ import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } fr
 import { providerLedgerDiagnostics, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadProviderPositionHistoriesPage, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, providerLivePositionLifecycleKey, loadProviderSyncStates, type ProviderLifecycleEvidenceRequest, type ProviderPositionHistoryCursor } from "../storage/provider-ledger.js";
 import { calculateNetPnlSinceBaseline, isFinancialRecordCoverageComplete } from "../trading/external-flow.js";
 import { resolveExternalFlowReadModel } from "../trading/external-flow-read-model.js";
-import { classifyProviderLifecycle, summarizeProviderLifecycleFillQuantities, type ProviderLifecycleClassification, type ProviderLifecycleHistory, type ProviderLifecycleCandidateOrder, type ProviderLifecycleCandidateFill } from "../trading/provider-lifecycle-reconciliation.js";
+import { classifyProviderLifecycle, summarizeProviderLifecycleFillQuantities, type ProviderLifecycleClassification, type ProviderLifecycleHistory, type ProviderLifecycleEvidence, type ProviderLifecycleCandidateOrder, type ProviderLifecycleCandidateFill } from "../trading/provider-lifecycle-reconciliation.js";
 import { rebuildProviderPerformance, type ProviderPerformanceLifecycle, type ProviderPerformanceTotals } from "../trading/provider-performance.js";
 import { resolveProviderPerformanceReadModel } from "../trading/provider-performance-read-model.js";
 
@@ -204,6 +204,8 @@ interface ResolvedProviderTradeFact {
   position?: PositionSnapshot;
   execution?: ProviderExecutionFact;
   providerPositionHistoryId?: string;
+  providerOrderId?: string;
+  unresolvedReason?: string;
   origin: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
 }
 
@@ -276,6 +278,7 @@ interface ProviderTradeFactResolutionOptions {
   historyDecisionIds?: ReadonlyMap<string, string>;
   historyLimit?: number;
   openPositionIdentities?: ReadonlyMap<string, { providerOrderId: string; decisionId: string }>;
+  positionContexts?: ReadonlyMap<string, PositionContext>;
 }
 
 export function resolveProviderTradeFacts(
@@ -284,13 +287,16 @@ export function resolveProviderTradeFacts(
   category: string,
   positions: readonly PositionSnapshot[],
   options: ProviderTradeFactResolutionOptions = {},
-): { facts: Map<string, ResolvedProviderTradeFact>; lifecycles: ProviderPerformanceLifecycle[]; providerOnlyHistories: Array<{ history: ProviderLifecycleHistory; decisionId: string }>; providerOnlyOpenPositions: Array<{ position: PositionSnapshot; providerOrderId: string; decisionId: string }> } {
+): { facts: Map<string, ResolvedProviderTradeFact>; lifecycles: ProviderPerformanceLifecycle[]; providerOnlyHistories: Array<{ history: ProviderLifecycleHistory; decisionId: string; providerOrderId: string; managementExecutions: ProviderExecutionFact[] }>; providerOnlyOpenPositions: Array<{ position: PositionSnapshot; providerOrderId: string; decisionId: string; managementExecutions: ProviderExecutionFact[] }> } {
   const facts = new Map<string, ResolvedProviderTradeFact>();
   const lifecycles: ProviderPerformanceLifecycle[] = [];
   const histories = options.histories ? [...options.histories] : loadProviderPositionHistories(executor, category, options.historyLimit);
   const historyDecisionIds = options.historyDecisionIds ?? loadProviderPositionHistoryDecisionIds(executor, category, histories);
   const openPositionIdentities = options.openPositionIdentities ?? loadProviderLiveOpeningOrderIdentities(executor, category, positions);
   const historiesByDecision = new Map<string, Array<{ history: ProviderLifecycleHistory; historyId: string; probeId: string; decisionId: string }>>();
+  const canonicalHistories = new Map<string, { history: ProviderLifecycleHistory; decisionId: string; providerOrderId: string; managementExecutions: ProviderExecutionFact[] }>();
+  const canonicalHistoryEvidence = new Map<string, ProviderLifecycleEvidence>();
+  const canonicalOpenPositions = new Map<string, { position: PositionSnapshot; providerOrderId: string; decisionId: string; managementExecutions: ProviderExecutionFact[] }>();
 
   const historyEvidenceRequests = histories.flatMap((history) => {
     const historyId = history.providerPositionHistoryId;
@@ -310,7 +316,8 @@ export function resolveProviderTradeFacts(
     const historyId = history.providerPositionHistoryId;
     const decisionId = historyId ? historyDecisionIds.get(historyId) : undefined;
     if (!historyId || !decisionId) continue;
-    const classification = classifyProviderLifecycle(historyEvidence.get(requestId) ?? {
+    const evidence = historyEvidence.get(requestId);
+    const classification = classifyProviderLifecycle(evidence ?? {
       experience,
       providerPositions: request.providerPosition ? [request.providerPosition] : [],
       history,
@@ -321,11 +328,13 @@ export function resolveProviderTradeFacts(
     }).classification;
     if (classification === "MATCHED_CLOSED" || classification === "LOCAL_OPEN_PROVIDER_CLOSED") {
       const probeId = `provider-history:${historyId}`;
-      facts.set(probeId, { source: "PROVIDER_LEDGER", history, providerPositionHistoryId: historyId, origin: "DARWIN" });
+      facts.set(probeId, { source: "PROVIDER_LEDGER", history, providerPositionHistoryId: historyId, ...(evidence?.entryIdentity?.providerOrderId ? { providerOrderId: evidence.entryIdentity.providerOrderId } : {}), origin: "DARWIN" });
       lifecycles.push({ lifecycleId: historyId, origin: "DARWIN", status: "CLOSED", ...(history.netProfit === null ? {} : { netProfit: history.netProfit }), ...(history.closingTime ? { closedAt: history.closingTime } : {}) });
       const matches = historiesByDecision.get(decisionId) ?? [];
       matches.push({ history, historyId, probeId, decisionId });
       historiesByDecision.set(decisionId, matches);
+      canonicalHistories.set(historyId, { history, decisionId, providerOrderId: evidence?.entryIdentity?.providerOrderId ?? "", managementExecutions: [] });
+      if (evidence) canonicalHistoryEvidence.set(historyId, evidence);
     }
   }
 
@@ -355,6 +364,7 @@ export function resolveProviderTradeFacts(
     if (classification !== "MATCHED_OPEN") continue;
     const position = request.providerPosition as PositionSnapshot;
     const lifecycleId = `open:${identity.providerOrderId}`;
+    canonicalOpenPositions.set(identity.providerOrderId, { position, providerOrderId: identity.providerOrderId, decisionId: identity.decisionId, managementExecutions: [] });
     if (!lifecycles.some((lifecycle) => lifecycle.lifecycleId === lifecycleId)) lifecycles.push({ lifecycleId, origin: "DARWIN", status: "OPEN" });
     const matches = openPositionsByDecision.get(identity.decisionId) ?? [];
     matches.push({ position, providerOrderId: identity.providerOrderId, decisionId: identity.decisionId });
@@ -362,11 +372,9 @@ export function resolveProviderTradeFacts(
   }
 
   // Local experiences only enrich already-resolved provider facts; they never create financial lifecycles.
-  const joinedHistoryIds = new Set<string>();
-  const joinedOpenOrderIds = new Set<string>();
   for (const experience of experiences) {
     if (!experience.positionSide) {
-      facts.set(experience.experienceId, { source: "UNRESOLVED", origin: "UNATTRIBUTED" });
+      facts.set(experience.experienceId, { source: "UNRESOLVED", origin: "UNATTRIBUTED", unresolvedReason: "LOCAL_POSITION_SIDE_MISSING" });
       continue;
     }
     const closed = (historiesByDecision.get(experience.entryDecisionId) ?? []).filter(({ history }) => history.symbol === experience.symbol && history.positionSide === experience.positionSide);
@@ -374,26 +382,57 @@ export function resolveProviderTradeFacts(
     if (closed.length === 1 && opened.length === 0) {
       const candidate = closed[0]!;
       facts.set(experience.experienceId, facts.get(candidate.probeId)!);
-      joinedHistoryIds.add(candidate.historyId);
     } else if (opened.length === 1 && closed.length === 0) {
       const candidate = opened[0]!;
-      facts.set(experience.experienceId, { source: "PROVIDER_LIVE", position: candidate.position, origin: "DARWIN" });
-      joinedOpenOrderIds.add(candidate.providerOrderId);
+      facts.set(experience.experienceId, { source: "PROVIDER_LIVE", position: candidate.position, providerOrderId: candidate.providerOrderId, origin: "DARWIN" });
     } else {
-      facts.set(experience.experienceId, { source: "UNRESOLVED", origin: "UNATTRIBUTED" });
+      facts.set(experience.experienceId, {
+        source: "UNRESOLVED",
+        origin: "UNATTRIBUTED",
+        unresolvedReason: closed.length > 1 || opened.length > 1 ? "AMBIGUOUS_PROVIDER_LIFECYCLE_MATCH" : "NO_CANONICAL_PROVIDER_LIFECYCLE_MATCH",
+      });
     }
   }
 
   const executionFacts = loadProviderExitExecutionFacts(executor, category, experiences);
   for (const experience of experiences) {
     const execution = executionFacts.get(experience.experienceId);
-    if (!execution || facts.get(experience.experienceId)?.source !== "UNRESOLVED") continue;
-    facts.set(experience.experienceId, { source: "PROVIDER_EXECUTION", execution, origin: "DARWIN" });
+    if (!execution) continue;
+    const executionTimes = execution.fills.map((fill) => Date.parse(fill.filledAt)).filter(Number.isFinite);
+    const matches = [...canonicalHistories.entries()].filter(([historyId, canonical]) => {
+      if (canonical.history.symbol !== execution.symbol || canonical.history.positionSide !== execution.positionSide) return false;
+      const evidence = canonicalHistoryEvidence.get(historyId);
+      const exactOrder = evidence?.orders.some((order) => order.providerOrderId === execution.providerOrderId && order.clientOid === execution.clientOrderId && order.origin === "DARWIN")
+        || evidence?.fills.some((fill) => fill.providerOrderId === execution.providerOrderId && fill.clientOid === execution.clientOrderId && fill.origin === "DARWIN");
+      const openedAt = Date.parse(canonical.history.openingTime);
+      const closedAt = Date.parse(canonical.history.closingTime);
+      const insideLifecycle = Number.isFinite(openedAt) && Number.isFinite(closedAt) && executionTimes.some((time) => time >= openedAt && time <= closedAt);
+      return Boolean(exactOrder && insideLifecycle);
+    });
+    if (matches.length === 1) {
+      const [historyId, canonical] = matches[0]!;
+      if (!canonical.managementExecutions.some((item) => item.providerOrderId === execution.providerOrderId)) canonical.managementExecutions.push(execution);
+      facts.set(experience.experienceId, { source: "PROVIDER_LEDGER", history: canonical.history, providerPositionHistoryId: historyId, ...(canonical.providerOrderId ? { providerOrderId: canonical.providerOrderId } : {}), execution, origin: "DARWIN" });
+      continue;
+    }
+    const context = options.positionContexts?.get(`${execution.symbol}:${execution.positionSide}`);
+    const localAction = experience.lastAction && experience.lastAction !== "HOLD" ? experience.lastAction : experience.action;
+    const hasExactManagementEvent = Boolean(context && experience.exitDecisionId === execution.decisionId && context.managementEvents.some((event) => event.decisionId === execution.decisionId && event.action === localAction));
+    const openMatches = hasExactManagementEvent ? [...canonicalOpenPositions.values()].filter((canonical) => {
+      if (canonical.position.symbol !== execution.symbol || canonical.position.positionSide !== execution.positionSide || canonical.decisionId !== context?.entryDecisionId) return false;
+      const openedAt = Date.parse(canonical.position.openedAt ?? "");
+      return Number.isFinite(openedAt) && executionTimes.length > 0 && executionTimes.every((time) => time >= openedAt);
+    }) : [];
+    if (openMatches.length === 1) {
+      const canonical = openMatches[0]!;
+      if (!canonical.managementExecutions.some((item) => item.providerOrderId === execution.providerOrderId)) canonical.managementExecutions.push(execution);
+      facts.set(experience.experienceId, { source: "PROVIDER_LIVE", position: canonical.position, providerOrderId: canonical.providerOrderId, origin: "DARWIN" });
+      continue;
+    }
+    if (facts.get(experience.experienceId)?.source === "UNRESOLVED") facts.set(experience.experienceId, { source: "PROVIDER_EXECUTION", execution, origin: "DARWIN" });
   }
 
-  const providerOnlyHistories = [...historiesByDecision.values()].flat().filter((candidate) => !joinedHistoryIds.has(candidate.historyId)).map(({ history, decisionId }) => ({ history, decisionId }));
-  const providerOnlyOpenPositions = [...openPositionsByDecision.values()].flat().filter((candidate) => !joinedOpenOrderIds.has(candidate.providerOrderId));
-  return { facts, lifecycles, providerOnlyHistories, providerOnlyOpenPositions };
+  return { facts, lifecycles, providerOnlyHistories: [...canonicalHistories.values()], providerOnlyOpenPositions: [...canonicalOpenPositions.values()] };
 }
 
 function tradeLogEntries(
@@ -424,10 +463,10 @@ function tradeLogEntries(
     const openedAt = history?.openingTime ?? livePosition?.openedAt ?? "UNAVAILABLE";
     const closedAt = history?.closingTime;
     const persistedReasoning = Boolean(entryReasoning || exitReasoning || managementEvents.length || experience.entryThesis.trim());
-    const financialStatus = isProviderClosed ? "CLOSED" : isProviderLive ? "OPEN" : providerExecution ? "EXECUTION_VERIFIED" : "UNRESOLVED";
+    const financialStatus = experience.outcomeStatus === "BLOCKED" ? "BLOCKED" : isProviderClosed ? "CLOSED" : isProviderLive ? "OPEN" : providerExecution ? "EXECUTION_VERIFIED" : "UNRESOLVED";
     return {
       tradeId: experience.experienceId,
-      timestamp: openedAt,
+      timestamp: isProviderClosed ? (closedAt ?? openedAt) : isProviderLive ? openedAt : providerExecution?.fills[0]?.filledAt ?? record?.decision.createdAt ?? "UNAVAILABLE",
       symbol: experience.symbol,
       action,
       marginAllocationPct: "UNAVAILABLE",
@@ -446,12 +485,14 @@ function tradeLogEntries(
       status: financialStatus,
       localLifecycleStatus: tradeLifecycleStatus(experience),
       thesis: experience.entryThesis,
-      orderReference: providerExecution?.providerOrderId ?? record?.executionResult?.providerOrderId ?? record?.executionResult?.clientOrderId ?? journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
+      orderReference: facts?.providerOrderId ?? providerExecution?.providerOrderId ?? record?.executionResult?.providerOrderId ?? record?.executionResult?.clientOrderId ?? journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
+      ...(facts?.providerOrderId ? { providerOrderId: facts.providerOrderId } : {}),
       positionSide: experience.positionSide,
       openedAt,
       entryTime: openedAt,
       ...(closedAt ? { closedAt, exitTime: closedAt } : {}),
       financialSource: isProviderClosed ? "PROVIDER_LEDGER" : isProviderLive ? "PROVIDER_LIVE" : providerExecution ? "PROVIDER_EXECUTION" : facts?.source ?? "UNRESOLVED",
+      ...(financialStatus === "UNRESOLVED" && facts?.unresolvedReason ? { unresolvedReason: facts.unresolvedReason } : {}),
       reasoningSource: persistedReasoning
         ? "DARWIN_PERSISTED" as const
         : facts?.origin === "PROVIDER_EXTERNAL" ? "PROVIDER_EXTERNAL" as const : "UNATTRIBUTED" as const,
@@ -459,7 +500,7 @@ function tradeLogEntries(
       ...(facts?.providerPositionHistoryId ? { providerPositionHistoryId: facts.providerPositionHistoryId } : {}),
       ...(providerExecution ? { providerExecution } : {}),
       ...(history ? {
-        quantity: history.closeTotalPos ?? history.openTotalPos ?? "UNAVAILABLE",
+        quantity: history.closeTotalPos ?? "UNAVAILABLE",
         openQuantity: history.openTotalPos ?? "UNAVAILABLE",
         closeQuantity: history.closeTotalPos ?? "UNAVAILABLE",
         cumRealisedPnl: history.cumRealisedPnl ?? "UNAVAILABLE",
@@ -1544,8 +1585,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
   private async getTradeHistory(url: URL): Promise<Response> {
     ensureStorage(this);
     const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
-    const recentExperiences = loadExperiences(this, limit);
-    const histories = loadProviderPositionHistories(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, limit);
+    const recentExperiences = loadExperiences(this, 100);
+    const histories = loadProviderPositionHistories(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, 100);
     const historyDecisionIds = loadProviderPositionHistoryDecisionIds(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, histories);
     const config = loadConfig(this.env, this.ensureActivePolicy());
     let positions: PositionSnapshot[] = [];
@@ -1556,11 +1597,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
     }
     const openPositionIdentities = loadProviderLiveOpeningOrderIdentities(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, positions);
     const reasoningDecisionIds = [...new Set([...historyDecisionIds.values(), ...[...openPositionIdentities.values()].map((identity) => identity.decisionId)])];
-    const targetedExperiences = loadExperiencesForDecisionIds(this, reasoningDecisionIds, limit);
+    const targetedExperiences = loadExperiencesForDecisionIds(this, reasoningDecisionIds, 100);
     const experiencesById = new Map([...recentExperiences, ...targetedExperiences].map((experience) => [experience.experienceId, experience]));
     const experiences = [...experiencesById.values()];
-    const journalsByCycleId = new Map(loadRecentJournals(this, limit).map((journal) => [journal.cycleId, journal]));
-    for (const journal of loadJournalsForDecisionIds(this, reasoningDecisionIds, limit)) journalsByCycleId.set(journal.cycleId, journal);
+    const journalsByCycleId = new Map(loadRecentJournals(this, 100).map((journal) => [journal.cycleId, journal]));
+    for (const journal of loadJournalsForDecisionIds(this, reasoningDecisionIds, 100)) journalsByCycleId.set(journal.cycleId, journal);
     const journals = [...journalsByCycleId.values()];
     const recentLivePositionKeys = positions
       .filter((position) => position.openedAt && (position.positionSide === "LONG" || position.positionSide === "SHORT"))
@@ -1573,13 +1614,17 @@ export class TraderAgent extends Agent<Env, AgentState> {
       ...recentLivePositionKeys,
     ];
     const contexts = loadPositionContextsForKeys(this, contextKeys, Math.min(limit * 4, 400));
-    const resolved = resolveProviderTradeFacts(this, experiences, PROVIDER_TRADE_LIFECYCLE_CATEGORY, positions, { histories, historyDecisionIds, openPositionIdentities });
-    const localTrades = tradeLogEntries(experiences, journals, contexts, resolved.facts);
-    const providerOnlyTrades: DashboardSnapshot["trades"] = resolved.providerOnlyHistories.map(({ history, decisionId }) => {
+    const resolved = resolveProviderTradeFacts(this, experiences, PROVIDER_TRADE_LIFECYCLE_CATEGORY, positions, { histories, historyDecisionIds, openPositionIdentities, positionContexts: contexts });
+    const localTrades = tradeLogEntries(experiences, journals, contexts, resolved.facts).filter((trade) => {
+      const fact = experiences.find((experience) => experience.experienceId === trade.tradeId);
+      const source = fact ? resolved.facts.get(fact.experienceId)?.source : undefined;
+      return source !== "PROVIDER_LEDGER" && source !== "PROVIDER_LIVE";
+    });
+    const providerOnlyTrades: DashboardSnapshot["trades"] = resolved.providerOnlyHistories.map(({ history, decisionId, providerOrderId, managementExecutions }) => {
       const persistedReasoning = providerPersistedReasoning(decisionId, history.symbol, history.positionSide as PositionSide, journals, contexts);
       return {
         tradeId: `provider-history:${history.providerPositionHistoryId}`,
-        timestamp: history.openingTime,
+        timestamp: history.closingTime ?? history.openingTime,
         symbol: history.symbol,
         action: history.positionSide === "SHORT" ? "OPEN_SHORT" : "OPEN_LONG",
         marginAllocationPct: "UNAVAILABLE",
@@ -1591,7 +1636,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
         realizedPnl: history.netProfit ?? "UNAVAILABLE",
         status: "CLOSED",
         thesis: persistedReasoning.thesis,
-        orderReference: persistedReasoning.orderReference,
+        orderReference: providerOrderId || "UNAVAILABLE",
+        providerOrderId: providerOrderId || "UNAVAILABLE",
         positionSide: history.positionSide as TradeExperience["positionSide"],
         openedAt: history.openingTime,
         entryTime: history.openingTime,
@@ -1602,8 +1648,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
         reasoningSource: persistedReasoning.reasoningSource,
         ...(persistedReasoning.entryReasoning ? { entryReasoning: persistedReasoning.entryReasoning } : {}),
         ...(persistedReasoning.managementEvents?.length ? { managementEvents: persistedReasoning.managementEvents } : {}),
+        ...(managementExecutions.length ? { managementExecutions } : {}),
         ...(history.providerPositionHistoryId ? { providerPositionHistoryId: history.providerPositionHistoryId } : {}),
-        quantity: history.closeTotalPos ?? history.openTotalPos ?? "UNAVAILABLE",
+        quantity: history.closeTotalPos ?? "UNAVAILABLE",
         openQuantity: history.openTotalPos ?? "UNAVAILABLE",
         closeQuantity: history.closeTotalPos ?? "UNAVAILABLE",
         cumRealisedPnl: history.cumRealisedPnl ?? "UNAVAILABLE",
@@ -1614,7 +1661,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
         cashDividend: history.cashDividend ?? "UNAVAILABLE",
       };
     });
-    const providerOnlyLiveTrades: DashboardSnapshot["trades"] = resolved.providerOnlyOpenPositions.map(({ position, providerOrderId, decisionId }) => {
+    const providerOnlyLiveTrades: DashboardSnapshot["trades"] = resolved.providerOnlyOpenPositions.map(({ position, providerOrderId, decisionId, managementExecutions }) => {
       const persistedReasoning = providerPersistedReasoning(decisionId, position.symbol, position.positionSide, journals, contexts);
       return {
         tradeId: `provider-open:${providerOrderId}`,
@@ -1631,6 +1678,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
         status: "OPEN",
         thesis: persistedReasoning.thesis,
         orderReference: providerOrderId,
+        providerOrderId,
         positionSide: position.positionSide,
         openedAt: position.openedAt ?? "UNAVAILABLE",
         entryTime: position.openedAt ?? "UNAVAILABLE",
@@ -1639,11 +1687,23 @@ export class TraderAgent extends Agent<Env, AgentState> {
         reasoningSource: persistedReasoning.reasoningSource,
         ...(persistedReasoning.entryReasoning ? { entryReasoning: persistedReasoning.entryReasoning } : {}),
         ...(persistedReasoning.managementEvents?.length ? { managementEvents: persistedReasoning.managementEvents } : {}),
+        ...(managementExecutions.length ? { managementExecutions } : {}),
         quantity: position.quantity,
         unrealizedPnl: position.unrealizedPnl,
+        ...(position.unrealizedPnlPct ? { unrealizedPnlPct: position.unrealizedPnlPct } : {}),
+        ...(position.markPrice ? { markPrice: position.markPrice } : {}),
+        ...(position.liquidationPrice ? { liquidationPrice: position.liquidationPrice } : {}),
       };
     });
-    const trades = [...localTrades, ...providerOnlyTrades, ...providerOnlyLiveTrades].sort((left, right) => right.timestamp.localeCompare(left.timestamp)).slice(0, limit);
+    const trades = [...localTrades, ...providerOnlyTrades, ...providerOnlyLiveTrades]
+      .sort((left, right) => {
+        const leftTime = Date.parse(left.timestamp);
+        const rightTime = Date.parse(right.timestamp);
+        const validLeft = Number.isFinite(leftTime) ? leftTime : -1;
+        const validRight = Number.isFinite(rightTime) ? rightTime : -1;
+        return validRight - validLeft || left.tradeId.localeCompare(right.tradeId);
+      })
+      .slice(0, limit);
     return json({ trades, financialSource: "PROVIDER_LEDGER_OR_LIVE", limit });
   }
 
@@ -1680,22 +1740,26 @@ export class TraderAgent extends Agent<Env, AgentState> {
     this.recordEvent("CYCLE_STARTED", cycleId);
     try {
       const client = new BitgetClient(config);
-      const openPositionSymbols = await client.getOpenPositionSymbols();
+      const initialPortfolio = await client.getDashboardPortfolio();
+      const livePositions = initialPortfolio.positions.filter((position) => Number(position.quantity) > 0);
+      const openPositionSymbols = [...new Set(livePositions.map((position) => position.symbol))];
+      const openPositionCount = countOpenPositionLifecycles(livePositions);
       const instruments = await client.getTradableInstruments().catch(() => {
         this.recordEvent("DEMO_UNIVERSE_UNAVAILABLE", cycleId);
         return [];
       });
-      if (instruments.length === 0 && openPositionSymbols.length === 0) throw new Error("NO_TRADABLE_INSTRUMENTS");
+      if (instruments.length === 0 && openPositionCount === 0) throw new Error("NO_TRADABLE_INSTRUMENTS");
       const supportedUniverse = instruments.map((instrument) => instrument.symbol);
       const allLessons = loadUsableLessons(this);
       const experiences = loadExperiences(this);
       const scan = await client.collectLightweightScan(instruments);
-      const rankedScan = rankMarketCandidates(scan);
+      const newEntryMarketCandidates = filterNewEntryMarketCandidates(scan, openPositionSymbols);
+      const rankedScan = rankMarketCandidates(newEntryMarketCandidates);
       this.recordEvent("MARKET_SCAN", cycleId, { symbols: String(scan.length), preRanked: String(rankedScan.length) });
       this.setState({ ...this.state, runtimeStatus: "ANALYZING", currentStage: "ANALYZING" });
-      const selectedEntryCandidateSymbols = await selectEntryCandidates(config, supportedUniverse, rankedScan, openPositionSymbols.length);
+      const selectedEntryCandidateSymbols = await selectEntryCandidates(config, supportedUniverse, rankedScan, openPositionCount);
       const evidenceSymbols = buildEvidenceSymbols(openPositionSymbols, selectedEntryCandidateSymbols);
-      if (calculateActionCapacity(openPositionSymbols.length).remainingEntrySlots === 0) this.recordEvent("CANDIDATE_SELECTION_SKIPPED", cycleId, { code: "CAPACITY_SATURATED", openPositionCount: String(openPositionSymbols.length) });
+      if (calculateActionCapacity(openPositionCount).remainingEntrySlots === 0) this.recordEvent("CANDIDATE_SELECTION_SKIPPED", cycleId, { code: "CAPACITY_SATURATED", openPositionCount: String(openPositionCount) });
       else this.recordEvent("CANDIDATE_SELECTED", cycleId, { symbols: selectedEntryCandidateSymbols.join(",") });
       const bundles = await client.collectEvidence(evidenceSymbols);
       const lessons = bundles.flatMap((bundle) => retrieveLessons(allLessons, { symbol: bundle.instrument.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN" }, 3))
@@ -1703,7 +1767,19 @@ export class TraderAgent extends Agent<Env, AgentState> {
         .slice(0, 5);
       const account = bundles[0]?.account ?? await client.getDashboardPortfolio();
       const openPositions = [...new Map((bundles.flatMap((bundle) => bundle.account.positions).length ? bundles.flatMap((bundle) => bundle.account.positions) : account.positions).map((position) => [`${position.symbol}:${position.positionSide}`, position])).values()];
-      const discovery: CycleDiscovery = { scannedUniverseCount: scan.length, selectedEntryCandidateSymbols, managedExistingPositionSymbols: openPositions.filter((position) => Number(position.quantity) > 0).map((position) => position.symbol).sort(), financialWritesPerformed: 0 };
+      const discovery: CycleDiscovery = {
+        executableStockUniverseCount: instruments.length,
+        scannedStockCount: scan.length,
+        rankedCandidatePoolCount: rankedScan.length,
+        selectedCandidateCount: selectedEntryCandidateSymbols.length,
+        currentOpenPositionCount: openPositionCount,
+        remainingEntrySlots: calculateActionCapacity(openPositionCount).remainingEntrySlots,
+        existingPositionsManagedCount: openPositions.filter((position) => Number(position.quantity) > 0).length,
+        scannedUniverseCount: scan.length,
+        selectedEntryCandidateSymbols,
+        managedExistingPositionSymbols: openPositions.filter((position) => Number(position.quantity) > 0).map((position) => position.symbol).sort(),
+        financialWritesPerformed: 0,
+      };
       journal.discovery = discovery;
       try {
         assertOpenPositionCountWithinPlanLimit(openPositions);

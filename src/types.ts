@@ -405,6 +405,13 @@ export interface CycleDecisionPlan {
 }
 
 export interface CycleDiscovery {
+  executableStockUniverseCount?: number;
+  scannedStockCount?: number;
+  rankedCandidatePoolCount?: number;
+  selectedCandidateCount?: number;
+  currentOpenPositionCount?: number;
+  remainingEntrySlots?: number;
+  existingPositionsManagedCount?: number;
   scannedUniverseCount: number;
   selectedEntryCandidateSymbols: string[];
   managedExistingPositionSymbols: string[];
@@ -769,6 +776,7 @@ export interface TradeLogEntry {
   exit: string;
   realizedPnl: string;
   status: TradeLifecycleStatus | "UNRESOLVED" | "EXECUTION_VERIFIED";
+  unresolvedReason?: string;
   localLifecycleStatus?: TradeLifecycleStatus;
   intendedMarginAllocated?: string;
   intendedMarginAllocationPct?: string;
@@ -777,8 +785,13 @@ export interface TradeLogEntry {
   legacyEntryPrice?: string;
   legacyEntryTime?: string;
   unrealizedPnl?: string;
+  unrealizedPnlPct?: string;
+  markPrice?: string;
+  liquidationPrice?: string;
   thesis: string;
   orderReference: string;
+  providerOrderId?: string;
+  managementExecutions?: ProviderExecutionFact[];
   positionSide?: PositionSide | null;
   openedAt?: string;
   closedAt?: string;

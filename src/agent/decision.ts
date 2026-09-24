@@ -220,6 +220,11 @@ export async function selectCandidates(
 
 type CandidateSelector = (config: RuntimeConfig, supportedUniverse: readonly string[], scan: readonly MarketSnapshot[]) => Promise<string[]>;
 
+export function filterNewEntryMarketCandidates(rankedScan: readonly MarketSnapshot[], openPositionSymbols: readonly string[]): MarketSnapshot[] {
+  const openSymbols = new Set(openPositionSymbols);
+  return rankedScan.filter((candidate) => !openSymbols.has(candidate.symbol));
+}
+
 export async function selectEntryCandidates(
   config: RuntimeConfig,
   supportedUniverse: readonly string[],
@@ -255,6 +260,10 @@ export function financialWriteCount(action: Decision["action"]): number {
 
 function liveOpenPositions(positions: readonly PositionSnapshot[]): PositionSnapshot[] {
   return positions.filter((position) => Number(position.quantity) > 0);
+}
+
+export function countOpenPositionLifecycles(positions: readonly PositionSnapshot[]): number {
+  return new Set(liveOpenPositions(positions).map((position) => positionKey(position.symbol, position.positionSide))).size;
 }
 
 export function calculateActionCapacity(openPositionCount: number): { openPositionCount: number; remainingEntrySlots: number } {

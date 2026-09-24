@@ -544,7 +544,7 @@ describe("journal observability persistence", () => {
     vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
     vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
     vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
-    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockRejectedValue(new Error("POST_WRITE_REFRESH_FAILURE"));
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValueOnce(account()).mockRejectedValue(new Error("POST_WRITE_REFRESH_FAILURE"));
 
     const fake = {
       env: { TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_CATEGORY: "USDT-FUTURES" },

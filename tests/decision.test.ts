@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertOpenPositionCountWithinPlanLimit, buildCycleDecisionPlanSchema, buildDecisionPrompt, calculateActionCapacity, cycleDecisionPlanSchema, buildEvidenceSymbols, MAX_FINANCIAL_WRITES_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, selectEntryCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
+import { assertOpenPositionCountWithinPlanLimit, buildCycleDecisionPlanSchema, buildDecisionPrompt, calculateActionCapacity, countOpenPositionLifecycles, cycleDecisionPlanSchema, buildEvidenceSymbols, filterNewEntryMarketCandidates, MAX_FINANCIAL_WRITES_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, selectEntryCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
 import type { AccountSnapshot, CycleDecisionPlan, Decision, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot, PositionManagementState, PositionSnapshot } from "../src/types.js";
 import { buildDecisionTaskPrompt, DECISION_TASK_PROMPT, PROMPT_VERSIONS } from "../src/agent/mandate.js";
 
@@ -142,6 +142,18 @@ describe("cycle decision plan contract", () => {
     expect(() => validateCycleDecisionPlan(plan(), context([], []))).not.toThrow();
   });
 
+  it("keeps remaining entry capacity aligned with the five-position cap", () => {
+    expect([0, 1, 2, 3, 4, 5].map((openCount) => calculateActionCapacity(openCount).remainingEntrySlots)).toEqual([5, 4, 3, 2, 1, 0]);
+    expect(MAX_TOTAL_ACTIONS_PER_CYCLE).toBe(5);
+  });
+
+  it("counts provider position sides rather than unique symbols for entry capacity", () => {
+    const positions = [position("AAPLUSDT", "LONG"), position("AAPLUSDT", "SHORT"), position("METAUSDT", "LONG"), position("TSLAUSDT", "LONG"), position("KORUUSDT", "SHORT")];
+    const count = countOpenPositionLifecycles(positions);
+    expect(count).toBe(5);
+    expect(calculateActionCapacity(count).remainingEntrySlots).toBe(0);
+  });
+
   it("rejects more open positions than the five-action plan can represent", () => {
     const positions = Array.from({ length: MAX_TOTAL_ACTIONS_PER_CYCLE + 1 }, (_, index) => position(`OPEN${index}USDT`));
     expect(() => assertOpenPositionCountWithinPlanLimit(positions)).toThrow("OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT");
@@ -173,6 +185,19 @@ describe("cycle decision plan contract", () => {
     });
     expect(candidateSelectorCalls).toBe(1);
     expect(selected).toEqual(["NVDAUSDT"]);
+  });
+
+  it("filters held symbols from new-entry selection while preserving their management evidence", async () => {
+    const pool = filterNewEntryMarketCandidates([snapshot("METAUSDT"), snapshot("NVDAUSDT")], ["METAUSDT"]);
+    expect(pool.map((item) => item.symbol)).toEqual(["NVDAUSDT"]);
+    let selectorInput: string[] = [];
+    const selected = await selectEntryCandidates({} as never, ["METAUSDT", "NVDAUSDT"], pool, 1, async (_config, _universe, ranked) => {
+      selectorInput = ranked.map((item) => item.symbol);
+      return ["NVDAUSDT"];
+    });
+    expect(selectorInput).toEqual(["NVDAUSDT"]);
+    expect(selected).toEqual(["NVDAUSDT"]);
+    expect(buildEvidenceSymbols(["METAUSDT"], selected)).toEqual(["METAUSDT", "NVDAUSDT"]);
   });
 
   it("enforces capacity in the generated model schema before semantic execution", () => {
