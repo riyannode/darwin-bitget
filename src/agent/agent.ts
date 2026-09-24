@@ -1073,8 +1073,12 @@ export class TraderAgent extends Agent<Env, AgentState> {
       openingTime: string | null;
       closingTime: string | null;
       entryIdentityFound: boolean;
-      entryIdentitySource: "IDEMPOTENCY" | "DERIVED_DARWIN_CLIENT_OID" | null;
+      entryIdentitySource: "IDEMPOTENCY" | "IDEMPOTENCY_CLIENT_OID" | "DERIVED_DARWIN_CLIENT_OID" | null;
       entryIdentityLookupCount: number;
+      idempotencyClientOidPresent: boolean | null;
+      idempotencyClientOidMatchesDeterministic: boolean | null;
+      idempotencyProviderOrderIdPresent: boolean | null;
+      idempotencyProviderOrderIdExact: boolean | null;
       entryDecisionId: string;
       entryClientOid: string | null;
       entryProviderOrderId: string | null;
@@ -1126,6 +1130,10 @@ export class TraderAgent extends Agent<Env, AgentState> {
         entryIdentityFound: Boolean(evidence.entryIdentity),
         entryIdentitySource: evidence.entryIdentitySource ?? null,
         entryIdentityLookupCount: evidence.entryIdentityLookupCount ?? 0,
+        idempotencyClientOidPresent: evidence.idempotencyClientOidPresent ?? null,
+        idempotencyClientOidMatchesDeterministic: evidence.idempotencyClientOidMatchesDeterministic ?? null,
+        idempotencyProviderOrderIdPresent: evidence.idempotencyProviderOrderIdPresent ?? null,
+        idempotencyProviderOrderIdExact: evidence.idempotencyProviderOrderIdExact ?? null,
         entryDecisionId: evidence.entryIdentity?.entryDecisionId ?? experience.entryDecisionId,
         entryClientOid: evidence.entryIdentity?.clientOid ?? null,
         entryProviderOrderId: evidence.entryIdentity?.providerOrderId ?? null,

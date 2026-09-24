@@ -457,34 +457,48 @@ export function loadProviderLifecycleEvidence(
 
   const identities = executor.sql<{ client_order_id: string | null; provider_order_id: string | null }>`SELECT client_order_id, provider_order_id FROM idempotency WHERE decision_id = ${experience.entryDecisionId} LIMIT 2`;
   const identity = identities.length === 1 ? identities[0] : null;
-  const clientOid = typeof identity?.client_order_id === "string" ? identity.client_order_id.trim() : "";
-  const providerOrderId = typeof identity?.provider_order_id === "string" ? identity.provider_order_id.trim() : "";
-  let entryIdentity = clientOid && providerOrderId
+  const rawClientOid = typeof identity?.client_order_id === "string" ? identity.client_order_id : "";
+  const clientOid = rawClientOid.trim();
+  const rawProviderOrderId = typeof identity?.provider_order_id === "string" ? identity.provider_order_id : "";
+  const providerOrderId = rawProviderOrderId.trim();
+  const canonicalClientOid = deterministicEntryIdentity?.entryDecisionId === experience.entryDecisionId
+    && /^[A-Za-z0-9_-]{1,32}$/.test(deterministicEntryIdentity.clientOid)
+    ? deterministicEntryIdentity.clientOid
+    : null;
+  const idempotencyIdentityDiagnostics = {
+    idempotencyClientOidPresent: identity ? Boolean(clientOid) : null,
+    idempotencyClientOidMatchesDeterministic: identity && canonicalClientOid ? rawClientOid === canonicalClientOid : null,
+    idempotencyProviderOrderIdPresent: identity ? Boolean(providerOrderId) : null,
+    idempotencyProviderOrderIdExact: identity ? rawProviderOrderId === providerOrderId : null,
+  };
+  let entryIdentity = rawClientOid === clientOid && rawProviderOrderId === providerOrderId && clientOid && providerOrderId
     ? { entryDecisionId: experience.entryDecisionId, clientOid, providerOrderId }
     : null;
   let entryIdentitySource: ProviderLifecycleEvidence["entryIdentitySource"] = entryIdentity ? "IDEMPOTENCY" : null;
-  // Recover only a missing idempotency row from the canonical client ID and a unique, already-attributed opening order.
-  // Any present-but-malformed or duplicated idempotency rows remain fail-closed.
-  if (!entryIdentity && identities.length === 0 && row && deterministicEntryIdentity?.entryDecisionId === experience.entryDecisionId
-    && /^[A-Za-z0-9_-]{1,32}$/.test(deterministicEntryIdentity.clientOid)) {
+  const recoverableClientOid = identity && rawClientOid && rawClientOid === clientOid && rawProviderOrderId === ""
+    ? rawClientOid
+    : identities.length === 0 ? canonicalClientOid : null;
+  // Use a decision-linked idempotency client ID, or (only when no row exists) the deterministic context ID.
+  // Both paths still require one matching DARWIN opening order; duplicate identities and existing mismatched IDs fail closed.
+  if (!entryIdentity && row && recoverableClientOid) {
     type CandidateOrder = { provider_order_id: string; client_oid: string | null; symbol: string; pos_side: string | null; trade_side: string | null; origin: ProviderEvidenceOrigin; created_time: string };
     const candidates = executor.sql<CandidateOrder>`
       SELECT provider_order_id, client_oid, symbol, pos_side, trade_side, origin, created_time
       FROM provider_orders
       WHERE category = ${category} AND symbol = ${experience.symbol}
-        AND client_oid = ${deterministicEntryIdentity.clientOid}
+        AND client_oid = ${recoverableClientOid}
         AND UPPER(pos_side) = ${experience.positionSide ?? ""} AND trade_side = 'open'
       ORDER BY created_time LIMIT 2
     `;
     const candidate = candidates.length === 1 ? candidates[0] : null;
     const candidateTime = candidate ? Date.parse(candidate.created_time) : Number.NaN;
     const historyTime = Date.parse(row.opening_time);
-    if (candidate && candidate.provider_order_id && candidate.client_oid === deterministicEntryIdentity.clientOid
+    if (candidate && candidate.provider_order_id && candidate.client_oid === recoverableClientOid
       && candidate.symbol === experience.symbol && candidate.pos_side?.toUpperCase() === experience.positionSide
       && candidate.trade_side?.toLowerCase() === "open" && candidate.origin === "DARWIN"
       && Number.isFinite(candidateTime) && Number.isFinite(historyTime) && Math.abs(candidateTime - historyTime) <= 5_000) {
       entryIdentity = { entryDecisionId: experience.entryDecisionId, clientOid: candidate.client_oid, providerOrderId: candidate.provider_order_id };
-      entryIdentitySource = "DERIVED_DARWIN_CLIENT_OID";
+      entryIdentitySource = identity ? "IDEMPOTENCY_CLIENT_OID" : "DERIVED_DARWIN_CLIENT_OID";
     }
   }
   const matchingPosition = providerPositions.find((position) => position.symbol === experience.symbol && position.positionSide === experience.positionSide);
@@ -514,7 +528,7 @@ export function loadProviderLifecycleEvidence(
   const evidenceComplete = orders.length <= MAX_LIFECYCLE_EVIDENCE_ROWS && fills.length <= MAX_LIFECYCLE_EVIDENCE_ROWS;
   const mappedOrders = orders.map((order) => ({ providerOrderId: order.provider_order_id, clientOid: order.client_oid, symbol: order.symbol, positionSide: order.pos_side?.toUpperCase() ?? null, tradeSide: order.trade_side?.toLowerCase() ?? null, origin: order.origin }));
   const mappedFills = fills.map((fill) => ({ providerOrderId: fill.provider_order_id, clientOid: fill.client_oid, symbol: fill.symbol, positionSide: fill.pos_side?.toUpperCase() ?? null, tradeSide: fill.trade_side?.toLowerCase() ?? null, quantity: fill.exec_qty, execPrice: fill.exec_price, createdAt: fill.created_time, origin: fill.origin }));
-  if (!row) return { experience, providerPositions, history: null, entryIdentity, entryIdentitySource, entryIdentityLookupCount: Math.min(identities.length, 2), orders: mappedOrders, fills: mappedFills, evidenceComplete };
+  if (!row) return { experience, providerPositions, history: null, entryIdentity, entryIdentitySource, entryIdentityLookupCount: Math.min(identities.length, 2), ...idempotencyIdentityDiagnostics, orders: mappedOrders, fills: mappedFills, evidenceComplete };
 
   return {
     experience,
@@ -540,6 +554,7 @@ export function loadProviderLifecycleEvidence(
     entryIdentity,
     entryIdentitySource,
     entryIdentityLookupCount: Math.min(identities.length, 2),
+    ...idempotencyIdentityDiagnostics,
     orders: mappedOrders,
     fills: mappedFills,
     evidenceComplete,
