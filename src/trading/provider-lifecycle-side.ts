@@ -1,5 +1,14 @@
 export type ProviderLifecycleSide = "OPEN" | "CLOSE" | "CONTRADICTORY" | "UNRESOLVED";
 
+export const PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS = 5_000;
+
+export function isProviderLifecycleTimestampNear(value: string, reference: string): boolean {
+  const valueTimestamp = Date.parse(value);
+  const referenceTimestamp = Date.parse(reference);
+  return Number.isFinite(valueTimestamp) && Number.isFinite(referenceTimestamp)
+    && Math.abs(valueTimestamp - referenceTimestamp) <= PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS;
+}
+
 export function resolveProviderLifecycleSide(
   side: string | null | undefined,
   positionSide: string | null | undefined,
