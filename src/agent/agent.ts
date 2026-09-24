@@ -1,6 +1,6 @@
 import { Agent } from "agents";
 import { ZodError } from "zod";
-import type { ActivityEvent, BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionManagementState, PositionSnapshot, PositionSide, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
+import type { ActivityEvent, BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionManagementState, PositionSnapshot, PositionSide, ProviderExecutionFact, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient } from "../bitget/client.js";
 import { syncProviderLedger, PROVIDER_FINANCIAL_CATEGORIES, PROVIDER_TRADE_LIFECYCLE_CATEGORY } from "../bitget/provider-sync.js";
@@ -78,7 +78,7 @@ import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../re
 import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
 import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } from "../trading/position-management.js";
-import { providerLedgerDiagnostics, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadProviderPositionHistoriesPage, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, providerLivePositionLifecycleKey, loadProviderSyncStates, type ProviderLifecycleEvidenceRequest, type ProviderPositionHistoryCursor } from "../storage/provider-ledger.js";
+import { providerLedgerDiagnostics, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadProviderPositionHistoriesPage, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, providerLivePositionLifecycleKey, loadProviderSyncStates, type ProviderLifecycleEvidenceRequest, type ProviderPositionHistoryCursor } from "../storage/provider-ledger.js";
 import { calculateNetPnlSinceBaseline, isFinancialRecordCoverageComplete } from "../trading/external-flow.js";
 import { resolveExternalFlowReadModel } from "../trading/external-flow-read-model.js";
 import { classifyProviderLifecycle, summarizeProviderLifecycleFillQuantities, type ProviderLifecycleClassification, type ProviderLifecycleHistory, type ProviderLifecycleCandidateOrder, type ProviderLifecycleCandidateFill } from "../trading/provider-lifecycle-reconciliation.js";
@@ -199,9 +199,10 @@ function tradeLifecycleStatus(experience: TradeExperience): TradeLifecycleStatus
 }
 
 interface ResolvedProviderTradeFact {
-  source: "PROVIDER_LEDGER" | "PROVIDER_LIVE" | "UNRESOLVED";
+  source: "PROVIDER_LEDGER" | "PROVIDER_LIVE" | "PROVIDER_EXECUTION" | "UNRESOLVED";
   history?: ProviderLifecycleHistory;
   position?: PositionSnapshot;
+  execution?: ProviderExecutionFact;
   providerPositionHistoryId?: string;
   origin: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
 }
@@ -383,6 +384,13 @@ export function resolveProviderTradeFacts(
     }
   }
 
+  const executionFacts = loadProviderExitExecutionFacts(executor, category, experiences);
+  for (const experience of experiences) {
+    const execution = executionFacts.get(experience.experienceId);
+    if (!execution || facts.get(experience.experienceId)?.source !== "UNRESOLVED") continue;
+    facts.set(experience.experienceId, { source: "PROVIDER_EXECUTION", execution, origin: "DARWIN" });
+  }
+
   const providerOnlyHistories = [...historiesByDecision.values()].flat().filter((candidate) => !joinedHistoryIds.has(candidate.historyId)).map(({ history, decisionId }) => ({ history, decisionId }));
   const providerOnlyOpenPositions = [...openPositionsByDecision.values()].flat().filter((candidate) => !joinedOpenOrderIds.has(candidate.providerOrderId));
   return { facts, lifecycles, providerOnlyHistories, providerOnlyOpenPositions };
@@ -392,7 +400,7 @@ function tradeLogEntries(
   experiences: readonly TradeExperience[],
   journals: readonly TradingJournal[],
   contexts: ReadonlyMap<string, PositionContext> = new Map(),
-  financialFacts: ReadonlyMap<string, { source: "PROVIDER_LEDGER" | "PROVIDER_LIVE" | "UNRESOLVED"; history?: ProviderLifecycleHistory; position?: PositionSnapshot; providerPositionHistoryId?: string; origin: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED" }> = new Map(),
+  financialFacts: ReadonlyMap<string, ResolvedProviderTradeFact> = new Map(),
 ): DashboardSnapshot["trades"] {
   const decisions = journals.flatMap((journal) => cyclePlanDecisions(journal));
   const verifiedOpenIds = verifiedLifecycleFacts(journals).verifiedOpenIds;
@@ -410,12 +418,13 @@ function tradeLogEntries(
     const facts = financialFacts.get(experience.experienceId);
     const history = facts?.history;
     const livePosition = facts?.position;
+    const providerExecution = facts?.source === "PROVIDER_EXECUTION" ? facts.execution : undefined;
     const isProviderClosed = facts?.source === "PROVIDER_LEDGER" && history !== undefined;
     const isProviderLive = facts?.source === "PROVIDER_LIVE" && livePosition !== undefined;
     const openedAt = history?.openingTime ?? livePosition?.openedAt ?? "UNAVAILABLE";
     const closedAt = history?.closingTime;
     const persistedReasoning = Boolean(entryReasoning || exitReasoning || managementEvents.length || experience.entryThesis.trim());
-    const financialStatus = isProviderClosed ? "CLOSED" : isProviderLive ? "OPEN" : "UNRESOLVED";
+    const financialStatus = isProviderClosed ? "CLOSED" : isProviderLive ? "OPEN" : providerExecution ? "EXECUTION_VERIFIED" : "UNRESOLVED";
     return {
       tradeId: experience.experienceId,
       timestamp: openedAt,
@@ -437,17 +446,18 @@ function tradeLogEntries(
       status: financialStatus,
       localLifecycleStatus: tradeLifecycleStatus(experience),
       thesis: experience.entryThesis,
-      orderReference: record?.executionResult?.providerOrderId ?? record?.executionResult?.clientOrderId ?? journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
+      orderReference: providerExecution?.providerOrderId ?? record?.executionResult?.providerOrderId ?? record?.executionResult?.clientOrderId ?? journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
       positionSide: experience.positionSide,
       openedAt,
       entryTime: openedAt,
       ...(closedAt ? { closedAt, exitTime: closedAt } : {}),
-      financialSource: isProviderClosed ? "PROVIDER_LEDGER" : facts?.source ?? "UNRESOLVED",
+      financialSource: isProviderClosed ? "PROVIDER_LEDGER" : isProviderLive ? "PROVIDER_LIVE" : providerExecution ? "PROVIDER_EXECUTION" : facts?.source ?? "UNRESOLVED",
       reasoningSource: persistedReasoning
         ? "DARWIN_PERSISTED" as const
         : facts?.origin === "PROVIDER_EXTERNAL" ? "PROVIDER_EXTERNAL" as const : "UNATTRIBUTED" as const,
       origin: facts?.origin ?? "UNATTRIBUTED",
       ...(facts?.providerPositionHistoryId ? { providerPositionHistoryId: facts.providerPositionHistoryId } : {}),
+      ...(providerExecution ? { providerExecution } : {}),
       ...(history ? {
         quantity: history.closeTotalPos ?? history.openTotalPos ?? "UNAVAILABLE",
         openQuantity: history.openTotalPos ?? "UNAVAILABLE",
