@@ -4,6 +4,7 @@ import server from "../src/server.js";
 import { BitgetClient } from "../src/bitget/client.js";
 import { TraderAgent } from "../src/agent/agent.js";
 import { clampHistoryLimit } from "../src/storage/store.js";
+import { PROVIDER_FINANCIAL_CATEGORIES } from "../src/bitget/provider-sync.js";
 import type { AccountSnapshot, Env, OwnerPolicy } from "../src/types.js";
 
 const policy: OwnerPolicy = {
@@ -69,6 +70,13 @@ describe("provider live read path", () => {
 });
 
 describe("bounded Durable Object read paths", () => {
+  it("rejects unauthenticated provider-ledger diagnostics before touching storage", async () => {
+    const fake = { env: { OWNER_CONTROL_TOKEN: "configured" }, sql: () => { throw new Error("storage must not be read"); } };
+    const response = await TraderAgent.prototype.onRequest.call(fake as never, new Request("https://darwin.test/provider-ledger"));
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "OWNER_AUTH_REQUIRED" });
+  });
+
   it("has no scheduled historical journal migration callback", () => {
     expect(TraderAgent.prototype).not.toHaveProperty("runJournalLookupMigrationBatch");
   });
@@ -105,13 +113,18 @@ describe("bounded Durable Object read paths", () => {
       reconcileScheduler: (TraderAgent.prototype as unknown as { reconcileScheduler: (intervalMinutes: number, options?: { now?: number }) => Promise<unknown> }).reconcileScheduler,
       getSchedulerDiagnostics: (TraderAgent.prototype as unknown as { getSchedulerDiagnostics: (intervalMinutes: number) => Promise<unknown> }).getSchedulerDiagnostics,
       isProviderSyncSchedulerHealthy: (TraderAgent.prototype as unknown as { isProviderSyncSchedulerHealthy: () => Promise<boolean> }).isProviderSyncSchedulerHealthy,
-      sql(strings: TemplateStringsArray, ...values: unknown[]) {
-        queries.push(strings.reduce((query, part, index) => query + part + (index < values.length ? "?" : ""), ""));
+      sql<T>(strings: TemplateStringsArray, ...values: unknown[]): T[] {
+        const query = strings.reduce((query, part, index) => query + part + (index < values.length ? "?" : ""), "");
+        queries.push(query);
+        if (query.includes("provider_data_revisions AS data")) return PROVIDER_FINANCIAL_CATEGORIES.map((category) => ({ category, lifecycle_revision: 0, financial_revision: 0, identity_revision: 0 })) as T[];
         return [];
       },
     };
     const snapshot = await TraderAgent.prototype.getDashboardSnapshot.call(fake as never);
+    const schemaChecksAfterFirstRead = queries.filter((query) => query.includes("pragma_table_info")).length;
     const repeatedSnapshot = await TraderAgent.prototype.getDashboardSnapshot.call(fake as never);
+    expect(schemaChecksAfterFirstRead).toBeGreaterThan(0);
+    expect(queries.filter((query) => query.includes("pragma_table_info")).length).toBe(schemaChecksAfterFirstRead);
     expect(snapshot.portfolio).toBeNull();
     expect(repeatedSnapshot.portfolio).toBeNull();
     expect(snapshot.performance.totalTrades).toBeNull();

@@ -78,7 +78,7 @@ import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../re
 import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
 import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } from "../trading/position-management.js";
-import { providerLedgerDiagnostics, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadProviderPositionHistoriesPage, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, providerLivePositionLifecycleKey, loadProviderSyncStates, type ProviderLifecycleEvidenceRequest, type ProviderPositionHistoryCursor } from "../storage/provider-ledger.js";
+import { providerLedgerDiagnostics, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadRecentProviderPositionHistories, loadProviderPositionHistoriesPage, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, providerLivePositionLifecycleKey, loadProviderSyncStates, loadProviderDataRevisions, type ProviderLifecycleEvidenceRequest, type ProviderPositionHistoryCursor } from "../storage/provider-ledger.js";
 import { calculateNetPnlSinceBaseline, isFinancialRecordCoverageComplete } from "../trading/external-flow.js";
 import { resolveExternalFlowReadModel } from "../trading/external-flow-read-model.js";
 import { classifyProviderLifecycle, summarizeProviderLifecycleFillQuantities, type ProviderLifecycleClassification, type ProviderLifecycleHistory, type ProviderLifecycleEvidence, type ProviderLifecycleCandidateOrder, type ProviderLifecycleCandidateFill } from "../trading/provider-lifecycle-reconciliation.js";
@@ -115,6 +115,13 @@ const STALE_CYCLE_TIMEOUT_MS = 120_000;
 const USER_STORAGE_VERSION = 6;
 const LATEST_VALID_PLAN_MIGRATION_VERSION = 5;
 const SNAPSHOT_EVENT_LIMIT = 25;
+const initializedStorageExecutors = new WeakSet<object>();
+
+function ensureStorageInitialized(executor: SqlExecutor): void {
+  if (initializedStorageExecutors.has(executor)) return;
+  ensureStorage(executor);
+  initializedStorageExecutors.add(executor);
+}
 
 const MAX_FAILURE_DIAGNOSTIC_LENGTH = 240;
 
@@ -728,7 +735,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   };
 
   public override async onStart(): Promise<void> {
-    ensureStorage(this);
+    ensureStorageInitialized(this);
     const userStorageVersion = this.state.userStorageVersion ?? 0;
     const needsLatestValidPlanMigration = userStorageVersion < LATEST_VALID_PLAN_MIGRATION_VERSION;
     if (userStorageVersion < USER_STORAGE_VERSION) {
@@ -772,7 +779,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (url.pathname === "/trade-history" && request.method === "GET") return this.getTradeHistory(url);
     if (url.pathname === "/learning" && request.method === "GET") return this.getLearning(url);
     if (url.pathname === "/provider-ledger" && request.method === "GET") {
-      ensureStorage(this);
+      const auth = authorizeOwner(request, this.env);
+      if (!auth.authorized) return json({ error: auth.code }, auth.status);
+      ensureStorageInitialized(this);
       const config = loadConfig(this.env, this.ensureActivePolicy());
       const categories = PROVIDER_FINANCIAL_CATEGORIES.map((category) => providerLedgerDiagnostics(this, category));
       const configured = categories.find((entry) => entry.category === config.bitgetCategory) ?? providerLedgerDiagnostics(this, config.bitgetCategory);
@@ -786,7 +795,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (url.pathname === "/provider-ledger/backfill" && request.method === "POST") {
       const auth = authorizeOwner(request, this.env);
       if (!auth.authorized) return json({ error: auth.code }, auth.status);
-      ensureStorage(this);
+      ensureStorageInitialized(this);
       const config = loadConfig(this.env, this.ensureActivePolicy());
       const storedPerformance = loadPerformanceAggregate<PerformanceAggregate>(this);
       const baselineAt = isPerformanceAggregate(storedPerformance) ? storedPerformance.performanceBaselineAt : null;
@@ -868,7 +877,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
 
   public async runScheduledProviderSync(): Promise<void> {
     try {
-      ensureStorage(this);
+      ensureStorageInitialized(this);
       const config = loadConfig(this.env, this.ensureActivePolicy());
       const client = new BitgetClient(config);
       const results = [];
@@ -1220,7 +1229,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
 
   public async repairProviderClosedLifecycle(experienceId: string, providerPositionHistoryId: string): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string; providerPositionHistoryId: string }> {
     if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
-    ensureStorage(this);
+    ensureStorageInitialized(this);
     const experience = loadExperienceById(this, experienceId);
     if (!experience) throw new Error("EXPERIENCE_NOT_FOUND");
     const eventId = providerLifecycleRepairEventId(experienceId, providerPositionHistoryId);
@@ -1327,7 +1336,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   public async getDashboardSnapshot(livePortfolio?: DashboardSnapshot["portfolio"]): Promise<DashboardSnapshot> {
-    ensureStorage(this);
+    ensureStorageInitialized(this);
     if (livePortfolio) this.persistPerformanceEquity(livePortfolio.portfolioEquity, livePortfolio.observedAt);
     const config = loadConfig(this.env, this.ensureActivePolicy());
     const journal = loadLatestJournal(this);
@@ -1353,15 +1362,14 @@ export class TraderAgent extends Agent<Env, AgentState> {
       : buildPerformanceAccounting(emptyPerformance(new Date().toISOString()), livePortfolio ? { portfolioEquity: livePortfolio.portfolioEquity, observedAt: livePortfolio.observedAt, unrealizedPnl: livePortfolio.unrealizedPnl, ...(livePortfolio.unrealizedPnlSource ? { unrealizedPnlSource: livePortfolio.unrealizedPnlSource } : {}) } satisfies PerformanceObservation : undefined);
     const baselineAt = accountingBase.baselineObservedAt;
     const syncStates = loadProviderSyncStates(this, PROVIDER_FINANCIAL_CATEGORIES);
-    const lifecycleSyncState = syncStates.get(PROVIDER_TRADE_LIFECYCLE_CATEGORY) ?? null;
+    const dataRevisions = loadProviderDataRevisions(this, PROVIDER_FINANCIAL_CATEGORIES);
+    const lifecycleRevisions = dataRevisions.get(PROVIDER_TRADE_LIFECYCLE_CATEGORY);
+    if (!lifecycleRevisions) throw new Error("PROVIDER_DATA_REVISION_UNAVAILABLE");
     const lifecyclePerformanceSignature = JSON.stringify({
-      version: 1,
+      version: 2,
       category: PROVIDER_TRADE_LIFECYCLE_CATEGORY,
-      revision: lifecycleSyncState?.revision ?? null,
-      updatedAt: lifecycleSyncState?.updatedAt ?? null,
-      lastSuccessfulSyncAt: lifecycleSyncState?.lastSuccessfulSyncAt ?? null,
-      lastError: lifecycleSyncState?.lastError ?? null,
-      checkpoints: lifecycleSyncState?.checkpoints ?? {},
+      lifecycleRevision: lifecycleRevisions.lifecycleRevision,
+      identityRevision: lifecycleRevisions.identityRevision,
     });
     const closedProviderPerformance = resolveProviderPerformanceReadModel(
       this,
@@ -1415,7 +1423,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
         coveredFrom: coverage?.coveredFrom ?? null,
         coveredThrough: coverage?.coveredThrough ?? null,
         lastError,
-        revision: sync?.revision ?? null,
+        revision: dataRevisions.get(category)?.financialRevision ?? 0,
         updatedAt: sync?.updatedAt ?? null,
         financialRecordCount: null,
       };
@@ -1565,7 +1573,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   private getAgentJournal(url: URL): Response {
-    ensureStorage(this);
+    ensureStorageInitialized(this);
     const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
     const journals = loadRecentJournals(this, limit);
     const storedCycles = loadRecentStoredCycles(this, limit);
@@ -1575,7 +1583,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   private getPositionContext(url: URL): Response {
-    ensureStorage(this);
+    ensureStorageInitialized(this);
     const symbol = url.searchParams.get("symbol")?.trim() ?? "";
     const positionSide = url.searchParams.get("positionSide");
     if (!/^[A-Z0-9_-]{1,40}$/.test(symbol) || (positionSide !== "LONG" && positionSide !== "SHORT")) return json({ error: "INVALID_POSITION_CONTEXT_KEY" }, 400);
@@ -1583,10 +1591,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   private async getTradeHistory(url: URL): Promise<Response> {
-    ensureStorage(this);
+    ensureStorageInitialized(this);
     const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
-    const recentExperiences = loadExperiences(this, 100);
-    const histories = loadProviderPositionHistories(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, 100);
+    const MAX_EXCEPTIONAL_EXPERIENCES = 5;
+    const recentExperiences = loadExperiences(this, Math.min(limit, MAX_EXCEPTIONAL_EXPERIENCES));
+    const histories = loadRecentProviderPositionHistories(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, limit);
     const historyDecisionIds = loadProviderPositionHistoryDecisionIds(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, histories);
     const config = loadConfig(this.env, this.ensureActivePolicy());
     let positions: PositionSnapshot[] = [];
@@ -1596,13 +1605,15 @@ export class TraderAgent extends Agent<Env, AgentState> {
       // Missing current provider evidence keeps open-trade financials unresolved.
     }
     const openPositionIdentities = loadProviderLiveOpeningOrderIdentities(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, positions);
-    const reasoningDecisionIds = [...new Set([...historyDecisionIds.values(), ...[...openPositionIdentities.values()].map((identity) => identity.decisionId)])];
-    const targetedExperiences = loadExperiencesForDecisionIds(this, reasoningDecisionIds, 100);
+    const reasoningDecisionIds = [...new Set([
+      ...historyDecisionIds.values(),
+      ...[...openPositionIdentities.values()].map((identity) => identity.decisionId),
+      ...recentExperiences.map((experience) => experience.entryDecisionId),
+    ])];
+    const targetedExperiences = loadExperiencesForDecisionIds(this, reasoningDecisionIds, Math.min(reasoningDecisionIds.length, 100));
     const experiencesById = new Map([...recentExperiences, ...targetedExperiences].map((experience) => [experience.experienceId, experience]));
     const experiences = [...experiencesById.values()];
-    const journalsByCycleId = new Map(loadRecentJournals(this, 100).map((journal) => [journal.cycleId, journal]));
-    for (const journal of loadJournalsForDecisionIds(this, reasoningDecisionIds, 100)) journalsByCycleId.set(journal.cycleId, journal);
-    const journals = [...journalsByCycleId.values()];
+    const journals = loadJournalsForDecisionIds(this, reasoningDecisionIds, Math.min(reasoningDecisionIds.length * 2, 100));
     const recentLivePositionKeys = positions
       .filter((position) => position.openedAt && (position.positionSide === "LONG" || position.positionSide === "SHORT"))
       .sort((left, right) => (right.openedAt ?? "").localeCompare(left.openedAt ?? ""))
@@ -1708,7 +1719,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   private getLearning(url: URL): Response {
-    ensureStorage(this);
+    ensureStorageInitialized(this);
     const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? "25"));
     const journal = loadLatestJournal(this);
     return json({ learning: { reflection: journal?.reflection ?? null, lessons: loadRecentLessons(this, limit), lessonsUsed: cyclePlanDecisions(journal).flatMap((decision) => decision.lessonsUsed), backtest: loadLatestBacktest(this), recentExperiences: loadExperiences(this, limit) }, limit });

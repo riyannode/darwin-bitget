@@ -70,6 +70,39 @@ interface SyncStateRow {
   revision: number;
 }
 
+interface ProviderDataRevisionRow {
+  category: string;
+  lifecycle_revision: number;
+  financial_revision: number;
+  identity_revision: number;
+}
+
+export interface ProviderDataRevisions {
+  lifecycleRevision: number;
+  financialRevision: number;
+  identityRevision: number;
+}
+
+export function loadProviderDataRevisions(executor: SqlExecutor, categories: readonly string[]): Map<string, ProviderDataRevisions> {
+  const requested = [...new Set(categories)].slice(0, 100);
+  if (requested.length === 0) return new Map();
+  const rows = executor.sql<ProviderDataRevisionRow>`
+    SELECT requested.value AS category,
+      COALESCE(data.lifecycle_revision, 0) AS lifecycle_revision,
+      COALESCE(data.financial_revision, 0) AS financial_revision,
+      COALESCE(identity.revision, 0) AS identity_revision
+    FROM json_each(${JSON.stringify(requested)}) AS requested
+    LEFT JOIN provider_data_revisions AS data ON data.category = requested.value
+    LEFT JOIN provider_identity_revision AS identity ON identity.revision_key = 1
+  `;
+  if (rows.length !== requested.length) throw new Error("PROVIDER_DATA_REVISION_UNAVAILABLE");
+  return new Map(rows.map((row) => [row.category, {
+    lifecycleRevision: Number(row.lifecycle_revision),
+    financialRevision: Number(row.financial_revision),
+    identityRevision: Number(row.identity_revision),
+  }]));
+}
+
 export function resolveProviderOrigin(executor: SqlExecutor, providerOrderId: string | null, clientOid: string | null, fallback: ProviderOrigin = "UNATTRIBUTED"): ProviderOrigin {
   if (clientOid) {
     const idempotency = executor.sql<{ client_order_id: string }>`SELECT client_order_id FROM idempotency WHERE client_order_id = ${clientOid} LIMIT 1`;
@@ -290,6 +323,20 @@ export function loadProviderPositionHistories(executor: SqlExecutor, category: s
   return rows.map(mapProviderPositionHistoryRow);
 }
 
+export function loadRecentProviderPositionHistories(executor: SqlExecutor, category: string, limit = 25): ProviderLifecycleHistory[] {
+  const historyLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 100) : 25;
+  const rows = executor.sql<ProviderPositionHistoryRow>`
+    SELECT provider_position_history_key, provider_position_history_id, symbol, position_side, open_total_pos, close_total_pos,
+      avg_entry_price, avg_exit_price, cum_realised_pnl, net_profit, open_fee_total, close_fee_total, total_funding,
+      cash_dividend, opening_time, closing_time, origin
+    FROM provider_position_history
+    WHERE category = ${category}
+    ORDER BY closing_time DESC, provider_position_history_key DESC
+    LIMIT ${historyLimit}
+  `;
+  return rows.map(mapProviderPositionHistoryRow);
+}
+
 export function loadProviderPositionHistoriesPage(
   executor: SqlExecutor,
   category: string,
@@ -326,12 +373,30 @@ export function loadProviderPositionHistoryDecisionIds(
   category: string,
   histories: readonly ProviderLifecycleHistory[],
 ): Map<string, string> {
-  const ids = [...new Set(histories.flatMap((history) => history.providerPositionHistoryId ? [history.providerPositionHistoryId] : []))];
+  const requestsById = new Map<string, { id: string; symbol: string; positionSide: string; openingTime: string; from: string; to: string }>();
+  const ambiguousIds = new Set<string>();
+  for (const history of histories) {
+    const id = history.providerPositionHistoryId;
+    const openingMs = Date.parse(history.openingTime);
+    if (!id || !Number.isFinite(openingMs) || (history.positionSide !== "LONG" && history.positionSide !== "SHORT")) continue;
+    const request = {
+      id,
+      symbol: history.symbol,
+      positionSide: history.positionSide,
+      openingTime: history.openingTime,
+      from: new Date(openingMs - PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS).toISOString(),
+      to: new Date(openingMs + PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS).toISOString(),
+    };
+    const existing = requestsById.get(id);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(request)) ambiguousIds.add(id);
+    else requestsById.set(id, request);
+  }
+  const requests = [...requestsById.values()].filter((request) => !ambiguousIds.has(request.id));
   const identitiesByHistory = new Map<string, Map<string, boolean>>();
   const batchSize = 100;
   const maxRowsPerBatch = 5_000;
-  for (let offset = 0; offset < ids.length; offset += batchSize) {
-    const batch = ids.slice(offset, offset + batchSize);
+  for (let offset = 0; offset < requests.length; offset += batchSize) {
+    const batch = requests.slice(offset, offset + batchSize);
     const rows = executor.sql<{
       history_id: string; decision_id: string; provider_order_id: string; client_oid: string;
       order_side: string | null; order_pos_side: string | null; order_trade_side: string | null; order_origin: ProviderEvidenceOrigin;
@@ -341,10 +406,16 @@ export function loadProviderPositionHistoryDecisionIds(
       SELECT DISTINCT h.provider_position_history_id AS history_id, i.decision_id, o.provider_order_id, o.client_oid,
         o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side, o.origin AS order_origin,
         f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side, f.origin AS fill_origin
-      FROM provider_position_history AS h
-      JOIN json_each(${JSON.stringify(batch)}) AS requested ON requested.value = h.provider_position_history_id
+      FROM json_each(${JSON.stringify(batch)}) AS requested
+      JOIN provider_position_history AS h ON h.category = ${category}
+        AND h.provider_position_history_id = json_extract(requested.value, '$.id')
+        AND h.symbol = json_extract(requested.value, '$.symbol')
+        AND UPPER(h.position_side) = UPPER(json_extract(requested.value, '$.positionSide'))
+        AND h.opening_time = json_extract(requested.value, '$.openingTime')
       JOIN provider_fills AS f ON f.category = h.category AND f.symbol = h.symbol
         AND UPPER(f.pos_side) = UPPER(h.position_side)
+        AND f.created_time >= json_extract(requested.value, '$.from')
+        AND f.created_time <= json_extract(requested.value, '$.to')
         AND ABS((julianday(f.created_time) - julianday(h.opening_time)) * 86400.0) <= ${PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS / 1_000}
       JOIN provider_orders AS o ON o.category = f.category AND o.provider_order_id = f.provider_order_id
         AND o.client_oid = f.client_oid AND o.symbol = f.symbol
@@ -390,9 +461,17 @@ export function loadProviderLiveOpeningOrderIdentities(
   positions: readonly PositionSnapshot[],
 ): Map<string, { providerOrderId: string; decisionId: string }> {
   const requests = [...new Map(positions.flatMap((position) => {
-    if (!position.openedAt || !Number.isFinite(Date.parse(position.openedAt))) return [];
+    const openedAtMs = position.openedAt ? Date.parse(position.openedAt) : Number.NaN;
+    if (!position.openedAt || !Number.isFinite(openedAtMs)) return [];
     const key = providerLivePositionLifecycleKey(position);
-    return [[key, { key, symbol: position.symbol, positionSide: position.positionSide, openedAt: position.openedAt }]] as const;
+    return [[key, {
+      key,
+      symbol: position.symbol,
+      positionSide: position.positionSide,
+      openedAt: position.openedAt,
+      from: new Date(openedAtMs - PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS).toISOString(),
+      to: new Date(openedAtMs + PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS).toISOString(),
+    }]] as const;
   })).values()];
   const candidatesByPosition = new Map<string, Map<string, boolean>>();
   const batchSize = 100;
@@ -413,6 +492,8 @@ export function loadProviderLiveOpeningOrderIdentities(
       JOIN provider_fills AS f ON f.category = o.category AND f.provider_order_id = o.provider_order_id
         AND f.client_oid = o.client_oid AND f.symbol = o.symbol AND UPPER(f.pos_side) = UPPER(o.pos_side)
         AND f.origin = o.origin
+        AND f.created_time >= json_extract(requested.value, '$.from')
+        AND f.created_time <= json_extract(requested.value, '$.to')
         AND ABS((julianday(f.created_time) - julianday(json_extract(requested.value, '$.openedAt'))) * 86400.0) <= ${PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS / 1_000}
       JOIN idempotency AS i ON i.client_order_id = o.client_oid
         AND i.client_order_id <> '' AND i.client_order_id = TRIM(i.client_order_id)
@@ -468,6 +549,8 @@ export function loadProviderLifecycleHistoryCandidateIds(executor: SqlExecutor, 
       AND h.symbol = ${experience.symbol} AND UPPER(h.position_side) = UPPER(${experience.positionSide?.toUpperCase() ?? ""})
       AND o.symbol = h.symbol AND UPPER(o.pos_side) = UPPER(h.position_side) AND o.origin = f.origin
       AND f.symbol = h.symbol AND UPPER(f.pos_side) = UPPER(h.position_side)
+      AND f.created_time >= strftime('%Y-%m-%dT%H:%M:%fZ', h.opening_time, ${`-${PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS / 1_000} seconds`})
+      AND f.created_time <= strftime('%Y-%m-%dT%H:%M:%fZ', h.opening_time, ${`${PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS / 1_000} seconds`})
       AND ABS((julianday(f.created_time) - julianday(h.opening_time)) * 86400.0) <= ${PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS / 1_000}
     LIMIT 5001
   `;
@@ -1074,7 +1157,7 @@ export function loadProviderFinancialRecordsSinceCategories(
   const boundedLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, MAX_EXTERNAL_FLOW_RECORD_READ_ROWS) : MAX_EXTERNAL_FLOW_RECORD_READ_ROWS;
   if (requested.length === 0) return { records: [], truncated: false };
   const rows = executor.sql<{ type: string; amount: string | null; fee: string | null; coin: string | null }>`
-    SELECT type, amount, fee, coin FROM provider_financial_records
+    SELECT type, amount, fee, coin FROM provider_financial_records INDEXED BY provider_financial_records_timestamp_category_key_idx
     WHERE category IN (SELECT value FROM json_each(${JSON.stringify(requested)})) AND provider_timestamp >= ${baselineAt}
     ORDER BY provider_timestamp, category, provider_record_key LIMIT ${boundedLimit + 1}
   `;
@@ -1082,19 +1165,15 @@ export function loadProviderFinancialRecordsSinceCategories(
 }
 
 export function providerLedgerDiagnostics(executor: SqlExecutor, category: string): ProviderLedgerDiagnostics {
-  const count = (table: string): number => {
-    const rows = table === "provider_orders"
-      ? executor.sql<CountRow>`SELECT COUNT(*) AS count FROM provider_orders WHERE category = ${category}`
-      : table === "provider_fills"
-        ? executor.sql<CountRow>`SELECT COUNT(*) AS count FROM provider_fills WHERE category = ${category}`
-        : table === "provider_position_history"
-          ? executor.sql<CountRow>`SELECT COUNT(*) AS count FROM provider_position_history WHERE category = ${category}`
-          : executor.sql<CountRow>`SELECT COUNT(*) AS count FROM provider_financial_records WHERE category = ${category}`;
-    return Number(rows[0]?.count ?? 0);
-  };
+  const counts: ProviderLedgerDiagnostics["counts"] = { orders: 0, fills: 0, positionHistory: 0, financialRecords: 0 };
   const origins = { DARWIN: 0, PROVIDER_EXTERNAL: 0, UNATTRIBUTED: 0 };
-  const originTables = ["provider_orders", "provider_fills", "provider_position_history", "provider_financial_records"] as const;
-  for (const table of originTables) {
+  const tables = [
+    ["provider_orders", "orders"],
+    ["provider_fills", "fills"],
+    ["provider_position_history", "positionHistory"],
+    ["provider_financial_records", "financialRecords"],
+  ] as const;
+  for (const [table, key] of tables) {
     const rows = table === "provider_orders"
       ? executor.sql<OriginCountRow>`SELECT origin, COUNT(*) AS count FROM provider_orders WHERE category = ${category} GROUP BY origin`
       : table === "provider_fills"
@@ -1102,17 +1181,16 @@ export function providerLedgerDiagnostics(executor: SqlExecutor, category: strin
         : table === "provider_position_history"
           ? executor.sql<OriginCountRow>`SELECT origin, COUNT(*) AS count FROM provider_position_history WHERE category = ${category} GROUP BY origin`
           : executor.sql<OriginCountRow>`SELECT origin, COUNT(*) AS count FROM provider_financial_records WHERE category = ${category} GROUP BY origin`;
-    for (const row of rows) if (row.origin in origins) origins[row.origin] += Number(row.count);
+    for (const row of rows) {
+      const rowCount = Number(row.count);
+      counts[key] += rowCount;
+      if (row.origin in origins) origins[row.origin] += rowCount;
+    }
   }
   const sync = loadProviderSyncState(executor, category);
   return {
     category,
-    counts: {
-      orders: count("provider_orders"),
-      fills: count("provider_fills"),
-      positionHistory: count("provider_position_history"),
-      financialRecords: count("provider_financial_records"),
-    },
+    counts,
     origins,
     sync,
     lastPartialOrFailureReason: sync?.lastError ?? null,
