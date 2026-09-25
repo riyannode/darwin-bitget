@@ -25,9 +25,15 @@ export interface ExternalFlowReadModelResult {
   truncated: boolean;
 }
 
-function categorySignature(categories: readonly FinancialFlowCategoryState[]): FinancialFlowCategoryState[] {
+function categorySignature(categories: readonly FinancialFlowCategoryState[]): Array<Pick<FinancialFlowCategoryState, "category" | "complete" | "lastError" | "revision" | "coveredFrom">> {
   return [...categories]
-    .map((category) => ({ ...category }))
+    .map(({ category, complete, lastError, revision, coveredFrom }) => ({
+      category,
+      complete,
+      lastError,
+      revision,
+      coveredFrom,
+    }))
     .sort((left, right) => left.category.localeCompare(right.category));
 }
 
@@ -38,7 +44,7 @@ function buildSignature(
   requiredCategories: readonly string[],
 ): string {
   return JSON.stringify({
-    version: 1,
+    version: 2,
     baselineAt,
     baselineEquity,
     requiredCategories: [...requiredCategories].sort(),

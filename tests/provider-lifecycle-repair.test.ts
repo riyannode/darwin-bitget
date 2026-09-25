@@ -1545,7 +1545,7 @@ describe("provider-first financial lifecycle resolution", () => {
   });
 
   it("constructs all 28 unique provider lifecycles before applying the requested 25-row limit", async () => {
-    const { db, executor } = memoryExecutor();
+    const { db, executor, queries } = memoryExecutor();
     insertProviderEvidence(executor);
     insertProviderHistoryFixtures(executor, 27);
     const resolved = resolveProviderTradeFacts(executor, [], "USDT-FUTURES", []);
@@ -1555,9 +1555,14 @@ describe("provider-first financial lifecycle resolution", () => {
 
     const agent = fakeAgent(executor, db, true);
     vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const queryOffset = queries.length;
     const response = await agent.getTradeHistory.call(agent, new URL("https://example.test/trade-history?limit=25"));
     const body = await response.json() as { trades: Array<Record<string, unknown>> };
+    const tradeHistoryQueries = queries.slice(queryOffset);
     const visibleIds = body.trades.map((trade) => trade.providerPositionHistoryId);
+    expect(tradeHistoryQueries.filter((query) => query.includes("FROM experiences ORDER BY created_at DESC")).length).toBe(1);
+    expect(tradeHistoryQueries.some((query) => query.includes("FROM journals ORDER BY created_at DESC"))).toBe(false);
+    expect(tradeHistoryQueries.some((query) => /FROM provider_position_history\s+WHERE category = \?\s+ORDER BY closing_time DESC/i.test(query))).toBe(true);
     expect(body.trades).toHaveLength(25);
     expect(new Set(visibleIds).size).toBe(25);
     expect(body.trades[0]?.providerPositionHistoryId).toBe(HISTORY_ID);
@@ -1673,14 +1678,23 @@ describe("provider-first financial lifecycle resolution", () => {
     expect(recordReadCount() - beforeRepeat).toBe(0);
     expect(historyReadCount() - beforeRepeatHistory).toBe(0);
 
-    saveProviderSyncState(executor, loadProviderSyncState(executor, "USDT-FUTURES")!);
+    const syncState = loadProviderSyncState(executor, "USDT-FUTURES")!;
+    const heartbeatAt = new Date(Date.now() + 1).toISOString();
+    saveProviderSyncState(executor, { ...syncState, updatedAt: heartbeatAt, lastSuccessfulSyncAt: heartbeatAt });
+    const beforeHeartbeat = recordReadCount();
+    const beforeHeartbeatHistory = historyReadCount();
+    const heartbeat = await agent.getDashboardSnapshot.call(agent, portfolio);
+    expect(heartbeat.performance.closedTrades).toBe(1);
+    expect(recordReadCount() - beforeHeartbeat).toBe(0);
+    expect(historyReadCount() - beforeHeartbeatHistory).toBe(0);
+
     insertFinancial("snapshot-flow-out", "TRANSFER_OUT", "-2");
     const beforeInvalidation = recordReadCount();
     const beforeInvalidatedHistory = historyReadCount();
     const invalidated = await agent.getDashboardSnapshot.call(agent, portfolio);
     expect(invalidated.accountPerformance).toMatchObject({ externalFlowStatus: "VERIFIED", netExternalInflows: "3" });
     expect(recordReadCount() - beforeInvalidation).toBe(1);
-    expect(historyReadCount() - beforeInvalidatedHistory).toBeGreaterThan(0);
+    expect(historyReadCount() - beforeInvalidatedHistory).toBe(0);
     db.close();
   });
 

@@ -14,6 +14,7 @@ import {
   loadProviderFinancialRecordsSinceCategories,
   loadProviderLifecycleEvidenceBatch,
   loadProviderPositionHistoriesPage,
+  loadRecentProviderPositionHistories,
   loadProviderSyncState,
   saveProviderSyncState,
   providerLedgerDiagnostics,
@@ -28,12 +29,14 @@ import { recordIdempotency, recordProviderOrderReference } from "../src/storage/
 
 type SqlValue = string | number | boolean | null;
 
-function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; executor: SqlExecutor; queries: string[] } {
+function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; executor: SqlExecutor; queries: string[]; queryParams: SqlValue[][] } {
   const queries: string[] = [];
+  const queryParams: SqlValue[][] = [];
   const executor: SqlExecutor = {
     sql<T>(strings: TemplateStringsArray, ...values: SqlValue[]): T[] {
       const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
       queries.push(query);
+      queryParams.push([...values]);
       const sqliteValues = values.map((value) => typeof value === "boolean" ? (value ? 1 : 0) : value) as (string | number | null)[];
       const normalizedQuery = query.trimStart().toUpperCase();
       if (normalizedQuery.startsWith("SELECT") || normalizedQuery.startsWith("WITH")) return db.prepare(query).all(...sqliteValues) as T[];
@@ -42,7 +45,7 @@ function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; 
     },
   };
   ensureStorage(executor);
-  return { db, executor, queries };
+  return { db, executor, queries, queryParams };
 }
 
 const observedAt = "2026-09-22T00:00:00.000Z";
@@ -547,8 +550,30 @@ describe("provider ledger persistence and sync", () => {
     expect(state?.lastSuccessfulSyncAt).toBeNull();
   });
 
-  it("reports bounded diagnostics without exposing raw provider payloads", () => {
+  it("returns the most recently closed lifecycle rows in a bounded window", () => {
     const { executor } = memoryExecutor();
+    for (const [id, closedAt] of [["old", "1730190000000"], ["new", "1730300000000"]] as const) {
+      const history = normalizeProviderPositionHistory(positionHistoryFixture({ positionId: id, createdTime: "1730181468493", updatedTime: closedAt }), observedAt)!;
+      upsertProviderPositionHistory(executor, history, observedAt);
+    }
+
+    const rows = loadRecentProviderPositionHistories(executor, category, 1);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.providerPositionHistoryId).toBe("new");
+  });
+
+  it("uses bounded indexes for provider identity lookups", () => {
+    const { db } = memoryExecutor();
+    const identityPlan = db.prepare("EXPLAIN QUERY PLAN SELECT provider_order_id FROM idempotency WHERE provider_order_id = ? LIMIT 1").all("order-1") as Array<{ detail: string }>;
+    const historyPlan = db.prepare("EXPLAIN QUERY PLAN SELECT provider_position_history_id FROM provider_position_history WHERE category = ? AND provider_position_history_id = ? LIMIT 1").all(category, "position-1") as Array<{ detail: string }>;
+
+    expect(identityPlan.map((row) => row.detail).join(" ")).toContain("idempotency_provider_order_idx");
+    expect(historyPlan.map((row) => row.detail).join(" ")).toContain("provider_position_history_category_id_idx");
+  });
+
+  it("reports bounded diagnostics without exposing raw provider payloads", () => {
+    const { executor, queries } = memoryExecutor();
     const order = normalizeProviderOrder(orderFixture(), "DARWIN", observedAt)!;
     const fill = normalizeProviderFill(fillFixture(), "DARWIN", observedAt)!;
     upsertProviderOrder(executor, order, observedAt);
@@ -557,9 +582,12 @@ describe("provider ledger persistence and sync", () => {
     upsertProviderFinancialRecord(executor, normalizeProviderFinancialRecord(financialFixture(), observedAt)!, observedAt);
     upsertProviderOrder(executor, normalizeProviderOrder(orderFixture({ orderId: "external", clientOid: "external-1" }), "PROVIDER_EXTERNAL", observedAt)!, observedAt);
 
+    const queryOffset = queries.length;
     const diagnostics = providerLedgerDiagnostics(executor, category);
+    const diagnosticQueries = queries.slice(queryOffset).filter((query) => /FROM provider_(orders|fills|position_history|financial_records)/.test(query));
 
     expect(diagnostics.counts).toEqual({ orders: 2, fills: 1, positionHistory: 1, financialRecords: 1 });
+    expect(diagnosticQueries).toHaveLength(4);
     expect(diagnostics.origins).toEqual({ DARWIN: 2, PROVIDER_EXTERNAL: 1, UNATTRIBUTED: 2 });
     expect(JSON.stringify(diagnostics)).not.toContain("order-1");
   });
