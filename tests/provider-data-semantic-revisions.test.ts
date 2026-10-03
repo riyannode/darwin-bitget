@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { loadProviderDataRevisions } from "../src/storage/provider-ledger.js";
+import { loadProviderDataRevisions, upsertProviderFill, upsertProviderOrder } from "../src/storage/provider-ledger.js";
 import { resolveProviderPerformanceReadModel } from "../src/trading/provider-performance-read-model.js";
 import { resolveExternalFlowReadModel, type FinancialFlowCategoryState } from "../src/trading/external-flow-read-model.js";
 
@@ -68,6 +68,91 @@ describe("provider data-semantic cache revisions", () => {
     db.close();
   });
 
+  it("does not invalidate external-flow replay when coverage bookkeeping changes without financial facts", () => {
+    const { db, executor } = fixture();
+    const revisions = loadProviderDataRevisions(executor, ["USDT-FUTURES"]).get("USDT-FUTURES")!;
+    const resolve = (coveredFrom: string, updatedAt: string) => resolveExternalFlowReadModel(
+      executor,
+      "2026-01-01T00:00:00.000Z",
+      "1000",
+      [{ ...category(revisions.financialRevision, updatedAt), coveredFrom }],
+      ["USDT-FUTURES"],
+      updatedAt,
+    );
+
+    expect(resolve("2026-01-01T00:00:00.000Z", "t1").cacheHit).toBe(false);
+    const heartbeat = resolve("2026-01-02T00:00:00.000Z", "t2");
+
+    expect(heartbeat.cacheHit).toBe(true);
+    expect(heartbeat.recordsRead).toBe(0);
+    db.close();
+  });
+
+  it("does not invalidate lifecycle performance when provider order and fill update timestamps change alone", () => {
+    const { db, executor } = fixture();
+    const order = {
+      providerOrderId: "order-1",
+      clientOid: "client-1",
+      category: "USDT-FUTURES",
+      symbol: "BTCUSDT",
+      side: "buy",
+      posSide: "long",
+      tradeSide: "open",
+      reduceOnly: null,
+      orderType: "market",
+      qty: "1",
+      cumExecQty: "1",
+      cumExecValue: "100",
+      avgPrice: "100",
+      orderStatus: "filled",
+      feeTotal: "0",
+      feeDetailsJson: "[]",
+      createdTime: "2026-02-01T00:00:00.000Z",
+      updatedTime: "2026-02-01T00:00:00.000Z",
+      origin: "DARWIN" as const,
+      rawProviderJson: "{}",
+    };
+    const fill = {
+      execId: "fill-1",
+      providerOrderId: "order-1",
+      clientOid: "client-1",
+      category: "USDT-FUTURES",
+      symbol: "BTCUSDT",
+      side: "buy",
+      posSide: "long",
+      tradeSide: "open",
+      execQty: "1",
+      execPrice: "100",
+      execValue: "100",
+      execPnl: "0",
+      feeTotal: "0",
+      feeDetailsJson: "[]",
+      createdTime: "2026-02-01T00:00:00.000Z",
+      updatedTime: "2026-02-01T00:00:00.000Z",
+      origin: "DARWIN" as const,
+      rawProviderJson: "{}",
+    };
+    const signature = () => {
+      const revisions = loadProviderDataRevisions(executor, ["USDT-FUTURES"]).get("USDT-FUTURES")!;
+      return `lifecycle:${revisions.lifecycleRevision}:${revisions.identityRevision}`;
+    };
+    const rebuild = vi.fn(() => TOTALS);
+    resolveProviderPerformanceReadModel(executor, signature(), "t1", rebuild);
+    upsertProviderOrder(executor, order, "t1");
+    upsertProviderFill(executor, fill, "t1");
+    resolveProviderPerformanceReadModel(executor, signature(), "t2", rebuild);
+    const revisionBeforeNoop = loadProviderDataRevisions(executor, ["USDT-FUTURES"]).get("USDT-FUTURES")!.lifecycleRevision;
+
+    upsertProviderOrder(executor, { ...order, updatedTime: "2026-02-01T00:05:00.000Z", rawProviderJson: "{\"observedAt\":\"t3\"}" }, "t3");
+    upsertProviderFill(executor, { ...fill, updatedTime: "2026-02-01T00:05:00.000Z", rawProviderJson: "{\"observedAt\":\"t3\"}" }, "t3");
+    const result = resolveProviderPerformanceReadModel(executor, signature(), "t3", rebuild);
+
+    expect(loadProviderDataRevisions(executor, ["USDT-FUTURES"]).get("USDT-FUTURES")!.lifecycleRevision).toBe(revisionBeforeNoop);
+    expect(result.cacheHit).toBe(true);
+    expect(rebuild).toHaveBeenCalledTimes(2);
+    db.close();
+  });
+
   it("invalidates lifecycle performance only when normalized lifecycle facts materially change", () => {
     const { db, executor } = fixture();
     const signature = () => {
@@ -92,10 +177,26 @@ describe("provider data-semantic cache revisions", () => {
     db.close();
   });
 
-  it("bounds financial replay using the timestamp-order index", () => {
+  it("bounds category-scoped financial replay with its category and timestamp index", () => {
     const { db } = fixture();
-    const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT type, amount, fee, coin FROM provider_financial_records INDEXED BY provider_financial_records_timestamp_category_key_idx WHERE category IN (SELECT value FROM json_each(?)) AND provider_timestamp >= ? ORDER BY provider_timestamp, category, provider_record_key LIMIT 50001`).all('["USDT-FUTURES","COIN-FUTURES"]', "2026-01-01T00:00:00.000Z") as Array<{ detail: string }>;
-    expect(plan.some(({ detail }) => detail.includes("provider_financial_records_timestamp_category_key_idx") && detail.includes("provider_timestamp>?"))).toBe(true);
+    const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT type, amount, fee, coin FROM provider_financial_records WHERE category = ? AND provider_timestamp >= ? ORDER BY provider_timestamp, provider_record_key LIMIT 50001`).all("USDT-FUTURES", "2026-01-01T00:00:00.000Z") as Array<{ detail: string }>;
+    expect(plan.some(({ detail }) => detail.includes("provider_financial_records_category_timestamp_key_idx") && detail.includes("category=?") && detail.includes("provider_timestamp>?"))).toBe(true);
+    expect(plan.some(({ detail }) => detail.includes("USE TEMP B-TREE FOR ORDER BY"))).toBe(false);
+    db.close();
+  });
+
+  it("serves the recent Trade History lifecycle page from its category and stable closing cursor index", () => {
+    const { db } = fixture();
+    const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT provider_position_history_key, provider_position_history_id, symbol, position_side, open_total_pos, close_total_pos, avg_entry_price, avg_exit_price, cum_realised_pnl, net_profit, open_fee_total, close_fee_total, total_funding, cash_dividend, opening_time, closing_time, origin FROM provider_position_history WHERE category = ? ORDER BY closing_time DESC, provider_position_history_key DESC LIMIT ?`).all("USDT-FUTURES", 25) as Array<{ detail: string }>;
+    expect(plan.some(({ detail }) => detail.includes("provider_position_history_category_closing_page_idx") && detail.includes("category=?"))).toBe(true);
+    expect(plan.some(({ detail }) => detail.includes("USE TEMP B-TREE FOR ORDER BY"))).toBe(false);
+    db.close();
+  });
+
+  it("serves recent snapshot cycles from a bounded descending index range", () => {
+    const { db } = fixture();
+    const plan = db.prepare("EXPLAIN QUERY PLAN SELECT cycle_id, status, started_at, completed_at FROM cycles ORDER BY started_at DESC, cycle_id DESC LIMIT ?").all(25) as Array<{ detail: string }>;
+    expect(plan.some(({ detail }) => detail.includes("cycles_started_at_page_idx") && detail.includes("SCAN cycles USING INDEX"))).toBe(true);
     expect(plan.some(({ detail }) => detail.includes("USE TEMP B-TREE FOR ORDER BY"))).toBe(false);
     db.close();
   });
@@ -119,6 +220,9 @@ describe("provider data-semantic cache revisions", () => {
     expect(changed.cacheHit).toBe(false);
     expect(changed.recordsRead).toBe(1);
     db.prepare("UPDATE provider_financial_records SET last_seen_at='t3', raw_provider_json='{\"observed\":true}' WHERE provider_record_key='record-1'").run();
+    const revisionBeforeMetadataUpdate = revision();
+    db.prepare("UPDATE provider_financial_records SET balance='1000', origin='DARWIN' WHERE provider_record_key='record-1'").run();
+    expect(revision()).toBe(revisionBeforeMetadataUpdate);
     expect(resolve("t3").cacheHit).toBe(true);
     db.prepare("UPDATE provider_financial_records SET amount='11' WHERE provider_record_key='record-1'").run();
     expect(resolve("t4").cacheHit).toBe(false);

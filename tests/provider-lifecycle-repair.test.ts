@@ -1,12 +1,12 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderLifecycleHistoryCandidateIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, loadProviderPositionHistoryDecisionIds, loadProviderSyncState, saveProviderSyncState } from "../src/storage/provider-ledger.js";
+import { loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderLifecycleHistoryCandidateIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, loadProviderPositionHistoryDecisionIds, loadProviderDataRevisions, loadProviderSyncState, saveProviderSyncState } from "../src/storage/provider-ledger.js";
 import { classifyProviderLifecycle } from "../src/trading/provider-lifecycle-reconciliation.js";
 import { hasEvent, loadAllEvents, loadAllExperiences, loadPositionContext, loadProviderLifecyclePerformanceReadModelCache, persistProviderLifecycleRepair, saveEvent, saveExperience, saveJournal, savePositionContext, saveProviderLifecyclePerformanceReadModelCache } from "../src/storage/store.js";
 import { TraderAgent, resolveProviderTradeFacts } from "../src/agent/agent.js";
 import { BitgetClient } from "../src/bitget/client.js";
-import { PROVIDER_FINANCIAL_CATEGORIES } from "../src/bitget/provider-sync.js";
+import { PROVIDER_FINANCIAL_CATEGORIES, syncProviderLedger } from "../src/bitget/provider-sync.js";
 import { rebuildProviderPerformance } from "../src/trading/provider-performance.js";
 import type { PerformanceAggregate } from "../src/trading/performance.js";
 import type { PositionContext, TradeExperience, TradingJournal } from "../src/types.js";
@@ -1572,6 +1572,34 @@ describe("provider-first financial lifecycle resolution", () => {
     db.close();
   });
 
+  it("keeps Trade History query count bounded with 1,000 older provider lifecycles", async () => {
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const readPage = async (historyCount: number) => {
+      const { db, executor, queries } = memoryExecutor();
+      insertProviderEvidence(executor);
+      insertProviderHistoryFixtures(executor, historyCount);
+      const queryOffset = queries.length;
+      const agent = fakeAgent(executor, db, true);
+      const response = await agent.getTradeHistory.call(agent, new URL("https://example.test/trade-history?limit=25"));
+      const body = await response.json() as { trades: Array<Record<string, unknown>> };
+      const reads = queries.slice(queryOffset).filter((query) => /^(SELECT|WITH)/i.test(query.trimStart()));
+      db.close();
+      return { body, reads };
+    };
+
+    const smallHistory = await readPage(25);
+    const largeHistory = await readPage(1_000);
+
+    expect(smallHistory.body.trades).toHaveLength(25);
+    expect(largeHistory.body.trades).toHaveLength(25);
+    expect(largeHistory.reads).toHaveLength(smallHistory.reads.length);
+    for (const table of ["provider_position_history", "provider_orders", "provider_fills", "experiences", "journals", "position_context"]) {
+      const tableReads = largeHistory.reads.filter((query) => new RegExp(`\\bFROM\\s+${table}\\b`, "i").test(query));
+      expect(tableReads.length).toBeGreaterThan(0);
+      expect(tableReads.every((query) => /\bLIMIT\b/i.test(query))).toBe(true);
+    }
+  });
+
   it("sorts provider lifecycles before stale unresolved local rows when applying the requested limit", async () => {
     const { db, executor } = memoryExecutor();
     insertProviderEvidence(executor);
@@ -1666,7 +1694,7 @@ describe("provider-first financial lifecycle resolution", () => {
     const first = await agent.getDashboardSnapshot.call(agent, portfolio);
     expect(first.performance.closedTrades).toBe(1);
     expect(first.accountPerformance).toMatchObject({ externalFlowStatus: "VERIFIED", netExternalInflows: "5" });
-    expect(recordReadCount() - beforeFirst).toBe(1);
+    expect(recordReadCount() - beforeFirst).toBe(PROVIDER_FINANCIAL_CATEGORIES.length);
     expect(historyReadCount() - beforeFirstHistory).toBeGreaterThan(0);
 
     const beforeRepeat = recordReadCount();
@@ -1679,22 +1707,46 @@ describe("provider-first financial lifecycle resolution", () => {
     expect(historyReadCount() - beforeRepeatHistory).toBe(0);
 
     const syncState = loadProviderSyncState(executor, "USDT-FUTURES")!;
-    const heartbeatAt = new Date(Date.now() + 1).toISOString();
-    saveProviderSyncState(executor, { ...syncState, updatedAt: heartbeatAt, lastSuccessfulSyncAt: heartbeatAt });
-    const beforeHeartbeat = recordReadCount();
-    const beforeHeartbeatHistory = historyReadCount();
-    const heartbeat = await agent.getDashboardSnapshot.call(agent, portfolio);
-    expect(heartbeat.performance.closedTrades).toBe(1);
-    expect(recordReadCount() - beforeHeartbeat).toBe(0);
-    expect(historyReadCount() - beforeHeartbeatHistory).toBe(0);
+    const revisionsBeforeNoopSync = loadProviderDataRevisions(executor, ["USDT-FUTURES"]).get("USDT-FUTURES")!;
+    const noOpClient = {
+      getOrderHistoryRead: async () => ({ data: { list: [], cursor: null } }),
+      getFillHistoryWindowRead: async () => ({ data: { list: [], cursor: null } }),
+      getPositionHistoryRead: async () => ({ data: { list: [], cursor: null } }),
+      getFinancialRecordsRead: async () => ({ data: { list: [], cursor: null } }),
+    };
+    const noOpSync = await syncProviderLedger(noOpClient, executor, {
+      category: "USDT-FUTURES",
+      mode: "recent",
+      now: new Date(Date.now() + 1_000),
+      recentWindowMs: 24 * 60 * 60 * 1000,
+      overlapMs: 15 * 60 * 1000,
+    });
+    expect(noOpSync.status).toBe("SUCCESS");
+    expect(loadProviderSyncState(executor, "USDT-FUTURES")!.revision ?? 0).toBeGreaterThan(syncState.revision ?? 0);
+    expect(loadProviderDataRevisions(executor, ["USDT-FUTURES"]).get("USDT-FUTURES")).toEqual(revisionsBeforeNoopSync);
+    const beforeNoopSyncSnapshot = recordReadCount();
+    const beforeNoopSyncHistory = historyReadCount();
+    const afterNoopSync = await agent.getDashboardSnapshot.call(agent, portfolio);
+    expect(afterNoopSync.performance.closedTrades).toBe(1);
+    expect(recordReadCount() - beforeNoopSyncSnapshot).toBe(0);
+    expect(historyReadCount() - beforeNoopSyncHistory).toBe(0);
 
     insertFinancial("snapshot-flow-out", "TRANSFER_OUT", "-2");
     const beforeInvalidation = recordReadCount();
     const beforeInvalidatedHistory = historyReadCount();
     const invalidated = await agent.getDashboardSnapshot.call(agent, portfolio);
     expect(invalidated.accountPerformance).toMatchObject({ externalFlowStatus: "VERIFIED", netExternalInflows: "3" });
-    expect(recordReadCount() - beforeInvalidation).toBe(1);
+    expect(recordReadCount() - beforeInvalidation).toBe(PROVIDER_FINANCIAL_CATEGORIES.length);
     expect(historyReadCount() - beforeInvalidatedHistory).toBe(0);
+
+    db.prepare("UPDATE provider_position_history SET net_profit = ? WHERE provider_position_history_id = ?").run("34.19485709", HISTORY_ID);
+    const beforeLifecycleChangeSnapshot = historyReadCount();
+    const lifecycleChanged = await agent.getDashboardSnapshot.call(agent, portfolio);
+    expect(lifecycleChanged.performance.closedTrades).toBe(1);
+    expect(historyReadCount() - beforeLifecycleChangeSnapshot).toBeGreaterThan(0);
+    const beforeLifecycleCacheHit = historyReadCount();
+    await agent.getDashboardSnapshot.call(agent, portfolio);
+    expect(historyReadCount() - beforeLifecycleCacheHit).toBe(0);
     db.close();
   });
 

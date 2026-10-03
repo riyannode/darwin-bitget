@@ -1,5 +1,16 @@
 export interface SqlExecutor {
   sql<T>(strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[];
+  measuredSql?<T>(path: string, queryName: string, strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[];
+}
+
+export function executeMeasuredSql<T>(
+  executor: SqlExecutor,
+  path: string,
+  queryName: string,
+): (strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) => T[] {
+  return (strings, ...values) => executor.measuredSql && "ctx" in executor && Boolean(executor.ctx)
+    ? executor.measuredSql(path, queryName, strings, ...values)
+    : executor.sql(strings, ...values);
 }
 
 type JournalLookupSchemaVersionRow = { version: number };
@@ -200,7 +211,7 @@ export function ensureStorage(executor: SqlExecutor): void {
       OR OLD.reduce_only IS NOT NEW.reduce_only OR OLD.order_type IS NOT NEW.order_type OR OLD.qty IS NOT NEW.qty
       OR OLD.cum_exec_qty IS NOT NEW.cum_exec_qty OR OLD.cum_exec_value IS NOT NEW.cum_exec_value OR OLD.avg_price IS NOT NEW.avg_price
       OR OLD.order_status IS NOT NEW.order_status OR OLD.fee_total IS NOT NEW.fee_total OR OLD.fee_details_json IS NOT NEW.fee_details_json
-      OR OLD.created_time IS NOT NEW.created_time OR OLD.updated_time IS NOT NEW.updated_time OR OLD.origin IS NOT NEW.origin
+      OR OLD.created_time IS NOT NEW.created_time OR OLD.origin IS NOT NEW.origin
   BEGIN
     INSERT INTO provider_data_revisions (category, lifecycle_revision) VALUES (NEW.category, 1)
     ON CONFLICT(category) DO UPDATE SET lifecycle_revision = provider_data_revisions.lifecycle_revision + 1;
@@ -222,7 +233,7 @@ export function ensureStorage(executor: SqlExecutor): void {
       OR OLD.trade_side IS NOT NEW.trade_side OR OLD.exec_qty IS NOT NEW.exec_qty OR OLD.exec_price IS NOT NEW.exec_price
       OR OLD.exec_value IS NOT NEW.exec_value OR OLD.exec_pnl IS NOT NEW.exec_pnl OR OLD.fee_total IS NOT NEW.fee_total
       OR OLD.fee_details_json IS NOT NEW.fee_details_json OR OLD.created_time IS NOT NEW.created_time
-      OR OLD.updated_time IS NOT NEW.updated_time OR OLD.origin IS NOT NEW.origin
+      OR OLD.origin IS NOT NEW.origin
   BEGIN
     INSERT INTO provider_data_revisions (category, lifecycle_revision) VALUES (NEW.category, 1)
     ON CONFLICT(category) DO UPDATE SET lifecycle_revision = provider_data_revisions.lifecycle_revision + 1;
@@ -238,11 +249,10 @@ export function ensureStorage(executor: SqlExecutor): void {
     INSERT INTO provider_data_revisions (category, financial_revision) VALUES (NEW.category, 1)
     ON CONFLICT(category) DO UPDATE SET financial_revision = provider_data_revisions.financial_revision + 1;
   END`;
+  executor.sql`DROP TRIGGER IF EXISTS provider_financial_revision_update`;
   executor.sql`CREATE TRIGGER IF NOT EXISTS provider_financial_revision_update AFTER UPDATE ON provider_financial_records
-    WHEN OLD.provider_record_id IS NOT NEW.provider_record_id OR OLD.category IS NOT NEW.category OR OLD.type IS NOT NEW.type
-      OR OLD.position_type IS NOT NEW.position_type OR OLD.coin IS NOT NEW.coin OR OLD.amount IS NOT NEW.amount OR OLD.fee IS NOT NEW.fee
-      OR OLD.position_amount IS NOT NEW.position_amount OR OLD.position_balance IS NOT NEW.position_balance OR OLD.balance IS NOT NEW.balance
-      OR OLD.provider_timestamp IS NOT NEW.provider_timestamp OR OLD.origin IS NOT NEW.origin
+    WHEN OLD.category IS NOT NEW.category OR OLD.type IS NOT NEW.type OR OLD.coin IS NOT NEW.coin
+      OR OLD.amount IS NOT NEW.amount OR OLD.fee IS NOT NEW.fee OR OLD.provider_timestamp IS NOT NEW.provider_timestamp
   BEGIN
     INSERT INTO provider_data_revisions (category, financial_revision) VALUES (NEW.category, 1)
     ON CONFLICT(category) DO UPDATE SET financial_revision = provider_data_revisions.financial_revision + 1;
@@ -271,6 +281,7 @@ export function ensureStorage(executor: SqlExecutor): void {
   END`;
   executor.sql`DROP INDEX IF EXISTS provider_orders_category_client_oid_uq`;
   executor.sql`CREATE INDEX IF NOT EXISTS journals_created_at_idx ON journals(created_at DESC)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS cycles_started_at_page_idx ON cycles(started_at DESC, cycle_id DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS experiences_created_at_idx ON experiences(created_at DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS experiences_entry_decision_idx ON experiences(CASE WHEN json_valid(payload) THEN json_extract(payload, '$.entryDecisionId') END)`;
   executor.sql`CREATE INDEX IF NOT EXISTS journal_decision_lookup_decision_idx ON journal_decision_lookup(decision_id, cycle_id)`;
@@ -287,15 +298,23 @@ export function ensureStorage(executor: SqlExecutor): void {
   executor.sql`CREATE INDEX IF NOT EXISTS provider_position_history_category_page_idx ON provider_position_history(category, opening_time, provider_position_history_key)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_orders_category_updated_idx ON provider_orders(category, updated_time DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_orders_lifecycle_window_idx ON provider_orders(category, symbol, created_time)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS provider_orders_category_client_oid_created_idx ON provider_orders(category, client_oid, created_time, provider_order_id)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS provider_orders_lifecycle_side_window_idx ON provider_orders(category, symbol, UPPER(pos_side), created_time, provider_order_id)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_orders_client_oid_idx ON provider_orders(client_oid)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_order_created_idx ON provider_fills(provider_order_id, created_time)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_lifecycle_window_idx ON provider_fills(category, symbol, created_time)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_category_client_oid_created_idx ON provider_fills(category, client_oid, created_time, exec_id)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_lifecycle_order_client_idx ON provider_fills(category, provider_order_id, client_oid, created_time, exec_id)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_lifecycle_side_window_idx ON provider_fills(category, symbol, UPPER(pos_side), created_time, exec_id)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_lifecycle_untyped_side_window_idx ON provider_fills(category, symbol, created_time, exec_id) WHERE pos_side IS NULL OR UPPER(pos_side) NOT IN ('LONG', 'SHORT')`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_category_created_idx ON provider_fills(category, created_time DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_fills_client_oid_idx ON provider_fills(client_oid)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_position_history_category_closing_idx ON provider_position_history(category, closing_time DESC)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS provider_position_history_category_closing_page_idx ON provider_position_history(category, closing_time DESC, provider_position_history_key DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_position_history_symbol_idx ON provider_position_history(symbol, position_side, closing_time DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_financial_records_category_timestamp_idx ON provider_financial_records(category, provider_timestamp DESC)`;
-  executor.sql`CREATE INDEX IF NOT EXISTS provider_financial_records_timestamp_category_key_idx ON provider_financial_records(provider_timestamp, category, provider_record_key)`;
+  executor.sql`DROP INDEX IF EXISTS provider_financial_records_timestamp_category_key_idx`;
+  executor.sql`CREATE INDEX IF NOT EXISTS provider_financial_records_category_timestamp_key_idx ON provider_financial_records(category, provider_timestamp, provider_record_key)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_financial_records_type_timestamp_idx ON provider_financial_records(type, provider_timestamp DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS provider_sync_state_updated_idx ON provider_sync_state(updated_at DESC)`;
 }

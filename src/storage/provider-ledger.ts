@@ -7,8 +7,10 @@ import type {
   ProviderOrderRecord,
   ProviderPositionHistoryRecord,
 } from "../bitget/provider-ledger.js";
-import type { SqlExecutor } from "./schema.js";
+import { executeMeasuredSql, type SqlExecutor } from "./schema.js";
 import { isProviderLifecycleTimestampNear, PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS, resolveProviderLifecycleSide } from "../trading/provider-lifecycle-side.js";
+
+export const MAX_PROVIDER_HISTORY_MS = 90 * 24 * 60 * 60 * 1000;
 
 export interface ProviderResourceCheckpoint {
   cursor?: string;
@@ -56,6 +58,7 @@ interface CountRow {
 }
 
 interface OriginCountRow {
+  category: string;
   origin: ProviderOrigin;
   count: number;
 }
@@ -323,9 +326,9 @@ export function loadProviderPositionHistories(executor: SqlExecutor, category: s
   return rows.map(mapProviderPositionHistoryRow);
 }
 
-export function loadRecentProviderPositionHistories(executor: SqlExecutor, category: string, limit = 25): ProviderLifecycleHistory[] {
+export function loadRecentProviderPositionHistories(executor: SqlExecutor, category: string, limit = 25, path = "/api/trade-history"): ProviderLifecycleHistory[] {
   const historyLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 100) : 25;
-  const rows = executor.sql<ProviderPositionHistoryRow>`
+  const rows = executeMeasuredSql<ProviderPositionHistoryRow>(executor, path, "trade_history_lifecycle_page")`
     SELECT provider_position_history_key, provider_position_history_id, symbol, position_side, open_total_pos, close_total_pos,
       avg_entry_price, avg_exit_price, cum_realised_pnl, net_profit, open_fee_total, close_fee_total, total_funding,
       cash_dividend, opening_time, closing_time, origin
@@ -342,18 +345,19 @@ export function loadProviderPositionHistoriesPage(
   category: string,
   cursor: ProviderPositionHistoryCursor | null,
   limit = 100,
+  path = "/api/snapshot",
 ): ProviderPositionHistoryPage {
   const pageLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 100) : 100;
   const rows = cursor
-    ? executor.sql<ProviderPositionHistoryRow>`
+    ? executeMeasuredSql<ProviderPositionHistoryRow>(executor, path, "lifecycle_performance_history_page")`
       SELECT provider_position_history_key, provider_position_history_id, symbol, position_side, open_total_pos, close_total_pos, avg_entry_price, avg_exit_price, cum_realised_pnl, net_profit, open_fee_total, close_fee_total, total_funding, cash_dividend, opening_time, closing_time, origin
       FROM provider_position_history
       WHERE category = ${category}
-        AND (opening_time > ${cursor.openingTime} OR (opening_time = ${cursor.openingTime} AND provider_position_history_key > ${cursor.providerPositionHistoryKey}))
+        AND (opening_time, provider_position_history_key) > (${cursor.openingTime}, ${cursor.providerPositionHistoryKey})
       ORDER BY opening_time, provider_position_history_key
       LIMIT ${pageLimit + 1}
     `
-    : executor.sql<ProviderPositionHistoryRow>`
+    : executeMeasuredSql<ProviderPositionHistoryRow>(executor, path, "lifecycle_performance_history_page")`
       SELECT provider_position_history_key, provider_position_history_id, symbol, position_side, open_total_pos, close_total_pos, avg_entry_price, avg_exit_price, cum_realised_pnl, net_profit, open_fee_total, close_fee_total, total_funding, cash_dividend, opening_time, closing_time, origin
       FROM provider_position_history WHERE category = ${category}
       ORDER BY opening_time, provider_position_history_key LIMIT ${pageLimit + 1}
@@ -372,6 +376,7 @@ export function loadProviderPositionHistoryDecisionIds(
   executor: SqlExecutor,
   category: string,
   histories: readonly ProviderLifecycleHistory[],
+  path = "/api/snapshot",
 ): Map<string, string> {
   const requestsById = new Map<string, { id: string; symbol: string; positionSide: string; openingTime: string; from: string; to: string }>();
   const ambiguousIds = new Set<string>();
@@ -397,12 +402,12 @@ export function loadProviderPositionHistoryDecisionIds(
   const maxRowsPerBatch = 5_000;
   for (let offset = 0; offset < requests.length; offset += batchSize) {
     const batch = requests.slice(offset, offset + batchSize);
-    const rows = executor.sql<{
+    const rows = executeMeasuredSql<{
       history_id: string; decision_id: string; provider_order_id: string; client_oid: string;
       order_side: string | null; order_pos_side: string | null; order_trade_side: string | null; order_origin: ProviderEvidenceOrigin;
       fill_side: string | null; fill_pos_side: string | null; fill_trade_side: string | null;
       fill_origin: ProviderEvidenceOrigin;
-    }>`
+    }>(executor, path, "lifecycle_performance_history_identity_batch")`
       SELECT DISTINCT h.provider_position_history_id AS history_id, i.decision_id, o.provider_order_id, o.client_oid,
         o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side, o.origin AS order_origin,
         f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side, f.origin AS fill_origin
@@ -459,6 +464,7 @@ export function loadProviderLiveOpeningOrderIdentities(
   executor: SqlExecutor,
   category: string,
   positions: readonly PositionSnapshot[],
+  path = "/api/snapshot",
 ): Map<string, { providerOrderId: string; decisionId: string }> {
   const requests = [...new Map(positions.flatMap((position) => {
     const openedAtMs = position.openedAt ? Date.parse(position.openedAt) : Number.NaN;
@@ -478,17 +484,19 @@ export function loadProviderLiveOpeningOrderIdentities(
   const maxRowsPerBatch = 5_000;
   for (let offset = 0; offset < requests.length; offset += batchSize) {
     const batch = requests.slice(offset, offset + batchSize);
-    const rows = executor.sql<{
+    const rows = executeMeasuredSql<{
       position_key: string; provider_order_id: string; client_oid: string; decision_id: string;
       order_side: string | null; order_pos_side: string | null; order_trade_side: string | null; order_origin: ProviderEvidenceOrigin;
       fill_side: string | null; fill_pos_side: string | null; fill_trade_side: string | null; fill_origin: ProviderEvidenceOrigin;
-    }>`
+    }>(executor, path, "lifecycle_live_position_identity_batch")`
       SELECT DISTINCT json_extract(requested.value, '$.key') AS position_key, o.provider_order_id, o.client_oid, i.decision_id,
         o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side, o.origin AS order_origin,
         f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side, f.origin AS fill_origin
       FROM json_each(${JSON.stringify(batch)}) AS requested
       JOIN provider_orders AS o ON o.category = ${category} AND o.symbol = json_extract(requested.value, '$.symbol')
         AND UPPER(o.pos_side) = UPPER(json_extract(requested.value, '$.positionSide'))
+        AND o.created_time >= json_extract(requested.value, '$.from')
+        AND o.created_time <= json_extract(requested.value, '$.to')
       JOIN provider_fills AS f ON f.category = o.category AND f.provider_order_id = o.provider_order_id
         AND f.client_oid = o.client_oid AND f.symbol = o.symbol AND UPPER(f.pos_side) = UPPER(o.pos_side)
         AND f.origin = o.origin
@@ -578,6 +586,15 @@ export interface ProviderLifecycleEvidenceRequest {
 }
 
 const MAX_LIFECYCLE_EVIDENCE_ROWS = 2_000;
+
+function parseLifecycleEvidenceRows<T>(json: string): T[] | null {
+  try {
+    const value: unknown = JSON.parse(json);
+    return Array.isArray(value) ? value as T[] : null;
+  } catch {
+    return null;
+  }
+}
 
 function isCanonicalNonEmptyClientOrderId(value: string | null | undefined): value is string {
   return typeof value === "string" && value.trim().length > 0 && value === value.trim();
@@ -777,6 +794,7 @@ export function loadProviderLifecycleEvidenceBatch(
   executor: SqlExecutor,
   category: string,
   requests: readonly ProviderLifecycleEvidenceRequest[],
+  path = "/api/snapshot",
 ): Map<string, ProviderLifecycleEvidence> {
   const result = new Map<string, ProviderLifecycleEvidence>();
   if (requests.length === 0) return result;
@@ -807,6 +825,8 @@ export function loadProviderLifecycleEvidenceBatch(
       identities.push({ clientOrderId: row.client_order_id, providerOrderId: row.provider_order_id });
       identitiesByDecision.set(row.decision_id, identities);
     }
+    const incompleteWindowRequests = new Set<string>();
+    const requestNow = Date.now();
     const queryRequests = batch.map((request) => {
       const identities = identitiesByDecision.get(request.experience.entryDecisionId) ?? [];
       const clientOrderId = identities[0]?.clientOrderId;
@@ -816,58 +836,108 @@ export function loadProviderLifecycleEvidenceBatch(
       const rangeStart = request.history?.openingTime
         ?? (position?.openedAt && Number.isFinite(Date.parse(position.openedAt)) ? new Date(Date.parse(position.openedAt) - PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS).toISOString() : null);
       const rangeEnd = request.history && !position ? request.history.closingTime : null;
-      return { requestId: request.requestId, symbol: request.experience.symbol, positionSide: request.experience.positionSide?.toLowerCase() ?? "", rangeStart, rangeEnd, entryProviderOrderId: identity?.providerOrderId ?? null, entryClientOid: identity?.clientOrderId ?? null };
+      const rangeStartMs = rangeStart ? Date.parse(rangeStart) : NaN;
+      const rangeEndMs = rangeEnd ? Date.parse(rangeEnd) : requestNow;
+      const validWindow = !rangeStart || (Number.isFinite(rangeStartMs) && Number.isFinite(rangeEndMs)
+        && rangeEndMs >= rangeStartMs && rangeEndMs - rangeStartMs <= MAX_PROVIDER_HISTORY_MS);
+      if (!validWindow) incompleteWindowRequests.add(request.requestId);
+      return {
+        requestId: request.requestId,
+        symbol: request.experience.symbol,
+        positionSide: request.experience.positionSide?.toLowerCase() ?? "",
+        rangeStart: validWindow ? rangeStart : null,
+        rangeEnd: validWindow ? rangeEnd : null,
+        entryProviderOrderId: identity?.providerOrderId ?? null,
+        entryClientOid: identity?.clientOrderId ?? null,
+      };
     });
     const requestJson = JSON.stringify(queryRequests);
-    type OrderRow = { request_id: string; provider_order_id: string; client_oid: string | null; symbol: string; side: string | null; pos_side: string | null; trade_side: string | null; created_time: string; origin: ProviderEvidenceOrigin; row_number: number };
-    type FillRow = OrderRow & { exec_qty: string; exec_price: string; created_time: string };
-    const orders = executor.sql<OrderRow>`
-      WITH candidates AS (
-        SELECT json_extract(r.value, '$.requestId') AS request_id, o.provider_order_id, o.client_oid, o.symbol, o.side, o.pos_side, o.trade_side, o.created_time, o.origin,
-          ROW_NUMBER() OVER (PARTITION BY json_extract(r.value, '$.requestId') ORDER BY o.created_time, o.provider_order_id) AS row_number
-        FROM json_each(${requestJson}) AS r
-        JOIN provider_orders AS o ON o.category = ${category}
-          AND ((json_extract(r.value, '$.entryProviderOrderId') IS NULL AND json_extract(r.value, '$.entryClientOid') IS NOT NULL AND o.client_oid = json_extract(r.value, '$.entryClientOid'))
-            OR (o.symbol = json_extract(r.value, '$.symbol') AND UPPER(o.pos_side) = UPPER(json_extract(r.value, '$.positionSide'))
-              AND ((json_extract(r.value, '$.entryProviderOrderId') IS NOT NULL AND o.provider_order_id = json_extract(r.value, '$.entryProviderOrderId') AND o.client_oid = json_extract(r.value, '$.entryClientOid'))
-                OR (json_extract(r.value, '$.rangeStart') IS NOT NULL AND o.created_time >= json_extract(r.value, '$.rangeStart')
-                  AND (json_extract(r.value, '$.rangeEnd') IS NULL OR o.created_time <= json_extract(r.value, '$.rangeEnd'))))))
-      )
-      SELECT request_id, provider_order_id, client_oid, symbol, side, pos_side, trade_side, created_time, origin, row_number FROM candidates
-      WHERE row_number <= ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1} ORDER BY request_id, row_number
+    type OrderEvidenceSqlRow = { request_id: string; client_oid_rows: string; entry_order_rows: string; range_order_rows: string };
+    type FillEvidenceSqlRow = { request_id: string; client_oid_rows: string; entry_order_rows: string; range_side_rows: string; range_untyped_rows: string };
+    type OrderEvidenceRow = { provider_order_id: string; client_oid: string | null; symbol: string; side: string | null; pos_side: string | null; trade_side: string | null; created_time: string; origin: ProviderEvidenceOrigin };
+    type FillEvidenceRow = OrderEvidenceRow & { exec_id: string; exec_qty: string; exec_price: string };
+    const orders = executeMeasuredSql<OrderEvidenceSqlRow>(executor, path, "lifecycle_evidence_order_batch")`
+      SELECT json_extract(r.value, '$.requestId') AS request_id,
+        COALESCE((SELECT json_group_array(json_object('provider_order_id', matched.provider_order_id, 'client_oid', matched.client_oid, 'symbol', matched.symbol, 'side', matched.side, 'pos_side', matched.pos_side, 'trade_side', matched.trade_side, 'created_time', matched.created_time, 'origin', matched.origin))
+          FROM (SELECT o.provider_order_id, o.client_oid, o.symbol, o.side, o.pos_side, o.trade_side, o.created_time, o.origin
+            FROM provider_orders AS o
+            WHERE o.category = ${category} AND json_extract(r.value, '$.entryProviderOrderId') IS NULL
+              AND json_extract(r.value, '$.entryClientOid') IS NOT NULL AND o.client_oid = json_extract(r.value, '$.entryClientOid')
+            ORDER BY o.created_time, o.provider_order_id LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}) AS matched), '[]') AS client_oid_rows,
+        COALESCE((SELECT json_group_array(json_object('provider_order_id', matched.provider_order_id, 'client_oid', matched.client_oid, 'symbol', matched.symbol, 'side', matched.side, 'pos_side', matched.pos_side, 'trade_side', matched.trade_side, 'created_time', matched.created_time, 'origin', matched.origin))
+          FROM (SELECT o.provider_order_id, o.client_oid, o.symbol, o.side, o.pos_side, o.trade_side, o.created_time, o.origin
+            FROM provider_orders AS o
+            WHERE o.category = ${category} AND json_extract(r.value, '$.entryProviderOrderId') IS NOT NULL
+              AND o.provider_order_id = json_extract(r.value, '$.entryProviderOrderId') AND o.client_oid = json_extract(r.value, '$.entryClientOid')
+            ORDER BY o.created_time, o.provider_order_id LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}) AS matched), '[]') AS entry_order_rows,
+        COALESCE((SELECT json_group_array(json_object('provider_order_id', matched.provider_order_id, 'client_oid', matched.client_oid, 'symbol', matched.symbol, 'side', matched.side, 'pos_side', matched.pos_side, 'trade_side', matched.trade_side, 'created_time', matched.created_time, 'origin', matched.origin))
+          FROM (SELECT o.provider_order_id, o.client_oid, o.symbol, o.side, o.pos_side, o.trade_side, o.created_time, o.origin
+            FROM provider_orders AS o
+            WHERE o.category = ${category} AND o.symbol = json_extract(r.value, '$.symbol')
+              AND UPPER(o.pos_side) = UPPER(json_extract(r.value, '$.positionSide'))
+              AND json_extract(r.value, '$.rangeStart') IS NOT NULL
+              AND o.created_time >= json_extract(r.value, '$.rangeStart')
+              AND (json_extract(r.value, '$.rangeEnd') IS NULL OR o.created_time <= json_extract(r.value, '$.rangeEnd'))
+            ORDER BY o.created_time, o.provider_order_id LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}) AS matched), '[]') AS range_order_rows
+      FROM json_each(${requestJson}) AS r
     `;
-    const fills = executor.sql<FillRow>`
-      WITH candidates AS (
-        SELECT json_extract(r.value, '$.requestId') AS request_id, f.provider_order_id, f.client_oid, f.symbol, f.side, f.pos_side, f.trade_side, f.origin,
-          f.exec_qty, f.exec_price, f.created_time,
-          ROW_NUMBER() OVER (PARTITION BY json_extract(r.value, '$.requestId') ORDER BY f.created_time, f.provider_order_id) AS row_number
-        FROM json_each(${requestJson}) AS r
-        JOIN provider_fills AS f ON f.category = ${category}
-          AND ((json_extract(r.value, '$.entryProviderOrderId') IS NULL AND json_extract(r.value, '$.entryClientOid') IS NOT NULL AND f.client_oid = json_extract(r.value, '$.entryClientOid'))
-            OR (f.symbol = json_extract(r.value, '$.symbol')
-              AND (f.pos_side IS NULL OR UPPER(f.pos_side) NOT IN ('LONG', 'SHORT') OR UPPER(f.pos_side) = UPPER(json_extract(r.value, '$.positionSide')))
-              AND ((json_extract(r.value, '$.entryProviderOrderId') IS NOT NULL AND f.provider_order_id = json_extract(r.value, '$.entryProviderOrderId') AND f.client_oid = json_extract(r.value, '$.entryClientOid'))
-                OR (json_extract(r.value, '$.rangeStart') IS NOT NULL AND f.created_time >= json_extract(r.value, '$.rangeStart')
-                  AND (json_extract(r.value, '$.rangeEnd') IS NULL OR f.created_time <= json_extract(r.value, '$.rangeEnd'))))))
-      )
-      SELECT request_id, provider_order_id, client_oid, symbol, side, pos_side, trade_side, origin, exec_qty, exec_price, created_time, row_number FROM candidates
-      WHERE row_number <= ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1} ORDER BY request_id, row_number
+    const fills = executeMeasuredSql<FillEvidenceSqlRow>(executor, path, "lifecycle_evidence_fill_batch")`
+      SELECT json_extract(r.value, '$.requestId') AS request_id,
+        COALESCE((SELECT json_group_array(json_object('exec_id', matched.exec_id, 'provider_order_id', matched.provider_order_id, 'client_oid', matched.client_oid, 'symbol', matched.symbol, 'side', matched.side, 'pos_side', matched.pos_side, 'trade_side', matched.trade_side, 'created_time', matched.created_time, 'origin', matched.origin, 'exec_qty', matched.exec_qty, 'exec_price', matched.exec_price))
+          FROM (SELECT f.exec_id, f.provider_order_id, f.client_oid, f.symbol, f.side, f.pos_side, f.trade_side, f.created_time, f.origin, f.exec_qty, f.exec_price
+            FROM provider_fills AS f
+            WHERE f.category = ${category} AND json_extract(r.value, '$.entryProviderOrderId') IS NULL
+              AND json_extract(r.value, '$.entryClientOid') IS NOT NULL AND f.client_oid = json_extract(r.value, '$.entryClientOid')
+            ORDER BY f.created_time, f.exec_id LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}) AS matched), '[]') AS client_oid_rows,
+        COALESCE((SELECT json_group_array(json_object('exec_id', matched.exec_id, 'provider_order_id', matched.provider_order_id, 'client_oid', matched.client_oid, 'symbol', matched.symbol, 'side', matched.side, 'pos_side', matched.pos_side, 'trade_side', matched.trade_side, 'created_time', matched.created_time, 'origin', matched.origin, 'exec_qty', matched.exec_qty, 'exec_price', matched.exec_price))
+          FROM (SELECT f.exec_id, f.provider_order_id, f.client_oid, f.symbol, f.side, f.pos_side, f.trade_side, f.created_time, f.origin, f.exec_qty, f.exec_price
+            FROM provider_fills AS f
+            WHERE f.category = ${category} AND json_extract(r.value, '$.entryProviderOrderId') IS NOT NULL
+              AND f.provider_order_id = json_extract(r.value, '$.entryProviderOrderId') AND f.client_oid = json_extract(r.value, '$.entryClientOid')
+            ORDER BY f.created_time, f.exec_id LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}) AS matched), '[]') AS entry_order_rows,
+        COALESCE((SELECT json_group_array(json_object('exec_id', matched.exec_id, 'provider_order_id', matched.provider_order_id, 'client_oid', matched.client_oid, 'symbol', matched.symbol, 'side', matched.side, 'pos_side', matched.pos_side, 'trade_side', matched.trade_side, 'created_time', matched.created_time, 'origin', matched.origin, 'exec_qty', matched.exec_qty, 'exec_price', matched.exec_price))
+          FROM (SELECT f.exec_id, f.provider_order_id, f.client_oid, f.symbol, f.side, f.pos_side, f.trade_side, f.created_time, f.origin, f.exec_qty, f.exec_price
+            FROM provider_fills AS f
+            WHERE f.category = ${category} AND f.symbol = json_extract(r.value, '$.symbol')
+              AND UPPER(f.pos_side) = UPPER(json_extract(r.value, '$.positionSide'))
+              AND json_extract(r.value, '$.rangeStart') IS NOT NULL
+              AND f.created_time >= json_extract(r.value, '$.rangeStart')
+              AND (json_extract(r.value, '$.rangeEnd') IS NULL OR f.created_time <= json_extract(r.value, '$.rangeEnd'))
+            ORDER BY f.created_time, f.exec_id LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}) AS matched), '[]') AS range_side_rows,
+        COALESCE((SELECT json_group_array(json_object('exec_id', matched.exec_id, 'provider_order_id', matched.provider_order_id, 'client_oid', matched.client_oid, 'symbol', matched.symbol, 'side', matched.side, 'pos_side', matched.pos_side, 'trade_side', matched.trade_side, 'created_time', matched.created_time, 'origin', matched.origin, 'exec_qty', matched.exec_qty, 'exec_price', matched.exec_price))
+          FROM (SELECT f.exec_id, f.provider_order_id, f.client_oid, f.symbol, f.side, f.pos_side, f.trade_side, f.created_time, f.origin, f.exec_qty, f.exec_price
+            FROM provider_fills AS f
+            WHERE f.category = ${category} AND f.symbol = json_extract(r.value, '$.symbol')
+              AND (f.pos_side IS NULL OR UPPER(f.pos_side) NOT IN ('LONG', 'SHORT'))
+              AND json_extract(r.value, '$.rangeStart') IS NOT NULL
+              AND f.created_time >= json_extract(r.value, '$.rangeStart')
+              AND (json_extract(r.value, '$.rangeEnd') IS NULL OR f.created_time <= json_extract(r.value, '$.rangeEnd'))
+            ORDER BY f.created_time, f.exec_id LIMIT ${MAX_LIFECYCLE_EVIDENCE_ROWS + 1}) AS matched), '[]') AS range_untyped_rows
+      FROM json_each(${requestJson}) AS r
     `;
     const ordersByRequest = new Map<string, ProviderLifecycleOrder[]>();
     const fillsByRequest = new Map<string, ProviderLifecycleFill[]>();
     const orderCounts = new Map<string, number>();
     const fillCounts = new Map<string, number>();
+    const invalidEvidenceRequests = new Set<string>();
     for (const row of orders) {
-      const values = ordersByRequest.get(row.request_id) ?? [];
-      values.push({ providerOrderId: row.provider_order_id, clientOid: row.client_oid, symbol: row.symbol, side: row.side, positionSide: row.pos_side?.toUpperCase() ?? null, tradeSide: row.trade_side?.trim().toLowerCase() ?? null, createdAt: row.created_time, origin: row.origin });
+      const rows = [row.client_oid_rows, row.entry_order_rows, row.range_order_rows].flatMap((json) => parseLifecycleEvidenceRows<OrderEvidenceRow>(json) ?? []);
+      if ([row.client_oid_rows, row.entry_order_rows, row.range_order_rows].some((json) => parseLifecycleEvidenceRows<OrderEvidenceRow>(json) === null)) invalidEvidenceRequests.add(row.request_id);
+      const unique = new Map(rows.map((item) => [item.provider_order_id, item]));
+      const values = [...unique.values()].sort((left, right) => left.created_time.localeCompare(right.created_time) || left.provider_order_id.localeCompare(right.provider_order_id))
+        .map((item) => ({ providerOrderId: item.provider_order_id, clientOid: item.client_oid, symbol: item.symbol, side: item.side, positionSide: item.pos_side?.toUpperCase() ?? null, tradeSide: item.trade_side?.trim().toLowerCase() ?? null, createdAt: item.created_time, origin: item.origin }));
       ordersByRequest.set(row.request_id, values);
-      orderCounts.set(row.request_id, (orderCounts.get(row.request_id) ?? 0) + 1);
+      orderCounts.set(row.request_id, values.length);
     }
     for (const row of fills) {
-      const values = fillsByRequest.get(row.request_id) ?? [];
-      values.push({ providerOrderId: row.provider_order_id, clientOid: row.client_oid, symbol: row.symbol, side: row.side, positionSide: row.pos_side?.toUpperCase() ?? null, tradeSide: row.trade_side?.trim().toLowerCase() ?? null, quantity: row.exec_qty, execPrice: row.exec_price, createdAt: row.created_time, origin: row.origin });
+      const jsonRows = [row.client_oid_rows, row.entry_order_rows, row.range_side_rows, row.range_untyped_rows];
+      const rows = jsonRows.flatMap((json) => parseLifecycleEvidenceRows<FillEvidenceRow>(json) ?? []);
+      if (jsonRows.some((json) => parseLifecycleEvidenceRows<FillEvidenceRow>(json) === null)) invalidEvidenceRequests.add(row.request_id);
+      const unique = new Map(rows.map((item) => [item.exec_id, item]));
+      const values = [...unique.values()].sort((left, right) => left.created_time.localeCompare(right.created_time) || left.exec_id.localeCompare(right.exec_id))
+        .map((item) => ({ providerOrderId: item.provider_order_id, clientOid: item.client_oid, symbol: item.symbol, side: item.side, positionSide: item.pos_side?.toUpperCase() ?? null, tradeSide: item.trade_side?.trim().toLowerCase() ?? null, quantity: item.exec_qty, execPrice: item.exec_price, createdAt: item.created_time, origin: item.origin }));
       fillsByRequest.set(row.request_id, values);
-      fillCounts.set(row.request_id, (fillCounts.get(row.request_id) ?? 0) + 1);
+      fillCounts.set(row.request_id, values.length);
     }
     for (const request of batch) {
       const identities = identitiesByDecision.get(request.experience.entryDecisionId) ?? [];
@@ -877,6 +947,7 @@ export function loadProviderLifecycleEvidenceBatch(
       const historyId = request.history?.providerPositionHistoryId;
       const duplicateHistory = Boolean(historyId && historyIdCounts.get(historyId)! > 1);
       const evidenceComplete = identityRows.length <= 5_000 && !duplicateHistory && !duplicateRequestIds.has(request.requestId)
+        && !incompleteWindowRequests.has(request.requestId) && !invalidEvidenceRequests.has(request.requestId)
         && (orderCounts.get(request.requestId) ?? 0) <= MAX_LIFECYCLE_EVIDENCE_ROWS
         && (fillCounts.get(request.requestId) ?? 0) <= MAX_LIFECYCLE_EVIDENCE_ROWS;
       let entryIdentity: ProviderLifecycleEvidence["entryIdentity"] = identity?.providerOrderId
@@ -1152,47 +1223,73 @@ export function loadProviderFinancialRecordsSinceCategories(
   categories: readonly string[],
   baselineAt: string,
   limit = MAX_EXTERNAL_FLOW_RECORD_READ_ROWS,
+  path = "/api/snapshot",
 ): { records: Array<{ type: string; amount: string | null; fee: string | null; coin: string | null }>; truncated: boolean } {
-  const requested = [...new Set(categories)].slice(0, 100);
+  const requested = [...new Set(categories)];
+  if (requested.length > 100) return { records: [], truncated: true };
   const boundedLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, MAX_EXTERNAL_FLOW_RECORD_READ_ROWS) : MAX_EXTERNAL_FLOW_RECORD_READ_ROWS;
   if (requested.length === 0) return { records: [], truncated: false };
-  const rows = executor.sql<{ type: string; amount: string | null; fee: string | null; coin: string | null }>`
-    SELECT type, amount, fee, coin FROM provider_financial_records INDEXED BY provider_financial_records_timestamp_category_key_idx
-    WHERE category IN (SELECT value FROM json_each(${JSON.stringify(requested)})) AND provider_timestamp >= ${baselineAt}
-    ORDER BY provider_timestamp, category, provider_record_key LIMIT ${boundedLimit + 1}
-  `;
-  return { records: rows.slice(0, boundedLimit), truncated: rows.length > boundedLimit };
+  type FinancialReplayRow = { category: string; provider_timestamp: string; provider_record_key: string; type: string; amount: string | null; fee: string | null; coin: string | null };
+  const rows: FinancialReplayRow[] = [];
+  for (const category of requested) {
+    const remaining = boundedLimit - rows.length;
+    const page = executeMeasuredSql<FinancialReplayRow>(executor, path, "external_flow_financial_replay")`
+      SELECT category, provider_timestamp, provider_record_key, type, amount, fee, coin
+      FROM provider_financial_records
+      WHERE category = ${category} AND provider_timestamp >= ${baselineAt}
+      ORDER BY provider_timestamp, provider_record_key LIMIT ${remaining + 1}
+    `;
+    if (page.length > remaining) {
+      rows.push(...page.slice(0, remaining));
+      rows.sort((left, right) => left.provider_timestamp.localeCompare(right.provider_timestamp)
+        || left.category.localeCompare(right.category)
+        || left.provider_record_key.localeCompare(right.provider_record_key));
+      return { records: rows.map(({ type, amount, fee, coin }) => ({ type, amount, fee, coin })), truncated: true };
+    }
+    rows.push(...page);
+  }
+  rows.sort((left, right) => left.provider_timestamp.localeCompare(right.provider_timestamp)
+    || left.category.localeCompare(right.category)
+    || left.provider_record_key.localeCompare(right.provider_record_key));
+  return { records: rows.map(({ type, amount, fee, coin }) => ({ type, amount, fee, coin })), truncated: false };
 }
 
-export function providerLedgerDiagnostics(executor: SqlExecutor, category: string): ProviderLedgerDiagnostics {
-  const counts: ProviderLedgerDiagnostics["counts"] = { orders: 0, fills: 0, positionHistory: 0, financialRecords: 0 };
-  const origins = { DARWIN: 0, PROVIDER_EXTERNAL: 0, UNATTRIBUTED: 0 };
-  const tables = [
-    ["provider_orders", "orders"],
-    ["provider_fills", "fills"],
-    ["provider_position_history", "positionHistory"],
-    ["provider_financial_records", "financialRecords"],
+export function providerLedgerDiagnosticsBatch(executor: SqlExecutor, categories: readonly string[], path = "/api/provider-ledger"): Map<string, ProviderLedgerDiagnostics> {
+  const requested = [...new Set(categories)];
+  if (requested.length > 100) throw new Error("PROVIDER_DIAGNOSTIC_CATEGORY_LIMIT_EXCEEDED");
+  const diagnostics = new Map<string, ProviderLedgerDiagnostics>(requested.map((category) => [category, {
+    category,
+    counts: { orders: 0, fills: 0, positionHistory: 0, financialRecords: 0 },
+    origins: { DARWIN: 0, PROVIDER_EXTERNAL: 0, UNATTRIBUTED: 0 },
+    sync: null,
+    lastPartialOrFailureReason: null,
+  } satisfies ProviderLedgerDiagnostics] as const));
+  if (requested.length === 0) return diagnostics;
+  const requestedJson = JSON.stringify(requested);
+  const groupedTables = [
+    ["orders", executeMeasuredSql<OriginCountRow>(executor, path, "provider_ledger_orders_by_category_origin")`SELECT category, origin, COUNT(*) AS count FROM provider_orders WHERE category IN (SELECT value FROM json_each(${requestedJson})) GROUP BY category, origin`],
+    ["fills", executeMeasuredSql<OriginCountRow>(executor, path, "provider_ledger_fills_by_category_origin")`SELECT category, origin, COUNT(*) AS count FROM provider_fills WHERE category IN (SELECT value FROM json_each(${requestedJson})) GROUP BY category, origin`],
+    ["positionHistory", executeMeasuredSql<OriginCountRow>(executor, path, "provider_ledger_history_by_category_origin")`SELECT category, origin, COUNT(*) AS count FROM provider_position_history WHERE category IN (SELECT value FROM json_each(${requestedJson})) GROUP BY category, origin`],
+    ["financialRecords", executeMeasuredSql<OriginCountRow>(executor, path, "provider_ledger_financial_by_category_origin")`SELECT category, origin, COUNT(*) AS count FROM provider_financial_records WHERE category IN (SELECT value FROM json_each(${requestedJson})) GROUP BY category, origin`],
   ] as const;
-  for (const [table, key] of tables) {
-    const rows = table === "provider_orders"
-      ? executor.sql<OriginCountRow>`SELECT origin, COUNT(*) AS count FROM provider_orders WHERE category = ${category} GROUP BY origin`
-      : table === "provider_fills"
-        ? executor.sql<OriginCountRow>`SELECT origin, COUNT(*) AS count FROM provider_fills WHERE category = ${category} GROUP BY origin`
-        : table === "provider_position_history"
-          ? executor.sql<OriginCountRow>`SELECT origin, COUNT(*) AS count FROM provider_position_history WHERE category = ${category} GROUP BY origin`
-          : executor.sql<OriginCountRow>`SELECT origin, COUNT(*) AS count FROM provider_financial_records WHERE category = ${category} GROUP BY origin`;
+  for (const [key, rows] of groupedTables) {
     for (const row of rows) {
+      const entry = diagnostics.get(row.category);
+      if (!entry) continue;
       const rowCount = Number(row.count);
-      counts[key] += rowCount;
-      if (row.origin in origins) origins[row.origin] += rowCount;
+      entry.counts[key] += rowCount;
+      if (row.origin in entry.origins) entry.origins[row.origin] += rowCount;
     }
   }
-  const sync = loadProviderSyncState(executor, category);
-  return {
-    category,
-    counts,
-    origins,
-    sync,
-    lastPartialOrFailureReason: sync?.lastError ?? null,
-  };
+  const syncStates = loadProviderSyncStates(executor, requested);
+  for (const [category, entry] of diagnostics) {
+    const sync = syncStates.get(category) ?? null;
+    entry.sync = sync;
+    entry.lastPartialOrFailureReason = sync?.lastError ?? null;
+  }
+  return diagnostics;
+}
+
+export function providerLedgerDiagnostics(executor: SqlExecutor, category: string, path = "/api/provider-ledger"): ProviderLedgerDiagnostics {
+  return providerLedgerDiagnosticsBatch(executor, [category], path).get(category)!;
 }

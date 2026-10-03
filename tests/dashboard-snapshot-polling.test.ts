@@ -46,4 +46,46 @@ describe("snapshot polling", () => {
     expect(pending?.delay).toBe(60_000);
     polling.stop();
   });
+
+  it("coalesces visibility refreshes while a snapshot request is in flight", async () => {
+    let visibilityHandler: (() => void) | undefined;
+    let hidden = false;
+    let activeRefreshes = 0;
+    let maximumActiveRefreshes = 0;
+    const finishRefresh: Array<() => void> = [];
+    const refresh = vi.fn(() => new Promise<void>((resolve) => {
+      activeRefreshes += 1;
+      maximumActiveRefreshes = Math.max(maximumActiveRefreshes, activeRefreshes);
+      finishRefresh.push(() => {
+        activeRefreshes -= 1;
+        resolve();
+      });
+    }));
+    const polling = createSnapshotPolling({
+      document: {
+        get hidden() { return hidden; },
+        addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => { visibilityHandler = listener as () => void; },
+        removeEventListener: () => undefined,
+      },
+      getAgent: () => ({ status: "PAUSED", currentStage: "PAUSED" }),
+      refresh,
+      setTimeoutFn: vi.fn(() => 1 as unknown as ReturnType<typeof setTimeout>),
+      clearTimeoutFn: vi.fn(),
+    });
+
+    polling.start();
+    expect(refresh).toHaveBeenCalledOnce();
+    hidden = true;
+    visibilityHandler?.();
+    hidden = false;
+    visibilityHandler?.();
+    visibilityHandler?.();
+    expect(refresh).toHaveBeenCalledOnce();
+
+    finishRefresh[0]?.();
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+    expect(maximumActiveRefreshes).toBe(1);
+    finishRefresh[1]?.();
+    polling.stop();
+  });
 });

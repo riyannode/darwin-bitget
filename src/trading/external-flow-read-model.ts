@@ -25,14 +25,11 @@ export interface ExternalFlowReadModelResult {
   truncated: boolean;
 }
 
-function categorySignature(categories: readonly FinancialFlowCategoryState[]): Array<Pick<FinancialFlowCategoryState, "category" | "complete" | "lastError" | "revision" | "coveredFrom">> {
+function categorySignature(categories: readonly FinancialFlowCategoryState[]): Array<Pick<FinancialFlowCategoryState, "category" | "revision">> {
   return [...categories]
-    .map(({ category, complete, lastError, revision, coveredFrom }) => ({
+    .map(({ category, revision }) => ({
       category,
-      complete,
-      lastError,
       revision,
-      coveredFrom,
     }))
     .sort((left, right) => left.category.localeCompare(right.category));
 }
@@ -44,7 +41,7 @@ function buildSignature(
   requiredCategories: readonly string[],
 ): string {
   return JSON.stringify({
-    version: 2,
+    version: 3,
     baselineAt,
     baselineEquity,
     requiredCategories: [...requiredCategories].sort(),
@@ -66,18 +63,8 @@ export function resolveExternalFlowReadModel(
   categories: readonly FinancialFlowCategoryState[],
   requiredCategories: readonly string[],
   updatedAt: string,
+  path = "/api/snapshot",
 ): ExternalFlowReadModelResult {
-  const signature = buildSignature(baselineAt, baselineEquity, categories, requiredCategories);
-  const cached = loadExternalFlowReadModelCache(executor);
-  if (cached?.signature === signature) {
-    return {
-      flows: cached.flows,
-      cacheHit: true,
-      recordsRead: 0,
-      truncated: cached.truncated,
-    };
-  }
-
   const categoryNames = new Set(categories.map((category) => category.category));
   const allRequiredComplete = Boolean(baselineAt)
     && requiredCategories.length > 0
@@ -86,22 +73,25 @@ export function resolveExternalFlowReadModel(
     && requiredCategories.every((category) => categoryNames.has(category))
     && categories.every((category) => category.complete && !category.lastError);
 
-  let recordsRead = 0;
-  let truncated = false;
-  let flows: VerifiedExternalFlows;
   if (!allRequiredComplete || !baselineAt) {
-    flows = unavailableFlows(categories);
-  } else {
-    const financialRecords = loadProviderFinancialRecordsSinceCategories(executor, requiredCategories, baselineAt);
-    recordsRead = financialRecords.records.length;
-    truncated = financialRecords.truncated;
-    flows = truncated
-      ? { status: "UNVERIFIED", netExternalInflows: "UNAVAILABLE", unknownTypes: [] }
-      : calculateVerifiedExternalFlows(financialRecords.records, categories.map((category) => ({
-        complete: category.complete,
-        lastError: category.lastError,
-      })));
+    return { flows: unavailableFlows(categories), cacheHit: false, recordsRead: 0, truncated: false };
   }
+
+  const signature = buildSignature(baselineAt, baselineEquity, categories, requiredCategories);
+  const cached = loadExternalFlowReadModelCache(executor);
+  if (cached?.signature === signature) {
+    return { flows: cached.flows, cacheHit: true, recordsRead: 0, truncated: cached.truncated };
+  }
+
+  const financialRecords = loadProviderFinancialRecordsSinceCategories(executor, requiredCategories, baselineAt, undefined, path);
+  const recordsRead = financialRecords.records.length;
+  const truncated = financialRecords.truncated;
+  const flows = truncated
+    ? { status: "UNVERIFIED" as const, netExternalInflows: "UNAVAILABLE" as const, unknownTypes: [] }
+    : calculateVerifiedExternalFlows(financialRecords.records, categories.map((category) => ({
+      complete: category.complete,
+      lastError: category.lastError,
+    })));
 
   saveExternalFlowReadModelCache(executor, { version: 1, signature, flows, truncated }, updatedAt);
   return { flows, cacheHit: false, recordsRead, truncated };

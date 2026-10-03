@@ -70,6 +70,24 @@ describe("provider live read path", () => {
 });
 
 describe("bounded Durable Object read paths", () => {
+  it("loads snapshot policy once and reuses its config for the provider and snapshot", async () => {
+    const ensureActivePolicy = vi.fn(() => policy);
+    const getDashboardSnapshot = vi.fn(async () => ({ ok: true }));
+    const fake = {
+      env: envWithThrowingDo(),
+      ensureActivePolicy,
+      getDashboardSnapshot,
+    };
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(portfolio);
+
+    const response = await TraderAgent.prototype.onRequest.call(fake as never, new Request("https://darwin.test/snapshot"));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+    expect(ensureActivePolicy).toHaveBeenCalledOnce();
+    expect(getDashboardSnapshot).toHaveBeenCalledWith(portfolio, expect.objectContaining({ ownerPolicy: policy }));
+  });
+
   it("rejects unauthenticated provider-ledger diagnostics before touching storage", async () => {
     const fake = { env: { OWNER_CONTROL_TOKEN: "configured" }, sql: () => { throw new Error("storage must not be read"); } };
     const response = await TraderAgent.prototype.onRequest.call(fake as never, new Request("https://darwin.test/provider-ledger"));
@@ -130,7 +148,7 @@ describe("bounded Durable Object read paths", () => {
     expect(snapshot.performance.totalTrades).toBeNull();
     expect(snapshot.scheduler).toMatchObject({ nextScanAt: null, nextScanStale: true, configuredIntervalMinutes: 15, matchingScheduleCount: 0, schedulerHealthy: true });
     expect(queries.filter((query) => query.includes("FROM events")).length).toBe(2);
-    expect(queries.filter((query) => query.includes("FROM risk_state")).length).toBe(10);
+    expect(queries.filter((query) => query.includes("FROM risk_state")).length).toBe(8);
     expect(queries.some((query) => /json_tree\s*\(/i.test(query) && /FROM\s+journals/i.test(query))).toBe(false);
     expect(queries.some((query) => /journal_decision_lookup_migration/i.test(query))).toBe(false);
     const journalReads = queries.filter((query) => /\bFROM\s+journals\b/i.test(query));
