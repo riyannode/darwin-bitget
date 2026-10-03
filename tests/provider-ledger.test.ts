@@ -15,6 +15,7 @@ import {
   loadProviderLifecycleEvidenceBatch,
   loadProviderLiveOpeningOrderIdentities,
   loadProviderPositionHistoriesPage,
+  loadProviderPositionHistoryDecisionIds,
   loadRecentProviderPositionHistories,
   loadProviderSyncState,
   MAX_PROVIDER_HISTORY_MS,
@@ -218,6 +219,26 @@ describe("provider ledger persistence and sync", () => {
       }
       expect(plan.some(({ detail }) => detail.includes("USE TEMP B-TREE FOR ORDER BY"))).toBe(false);
     }
+    db.close();
+  });
+
+  it("plans lifecycle identity lookup through exact symbol and opening-time indexes", () => {
+    const { db, executor, queries, queryParams } = memoryExecutor();
+    const queryOffset = queries.length;
+    loadProviderPositionHistoryDecisionIds(executor, category, [{
+      providerPositionHistoryId: "history-1",
+      symbol: "CRCLUSDT",
+      positionSide: "LONG",
+      openingTime: observedAt,
+    } as never]);
+    const queryIndex = queries.findIndex((query, index) => index >= queryOffset && query.includes("json_each"));
+    expect(queryIndex).toBeGreaterThanOrEqual(0);
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${queries[queryIndex]!}`).all(...queryParams[queryIndex]!.map((value) => typeof value === "boolean" ? Number(value) : value)) as Array<{ detail: string }>;
+    expect(plan.some(({ detail }) => detail.includes("provider_position_history_category_symbol_opening_idx") && detail.includes("opening_time=?"))).toBe(true);
+    expect(plan.some(({ detail }) => detail.includes("provider_fills_lifecycle_window_idx") && detail.includes("symbol=?") && detail.includes("created_time>?"))).toBe(true);
+    expect(plan.some(({ detail }) => detail.includes("provider_orders_client_oid_idx") && detail.includes("client_oid=?"))).toBe(true);
+    expect(plan.some(({ detail }) => detail.includes("provider_fills_category_created_idx"))).toBe(false);
+    expect(plan.some(({ detail }) => /\bSCAN (provider_position_history|provider_fills|provider_orders)\b/.test(detail))).toBe(false);
     db.close();
   });
 

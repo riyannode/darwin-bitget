@@ -78,12 +78,12 @@ import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../re
 import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
 import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } from "../trading/position-management.js";
-import { providerLedgerDiagnostics, providerLedgerDiagnosticsBatch, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadRecentProviderPositionHistories, loadProviderPositionHistoriesPage, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, providerLivePositionLifecycleKey, loadProviderSyncStates, loadProviderDataRevisions, type ProviderLifecycleEvidenceRequest, type ProviderPositionHistoryCursor } from "../storage/provider-ledger.js";
+import { providerLedgerDiagnostics, providerLedgerDiagnosticsBatch, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadRecentProviderPositionHistories, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, providerLivePositionLifecycleKey, loadProviderSyncStates, loadProviderDataRevisions, type ProviderLifecycleEvidenceRequest } from "../storage/provider-ledger.js";
 import { calculateNetPnlSinceBaseline, isFinancialRecordCoverageComplete } from "../trading/external-flow.js";
 import { resolveExternalFlowReadModel } from "../trading/external-flow-read-model.js";
 import { classifyProviderLifecycle, summarizeProviderLifecycleFillQuantities, type ProviderLifecycleClassification, type ProviderLifecycleHistory, type ProviderLifecycleEvidence, type ProviderLifecycleCandidateOrder, type ProviderLifecycleCandidateFill } from "../trading/provider-lifecycle-reconciliation.js";
-import { rebuildProviderPerformance, type ProviderPerformanceLifecycle, type ProviderPerformanceTotals } from "../trading/provider-performance.js";
-import { resolveProviderPerformanceReadModel } from "../trading/provider-performance-read-model.js";
+import { type ProviderPerformanceLifecycle, type ProviderPerformanceTotals } from "../trading/provider-performance.js";
+import { ProviderPerformanceMaterializationError, loadProviderPerformanceMaterializationState, providerPerformanceMigrationProgress, resolveProviderPerformanceMaterializedTotals, runProviderPerformanceMigrationBatch, type ProviderPerformanceLifecycleRow, type ProviderPerformanceRevisions } from "../trading/provider-performance-materializer.js";
 
 class ProviderLifecycleClassificationError extends Error {
   public constructor(readonly classification: ProviderLifecycleClassification, readonly reason: string) {
@@ -121,6 +121,35 @@ function ensureStorageInitialized(executor: SqlExecutor): void {
   if (initializedStorageExecutors.has(executor)) return;
   ensureStorage(executor);
   initializedStorageExecutors.add(executor);
+}
+
+function readProviderPerformanceRevisions(executor: SqlExecutor): ProviderPerformanceRevisions {
+  const revisions = loadProviderDataRevisions(executor, [PROVIDER_TRADE_LIFECYCLE_CATEGORY]).get(PROVIDER_TRADE_LIFECYCLE_CATEGORY);
+  if (!revisions) throw new Error("PROVIDER_DATA_REVISION_UNAVAILABLE");
+  return { lifecycleRevision: revisions.lifecycleRevision, identityRevision: revisions.identityRevision };
+}
+
+function resolveProviderPerformanceRows(
+  executor: SqlExecutor,
+  rows: readonly ProviderPerformanceLifecycleRow[],
+  path: string,
+): ReadonlyMap<string, ProviderPerformanceLifecycle | null> {
+  if (rows.length === 0) return new Map();
+  const histories = rows.filter((row) => row.category === PROVIDER_TRADE_LIFECYCLE_CATEGORY).map((row) => row.history);
+  const decisionIds = loadProviderPositionHistoryDecisionIds(executor, PROVIDER_TRADE_LIFECYCLE_CATEGORY, histories, path);
+  const resolved = resolveProviderTradeFacts(executor, [], PROVIDER_TRADE_LIFECYCLE_CATEGORY, [], {
+    histories,
+    historyDecisionIds: decisionIds,
+    openPositionIdentities: new Map<string, { providerOrderId: string; decisionId: string }>(),
+    queryPath: path,
+  });
+  const lifecycles = new Map<string, ProviderPerformanceLifecycle>();
+  for (const lifecycle of resolved.lifecycles) {
+    const previous = lifecycles.get(lifecycle.lifecycleId);
+    if (previous && JSON.stringify(previous) !== JSON.stringify(lifecycle)) throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_DUPLICATE_LIFECYCLE_CONTRADICTION");
+    lifecycles.set(lifecycle.lifecycleId, lifecycle);
+  }
+  return new Map(rows.map((row) => [row.historyKey, lifecycles.get(row.history.providerPositionHistoryId ?? "") ?? null]));
 }
 
 const MAX_FAILURE_DIAGNOSTIC_LENGTH = 240;
@@ -787,7 +816,12 @@ export class TraderAgent extends Agent<Env, AgentState> {
       } catch {
         livePortfolio = undefined;
       }
-      return json(await this.getDashboardSnapshot(livePortfolio, config));
+      try {
+        return json(await this.getDashboardSnapshot(livePortfolio, config));
+      } catch (error) {
+        if (error instanceof ProviderPerformanceMaterializationError) return json({ error: error.code }, 503);
+        throw error;
+      }
     }
     if (url.pathname === "/position-context" && request.method === "GET") return this.getPositionContext(url);
     if (url.pathname === "/agent-journal" && request.method === "GET") return this.getAgentJournal(url);
@@ -806,6 +840,32 @@ export class TraderAgent extends Agent<Env, AgentState> {
         rowCount: entry.counts.financialRecords,
         checkpoint: entry.sync?.checkpoints.financialRecords ?? null,
       })) });
+    }
+    if (url.pathname === "/provider-performance/rebuild" && request.method === "POST") {
+      const auth = authorizeOwner(request, this.env);
+      if (!auth.authorized) return json({ error: auth.code }, auth.status);
+      if (this.env.TRADING_MODE !== "PAPER" || this.env.PAPER_ONLY !== "true" || !this.state.paused || this.state.runtimeStatus !== "PAUSED") {
+        return json({ error: "PROVIDER_PERFORMANCE_REBUILD_REQUIRES_PAPER_PAUSED" }, 409);
+      }
+      ensureStorageInitialized(this);
+      const now = new Date().toISOString();
+      try {
+        const state = runProviderPerformanceMigrationBatch(
+          this,
+          (closure) => this.ctx.storage.transactionSync(closure),
+          PROVIDER_TRADE_LIFECYCLE_CATEGORY,
+          now,
+          () => readProviderPerformanceRevisions(this),
+          (rows, path) => resolveProviderPerformanceRows(this, rows, path),
+        );
+        return json({ source: "PROVIDER_LEDGER", ...providerPerformanceMigrationProgress(state) });
+      } catch (error) {
+        if (error instanceof ProviderPerformanceMaterializationError) {
+          const state = loadProviderPerformanceMaterializationState(this);
+          return json({ error: error.code, ...(state ? providerPerformanceMigrationProgress(state) : {}) }, 409);
+        }
+        throw error;
+      }
     }
     if (url.pathname === "/provider-ledger/backfill" && request.method === "POST") {
       const auth = authorizeOwner(request, this.env);
@@ -1380,35 +1440,14 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const dataRevisions = loadProviderDataRevisions(this, PROVIDER_FINANCIAL_CATEGORIES);
     const lifecycleRevisions = dataRevisions.get(PROVIDER_TRADE_LIFECYCLE_CATEGORY);
     if (!lifecycleRevisions) throw new Error("PROVIDER_DATA_REVISION_UNAVAILABLE");
-    const lifecyclePerformanceSignature = JSON.stringify({
-      version: 2,
-      category: PROVIDER_TRADE_LIFECYCLE_CATEGORY,
-      lifecycleRevision: lifecycleRevisions.lifecycleRevision,
-      identityRevision: lifecycleRevisions.identityRevision,
-    });
-    const closedProviderPerformance = resolveProviderPerformanceReadModel(
+    const closedProviderPerformance = resolveProviderPerformanceMaterializedTotals(
       this,
-      lifecyclePerformanceSignature,
+      (closure) => this.ctx.storage.transactionSync(closure),
+      PROVIDER_TRADE_LIFECYCLE_CATEGORY,
       livePortfolio?.observedAt ?? new Date().toISOString(),
-      () => {
-        const closedLifecycles: ProviderPerformanceLifecycle[] = [];
-        let cursor: ProviderPositionHistoryCursor | null = null;
-        while (true) {
-          const page = loadProviderPositionHistoriesPage(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, cursor, 100, "/api/snapshot");
-          const pageDecisionIds = loadProviderPositionHistoryDecisionIds(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, page.histories, "/api/snapshot");
-          const pageResolved = resolveProviderTradeFacts(this, [], PROVIDER_TRADE_LIFECYCLE_CATEGORY, [], {
-            histories: page.histories,
-            historyDecisionIds: pageDecisionIds,
-            openPositionIdentities: new Map<string, { providerOrderId: string; decisionId: string }>(),
-          });
-          closedLifecycles.push(...pageResolved.lifecycles.filter((lifecycle) => lifecycle.status === "CLOSED"));
-          if (!page.hasMore) break;
-          if (!page.nextCursor) throw new Error("PROVIDER_HISTORY_PAGE_CURSOR_MISSING");
-          cursor = page.nextCursor;
-        }
-        return rebuildProviderPerformance(closedLifecycles);
-      },
-    ).totals;
+      () => ({ lifecycleRevision: lifecycleRevisions.lifecycleRevision, identityRevision: lifecycleRevisions.identityRevision }),
+      (rows, path) => resolveProviderPerformanceRows(this, rows, path),
+    );
     const openPositionIdentities = livePortfolio
       ? loadProviderLiveOpeningOrderIdentities(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, livePortfolio.positions, "/api/snapshot")
       : new Map<string, { providerOrderId: string; decisionId: string }>();

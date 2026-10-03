@@ -8,6 +8,7 @@ import { TraderAgent, resolveProviderTradeFacts } from "../src/agent/agent.js";
 import { BitgetClient } from "../src/bitget/client.js";
 import { PROVIDER_FINANCIAL_CATEGORIES, syncProviderLedger } from "../src/bitget/provider-sync.js";
 import { rebuildProviderPerformance } from "../src/trading/provider-performance.js";
+import { loadProviderPerformanceMaterializationState } from "../src/trading/provider-performance-materializer.js";
 import type { PerformanceAggregate } from "../src/trading/performance.js";
 import type { PositionContext, TradeExperience, TradingJournal } from "../src/types.js";
 
@@ -80,11 +81,11 @@ function insertProviderEvidence(executor: SqlExecutor): void {
   });
 }
 
-function insertProviderHistoryFixtures(executor: SqlExecutor, count: number): void {
+function insertProviderHistoryFixtures(executor: SqlExecutor, count: number, offset = 0): void {
   const run = (sql: string, ...values: (string | null)[]) => executor.sql(sql.split("?") as unknown as TemplateStringsArray, ...values);
   const start = Date.parse("2026-09-22T00:00:00.000Z");
   for (let index = 0; index < count; index += 1) {
-    const suffix = String(index).padStart(3, "0");
+    const suffix = String(index + offset).padStart(3, "0");
     const id = `history-${suffix}`;
     const symbol = `STOCK${suffix}USDT`;
     const decisionId = `decision-${suffix}`;
@@ -148,9 +149,38 @@ async function invokeControl(agent: ReturnType<typeof fakeAgent>, authorized = t
   }));
 }
 
+async function runProviderPerformanceMigration(agent: ReturnType<typeof fakeAgent>, maximumCalls = 1_000): Promise<Record<string, unknown>> {
+  for (let attempt = 0; attempt < maximumCalls; attempt += 1) {
+    const response = await agent.onRequest.call(agent, new Request("https://example.test/provider-performance/rebuild", {
+      method: "POST",
+      headers: { authorization: `Bearer ${OWNER_TOKEN}` },
+    }));
+    const body = await response.json() as Record<string, unknown>;
+    if (response.status !== 200) throw new Error(String(body.error ?? `PROVIDER_PERFORMANCE_MIGRATION_HTTP_${response.status}`));
+    if (body.complete === true) return body;
+  }
+  throw new Error("PROVIDER_PERFORMANCE_MIGRATION_CALL_CAP_EXCEEDED");
+}
+
 afterEach(() => vi.restoreAllMocks());
 
 describe("provider-first financial lifecycle resolution", () => {
+  it("fails snapshot closed when the provider performance materialization is absent instead of replaying history", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    insertProviderEvidence(executor);
+    const agent = fakeAgent(executor, db, true);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    try {
+      const response = await agent.onRequest.call(agent, new Request("https://example.test/snapshot"));
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({ error: "PROVIDER_PERFORMANCE_MIGRATION_REQUIRED" });
+      expect(queries.some((query) => query.includes("FROM provider_position_history") && query.includes("ORDER BY opening_time"))).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
   it("keeps a provider-confirmed closed DARWIN lifecycle in performance and trade history without TradeExperience or PositionContext", async () => {
     const { db, executor } = memoryExecutor();
     insertProviderEvidence(executor);
@@ -1634,7 +1664,7 @@ describe("provider-first financial lifecycle resolution", () => {
     db.close();
   });
 
-  it("rebuilds stale provider lifecycle performance while retaining Samsung closed and three live DARWIN positions open", async () => {
+  it("materializes closed provider lifecycle performance through the explicit owner migration", async () => {
     const { db, executor } = memoryExecutor();
     insertProviderEvidence(executor);
     const livePositions = [
@@ -1654,12 +1684,72 @@ describe("provider-first financial lifecycle resolution", () => {
     const signature = JSON.stringify({ version: 1, category: "USDT-FUTURES", revision: sync?.revision ?? null, updatedAt: sync?.updatedAt ?? null, lastSuccessfulSyncAt: sync?.lastSuccessfulSyncAt ?? null, lastError: sync?.lastError ?? null, checkpoints: sync?.checkpoints ?? {} });
     saveProviderLifecyclePerformanceReadModelCache(executor, { version: 1, semanticVersion: 1, signature, totals: rebuildProviderPerformance([]) }, OPENED_AT);
     const agent = fakeAgent(executor, db, true);
+    const migration = await runProviderPerformanceMigration(agent);
+    expect(migration).toMatchObject({ complete: true, phase: "READY", scannedHistories: 1 });
     const snapshot = await agent.getDashboardSnapshot.call(agent, { positions: livePositions, portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
-    const refreshedCache = loadProviderLifecyclePerformanceReadModelCache(executor);
+    const materialized = loadProviderPerformanceMaterializationState(executor);
     const journalAfter = executor.sql<{ payload: string }>`SELECT payload FROM journals WHERE cycle_id = ${journal.cycleId}`[0]?.payload;
     expect(snapshot.performance).toMatchObject({ financialSource: "PROVIDER_LEDGER", closedTrades: 1, openTrades: 3, totalTrades: 4, wins: 1, verifiedRealizedPnl: "33.19485709" });
-    expect(refreshedCache).toMatchObject({ semanticVersion: 2, totals: { closedTrades: 1, verifiedRealizedPnl: "33.19485709" } });
+    expect(materialized).toMatchObject({ phase: "READY", totals: { closedTrades: 1, verifiedRealizedPnl: "33.19485709" } });
     expect(journalAfter).toBe(journalBefore);
+    db.close();
+  });
+
+  it("adds one newly closed lifecycle once and reuses its persisted aggregate after executor restart", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    insertProviderHistoryFixtures(executor, 1);
+    const agent = fakeAgent(executor, db, true);
+    await runProviderPerformanceMigration(agent);
+    const beforeNewLifecycle = queries.length;
+    insertProviderHistoryFixtures(executor, 1, 1_000);
+
+    const updated = await agent.getDashboardSnapshot.call(agent, { positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    expect(updated.performance).toMatchObject({ closedTrades: 2, totalTrades: 2, wins: 2, verifiedRealizedPnl: "2" });
+    const lifecycleQueries = queries.slice(beforeNewLifecycle);
+    expect(lifecycleQueries.some((query) => /FROM provider_position_history\s+WHERE category = \?\s+ORDER BY opening_time/i.test(query))).toBe(false);
+    expect(lifecycleQueries.some((query) => /FROM provider_position_history\s+WHERE provider_position_history_key IN/i.test(query))).toBe(true);
+
+    const afterIncrement = loadProviderPerformanceMaterializationState(executor)?.totals;
+    const restartedAgent = fakeAgent(executor, db, true);
+    const beforeRepeat = queries.length;
+    const repeated = await restartedAgent.getDashboardSnapshot.call(restartedAgent, { positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    expect(repeated.performance).toMatchObject({ closedTrades: 2, totalTrades: 2, wins: 2, verifiedRealizedPnl: "2" });
+    expect(loadProviderPerformanceMaterializationState(executor)?.totals).toEqual(afterIncrement);
+    expect(queries.slice(beforeRepeat).some((query) => query.includes("FROM provider_position_history"))).toBe(false);
+    db.close();
+  });
+
+  it("uses the time-window indexes for bounded lifecycle change reconciliation", () => {
+    const { db } = memoryExecutor();
+    const openPlan = db.prepare(`EXPLAIN QUERY PLAN
+      SELECT provider_position_history_key FROM provider_position_history
+      WHERE category = ? AND symbol = ? AND opening_time >= ? AND opening_time <= ?
+      ORDER BY opening_time, provider_position_history_key LIMIT 21
+    `).all("USDT-FUTURES", "SAMSUNGUSDT", OPENED_AT, CLOSED_AT) as Array<{ detail: string }>;
+    const closePlan = db.prepare(`EXPLAIN QUERY PLAN
+      SELECT provider_position_history_key FROM provider_position_history
+      WHERE category = ? AND symbol = ? AND closing_time >= ? AND closing_time <= ?
+      ORDER BY closing_time, provider_position_history_key LIMIT 21
+    `).all("USDT-FUTURES", "SAMSUNGUSDT", OPENED_AT, CLOSED_AT) as Array<{ detail: string }>;
+
+    expect(openPlan.some(({ detail }) => detail.includes("provider_position_history_category_symbol_opening_idx"))).toBe(true);
+    expect(closePlan.some(({ detail }) => detail.includes("provider_position_history_category_symbol_closing_idx"))).toBe(true);
+    db.close();
+  });
+
+  it("keeps initialized snapshot reads independent of hundreds of historical lifecycle rows", async () => {
+    const { db, executor, queries } = memoryExecutor();
+    insertProviderHistoryFixtures(executor, 500);
+    const agent = fakeAgent(executor, db, true);
+    const migration = await runProviderPerformanceMigration(agent);
+    expect(migration).toMatchObject({ complete: true, phase: "READY", scannedHistories: 500 });
+
+    const beforeSnapshot = queries.length;
+    const snapshot = await agent.getDashboardSnapshot.call(agent, { positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+    const snapshotQueries = queries.slice(beforeSnapshot);
+    expect(snapshot.performance).toMatchObject({ closedTrades: 500, totalTrades: 500, wins: 500, verifiedRealizedPnl: "500" });
+    expect(snapshotQueries.some((query) => query.includes("FROM provider_position_history"))).toBe(false);
+    expect(snapshotQueries.length).toBeLessThan(100);
     db.close();
   });
 
@@ -1686,6 +1776,7 @@ describe("provider-first financial lifecycle resolution", () => {
     `;
     insertFinancial("snapshot-flow-in", "TRANSFER_IN", "5");
     agent.persistPerformanceEquity.call(agent, "1000", observedAt);
+    await runProviderPerformanceMigration(agent);
     const portfolio = { positions: [], portfolioEquity: "1000", observedAt } as never;
     const recordReadCount = () => queries.filter((query) => query.includes("FROM provider_financial_records")).length;
     const historyReadCount = () => queries.filter((query) => query.includes("FROM provider_position_history")).length;
@@ -1695,7 +1786,7 @@ describe("provider-first financial lifecycle resolution", () => {
     expect(first.performance.closedTrades).toBe(1);
     expect(first.accountPerformance).toMatchObject({ externalFlowStatus: "VERIFIED", netExternalInflows: "5" });
     expect(recordReadCount() - beforeFirst).toBe(PROVIDER_FINANCIAL_CATEGORIES.length);
-    expect(historyReadCount() - beforeFirstHistory).toBeGreaterThan(0);
+    expect(historyReadCount() - beforeFirstHistory).toBe(0);
 
     const beforeRepeat = recordReadCount();
     const beforeRepeatHistory = historyReadCount();
@@ -1708,6 +1799,7 @@ describe("provider-first financial lifecycle resolution", () => {
 
     const syncState = loadProviderSyncState(executor, "USDT-FUTURES")!;
     const revisionsBeforeNoopSync = loadProviderDataRevisions(executor, ["USDT-FUTURES"]).get("USDT-FUTURES")!;
+    const materializedBeforeNoopSync = loadProviderPerformanceMaterializationState(executor)!;
     const noOpClient = {
       getOrderHistoryRead: async () => ({ data: { list: [], cursor: null } }),
       getFillHistoryWindowRead: async () => ({ data: { list: [], cursor: null } }),
@@ -1728,6 +1820,11 @@ describe("provider-first financial lifecycle resolution", () => {
     const beforeNoopSyncHistory = historyReadCount();
     const afterNoopSync = await agent.getDashboardSnapshot.call(agent, portfolio);
     expect(afterNoopSync.performance.closedTrades).toBe(1);
+    expect(loadProviderPerformanceMaterializationState(executor)).toMatchObject({
+      lifecycleRevision: materializedBeforeNoopSync.lifecycleRevision,
+      identityRevision: materializedBeforeNoopSync.identityRevision,
+      totals: materializedBeforeNoopSync.totals,
+    });
     expect(recordReadCount() - beforeNoopSyncSnapshot).toBe(0);
     expect(historyReadCount() - beforeNoopSyncHistory).toBe(0);
 
@@ -1739,11 +1836,13 @@ describe("provider-first financial lifecycle resolution", () => {
     expect(recordReadCount() - beforeInvalidation).toBe(PROVIDER_FINANCIAL_CATEGORIES.length);
     expect(historyReadCount() - beforeInvalidatedHistory).toBe(0);
 
-    db.prepare("UPDATE provider_position_history SET net_profit = ? WHERE provider_position_history_id = ?").run("34.19485709", HISTORY_ID);
+    db.prepare("UPDATE provider_position_history SET net_profit = ? WHERE provider_position_history_id = ?").run("-34.19485709", HISTORY_ID);
+    const beforeLifecycleChangeQueries = queries.length;
     const beforeLifecycleChangeSnapshot = historyReadCount();
     const lifecycleChanged = await agent.getDashboardSnapshot.call(agent, portfolio);
-    expect(lifecycleChanged.performance.closedTrades).toBe(1);
+    expect(lifecycleChanged.performance).toMatchObject({ closedTrades: 1, wins: 0, losses: 1, verifiedRealizedPnl: "-34.19485709" });
     expect(historyReadCount() - beforeLifecycleChangeSnapshot).toBeGreaterThan(0);
+    expect(queries.slice(beforeLifecycleChangeQueries).some((query) => /FROM provider_position_history\s+WHERE category = \?/i.test(query))).toBe(false);
     const beforeLifecycleCacheHit = historyReadCount();
     await agent.getDashboardSnapshot.call(agent, portfolio);
     expect(historyReadCount() - beforeLifecycleCacheHit).toBe(0);
@@ -1799,21 +1898,23 @@ describe("provider-first financial lifecycle resolution", () => {
     expect(samsung?.realizedPnl).not.toBe("19.1364");
 
     const originalSql = agent.sql;
-    let performanceCacheWrites = 0;
     let injectedFailure = false;
     agent.sql = ((strings: TemplateStringsArray, ...values: unknown[]) => {
       const query = strings.join("?");
-      if (query.includes("INSERT INTO risk_state")) {
-        performanceCacheWrites += 1;
-        if (performanceCacheWrites === 2 && !injectedFailure) {
-          injectedFailure = true;
-          throw new Error("performance-rebuild-fault");
-        }
+      if (query.includes("INSERT INTO provider_performance_generation_groups") && !injectedFailure) {
+        injectedFailure = true;
+        throw new Error("performance-rebuild-fault");
       }
       return originalSql(strings, ...values as (string | number | boolean | null)[]);
     }) as typeof agent.sql;
-    await expect(agent.getDashboardSnapshot.call(agent, { positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never)).rejects.toThrow("performance-rebuild-fault");
+    await expect(agent.onRequest.call(agent, new Request("https://example.test/provider-performance/rebuild", {
+      method: "POST",
+      headers: { authorization: `Bearer ${OWNER_TOKEN}` },
+    }))).rejects.toThrow("performance-rebuild-fault");
     expect(injectedFailure).toBe(true);
+    agent.sql = originalSql;
+    const migration = await runProviderPerformanceMigration(agent);
+    expect(migration).toMatchObject({ complete: true, phase: "READY", scannedHistories: 1 });
 
     const snapshot = await agent.getDashboardSnapshot.call(agent, { positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
     expect(snapshot.performance).toMatchObject({ financialSource: "PROVIDER_LEDGER", scope: "DARWIN_ATTRIBUTED", totalTrades: 1, openTrades: 0, closedTrades: 1, wins: 1, losses: 0, breakeven: 0, totalPnl: "33.19485709", closedEpisodeRealizedPnl: "33.19485709", verifiedRealizedPnl: "33.19485709" });

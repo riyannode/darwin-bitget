@@ -88,11 +88,42 @@ describe("bounded Durable Object read paths", () => {
     expect(getDashboardSnapshot).toHaveBeenCalledWith(portfolio, expect.objectContaining({ ownerPolicy: policy }));
   });
 
+  it("routes owner lifecycle-performance maintenance to the Durable Object only", async () => {
+    let forwardedPath = "";
+    const namespace = {
+      idFromName: () => "primary",
+      get: () => ({ fetch: async (request: Request) => { forwardedPath = new URL(request.url).pathname; return Response.json({ ok: true }); } }),
+    };
+    const env = { ...envWithThrowingDo(), TRADER_AGENT: namespace } as unknown as Env;
+    const response = await server.fetch(new Request("https://darwin.test/api/provider-performance/rebuild", { method: "POST" }), env);
+
+    expect(response.status).toBe(200);
+    expect(forwardedPath).toBe("/provider-performance/rebuild");
+  });
+
   it("rejects unauthenticated provider-ledger diagnostics before touching storage", async () => {
     const fake = { env: { OWNER_CONTROL_TOKEN: "configured" }, sql: () => { throw new Error("storage must not be read"); } };
     const response = await TraderAgent.prototype.onRequest.call(fake as never, new Request("https://darwin.test/provider-ledger"));
     expect(response.status).toBe(401);
     expect(await response.json()).toEqual({ error: "OWNER_AUTH_REQUIRED" });
+  });
+
+  it("requires owner auth and PAPER plus PAUSED before lifecycle-performance migration reads", async () => {
+    const fake = {
+      env: { OWNER_CONTROL_TOKEN: "configured", TRADING_MODE: "PAPER", PAPER_ONLY: "true" },
+      state: { paused: false, runtimeStatus: "ONLINE" },
+      sql: () => { throw new Error("storage must not be read"); },
+    };
+    const unauthenticated = await TraderAgent.prototype.onRequest.call(fake as never, new Request("https://darwin.test/provider-performance/rebuild", { method: "POST" }));
+    expect(unauthenticated.status).toBe(401);
+    expect(await unauthenticated.json()).toEqual({ error: "OWNER_AUTH_REQUIRED" });
+
+    const notPaused = await TraderAgent.prototype.onRequest.call(fake as never, new Request("https://darwin.test/provider-performance/rebuild", {
+      method: "POST",
+      headers: { authorization: "Bearer configured" },
+    }));
+    expect(notPaused.status).toBe(409);
+    expect(await notPaused.json()).toEqual({ error: "PROVIDER_PERFORMANCE_REBUILD_REQUIRES_PAPER_PAUSED" });
   });
 
   it("has no scheduled historical journal migration callback", () => {
@@ -122,9 +153,35 @@ describe("bounded Durable Object read paths", () => {
 
   it("keeps snapshot reads lightweight and reuses one bounded event result", async () => {
     const queries: string[] = [];
+    const materializedTotals = {
+      source: "PROVIDER_LEDGER",
+      closedTrades: 0,
+      openTrades: 0,
+      totalTrades: 0,
+      wins: 0,
+      losses: 0,
+      breakeven: 0,
+      closedEpisodeRealizedPnl: "0",
+      verifiedRealizedPnl: "0",
+      unresolvedClosedLifecycles: 0,
+      dailyPnl: {},
+    };
+    const materialization = {
+      version: 1,
+      generation: "test-generation",
+      phase: "READY",
+      cursor: null,
+      queueCursor: 0,
+      scannedHistories: 0,
+      lifecycleRevision: 0,
+      identityRevision: 0,
+      realizedPnlAccumulator: "0",
+      totals: materializedTotals,
+    };
     const fake = {
       env: { TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_CATEGORY: "USDT-FUTURES" },
       state: { runtimeStatus: "ONLINE", currentStage: "ONLINE", lastScanAt: null, nextScanAt: null, model: "qwen", temporaryScanIntervalExpiresAt: null, temporaryScanIntervalCompleted: true, paused: true, emergencyStop: false, lastStatus: "IDLE", cycleStartedAt: null },
+      ctx: { storage: { transactionSync: <T>(closure: () => T) => closure() } },
       ensureActivePolicy: () => policy,
       activeScanIntervalMinutes: () => 15,
       listSchedules: async () => [],
@@ -135,6 +192,8 @@ describe("bounded Durable Object read paths", () => {
         const query = strings.reduce((query, part, index) => query + part + (index < values.length ? "?" : ""), "");
         queries.push(query);
         if (query.includes("provider_data_revisions AS data")) return PROVIDER_FINANCIAL_CATEGORIES.map((category) => ({ category, lifecycle_revision: 0, financial_revision: 0, identity_revision: 0 })) as T[];
+        if (query.includes("SELECT payload FROM risk_state WHERE state_key = ? LIMIT 1")) return [{ payload: JSON.stringify(materialization) }] as T[];
+        if (query.includes("FROM provider_performance_change_queue")) return [] as T[];
         return [];
       },
     };

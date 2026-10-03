@@ -316,6 +316,7 @@ export interface ProviderPositionHistoryCursor {
 
 export interface ProviderPositionHistoryPage {
   histories: ProviderLifecycleHistory[];
+  historyKeys: string[];
   nextCursor: ProviderPositionHistoryCursor | null;
   hasMore: boolean;
 }
@@ -367,6 +368,7 @@ export function loadProviderPositionHistoriesPage(
   const lastRow = pageRows[pageRows.length - 1];
   return {
     histories: pageRows.map(mapProviderPositionHistoryRow),
+    historyKeys: pageRows.map((row) => row.provider_position_history_key),
     nextCursor: hasMore && lastRow ? { openingTime: lastRow.opening_time, providerPositionHistoryKey: lastRow.provider_position_history_key } : null,
     hasMore,
   };
@@ -412,12 +414,12 @@ export function loadProviderPositionHistoryDecisionIds(
         o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side, o.origin AS order_origin,
         f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side, f.origin AS fill_origin
       FROM json_each(${JSON.stringify(batch)}) AS requested
-      JOIN provider_position_history AS h ON h.category = ${category}
+      CROSS JOIN provider_position_history AS h INDEXED BY provider_position_history_category_symbol_opening_idx ON h.category = ${category}
         AND h.provider_position_history_id = json_extract(requested.value, '$.id')
         AND h.symbol = json_extract(requested.value, '$.symbol')
         AND UPPER(h.position_side) = UPPER(json_extract(requested.value, '$.positionSide'))
         AND h.opening_time = json_extract(requested.value, '$.openingTime')
-      JOIN provider_fills AS f ON f.category = h.category AND f.symbol = h.symbol
+      CROSS JOIN provider_fills AS f INDEXED BY provider_fills_lifecycle_window_idx ON f.category = h.category AND f.symbol = h.symbol
         AND UPPER(f.pos_side) = UPPER(h.position_side)
         AND f.created_time >= json_extract(requested.value, '$.from')
         AND f.created_time <= json_extract(requested.value, '$.to')
