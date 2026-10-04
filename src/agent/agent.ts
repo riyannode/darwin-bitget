@@ -78,7 +78,7 @@ import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../re
 import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
 import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } from "../trading/position-management.js";
-import { providerLedgerDiagnostics, providerLedgerDiagnosticsBatch, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadRecentProviderPositionHistories, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, providerLivePositionLifecycleKey, loadProviderSyncStates, loadProviderDataRevisions, type ProviderLifecycleEvidenceRequest } from "../storage/provider-ledger.js";
+import { providerLedgerDiagnostics, providerLedgerDiagnosticsBatch, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadRecentProviderPositionHistories, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, providerLivePositionLifecycleKey, loadProviderSyncStates, loadProviderDataRevisions, ProviderLifecycleIdentityLookupError, type ProviderLifecycleEvidenceRequest } from "../storage/provider-ledger.js";
 import { calculateNetPnlSinceBaseline, isFinancialRecordCoverageComplete } from "../trading/external-flow.js";
 import { resolveExternalFlowReadModel } from "../trading/external-flow-read-model.js";
 import { classifyProviderLifecycle, summarizeProviderLifecycleFillQuantities, type ProviderLifecycleClassification, type ProviderLifecycleHistory, type ProviderLifecycleEvidence, type ProviderLifecycleCandidateOrder, type ProviderLifecycleCandidateFill } from "../trading/provider-lifecycle-reconciliation.js";
@@ -136,7 +136,13 @@ function resolveProviderPerformanceRows(
 ): ReadonlyMap<string, ProviderPerformanceLifecycle | null> {
   if (rows.length === 0) return new Map();
   const histories = rows.filter((row) => row.category === PROVIDER_TRADE_LIFECYCLE_CATEGORY).map((row) => row.history);
-  const decisionIds = loadProviderPositionHistoryDecisionIds(executor, PROVIDER_TRADE_LIFECYCLE_CATEGORY, histories, path);
+  let decisionIds: Map<string, string>;
+  try {
+    decisionIds = loadProviderPositionHistoryDecisionIds(executor, PROVIDER_TRADE_LIFECYCLE_CATEGORY, histories, path);
+  } catch (error) {
+    if (error instanceof ProviderLifecycleIdentityLookupError) throw new ProviderPerformanceMaterializationError(error.code);
+    throw error;
+  }
   const resolved = resolveProviderTradeFacts(executor, [], PROVIDER_TRADE_LIFECYCLE_CATEGORY, [], {
     histories,
     historyDecisionIds: decisionIds,

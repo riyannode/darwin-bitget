@@ -80,6 +80,12 @@ interface ProviderDataRevisionRow {
   identity_revision: number;
 }
 
+export class ProviderLifecycleIdentityLookupError extends Error {
+  public constructor(readonly code: string) {
+    super(code);
+  }
+}
+
 export interface ProviderDataRevisions {
   lifecycleRevision: number;
   financialRevision: number;
@@ -436,7 +442,7 @@ export function loadProviderPositionHistoryDecisionIds(
       WHERE h.category = ${category} AND h.provider_position_history_id IS NOT NULL
       LIMIT ${maxRowsPerBatch + 1}
     `;
-    if (rows.length > maxRowsPerBatch) continue;
+    if (rows.length > maxRowsPerBatch) throw new ProviderLifecycleIdentityLookupError("PROVIDER_LIFECYCLE_IDENTITY_LOOKUP_CAP_EXCEEDED");
     for (const row of rows) {
       const candidate = JSON.stringify([row.decision_id, row.provider_order_id, row.client_oid, row.order_origin, row.fill_origin]);
       const identities = identitiesByHistory.get(row.history_id) ?? new Map<string, boolean>();
@@ -495,16 +501,13 @@ export function loadProviderLiveOpeningOrderIdentities(
         o.side AS order_side, o.pos_side AS order_pos_side, o.trade_side AS order_trade_side, o.origin AS order_origin,
         f.side AS fill_side, f.pos_side AS fill_pos_side, f.trade_side AS fill_trade_side, f.origin AS fill_origin
       FROM json_each(${JSON.stringify(batch)}) AS requested
-      JOIN provider_orders AS o ON o.category = ${category} AND o.symbol = json_extract(requested.value, '$.symbol')
-        AND UPPER(o.pos_side) = UPPER(json_extract(requested.value, '$.positionSide'))
-        AND o.created_time >= json_extract(requested.value, '$.from')
-        AND o.created_time <= json_extract(requested.value, '$.to')
-      JOIN provider_fills AS f ON f.category = o.category AND f.provider_order_id = o.provider_order_id
-        AND f.client_oid = o.client_oid AND f.symbol = o.symbol AND UPPER(f.pos_side) = UPPER(o.pos_side)
-        AND f.origin = o.origin
+      CROSS JOIN provider_fills AS f INDEXED BY provider_fills_lifecycle_window_idx ON f.category = ${category} AND f.symbol = json_extract(requested.value, '$.symbol')
         AND f.created_time >= json_extract(requested.value, '$.from')
         AND f.created_time <= json_extract(requested.value, '$.to')
         AND ABS((julianday(f.created_time) - julianday(json_extract(requested.value, '$.openedAt'))) * 86400.0) <= ${PROVIDER_LIFECYCLE_TIME_TOLERANCE_MS / 1_000}
+      CROSS JOIN provider_orders AS o INDEXED BY sqlite_autoindex_provider_orders_1 ON o.provider_order_id = f.provider_order_id
+        AND o.category = f.category AND o.client_oid = f.client_oid AND o.symbol = f.symbol
+        AND UPPER(o.pos_side) = UPPER(f.pos_side) AND o.origin = f.origin
       JOIN idempotency AS i ON i.client_order_id = o.client_oid
         AND i.client_order_id <> '' AND i.client_order_id = TRIM(i.client_order_id)
         AND ((i.provider_order_id IS NOT NULL AND i.provider_order_id <> '' AND i.provider_order_id = TRIM(i.provider_order_id) AND i.provider_order_id = o.provider_order_id)

@@ -117,7 +117,10 @@ export function startProviderPerformanceMigration(
 ): ProviderPerformanceMaterializationState {
   return transactionSync(() => {
     const current = loadProviderPerformanceMaterializationState(executor);
-    if (current && current.phase !== "RECONCILIATION_REQUIRED") return current;
+    if (current?.phase === "RECONCILIATION_REQUIRED") {
+      throw new ProviderPerformanceMaterializationError(current.errorCode ?? "PROVIDER_PERFORMANCE_RECONCILIATION_REQUIRED");
+    }
+    if (current) return current;
     const watermark = executor.sql<{ change_id: number }>`SELECT COALESCE(MAX(change_id), 0) AS change_id FROM provider_performance_change_queue`[0]?.change_id ?? 0;
     const state: ProviderPerformanceMaterializationState = {
       version: PROVIDER_PERFORMANCE_MATERIALIZATION_VERSION,
