@@ -28,6 +28,15 @@ interface ExperienceRow {
   payload: string;
 }
 
+export interface ExecutionQuarantine {
+  symbol: string;
+  decisionId: string;
+  cycleId: string;
+  clientOrderId: string;
+  reason: string;
+  createdAt: string;
+}
+
 interface RiskStateRow {
   payload: string;
 }
@@ -38,6 +47,10 @@ interface PositionContextRow {
 
 interface JournalRow {
   payload: string;
+}
+
+interface JournalPageRow extends JournalRow {
+  cycle_id: string;
 }
 
 interface ExactJournalRow extends JournalRow {
@@ -691,6 +704,52 @@ export function loadRecentJournals(executor: SqlExecutor, limit = 50): TradingJo
   });
 }
 
+export interface ExecutionQuarantineBackfillState {
+  complete: boolean;
+  cursor: string | null;
+}
+
+export function loadExecutionQuarantineBackfillState(executor: SqlExecutor): ExecutionQuarantineBackfillState {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = 'execution_quarantine_backfill_v1'`;
+  try {
+    const value: unknown = JSON.parse(rows[0]?.payload ?? "");
+    if (typeof value !== "object" || value === null) return { complete: false, cursor: null };
+    const state = value as Record<string, unknown>;
+    return { complete: state.complete === true, cursor: typeof state.cursor === "string" ? state.cursor : null };
+  } catch {
+    return { complete: false, cursor: null };
+  }
+}
+
+export function saveExecutionQuarantineBackfillState(executor: SqlExecutor, state: ExecutionQuarantineBackfillState, updatedAt: string): void {
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES ('execution_quarantine_backfill_v1', ${JSON.stringify(state)}, ${updatedAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+}
+
+export function loadJournalBackfillPage(
+  executor: SqlExecutor,
+  afterCycleId: string | null,
+  limit = 50,
+): { journals: TradingJournal[]; nextCursor: string | null; hasMore: boolean } {
+  const pageLimit = clampHistoryLimit(limit, 50);
+  const rows = afterCycleId === null
+    ? executor.sql<JournalPageRow>`SELECT cycle_id, payload FROM journals ORDER BY cycle_id ASC LIMIT ${pageLimit + 1}`
+    : executor.sql<JournalPageRow>`SELECT cycle_id, payload FROM journals WHERE cycle_id > ${afterCycleId} ORDER BY cycle_id ASC LIMIT ${pageLimit + 1}`;
+  const hasMore = rows.length > pageLimit;
+  const pageRows = hasMore ? rows.slice(0, pageLimit) : rows;
+  const journals = pageRows.flatMap((row) => {
+    try {
+      return [JSON.parse(row.payload) as TradingJournal];
+    } catch {
+      return [];
+    }
+  });
+  return { journals, nextCursor: pageRows[pageRows.length - 1]?.cycle_id ?? afterCycleId, hasMore };
+}
+
 export function loadAllAutonomousJournals(executor: SqlExecutor, from?: string, to?: string): TradingJournal[] {
   const rows = from && to
     ? executor.sql<JournalRow>`SELECT payload FROM journals WHERE created_at >= ${from} AND created_at <= ${to} ORDER BY created_at ASC, cycle_id ASC`
@@ -840,6 +899,53 @@ export function loadAllEvents(executor: SqlExecutor): ActivityEvent[] {
       return [];
     }
   });
+}
+
+const EXECUTION_QUARANTINE_STATE_KEY = "unresolved_execution_quarantine";
+
+export function loadExecutionQuarantines(executor: SqlExecutor): ExecutionQuarantine[] {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${EXECUTION_QUARANTINE_STATE_KEY}`;
+  if (rows.length === 0) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rows[0]!.payload);
+  } catch {
+    throw new Error("EXECUTION_QUARANTINE_STATE_INVALID");
+  }
+  if (!Array.isArray(parsed) || parsed.some((item) => !item || typeof item !== "object"
+    || typeof item.symbol !== "string" || typeof item.decisionId !== "string" || typeof item.cycleId !== "string"
+    || typeof item.clientOrderId !== "string" || typeof item.reason !== "string" || typeof item.createdAt !== "string")) {
+    throw new Error("EXECUTION_QUARANTINE_STATE_INVALID");
+  }
+  return parsed as ExecutionQuarantine[];
+}
+
+export function saveExecutionQuarantine(executor: SqlExecutor, quarantine: ExecutionQuarantine, updatedAt = quarantine.createdAt): void {
+  const existing = loadExecutionQuarantines(executor);
+  const next = [...existing.filter((item) => item.symbol !== quarantine.symbol), quarantine];
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${EXECUTION_QUARANTINE_STATE_KEY}, ${JSON.stringify(next)}, ${updatedAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+}
+
+export function clearExecutionQuarantine(
+  executor: SqlExecutor,
+  identity: Pick<ExecutionQuarantine, "symbol" | "decisionId" | "cycleId" | "clientOrderId">,
+  updatedAt: string,
+): boolean {
+  const existing = loadExecutionQuarantines(executor);
+  const match = existing.find((item) => item.symbol === identity.symbol && item.decisionId === identity.decisionId
+    && item.cycleId === identity.cycleId && item.clientOrderId === identity.clientOrderId);
+  if (!match) return false;
+  const next = existing.filter((item) => item !== match);
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${EXECUTION_QUARANTINE_STATE_KEY}, ${JSON.stringify(next)}, ${updatedAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+  return true;
 }
 
 export function recordProviderOrderReference(executor: SqlExecutor, clientOrderId: string, providerOrderId: string): void {

@@ -9,6 +9,7 @@ export interface CyclePlanExecutionCallbacks {
   persist: (record: DecisionExecutionRecord, bundle: EvidenceBundle) => Promise<void>;
   refreshPortfolio: () => Promise<AccountSnapshot>;
   onAmbiguousWrite?: (record: DecisionExecutionRecord) => void;
+  onEvidenceUnavailable?: (decision: Decision, parent?: Decision) => void;
 }
 
 export interface CyclePlanExecutionResult {
@@ -38,23 +39,11 @@ function symbolStillOpen(account: AccountSnapshot, decision: Decision): boolean 
   return account.positions.some((position) => position.symbol === decision.symbol && Number(position.quantity) > 0);
 }
 
-function stageFailure(stage: string, error: unknown, symbol?: string): Error {
+function stageFailure(stage: string, error: unknown): Error {
   const rawCause = error instanceof Error ? error.message : "Unknown runtime error";
   const safeCause = safeDiagnosticMessage(rawCause, "Runtime error");
-  const safeSymbol = symbol ? safeDiagnosticMessage(symbol, "UNKNOWN_SYMBOL").slice(0, 80) : "";
-  return new Error(`${stage}${safeSymbol ? `:${safeSymbol}` : ""}:${safeCause}`);
+  return new Error(`${stage}:${safeCause}`);
 }
-
-async function refreshEvidence(callbacks: CyclePlanExecutionCallbacks, symbol: string): Promise<EvidenceBundle> {
-  try {
-    const bundle = await callbacks.refreshEvidence(symbol);
-    if (!bundle) throw new Error("EVIDENCE_READBACK_UNAVAILABLE");
-    return bundle;
-  } catch (error) {
-    throw stageFailure("EVIDENCE_REFRESH_FAILED", error, symbol);
-  }
-}
-
 async function refreshPortfolio(callbacks: CyclePlanExecutionCallbacks): Promise<AccountSnapshot> {
   try {
     return await callbacks.refreshPortfolio();
@@ -80,9 +69,13 @@ export async function executeCyclePlan(plan: CycleDecisionPlan, callbacks: Cycle
     if (persisted.executionResult) financialWrites += 1;
     return persisted;
   };
-  const executeOne = async (decision: Decision, actionCategory: "POSITION_MANAGEMENT" | "NEW_ENTRY", parent?: Decision): Promise<{ record: DecisionExecutionRecord; bundle: EvidenceBundle }> => {
+  const executeOne = async (decision: Decision, actionCategory: "POSITION_MANAGEMENT" | "NEW_ENTRY", parent?: Decision): Promise<{ record: DecisionExecutionRecord; bundle: EvidenceBundle } | { skipped: true }> => {
     if (financialWriteCount(decision.action) > 0 && financialWrites >= MAX_FINANCIAL_WRITES_PER_CYCLE) throw new Error("MAX_FINANCIAL_WRITES_PER_CYCLE");
-    const bundle = await refreshEvidence(callbacks, decision.symbol);
+    const bundle = await callbacks.refreshEvidence(decision.symbol);
+    if (!bundle) {
+      callbacks.onEvidenceUnavailable?.(decision, parent);
+      return { skipped: true };
+    }
     const record = withParent(await callbacks.execute(decision, bundle, actionCategory, parent), parent);
     await persistRecord(record, bundle);
     return { record, bundle };
@@ -91,6 +84,8 @@ export async function executeCyclePlan(plan: CycleDecisionPlan, callbacks: Cycle
   for (const decision of orderCycleActions(plan)) {
     if (decision.action === "REVERSE") {
       const close = await executeOne(reverseLeg(decision, "CLOSE"), "POSITION_MANAGEMENT", decision);
+      if ("skipped" in close) continue;
+      if (!close.record.executionResult && close.record.riskGateResult.status === "BLOCK") continue;
       if (requiresStop(close.record) || !close.record.executionResult || close.record.executionResult.status !== "filled" || close.record.reconciliationResult?.status !== "MATCHED") {
         callbacks.onAmbiguousWrite?.(close.record);
         return { records, finalPortfolio, stoppedAfterAmbiguity: true };
@@ -103,7 +98,9 @@ export async function executeCyclePlan(plan: CycleDecisionPlan, callbacks: Cycle
       pendingReversals.push(decision);
       continue;
     }
-    const { record } = await executeOne(decision, category(plan, decision));
+    const result = await executeOne(decision, category(plan, decision));
+    if ("skipped" in result) continue;
+    const { record } = result;
     if (requiresStop(record)) {
       callbacks.onAmbiguousWrite?.(record);
       return { records, finalPortfolio, stoppedAfterAmbiguity: true };
@@ -112,6 +109,7 @@ export async function executeCyclePlan(plan: CycleDecisionPlan, callbacks: Cycle
   }
   for (const decision of pendingReversals) {
     const open = await executeOne(reverseLeg(decision, decision.targetPositionSide === "LONG" ? "OPEN_LONG" : "OPEN_SHORT"), "NEW_ENTRY", decision);
+    if ("skipped" in open) continue;
     if (requiresStop(open.record)) {
       callbacks.onAmbiguousWrite?.(open.record);
       return { records, finalPortfolio, stoppedAfterAmbiguity: true };

@@ -91,6 +91,27 @@ describe("paper log export", () => {
     expect(parsed.summary.cycles.total).toBe(1);
   });
 
+  it("exports skipped-action evidence alongside the unchanged planned decision", () => {
+    const cycleId = "cycle-market-skip";
+    const planned = { ...decision(cycleId, "OPEN_LONG", "decision-mstr", "2026-10-04T00:00:00.000Z"), symbol: "MSTRUSDT", positionSide: "LONG" as const };
+    const skipped: ActivityEvent = {
+      eventId: "event-action-skipped", type: "ACTION_SKIPPED", cycleId, createdAt: "2026-10-04T00:00:01.000Z",
+      metadata: { symbol: "MSTRUSDT", action: "OPEN_LONG", decisionId: planned.decisionId, decisionType: "NEW_ENTRY", code: "EVIDENCE_UNAVAILABLE", providerOperation: "getTickers", diagnostic: "BITGET_READ_FAILED_getTickers_MSTRUSDT" },
+    };
+    const current: TradingJournal = {
+      ...journal(4, "OPEN_LONG"), cycleId,
+      cyclePlan: { positionActions: [], entryActions: [planned as never] },
+    };
+    const exported = buildPaperLogExport({
+      generatedAt: "2026-10-04T00:01:00.000Z", period: { start: null, end: null }, environment: "test", model: "qwen", version: "0.2.0", commit: "abc123",
+      cycles: [{ cycleId, status: "COMPLETED", startedAt: current.startedAt, completedAt: current.completedAt ?? null }],
+      journals: [current], experiences: [], events: [skipped],
+    });
+
+    expect(exported.decisions).toMatchObject([{ cycleId, decisionId: "decision-mstr", symbol: "MSTRUSDT", action: "OPEN_LONG" }]);
+    expect(exported.events).toContainEqual(skipped);
+  });
+
   it("marks commit as UNAVAILABLE for unknown or local placeholders", () => {
     const exported = buildPaperLogExport({
       generatedAt: "2026-09-12T00:03:00.000Z",

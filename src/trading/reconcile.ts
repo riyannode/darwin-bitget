@@ -1,4 +1,18 @@
 import type { ExecutionResult, ExecutionRequest, PositionSnapshot, ReconciliationResult } from "../types.js";
+import { isZeroDecimal } from "./decimal.js";
+
+export function isDefinitivelyRejectedExecution(
+  execution: ExecutionResult,
+  request: ExecutionRequest | undefined,
+  expectedIdentity: { cycleId: string; decisionId: string },
+): boolean {
+  if (execution.status !== "rejected" || !request || !isZeroDecimal(execution.executedQuantity)) return false;
+  if (request.cycleId !== expectedIdentity.cycleId || request.decisionId !== expectedIdentity.decisionId
+    || execution.clientOrderId !== request.clientOrderId || execution.symbol !== request.symbol || execution.action !== request.action
+    || execution.positionSide !== request.positionSide || execution.providerSide !== request.providerSide || execution.tradeSide !== request.tradeSide) return false;
+  return Boolean(execution.providerOrderId)
+    || (execution.providerFailureClass === "PROVIDER_REJECTED" && execution.providerReadbackFailureClass === "PROVIDER_NOT_FOUND");
+}
 
 export function reconcileExecution(
   request: ExecutionRequest,

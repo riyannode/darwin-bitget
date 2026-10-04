@@ -323,7 +323,7 @@ describe("journal observability persistence", () => {
     vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
     vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
     vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
-    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "collectSymbolMarketEvidence").mockResolvedValue({ bundles: [bundle()], unavailable: [] });
     vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(account());
 
     const fake = {
@@ -362,7 +362,7 @@ describe("journal observability persistence", () => {
     vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
     vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
     vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
-    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "collectSymbolMarketEvidence").mockResolvedValue({ bundles: [bundle()], unavailable: [] });
     vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(account());
 
     const fake = cycleTestAgent(executor, events);
@@ -386,7 +386,7 @@ describe("journal observability persistence", () => {
     vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
     vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
     vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
-    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "collectSymbolMarketEvidence").mockResolvedValue({ bundles: [bundle()], unavailable: [] });
     vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(account());
 
     const fake = cycleTestAgent(executor, events);
@@ -424,23 +424,58 @@ describe("journal observability persistence", () => {
     db.close();
   });
 
-  it("blocks the whole cycle when any provider position lacks local lifecycle ownership", async () => {
+  it.each(["LOCAL_EXPERIENCE_MISSING:MSTRUSDT:LONG", "PROVIDER_POSITION_MISSING:MSTRUSDT:LONG"])("allows an unrelated valid PAPER action despite the symbol-scoped discrepancy %s", async (discrepancy) => {
     const { db, executor } = memoryExecutor();
     const events: Array<{ type: string; metadata?: Record<string, string> }> = [];
-    const entry = { ...plan().positionActions[0], decisionId: "entry-nvda", action: "OPEN_LONG" as const, positionSide: "LONG" as const, symbol: "NVDAUSDT", marginAllocationPct: "1", reductionPct: null };
-    vi.mocked(decide).mockResolvedValue({ plan: { positionActions: plan().positionActions, entryActions: [entry] as CycleDecisionPlan["entryActions"] }, ignoredLessonIds: [] });
-    vi.mocked(executeCyclePlan).mockImplementation(async () => { throw new Error("EXECUTION_PLANNER_SHOULD_NOT_RUN"); });
+    const entry = { ...plan().positionActions[0], decisionId: "entry-hood", action: "OPEN_LONG" as const, positionSide: "LONG" as const, symbol: "HOODUSDT", marginAllocationPct: "1", reductionPct: null };
+    const mstrAction = { ...entry, decisionId: "entry-mstr", symbol: "MSTRUSDT" };
+    vi.mocked(decide).mockResolvedValue({ plan: { positionActions: plan().positionActions, entryActions: [mstrAction, entry] as CycleDecisionPlan["entryActions"] }, ignoredLessonIds: [] });
+    const currentMarket = { ...bundle().market, observedAt: new Date().toISOString() };
+    const unresolvedBundle: EvidenceBundle = {
+      ...bundle(),
+      instrument: { ...instrument(), symbol: "MSTRUSDT", baseCoin: "MSTR", minOrderQty: "0.001" },
+      market: { ...currentMarket, symbol: "MSTRUSDT" },
+    };
+    const unrelatedBundle: EvidenceBundle = {
+      ...bundle(),
+      instrument: { ...instrument(), symbol: "HOODUSDT", baseCoin: "HOOD", minOrderQty: "0.001" },
+      market: { ...currentMarket, symbol: "HOODUSDT" },
+    };
+    const records: DecisionExecutionRecord[] = [];
+    vi.mocked(executeCyclePlan).mockImplementation(async (cyclePlan, callbacks) => {
+      for (const action of cyclePlan.entryActions) {
+        const actionBundle = await callbacks.refreshEvidence(action.symbol);
+        if (!actionBundle) throw new Error("TEST_ACTION_EVIDENCE_MISSING");
+        const record = await callbacks.execute(action, actionBundle, "NEW_ENTRY");
+        records.push(record);
+        await callbacks.persist(record, actionBundle);
+      }
+      return { records, finalPortfolio: undefined, stoppedAfterAmbiguity: false };
+    });
     vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
-    vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
+    vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument(), { ...instrument(), symbol: "MSTRUSDT", baseCoin: "MSTR" }, { ...instrument(), symbol: "HOODUSDT", baseCoin: "HOOD" }]);
     vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
-    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "collectSymbolMarketEvidence").mockImplementation(async (symbols) => ({ bundles: symbols.includes("HOODUSDT") && symbols.includes("MSTRUSDT") ? [unresolvedBundle, unrelatedBundle] : symbols.includes("MSTRUSDT") ? [unresolvedBundle] : symbols.includes("HOODUSDT") ? [unrelatedBundle] : [bundle()], unavailable: [] }));
     vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(account());
+    vi.spyOn(BitgetClient.prototype, "placePaperOrder").mockResolvedValue({ provider: "BITGET_PAPER", providerOrderId: "paper-order-hood", clientOrderId: "paper-client-hood", symbol: "HOODUSDT", action: "OPEN_LONG", positionSide: "LONG", providerSide: "buy", tradeSide: "open", marginAllocated: "10", leverage: "1", positionNotional: "10", requestedQuantity: "0.094", executedQuantity: "0.094", status: "filled", submittedAt: "2026-09-21T00:00:31.000Z", readBackAt: "2026-09-21T00:00:32.000Z", averageFillPrice: "106" });
 
-    const fake = cycleTestAgent(executor, events, ["LOCAL_EXPERIENCE_MISSING:CRCLUSDT:LONG"]);
+    const fake = cycleTestAgent(executor, events, [discrepancy]);
+    Object.assign(fake, {
+      executeDecision: (TraderAgent.prototype as unknown as { executeDecision: (...args: unknown[]) => Promise<DecisionExecutionRecord> }).executeDecision,
+    });
     const journal = await (TraderAgent.prototype as unknown as { runCycle: () => Promise<TradingJournal> }).runCycle.call(fake);
-    expect(executeCyclePlan).not.toHaveBeenCalled();
-    expect(journal.discovery?.financialWritesPerformed).toBe(0);
-    expect(events.find((event) => event.type === "FINANCIAL_WRITES_STOPPED")?.metadata).toMatchObject({ code: "LOCAL_LIFECYCLE_UNRESOLVED" });
+
+    expect(executeCyclePlan).toHaveBeenCalledOnce();
+    expect(records).toHaveLength(2);
+    expect(records[0]?.decision.symbol).toBe("MSTRUSDT");
+    expect(records[0]?.riskGateResult).toMatchObject({ status: "BLOCK" });
+    expect(records[0]?.riskGateResult.codes).toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+    expect(records[1]?.decision.symbol).toBe("HOODUSDT");
+    expect(records[1]?.riskGateResult).toMatchObject({ status: "PASS" });
+    expect(BitgetClient.prototype.placePaperOrder).toHaveBeenCalledOnce();
+    expect(journal.positionDiscrepancies).toEqual([discrepancy]);
+    expect(journal.discovery?.financialWritesPerformed).toBe(1);
+    expect(events.some((event) => event.type === "FINANCIAL_WRITES_STOPPED" && event.metadata?.code === "LOCAL_LIFECYCLE_UNRESOLVED")).toBe(false);
     db.close();
   });
 
@@ -473,7 +508,8 @@ describe("journal observability persistence", () => {
       },
       sql: executor.sql,
     } as unknown as { state: { paused: boolean } };
-    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "collectSymbolMarketEvidence").mockResolvedValue({ bundles: [bundle()], unavailable: [] });
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(bundle().account);
     vi.spyOn(BitgetClient.prototype, "getOrderDetailsRead").mockResolvedValue({ orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "3", cumExecQty: "3", avgPrice: "100", orderStatus: "filled", createdTime: "1789968749335" });
     vi.spyOn(BitgetClient.prototype, "getFillHistoryRead").mockResolvedValue({ list: [{ execId: "fill-open", orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "3", execPrice: "100", createdTime: "1789968749337" }] });
 
@@ -543,7 +579,7 @@ describe("journal observability persistence", () => {
     vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
     vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
     vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
-    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "collectSymbolMarketEvidence").mockResolvedValue({ bundles: [bundle()], unavailable: [] });
     vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValueOnce(account()).mockRejectedValue(new Error("POST_WRITE_REFRESH_FAILURE"));
 
     const fake = {

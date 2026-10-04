@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { BitgetApiError } from "@bitget-ai/bitget-agent-sdk";
-import { BitgetClient, buildOpenOrdersReadParams, buildPaperOrderParams, buildUnresolvedExecution, extractProviderError, formatBitgetReadFailure, normalizeBitgetOrderStatus } from "../src/bitget/client.js";
+import { BitgetClient, BitgetReadError, buildOpenOrdersReadParams, buildPaperOrderParams, buildUnresolvedExecution, extractProviderError, formatBitgetReadFailure, normalizeBitgetOrderStatus } from "../src/bitget/client.js";
 import { loadConfig } from "../src/config.js";
 import type { ExecutionRequest } from "../src/types.js";
 
@@ -29,6 +29,29 @@ function gatewayResponse(data: unknown): Response {
 }
 
 describe("Bitget read diagnostics", () => {
+  it("retries a symbol market read once and never retries it beyond the bound", async () => {
+    const client = new BitgetClient(gatewayConfig());
+    const callRead = vi.spyOn(client as unknown as { callRead: (operation: string, params: Record<string, string>) => Promise<{ data: unknown }> }, "callRead")
+      .mockRejectedValueOnce(new BitgetReadError("getTickers", "MSTRUSDT", new Error("temporary")))
+      .mockResolvedValueOnce({ data: [{ symbol: "MSTRUSDT", lastPrice: "100", bid1Price: "99", ask1Price: "101", price24hPcnt: "0.01", volume24h: "1000" }] });
+
+    const snapshot = await client.getMarketSnapshot("MSTRUSDT");
+
+    expect(snapshot.lastPrice).toBe("100");
+    expect(callRead).toHaveBeenCalledTimes(2);
+    expect(callRead.mock.calls.map(([operation]) => operation)).toEqual(["getTickers", "getTickers"]);
+  });
+
+  it("does not retry a provider-classified permanent market rejection", async () => {
+    const client = new BitgetClient(gatewayConfig());
+    const permanent = Object.assign(new Error("unsupported symbol"), { classification: "PROVIDER_REJECTED" });
+    const callRead = vi.spyOn(client as unknown as { callRead: (operation: string, params: Record<string, string>) => Promise<{ data: unknown }> }, "callRead")
+      .mockRejectedValue(new BitgetReadError("getTickers", "MSTRUSDT", permanent));
+
+    await expect(client.getMarketSnapshot("MSTRUSDT")).rejects.toThrow("BITGET_READ_FAILED_getTickers_MSTRUSDT");
+    expect(callRead).toHaveBeenCalledTimes(1);
+  });
+
   it("reads live dashboard portfolio without invoking financial writes", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = new URL(String(input)).pathname;

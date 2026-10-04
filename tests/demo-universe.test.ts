@@ -61,7 +61,7 @@ describe("Demo executable universe", () => {
     await expect(new BitgetClient(config).getTradableInstruments()).rejects.toThrow("NETWORK_FAILURE");
   });
 
-  it("retains public evidence for a held symbol removed from Demo discovery", async () => {
+  it("keeps valid symbol bundles when another symbol market read fails and preserves canonical account facts", async () => {
     const gateway = vi.fn(async (input: RequestInfo | URL) => {
       const path = new URL(String(input)).pathname;
       if (path.endsWith("/account-assets")) return Response.json({ data: { usdtEquity: "50000" }, endpoint: "fixture", requestTime: "0" });
@@ -70,9 +70,35 @@ describe("Demo executable universe", () => {
     });
     vi.stubGlobal("fetch", gateway);
     const client = new BitgetClient(loadConfig({ TRADING_MODE: "PAPER", PAPER_ONLY: "true", AGENT_MODE: "AUTONOMOUS", BITGET_GATEWAY_URL: "https://gateway.test", BITGET_GATEWAY_SERVICE_SECRET: "gateway-secret" }));
-    vi.spyOn(client, "getInstruments").mockResolvedValue(parseInstruments(publicRows));
+    const account = await client.getDashboardPortfolio();
+    vi.spyOn(client, "getMarketSnapshot").mockImplementation(async (symbol) => {
+      if (symbol === "MSTRUSDT") throw new Error("MSTR_TICKER_UNAVAILABLE");
+      return { symbol, lastPrice: "100", bidPrice: "99", askPrice: "101", priceChange24h: "0.01", volume24h: "1000", observedAt: "2026-10-04T00:00:00.000Z" };
+    });
+    vi.spyOn(client, "getHistoricalBars").mockResolvedValue([]);
+    const evidence = await client.collectSymbolMarketEvidence(["MSTRUSDT", "HOODUSDT"], account, parseInstruments([row("MSTRUSDT"), row("HOODUSDT")]));
+
+    expect(evidence.bundles.map((bundle) => bundle.instrument.symbol)).toEqual(["HOODUSDT"]);
+    expect(evidence.unavailable.map((item) => item.symbol)).toEqual(["MSTRUSDT"]);
+    expect(account.portfolioEquity).toBe("50000");
+    expect(account.positions).toEqual([]);
+  });
+
+  it("keeps a symbol-specific market failure separate from account evidence", async () => {
+    const gateway = vi.fn(async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/account-assets")) return Response.json({ data: { usdtEquity: "50000" }, endpoint: "fixture", requestTime: "0" });
+      if (path.endsWith("/position-info") || path.endsWith("/open-orders")) return Response.json({ data: [], endpoint: "fixture", requestTime: "0" });
+      throw new Error(`UNEXPECTED_ROUTE_${path}`);
+    });
+    vi.stubGlobal("fetch", gateway);
+    const client = new BitgetClient(loadConfig({ TRADING_MODE: "PAPER", PAPER_ONLY: "true", AGENT_MODE: "AUTONOMOUS", BITGET_GATEWAY_URL: "https://gateway.test", BITGET_GATEWAY_SERVICE_SECRET: "gateway-secret" }));
+    const account = await client.getDashboardPortfolio();
     const evidence = vi.spyOn(client, "getMarketSnapshot").mockRejectedValue(new Error("REACHED_MARKET_READ"));
-    await expect(client.collectEvidence(["SOXLUSDT"])).rejects.toThrow("REACHED_MARKET_READ");
+    const result = await client.collectSymbolMarketEvidence(["SOXLUSDT"], account, parseInstruments([row("SOXLUSDT")]));
+    expect(result.bundles).toEqual([]);
+    expect(result.unavailable).toMatchObject([{ symbol: "SOXLUSDT", operation: "marketEvidence" }]);
     expect(evidence).toHaveBeenCalledWith("SOXLUSDT");
+    expect(account.portfolioEquity).toBe("50000");
   });
 });

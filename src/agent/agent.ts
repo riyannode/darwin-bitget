@@ -2,7 +2,7 @@ import { Agent } from "agents";
 import { ZodError } from "zod";
 import type { ActivityEvent, BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionManagementState, PositionSnapshot, PositionSide, ProviderExecutionFact, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
-import { BitgetClient } from "../bitget/client.js";
+import { BitgetClient, type MarketEvidenceFailure } from "../bitget/client.js";
 import { syncProviderLedger, PROVIDER_FINANCIAL_CATEGORIES, PROVIDER_TRADE_LIFECYCLE_CATEGORY } from "../bitget/provider-sync.js";
 import { MANDATE_VERSION, PROMPT_VERSIONS, TRADING_MANDATE } from "./mandate.js";
 import { assertOpenPositionCountWithinPlanLimit, buildEvidenceSymbols, calculateActionCapacity, countOpenPositionLifecycles, decide, filterNewEntryMarketCandidates, rankMarketCandidates, selectEntryCandidates } from "./decision.js";
@@ -24,6 +24,9 @@ import {
   loadAllStoredCycles,
   loadRecentStoredCycles,
   loadRecentJournals,
+  loadJournalBackfillPage,
+  loadExecutionQuarantineBackfillState,
+  saveExecutionQuarantineBackfillState,
   loadRecentEvents,
   loadRecentLessons,
   loadOpenExperiences,
@@ -41,6 +44,7 @@ import {
   loadPositionContextBootstrap,
   savePositionContextBootstrap,
   loadDailyDrawdownState,
+  loadExecutionQuarantines,
   loadExperiences,
   loadExperienceById,
   loadActiveOwnerPolicy,
@@ -52,6 +56,8 @@ import {
   saveBacktest,
   saveCycle,
   saveDailyDrawdownState,
+  saveExecutionQuarantine,
+  clearExecutionQuarantine,
   saveActiveOwnerPolicy,
   saveEvent,
   saveExperience,
@@ -66,7 +72,7 @@ import { evaluateDrawdown } from "../trading/drawdown.js";
 import { loadOwnerPolicy, updateOwnerPolicy } from "../trading/policy.js";
 import { buildExecutionClientOrderId, buildExecutionRequest, executePaperOrder } from "../trading/execution.js";
 import { executeCyclePlan } from "../trading/execution-planner.js";
-import { reconcileExecution } from "../trading/reconcile.js";
+import { reconcileExecution, isDefinitivelyRejectedExecution } from "../trading/reconcile.js";
 import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal } from "../trading/decimal.js";
 import { buildPerformanceAccounting, classifiedWinRate, emptyPerformance, isPerformanceAggregate, migratePerformanceEquityObservations, PERFORMANCE_READ_MODEL_VERSION, POSITION_CONTEXT_READ_MODEL_VERSION, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate, type PerformanceObservation } from "../trading/performance.js";
 import { bootstrapPositionContexts, decisionReasoning, upsertPositionContext } from "./position-context.js";
@@ -791,6 +797,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       });
     }
     this.ensureReadModels(needsLatestValidPlanMigration);
+    this.seedExecutionQuarantinesFromRecentJournals();
     const policy = this.ensureActivePolicy();
     const config = loadConfig(this.env, policy);
     const activeCycle = this.state.lastStatus === "RUNNING";
@@ -1097,6 +1104,73 @@ export class TraderAgent extends Agent<Env, AgentState> {
     return temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : policy.scanIntervalMinutes;
   }
 
+  private seedExecutionQuarantinesFromRecentJournals(): void {
+    const existingSymbols = new Set(loadExecutionQuarantines(this).map((entry) => entry.symbol));
+    const seedJournals = (journals: readonly TradingJournal[]): void => {
+      for (const journal of journals) {
+        if (journal.mode !== "AUTONOMOUS") continue;
+        for (const record of normalizeCycleDecisions(journal).records) {
+          const execution = record.executionResult;
+          if (!execution) continue;
+          const clientOrderId = record.executionRequest?.clientOrderId ?? execution.clientOrderId;
+          const quarantineIdentity = { symbol: record.decision.symbol, decisionId: record.decision.decisionId, cycleId: journal.cycleId, clientOrderId };
+          if (isDefinitivelyRejectedExecution(execution, record.executionRequest, { cycleId: journal.cycleId, decisionId: record.decision.decisionId })) {
+            if (clearExecutionQuarantine(this, quarantineIdentity, execution.readBackAt)) {
+              existingSymbols.delete(record.decision.symbol);
+              this.recordEvent("EXECUTION_QUARANTINE_CLEARED", journal.cycleId, {
+                ...quarantineIdentity,
+                code: "DETERMINISTIC_PROVIDER_REJECTION",
+                source: "HISTORICAL_JOURNAL_RECONCILIATION",
+              });
+            }
+            continue;
+          }
+          if (execution.status !== "unknown" && record.reconciliationResult?.status === "MATCHED") continue;
+          if (existingSymbols.has(record.decision.symbol)) continue;
+          const reason = execution.status === "unknown"
+            ? "EXECUTION_UNKNOWN"
+            : record.reconciliationResult?.codes.join(",") || "EXECUTION_NOT_RECONCILED";
+          saveExecutionQuarantine(this, {
+            symbol: record.decision.symbol,
+            decisionId: record.decision.decisionId,
+            cycleId: journal.cycleId,
+            clientOrderId,
+            reason,
+            createdAt: execution.submittedAt,
+          });
+          existingSymbols.add(record.decision.symbol);
+          this.recordEvent("EXECUTION_QUARANTINED", journal.cycleId, {
+            symbol: record.decision.symbol,
+            decisionId: record.decision.decisionId,
+            clientOrderId,
+            reason,
+            code: "UNRESOLVED_PRIOR_EXECUTION",
+            source: "HISTORICAL_JOURNAL_SEED",
+          });
+        }
+      }
+    };
+
+    const backfill = loadExecutionQuarantineBackfillState(this);
+    if (backfill.complete) {
+      seedJournals(loadRecentJournals(this, 50));
+      return;
+    }
+
+    let cursor = backfill.cursor;
+    while (true) {
+      const page = loadJournalBackfillPage(this, cursor, 50);
+      seedJournals(page.journals);
+      if (!page.hasMore) {
+        saveExecutionQuarantineBackfillState(this, { complete: true, cursor: null }, new Date().toISOString());
+        return;
+      }
+      if (!page.nextCursor) throw new Error("EXECUTION_QUARANTINE_BACKFILL_CURSOR_MISSING");
+      cursor = page.nextCursor;
+      saveExecutionQuarantineBackfillState(this, { complete: false, cursor }, new Date().toISOString());
+    }
+  }
+
   private ensureReadModels(migrateLatestValidPlan = false): void {
     const initializedAt = new Date().toISOString();
     const performance = loadPerformanceAggregate<PerformanceAggregate>(this);
@@ -1377,9 +1451,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const record = normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === decisionId);
     if (!record || !isReadbackOnlyExecutionMismatch(record) || !record.executionResult) throw new Error("LATE_RECONCILIATION_RECORD_NOT_ELIGIBLE");
     const client = new BitgetClient(loadConfig(this.env, this.ensureActivePolicy()));
-    const bundle = (await client.collectEvidence([record.decision.symbol]))[0];
-    const position = bundle?.account.positions.find((candidate) => candidate.symbol === record.decision.symbol && candidate.positionSide === record.decision.positionSide);
-    if (!bundle || !position) throw new Error("LATE_RECONCILIATION_POSITION_MISSING");
+    const portfolio = await client.getDashboardPortfolio();
+    const position = portfolio.positions.find((candidate) => candidate.symbol === record.decision.symbol && candidate.positionSide === record.decision.positionSide);
+    if (!position) throw new Error("LATE_RECONCILIATION_POSITION_MISSING");
     const rawOrder = await client.getOrderDetailsRead(record.executionResult.providerOrderId, record.executionResult.clientOrderId);
     const order = parseProviderOrderEvidence(rawOrder);
     if (!order) throw new Error("LATE_RECONCILIATION_ORDER_INVALID");
@@ -1398,13 +1472,19 @@ export class TraderAgent extends Agent<Env, AgentState> {
       resolvedAt,
       ...(existingExperience ? { existingExperience } : {}),
     });
-    if (result.status === "ALREADY_RECONCILED") return { status: result.status, experienceId: result.experience.experienceId };
-    const performance = this.performanceWithEquity(bundle.account.portfolioEquity, resolvedAt);
+    const clientOrderId = record.executionRequest?.clientOrderId ?? record.executionResult.clientOrderId;
+    const quarantineIdentity = { symbol: record.decision.symbol, decisionId, cycleId: originalCycleId, clientOrderId };
+    if (result.status === "ALREADY_RECONCILED") {
+      if (clearExecutionQuarantine(this, quarantineIdentity, resolvedAt)) this.recordEvent("EXECUTION_QUARANTINE_CLEARED", originalCycleId, { symbol: record.decision.symbol, decisionId, clientOrderId, code: "DETERMINISTIC_PROVIDER_RECONCILIATION" });
+      return { status: result.status, experienceId: result.experience.experienceId };
+    }
+    const performance = this.performanceWithEquity(portfolio.portfolioEquity, resolvedAt);
     saveExperience(this, result.experience, resolvedAt);
     savePositionContext(this, result.positionContext);
     savePerformanceAggregate(this, performance, resolvedAt);
     const audited = loadAllEvents(this).some((event) => event.type === "LATE_EXECUTION_RECONCILED" && event.metadata?.originalCycleId === originalCycleId && event.metadata?.decisionId === decisionId);
     if (!audited) this.recordEvent("LATE_EXECUTION_RECONCILED", originalCycleId, result.auditMetadata);
+    if (clearExecutionQuarantine(this, quarantineIdentity, resolvedAt)) this.recordEvent("EXECUTION_QUARANTINE_CLEARED", originalCycleId, { symbol: record.decision.symbol, decisionId, clientOrderId, code: "DETERMINISTIC_PROVIDER_RECONCILIATION" });
     return { status: result.status, experienceId: result.experience.experienceId };
   }
 
@@ -1824,12 +1904,19 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const evidenceSymbols = buildEvidenceSymbols(openPositionSymbols, selectedEntryCandidateSymbols);
       if (calculateActionCapacity(openPositionCount).remainingEntrySlots === 0) this.recordEvent("CANDIDATE_SELECTION_SKIPPED", cycleId, { code: "CAPACITY_SATURATED", openPositionCount: String(openPositionCount) });
       else this.recordEvent("CANDIDATE_SELECTED", cycleId, { symbols: selectedEntryCandidateSymbols.join(",") });
-      const bundles = await client.collectEvidence(evidenceSymbols);
+      const evidenceCollection = await client.collectSymbolMarketEvidence(evidenceSymbols, initialPortfolio, instruments);
+      for (const unavailable of evidenceCollection.unavailable) this.recordEvent("MARKET_EVIDENCE_UNAVAILABLE", cycleId, {
+        symbol: unavailable.symbol,
+        providerOperation: unavailable.operation,
+        code: "EVIDENCE_UNAVAILABLE",
+        diagnostic: unavailable.diagnostic,
+      });
+      const bundles = evidenceCollection.bundles;
       const lessons = bundles.flatMap((bundle) => retrieveLessons(allLessons, { symbol: bundle.instrument.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN" }, 3))
         .filter((lesson, index, list) => list.findIndex((candidate) => candidate.lessonId === lesson.lessonId) === index)
         .slice(0, 5);
-      const account = bundles[0]?.account ?? await client.getDashboardPortfolio();
-      const openPositions = [...new Map((bundles.flatMap((bundle) => bundle.account.positions).length ? bundles.flatMap((bundle) => bundle.account.positions) : account.positions).map((position) => [`${position.symbol}:${position.positionSide}`, position])).values()];
+      const account = initialPortfolio;
+      const openPositions = account.positions;
       const discovery: CycleDiscovery = {
         executableStockUniverseCount: instruments.length,
         scannedStockCount: scan.length,
@@ -1897,14 +1984,19 @@ export class TraderAgent extends Agent<Env, AgentState> {
       journal.retrievedLessons = lessons.map((lesson) => lesson.lessonId);
       const plan: CycleDecisionPlan = decisionSet.plan;
       journal.cyclePlan = plan;
-      const execution = journal.positionDiscrepancies && journal.positionDiscrepancies.length > 0
-        ? (() => {
-          this.recordEvent("FINANCIAL_WRITES_STOPPED", cycleId, { code: "LOCAL_LIFECYCLE_UNRESOLVED" });
-          this.recordEvent("PLAN_REMAINING_ACTIONS_SKIPPED", cycleId, { code: "LOCAL_LIFECYCLE_UNRESOLVED" });
-          return { records: [], finalPortfolio: undefined, stoppedAfterAmbiguity: true };
-        })()
-        : await executeCyclePlan(plan, {
-        refreshEvidence: async (symbol) => (await client.collectEvidence([symbol]))[0],
+      const marketEvidenceFailures = new Map<string, MarketEvidenceFailure>();
+      const execution = await executeCyclePlan(plan, {
+        refreshEvidence: async (symbol) => {
+          const account = await client.getDashboardPortfolio();
+          const collection = await client.collectSymbolMarketEvidence([symbol], account, instruments);
+          const failure = collection.unavailable[0];
+          if (failure) {
+            marketEvidenceFailures.set(symbol, failure);
+            return undefined;
+          }
+          marketEvidenceFailures.delete(symbol);
+          return collection.bundles[0];
+        },
         execute: async (action, actionBundle, decisionType, parentDecision) => {
           this.setState({ ...this.state, runtimeStatus: "RISK_CHECK", currentStage: "RISK_CHECK" });
           return this.executeDecision(client, config, action, actionBundle, cycleId, supportedUniverse, drawdown.blocked, startedAt, decisionType, parentDecision, journal.positionDiscrepancies ?? []);
@@ -1918,6 +2010,20 @@ export class TraderAgent extends Agent<Env, AgentState> {
         onAmbiguousWrite: (record) => {
           this.recordEvent("FINANCIAL_WRITES_STOPPED", cycleId, { code: "EXECUTION_UNRESOLVED", symbol: record.decision.symbol, action: record.decision.action });
           this.recordEvent("PLAN_REMAINING_ACTIONS_SKIPPED", cycleId, { code: "EXECUTION_UNRESOLVED" });
+        },
+        onEvidenceUnavailable: (decision, parentDecision) => {
+          const failure = marketEvidenceFailures.get(decision.symbol);
+          const plannedDecision = parentDecision ?? decision;
+          this.recordEvent("ACTION_SKIPPED", cycleId, {
+            symbol: decision.symbol,
+            action: plannedDecision.action,
+            executionAction: decision.action,
+            decisionId: plannedDecision.decisionId,
+            decisionType: parentDecision ? "POSITION_MANAGEMENT" : plan.entryActions.some((entry) => entry.decisionId === decision.decisionId) ? "NEW_ENTRY" : "POSITION_MANAGEMENT",
+            code: "EVIDENCE_UNAVAILABLE",
+            providerOperation: failure?.operation ?? "marketEvidence",
+            diagnostic: safeDiagnosticMessage(failure?.diagnostic, "Market evidence unavailable"),
+          });
         },
       });
       journal.executionRecords = execution.records;
@@ -2061,9 +2167,22 @@ export class TraderAgent extends Agent<Env, AgentState> {
     parentDecision?: Decision,
     positionDiscrepancies: readonly string[] = [],
   ): Promise<DecisionExecutionRecord> {
-    const riskGateResult = evaluateRiskGate(config, { decision, instrument: bundle.instrument, account: bundle.account, market: bundle.market, evidenceObservedAt: bundle.market.observedAt, openOrderSymbols: bundle.account.openOrderSymbols, supportedUniverse, emergencyStop: this.state.emergencyStop || config.ownerPolicy.emergencyStop, dailyDrawdownBlocked, positionDiscrepancies });
+    const unresolvedExecutionSymbols = loadExecutionQuarantines(this).map((entry) => entry.symbol);
+    const riskGateResult = evaluateRiskGate(config, { decision, instrument: bundle.instrument, account: bundle.account, market: bundle.market, evidenceObservedAt: bundle.market.observedAt, openOrderSymbols: bundle.account.openOrderSymbols, supportedUniverse, emergencyStop: this.state.emergencyStop || config.ownerPolicy.emergencyStop, dailyDrawdownBlocked, positionDiscrepancies, unresolvedExecutionSymbols });
     this.recordEvent("DECISION_CREATED", cycleId, { action: decision.action, symbol: decision.symbol, decisionType });
     this.recordEvent(riskGateResult.status === "PASS" ? "RISK_GATE_PASS" : "RISK_GATE_BLOCK", cycleId, { codes: riskGateResult.codes.join(","), decisionType, symbol: decision.symbol });
+    if (riskGateResult.codes.includes("OPEN_ORDERS_READ_UNAVAILABLE")) {
+      const failure = bundle.account.openOrdersReadFailure;
+      this.recordEvent("ACTION_SKIPPED", cycleId, {
+        symbol: decision.symbol,
+        action: decision.action,
+        decisionId: decision.decisionId,
+        decisionType,
+        code: "OPEN_ORDERS_READ_UNAVAILABLE",
+        providerOperation: failure?.operation ?? "getOpenOrders",
+        diagnostic: safeDiagnosticMessage(failure?.message ?? failure?.code, "Provider open-orders state unavailable"),
+      });
+    }
     const positionBefore = findPosition(bundle.account.positions, decision.symbol, decision.positionSide);
     const record: DecisionExecutionRecord = { decision, riskGateResult, ...(parentDecision ? { parentDecisionId: parentDecision.decisionId, parentAction: "REVERSE" as const, parentDecision } : {}), ...(positionBefore ? { positionBefore } : {}) };
     if (riskGateResult.status === "BLOCK" || decision.action === "HOLD") return record;
@@ -2077,22 +2196,31 @@ export class TraderAgent extends Agent<Env, AgentState> {
     let positionAfter: PositionSnapshot | undefined;
     let readbackFailure = false;
     try {
-      const afterBundle = (await client.collectEvidence([decision.symbol]))[0];
-      if (afterBundle) {
-        record.accountAfter = afterBundle.account;
-        positionAfter = findPosition(afterBundle.account.positions, decision.symbol, decision.positionSide);
-      }
-      else readbackFailure = true;
+      const afterPortfolio = await client.getDashboardPortfolio();
+      record.accountAfter = afterPortfolio;
+      positionAfter = findPosition(afterPortfolio.positions, decision.symbol, decision.positionSide);
     } catch {
       readbackFailure = true;
     }
     let reconciliationResult = reconcileExecution(executionRequest, executionResult, record.positionBefore, positionAfter);
     if (readbackFailure) reconciliationResult = { ...reconciliationResult, status: "UNKNOWN", codes: [...reconciliationResult.codes, "POSITION_READBACK_UNAVAILABLE"] };
-    if (executionRequest.tradeSide === "open" && executionResult.status === "filled" && !positionAfter) reconciliationResult = { ...reconciliationResult, status: "MISMATCH", codes: [...reconciliationResult.codes, "POSITION_READBACK_MISSING"] };
+    if (!readbackFailure && executionRequest.tradeSide === "open" && executionResult.status === "filled" && !positionAfter) reconciliationResult = { ...reconciliationResult, status: "MISMATCH", codes: [...reconciliationResult.codes, "POSITION_READBACK_MISSING"] };
     record.executionRequest = executionRequest;
     record.executionResult = executionResult;
     record.reconciliationResult = reconciliationResult;
     if (positionAfter) record.positionAfter = positionAfter;
+    if (!isDefinitivelyRejectedExecution(executionResult, executionRequest, { cycleId, decisionId: decision.decisionId }) && (executionResult.status === "unknown" || reconciliationResult.status !== "MATCHED")) {
+      const quarantine = {
+        symbol: decision.symbol,
+        decisionId: decision.decisionId,
+        cycleId,
+        clientOrderId: executionRequest.clientOrderId,
+        reason: executionResult.status === "unknown" ? "EXECUTION_UNKNOWN" : reconciliationResult.codes.join(",") || "EXECUTION_NOT_RECONCILED",
+        createdAt: executionResult.submittedAt,
+      };
+      saveExecutionQuarantine(this, quarantine, executionResult.readBackAt);
+      this.recordEvent("EXECUTION_QUARANTINED", cycleId, { symbol: decision.symbol, decisionId: decision.decisionId, clientOrderId: executionRequest.clientOrderId, reason: quarantine.reason });
+    }
     this.recordEvent(reconciliationResult.status === "MATCHED" ? "EXECUTION_VERIFIED" : "EXECUTION_UNRESOLVED", cycleId, {
       decisionType,
       symbol: decision.symbol,
@@ -2121,7 +2249,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const managementDecision = record.parentDecision ?? decision;
     const isEntryDecision = decision.action === "OPEN_LONG" || decision.action === "OPEN_SHORT";
     const isManagementDecision = managementDecision.action === "HOLD" || managementDecision.action === "INCREASE" || managementDecision.action === "REDUCE" || managementDecision.action === "CLOSE" || managementDecision.action === "REVERSE";
-    if (isManagementDecision && (!isEntryDecision || verified)) this.updatePositionContext(record);
+    if (isManagementDecision && (decision.action === "HOLD" || verified)) this.updatePositionContext(record);
     const currentExperience = experiences.find((experience) => experience.outcomeStatus === "OPEN" && experience.symbol === decision.symbol && experience.positionSide === decision.positionSide);
     this.updatePerformanceReadModel(record, bundle, verified, currentExperience);
     const filledPositionUnverified = isEntryDecision && executionResult?.status === "filled" && isReadbackOnlyExecutionMismatch(record);

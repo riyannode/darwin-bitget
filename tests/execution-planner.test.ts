@@ -36,6 +36,57 @@ describe("sequential cycle execution planner", () => {
     expect(events.indexOf("portfolio:3")).toBeGreaterThan(events.indexOf("persist:OPEN_LONG"));
   });
 
+  it("continues unrelated actions when a quarantined reverse is blocked before any write", async () => {
+    const reverse: Decision = { ...decision("CLOSE", "MSTRUSDT"), decisionId: "reverse-mstr", action: "REVERSE", targetPositionSide: "SHORT", marginAllocationPct: "10", reductionPct: null };
+    const unrelated = decision("OPEN_LONG", "HOODUSDT");
+    const executed: string[] = [];
+    const resultValue = await executeCyclePlan({ positionActions: [reverse] as CycleDecisionPlan["positionActions"], entryActions: [unrelated] as CycleDecisionPlan["entryActions"] }, {
+      refreshEvidence: async (symbol) => bundle(symbol, "100"),
+      execute: async (item) => {
+        executed.push(item.symbol);
+        if (item.symbol === "MSTRUSDT") return { decision: item, riskGateResult: { status: "BLOCK", codes: ["UNRESOLVED_PRIOR_EXECUTION"], checkedAt: "2026-09-12T00:00:00.000Z" } };
+        return result(item);
+      },
+      persist: async () => undefined,
+      refreshPortfolio: async () => account("100"),
+    });
+
+    expect(resultValue.stoppedAfterAmbiguity).toBe(false);
+    expect(executed).toEqual(["MSTRUSDT", "HOODUSDT"]);
+    expect(resultValue.records).toHaveLength(2);
+    expect(resultValue.records[0]?.executionResult).toBeUndefined();
+    expect(resultValue.records[1]?.executionResult?.status).toBe("filled");
+  });
+
+  it("continues unrelated actions when a reverse is blocked before write by unavailable open orders", async () => {
+    const reverse: Decision = { ...decision("CLOSE", "MSTRUSDT"), decisionId: "reverse-mstr-open-orders", action: "REVERSE", targetPositionSide: "SHORT", marginAllocationPct: "10", reductionPct: null };
+    const unrelated = decision("OPEN_LONG", "HOODUSDT");
+    const executed: string[] = [];
+    const evidenceReads: string[] = [];
+    const resultValue = await executeCyclePlan({ positionActions: [reverse] as CycleDecisionPlan["positionActions"], entryActions: [unrelated] as CycleDecisionPlan["entryActions"] }, {
+      refreshEvidence: async (symbol) => {
+        evidenceReads.push(symbol);
+        const current = bundle(symbol, "100");
+        return symbol === "MSTRUSDT" ? { ...current, account: { ...current.account, openOrders: null, openOrdersReadFailure: { operation: "getOpenOrders" } } } : current;
+      },
+      execute: async (item, currentBundle) => {
+        executed.push(item.symbol);
+        if (item.symbol === "MSTRUSDT") return { decision: item, riskGateResult: { status: "BLOCK", codes: ["OPEN_ORDERS_READ_UNAVAILABLE"], checkedAt: "2026-09-12T00:00:00.000Z" } };
+        expect(currentBundle.account.openOrdersReadFailure).toBeUndefined();
+        return result(item);
+      },
+      persist: async () => undefined,
+      refreshPortfolio: async () => account("100"),
+    });
+
+    expect(resultValue.stoppedAfterAmbiguity).toBe(false);
+    expect(evidenceReads).toEqual(["MSTRUSDT", "HOODUSDT"]);
+    expect(executed).toEqual(["MSTRUSDT", "HOODUSDT"]);
+    expect(resultValue.records).toHaveLength(2);
+    expect(resultValue.records[0]?.executionResult).toBeUndefined();
+    expect(resultValue.records[1]?.executionResult?.status).toBe("filled");
+  });
+
   it("stops after the first unresolved write and does not call later execution", async () => {
     const first = decision("CLOSE", "CRCLUSDT");
     const second = decision("OPEN_LONG", "NVDAUSDT");
@@ -150,28 +201,22 @@ describe("sequential cycle execution planner", () => {
     expect(portfolioRefreshCalls).toBe(1);
   });
 
-  it("identifies a later action evidence refresh failure by stage and symbol", async () => {
-    const metaClose = decision("CLOSE", "METAUSDT");
-    const tslaClose = decision("CLOSE", "TSLAUSDT");
-    const evidenceCalls: string[] = [];
-    let executeCalls = 0;
-    let persistCalls = 0;
-    let portfolioRefreshCalls = 0;
+  it("soft-skips an action with unavailable pre-write evidence and continues independent actions", async () => {
+    const unavailable = decision("OPEN_LONG", "MSTRUSDT");
+    const independent = decision("OPEN_LONG", "HOODUSDT");
+    const executed: string[] = [];
+    const skipped: Decision[] = [];
+    const resultValue = await executeCyclePlan({ positionActions: [], entryActions: [unavailable, independent] as CycleDecisionPlan["entryActions"] }, {
+      refreshEvidence: async (symbol) => symbol === "MSTRUSDT" ? undefined : bundle(symbol, "100"),
+      execute: async (item) => { executed.push(item.symbol); return result(item); },
+      persist: async () => undefined,
+      refreshPortfolio: async () => account("100"),
+      onEvidenceUnavailable: (item) => skipped.push(item),
+    });
 
-    await expect(executeCyclePlan({ positionActions: [tslaClose, metaClose] as CycleDecisionPlan["positionActions"], entryActions: [] }, {
-      refreshEvidence: async (symbol) => {
-        evidenceCalls.push(symbol);
-        if (symbol === "TSLAUSDT") throw new Error("fetch failed: Authorization: Bearer secret-token");
-        return bundle(symbol, "100");
-      },
-      execute: async (item) => { executeCalls += 1; return result(item); },
-      persist: async () => { persistCalls += 1; },
-      refreshPortfolio: async () => { portfolioRefreshCalls += 1; return account("100"); },
-    })).rejects.toThrow("EVIDENCE_REFRESH_FAILED:TSLAUSDT:Runtime error");
-
-    expect(evidenceCalls).toEqual(["METAUSDT", "TSLAUSDT"]);
-    expect(executeCalls).toBe(1);
-    expect(persistCalls).toBe(1);
-    expect(portfolioRefreshCalls).toBe(1);
+    expect(resultValue.stoppedAfterAmbiguity).toBe(false);
+    expect(skipped).toEqual([unavailable]);
+    expect(executed).toEqual(["HOODUSDT"]);
+    expect(resultValue.records.map((record) => record.decision.symbol)).toEqual(["HOODUSDT"]);
   });
 });
