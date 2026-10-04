@@ -13,10 +13,15 @@ import { PROVIDER_FINANCIAL_CATEGORIES, syncProviderLedger, type ProviderLedgerR
 import {
   loadProviderFinancialRecordsSinceCategories,
   loadProviderLifecycleEvidenceBatch,
+  loadProviderLiveOpeningOrderIdentities,
   loadProviderPositionHistoriesPage,
+  loadProviderPositionHistoryDecisionIds,
+  loadRecentProviderPositionHistories,
   loadProviderSyncState,
+  MAX_PROVIDER_HISTORY_MS,
   saveProviderSyncState,
   providerLedgerDiagnostics,
+  providerLedgerDiagnosticsBatch,
   resolveProviderOrigin,
   upsertProviderFill,
   upsertProviderFinancialRecord,
@@ -28,12 +33,14 @@ import { recordIdempotency, recordProviderOrderReference } from "../src/storage/
 
 type SqlValue = string | number | boolean | null;
 
-function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; executor: SqlExecutor; queries: string[] } {
+function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; executor: SqlExecutor; queries: string[]; queryParams: SqlValue[][] } {
   const queries: string[] = [];
+  const queryParams: SqlValue[][] = [];
   const executor: SqlExecutor = {
     sql<T>(strings: TemplateStringsArray, ...values: SqlValue[]): T[] {
       const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
       queries.push(query);
+      queryParams.push([...values]);
       const sqliteValues = values.map((value) => typeof value === "boolean" ? (value ? 1 : 0) : value) as (string | number | null)[];
       const normalizedQuery = query.trimStart().toUpperCase();
       if (normalizedQuery.startsWith("SELECT") || normalizedQuery.startsWith("WITH")) return db.prepare(query).all(...sqliteValues) as T[];
@@ -42,7 +49,7 @@ function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; 
     },
   };
   ensureStorage(executor);
-  return { db, executor, queries };
+  return { db, executor, queries, queryParams };
 }
 
 const observedAt = "2026-09-22T00:00:00.000Z";
@@ -189,7 +196,7 @@ describe("provider ledger normalization", () => {
 
 describe("provider ledger persistence and sync", () => {
   it("pages position histories with a stable keyset cursor", () => {
-    const { db, executor } = memoryExecutor();
+    const { db, executor, queries, queryParams } = memoryExecutor();
     const baseTime = Date.parse(observedAt);
     for (let index = 0; index < 3; index += 1) {
       const opening = new Date(baseTime + index * 1_000).toISOString();
@@ -197,12 +204,41 @@ describe("provider ledger persistence and sync", () => {
       const history = normalizeProviderPositionHistory(positionHistoryFixture({ positionId: `page-${index + 1}`, createdTime: opening, updatedTime: closing }), observedAt)!;
       upsertProviderPositionHistory(executor, history, observedAt);
     }
+    const queryOffset = queries.length;
     const first = loadProviderPositionHistoriesPage(executor, category, null, 2);
     const second = loadProviderPositionHistoriesPage(executor, category, first.nextCursor, 2);
     expect(first.histories.map((history) => history.providerPositionHistoryId)).toEqual(["page-1", "page-2"]);
     expect(first.hasMore).toBe(true);
     expect(second.histories.map((history) => history.providerPositionHistoryId)).toEqual(["page-3"]);
     expect(second.hasMore).toBe(false);
+    for (let index = queryOffset; index < queries.length; index += 1) {
+      const plan = db.prepare("EXPLAIN QUERY PLAN " + queries[index]!).all(...queryParams[index]!.map((value) => typeof value === "boolean" ? Number(value) : value)) as Array<{ detail: string }>;
+      expect(plan.some(({ detail }) => detail.includes("provider_position_history_category_page_idx") && detail.includes("category=?"))).toBe(true);
+      if (queries[index]!.includes("(opening_time, provider_position_history_key) >")) {
+        expect(plan.some(({ detail }) => detail.includes("(opening_time,provider_position_history_key)>(?,?)"))).toBe(true);
+      }
+      expect(plan.some(({ detail }) => detail.includes("USE TEMP B-TREE FOR ORDER BY"))).toBe(false);
+    }
+    db.close();
+  });
+
+  it("plans lifecycle identity lookup through exact symbol and opening-time indexes", () => {
+    const { db, executor, queries, queryParams } = memoryExecutor();
+    const queryOffset = queries.length;
+    loadProviderPositionHistoryDecisionIds(executor, category, [{
+      providerPositionHistoryId: "history-1",
+      symbol: "CRCLUSDT",
+      positionSide: "LONG",
+      openingTime: observedAt,
+    } as never]);
+    const queryIndex = queries.findIndex((query, index) => index >= queryOffset && query.includes("json_each"));
+    expect(queryIndex).toBeGreaterThanOrEqual(0);
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${queries[queryIndex]!}`).all(...queryParams[queryIndex]!.map((value) => typeof value === "boolean" ? Number(value) : value)) as Array<{ detail: string }>;
+    expect(plan.some(({ detail }) => detail.includes("provider_position_history_category_symbol_opening_idx") && detail.includes("opening_time=?"))).toBe(true);
+    expect(plan.some(({ detail }) => detail.includes("provider_fills_lifecycle_window_idx") && detail.includes("symbol=?") && detail.includes("created_time>?"))).toBe(true);
+    expect(plan.some(({ detail }) => detail.includes("provider_orders_client_oid_idx") && detail.includes("client_oid=?"))).toBe(true);
+    expect(plan.some(({ detail }) => detail.includes("provider_fills_category_created_idx"))).toBe(false);
+    expect(plan.some(({ detail }) => /\bSCAN (provider_position_history|provider_fills|provider_orders)\b/.test(detail))).toBe(false);
     db.close();
   });
 
@@ -222,6 +258,73 @@ describe("provider ledger persistence and sync", () => {
     };
     expect(countEvidenceQueries(1)).toBe(3);
     expect(countEvidenceQueries(25)).toBe(6);
+    db.close();
+  });
+
+  it("plans lifecycle evidence identities and bounded time windows through provider lookup indexes", () => {
+    const { db, executor, queries, queryParams } = memoryExecutor();
+    const history = {
+      providerPositionHistoryId: "history-1",
+      symbol: "CRCLUSDT",
+      positionSide: "LONG",
+      openingTime: "2026-09-21T00:00:00.000Z",
+      closingTime: "2026-09-22T00:00:00.000Z",
+    } as never;
+    const queryOffset = queries.length;
+    loadProviderLifecycleEvidenceBatch(executor, category, [{
+      requestId: "plan-request",
+      experience: { experienceId: "experience-1", symbol: "CRCLUSDT", positionSide: "LONG", entryDecisionId: "decision-1" } as never,
+      history,
+    }]);
+    const indexesByTable = new Map<string, Set<string>>();
+    for (let index = queryOffset; index < queries.length; index += 1) {
+      const query = queries[index]!;
+      if (!query.includes("provider_orders") && !query.includes("provider_fills")) continue;
+      const details = db.prepare(`EXPLAIN QUERY PLAN ${query}`).all(...queryParams[index]!.map((value) => typeof value === "boolean" ? Number(value) : value)) as Array<{ detail: string }>;
+      for (const table of ["provider_orders", "provider_fills"]) {
+        const indexes = indexesByTable.get(table) ?? new Set<string>();
+        for (const { detail } of details) {
+          const match = detail.match(new RegExp(`USING INDEX (${table}_[a-z0-9_]+)`));
+          if (match) indexes.add(match[1]!);
+        }
+        indexesByTable.set(table, indexes);
+      }
+    }
+    expect([...indexesByTable.get("provider_orders") ?? []]).toEqual(expect.arrayContaining([
+      "provider_orders_category_client_oid_created_idx",
+      "provider_orders_lifecycle_side_window_idx",
+    ]));
+    expect([...indexesByTable.get("provider_fills") ?? []]).toEqual(expect.arrayContaining([
+      "provider_fills_category_client_oid_created_idx",
+      "provider_fills_lifecycle_side_window_idx",
+      "provider_fills_lifecycle_untyped_side_window_idx",
+    ]));
+    db.close();
+  });
+
+  it("fails closed instead of reading lifecycle evidence outside the configured history window", () => {
+    const { db, executor } = memoryExecutor();
+    const openingTime = new Date(Date.now() - MAX_PROVIDER_HISTORY_MS - 1_000).toISOString();
+    const result = loadProviderLifecycleEvidenceBatch(executor, category, [{
+      requestId: "expired-window",
+      experience: { experienceId: "experience-old", symbol: "CRCLUSDT", positionSide: "LONG", entryDecisionId: "decision-old" } as never,
+      history: { providerPositionHistoryId: "history-old", symbol: "CRCLUSDT", positionSide: "LONG", openingTime, closingTime: new Date(Date.now() + 1_000).toISOString() } as never,
+    }]).get("expired-window");
+    expect(result?.evidenceComplete).toBe(false);
+    expect(result?.orders).toEqual([]);
+    expect(result?.fills).toEqual([]);
+    db.close();
+  });
+
+  it("bounds live-position opening identity lookups by category, symbol, side, and time", () => {
+    const { db, executor, queries, queryParams } = memoryExecutor();
+    const queryOffset = queries.length;
+    loadProviderLiveOpeningOrderIdentities(executor, category, [{ symbol: "CRCLUSDT", positionSide: "LONG", openedAt: observedAt } as never]);
+    const queryIndex = queries.findIndex((query, index) => index >= queryOffset && query.includes("JOIN provider_orders AS o"));
+    expect(queryIndex).toBeGreaterThanOrEqual(0);
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${queries[queryIndex]!}`).all(...queryParams[queryIndex]!.map((value) => typeof value === "boolean" ? Number(value) : value)) as Array<{ detail: string }>;
+    expect(plan.some(({ detail }) => detail.includes("provider_fills_lifecycle_window_idx") && detail.includes("created_time>?") && detail.includes("created_time<?"))).toBe(true);
+    expect(plan.some(({ detail }) => detail.includes("SEARCH o USING INDEX sqlite_autoindex_provider_orders_1 (provider_order_id=?)"))).toBe(true);
     db.close();
   });
 
@@ -259,6 +362,30 @@ describe("provider ledger persistence and sync", () => {
     expect(legacy).toMatchObject({ category: "MARGIN", revision: 0, checkpoints: { financialRecords: { windowStart: observedAt, windowEnd: observedAt } } });
     saveProviderSyncState(executor, legacy!);
     expect(loadProviderSyncState(executor, "MARGIN")?.revision).toBe(1);
+    db.close();
+  });
+
+  it("groups provider-ledger diagnostic aggregates across requested categories", () => {
+    const { db, executor, queries, queryParams } = memoryExecutor();
+    const queryOffset = queries.length;
+    const diagnostics = providerLedgerDiagnosticsBatch(executor, ["USDT-FUTURES", "SPOT", "MARGIN"]);
+    const aggregates = queries.slice(queryOffset).filter((query) => /GROUP BY category, origin/i.test(query));
+    expect(diagnostics.size).toBe(3);
+    expect(aggregates).toHaveLength(4);
+    expect([...diagnostics.values()].every((entry) => Object.values(entry.counts).every((count) => count === 0))).toBe(true);
+    const expectedIndexes = new Map([
+      ["provider_orders", "provider_orders_category_updated_idx"],
+      ["provider_fills", "provider_fills_category_created_idx"],
+      ["provider_position_history", "provider_position_history_category_closing_idx"],
+      ["provider_financial_records", "provider_financial_records_category_timestamp_idx"],
+    ]);
+    for (let index = queryOffset; index < queries.length; index += 1) {
+      const query = queries[index]!;
+      const table = query.match(/FROM (provider_[a-z_]+)/i)?.[1];
+      if (!table || !expectedIndexes.has(table)) continue;
+      const plan = db.prepare(`EXPLAIN QUERY PLAN ${query}`).all(...queryParams[index]!.map((value) => typeof value === "boolean" ? Number(value) : value)) as Array<{ detail: string }>;
+      expect(plan.some(({ detail }) => detail.includes(expectedIndexes.get(table)!))).toBe(true);
+    }
     db.close();
   });
 
@@ -547,8 +674,30 @@ describe("provider ledger persistence and sync", () => {
     expect(state?.lastSuccessfulSyncAt).toBeNull();
   });
 
-  it("reports bounded diagnostics without exposing raw provider payloads", () => {
+  it("returns the most recently closed lifecycle rows in a bounded window", () => {
     const { executor } = memoryExecutor();
+    for (const [id, closedAt] of [["old", "1730190000000"], ["new", "1730300000000"]] as const) {
+      const history = normalizeProviderPositionHistory(positionHistoryFixture({ positionId: id, createdTime: "1730181468493", updatedTime: closedAt }), observedAt)!;
+      upsertProviderPositionHistory(executor, history, observedAt);
+    }
+
+    const rows = loadRecentProviderPositionHistories(executor, category, 1);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.providerPositionHistoryId).toBe("new");
+  });
+
+  it("uses bounded indexes for provider identity lookups", () => {
+    const { db } = memoryExecutor();
+    const identityPlan = db.prepare("EXPLAIN QUERY PLAN SELECT provider_order_id FROM idempotency WHERE provider_order_id = ? LIMIT 1").all("order-1") as Array<{ detail: string }>;
+    const historyPlan = db.prepare("EXPLAIN QUERY PLAN SELECT provider_position_history_id FROM provider_position_history WHERE category = ? AND provider_position_history_id = ? LIMIT 1").all(category, "position-1") as Array<{ detail: string }>;
+
+    expect(identityPlan.map((row) => row.detail).join(" ")).toContain("idempotency_provider_order_idx");
+    expect(historyPlan.map((row) => row.detail).join(" ")).toContain("provider_position_history_category_id_idx");
+  });
+
+  it("reports bounded diagnostics without exposing raw provider payloads", () => {
+    const { executor, queries } = memoryExecutor();
     const order = normalizeProviderOrder(orderFixture(), "DARWIN", observedAt)!;
     const fill = normalizeProviderFill(fillFixture(), "DARWIN", observedAt)!;
     upsertProviderOrder(executor, order, observedAt);
@@ -557,9 +706,12 @@ describe("provider ledger persistence and sync", () => {
     upsertProviderFinancialRecord(executor, normalizeProviderFinancialRecord(financialFixture(), observedAt)!, observedAt);
     upsertProviderOrder(executor, normalizeProviderOrder(orderFixture({ orderId: "external", clientOid: "external-1" }), "PROVIDER_EXTERNAL", observedAt)!, observedAt);
 
+    const queryOffset = queries.length;
     const diagnostics = providerLedgerDiagnostics(executor, category);
+    const diagnosticQueries = queries.slice(queryOffset).filter((query) => /FROM provider_(orders|fills|position_history|financial_records)/.test(query));
 
     expect(diagnostics.counts).toEqual({ orders: 2, fills: 1, positionHistory: 1, financialRecords: 1 });
+    expect(diagnosticQueries).toHaveLength(4);
     expect(diagnostics.origins).toEqual({ DARWIN: 2, PROVIDER_EXTERNAL: 1, UNATTRIBUTED: 2 });
     expect(JSON.stringify(diagnostics)).not.toContain("order-1");
   });

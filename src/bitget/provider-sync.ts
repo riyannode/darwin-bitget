@@ -7,6 +7,7 @@ import {
   type ProviderLedgerReadParams,
 } from "./provider-ledger.js";
 import {
+  MAX_PROVIDER_HISTORY_MS,
   loadProviderSyncState,
   resolveProviderOrigin,
   saveProviderSyncState,
@@ -21,7 +22,6 @@ import {
 import type { SqlExecutor } from "../storage/schema.js";
 
 const MAX_PROVIDER_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
-const MAX_PROVIDER_HISTORY_MS = 90 * 24 * 60 * 60 * 1000;
 const PROVIDER_HISTORY_SAFETY_MS = 60 * 1000;
 const DEFAULT_INITIAL_LOOKBACK_MS = MAX_PROVIDER_HISTORY_MS;
 export const PROVIDER_TRADE_LIFECYCLE_CATEGORY = "USDT-FUTURES" as const;

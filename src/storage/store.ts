@@ -6,7 +6,7 @@ import { parseOwnerPolicy } from "../trading/policy.js";
 import { normalizeCycleDecisions, cyclePlanDecisions, journalHasPersistedPlan } from "./journal-normalizer.js";
 import type { VerifiedExternalFlows } from "../trading/external-flow.js";
 import type { ProviderPerformanceTotals } from "../trading/provider-performance.js";
-import type { SqlExecutor } from "./schema.js";
+import { executeMeasuredSql, type SqlExecutor } from "./schema.js";
 
 interface LessonRow {
   payload: string;
@@ -188,11 +188,11 @@ export function loadExperiences(executor: SqlExecutor, limit = MAX_HISTORY_LIMIT
   });
 }
 
-export function loadExperiencesForDecisionIds(executor: SqlExecutor, decisionIds: readonly string[], limit = MAX_HISTORY_LIMIT): TradeExperience[] {
+export function loadExperiencesForDecisionIds(executor: SqlExecutor, decisionIds: readonly string[], limit = MAX_HISTORY_LIMIT, path = "/api/trade-history"): TradeExperience[] {
   const requested = [...new Set(decisionIds)].filter((id) => typeof id === "string" && id.trim().length > 0 && id.length <= MAX_TARGETED_DECISION_ID_LENGTH).slice(0, MAX_HISTORY_LIMIT);
   if (requested.length === 0) return [];
   const requestedSet = new Set(requested);
-  const rows = executor.sql<ExperienceRow>`
+  const rows = executeMeasuredSql<ExperienceRow>(executor, path, "trade_history_experience_enrichment_batch")`
     SELECT experience.payload
     FROM experiences AS experience
     JOIN json_each(${JSON.stringify(requested)}) AS requested
@@ -255,11 +255,11 @@ function journalContainsAnyDecisionId(payload: string, decisionIds: ReadonlySet<
   return false;
 }
 
-export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: readonly string[], limit = MAX_HISTORY_LIMIT): TradingJournal[] {
+export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: readonly string[], limit = MAX_HISTORY_LIMIT, path = "/api/trade-history"): TradingJournal[] {
   const requested = [...new Set(decisionIds)].filter((id) => typeof id === "string" && id.trim().length > 0 && id.length <= MAX_TARGETED_DECISION_ID_LENGTH).slice(0, MAX_HISTORY_LIMIT);
   if (requested.length === 0) return [];
   const maxRows = Math.min(requested.length * 2, MAX_HISTORY_LIMIT * 2);
-  const rows = executor.sql<JournalRow>`
+  const rows = executeMeasuredSql<JournalRow>(executor, path, "trade_history_journal_enrichment_batch")`
     SELECT j.payload
     FROM journals AS j
     JOIN journal_decision_lookup AS indexed ON indexed.cycle_id = j.cycle_id
@@ -583,11 +583,11 @@ export function loadPositionContext(executor: SqlExecutor, symbol: string, posit
   }
 }
 
-export function loadPositionContextsForKeys(executor: SqlExecutor, contextKeys: readonly string[], limit = MAX_HISTORY_LIMIT): Map<string, PositionContext> {
+export function loadPositionContextsForKeys(executor: SqlExecutor, contextKeys: readonly string[], limit = MAX_HISTORY_LIMIT, path = "/api/trade-history"): Map<string, PositionContext> {
   const maxContextKeys = MAX_HISTORY_LIMIT * 4;
   const keys = [...new Set(contextKeys)].filter((key) => typeof key === "string" && key.trim().length > 0 && key.length <= 80).slice(0, maxContextKeys);
   if (keys.length === 0) return new Map();
-  const rows = executor.sql<PositionContextRow & { context_key: string }>`
+  const rows = executeMeasuredSql<PositionContextRow & { context_key: string }>(executor, path, "trade_history_context_enrichment_batch")`
     SELECT context_key, payload FROM position_context
     WHERE context_key IN (SELECT value FROM json_each(${JSON.stringify(keys)}))
     ORDER BY updated_at DESC LIMIT ${Math.min(Number.isInteger(limit) && limit > 0 ? limit : maxContextKeys, maxContextKeys)}

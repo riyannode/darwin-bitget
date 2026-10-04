@@ -7,7 +7,7 @@ import { failureDiagnostic, TraderAgent } from "../src/agent/agent.js";
 import { QwenJsonError } from "../src/agent/qwen.js";
 import { cycleReadModel } from "../src/storage/journal-normalizer.js";
 import { loadLatestCompletedCyclePlanFromHistory, loadLatestValidCyclePlan, saveCycle, saveJournal, saveLatestValidCyclePlan } from "../src/storage/store.js";
-import type { SqlExecutor } from "../src/storage/schema.js";
+import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
 import type { CycleDecisionPlan, Decision, TradingJournal } from "../src/types.js";
 
 const baseJournal = {
@@ -124,6 +124,34 @@ describe("cycle status read model", () => {
         return [];
       },
     };
+    ensureStorage(executor);
+    executor.sql`
+      INSERT INTO risk_state (state_key, payload, updated_at)
+      VALUES ('provider_lifecycle_performance_materialized_v1', ${JSON.stringify({
+        version: 1,
+        generation: "cycle-test",
+        phase: "READY",
+        cursor: null,
+        queueCursor: 0,
+        scannedHistories: 0,
+        lifecycleRevision: 0,
+        identityRevision: 0,
+        realizedPnlAccumulator: "0",
+        totals: {
+          source: "PROVIDER_LEDGER",
+          closedTrades: 0,
+          openTrades: 0,
+          totalTrades: 0,
+          wins: 0,
+          losses: 0,
+          breakeven: 0,
+          closedEpisodeRealizedPnl: "0",
+          verifiedRealizedPnl: "0",
+          unresolvedClosedLifecycles: 0,
+          dailyPnl: {},
+        },
+      })}, '2026-09-14T12:00:00.000Z')
+    `;
     const plan = { positionActions: [hold], entryActions: [] } as unknown as CycleDecisionPlan;
     saveJournal(executor, { ...baseJournal, cycleId: "cycle-completed", startedAt: "2026-09-14T11:00:00.000Z", completedAt: "2026-09-14T11:01:00.000Z", cyclePlan: plan } as TradingJournal);
     saveCycle(executor, "cycle-completed", "COMPLETED", "2026-09-14T11:00:00.000Z", "2026-09-14T11:01:00.000Z");
@@ -137,6 +165,7 @@ describe("cycle status read model", () => {
     const fake = {
       env: { TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_CATEGORY: "USDT-FUTURES" },
       state: { runtimeStatus: "ONLINE", currentStage: "ONLINE", lastScanAt: null, nextScanAt: null, model: "qwen", temporaryScanIntervalExpiresAt: null, temporaryScanIntervalCompleted: true, paused: true, emergencyStop: false, lastStatus: "IDLE", cycleStartedAt: null },
+      ctx: { storage: { transactionSync: <T>(closure: () => T) => closure() } },
       ensureActivePolicy: () => policy,
       activeScanIntervalMinutes: () => 15,
       getSchedulerDiagnostics: async () => ({ nextScanAt: null, nextScanStale: true, configuredIntervalMinutes: 15, matchingScheduleCount: 0, schedulerHealthy: true }),

@@ -1,3 +1,5 @@
+import { createSnapshotPolling } from "./snapshot-polling.js";
+
 const $ = (id) => document.getElementById(id);
 const text = (value, fallback = "—") => value === undefined || value === null || value === "" ? fallback : String(value);
 const money = (value) => value === undefined || value === null || value === "" || value === "UNAVAILABLE" ? "—" : `$${value}`;
@@ -380,4 +382,13 @@ document.querySelectorAll("[data-page]").forEach((button) => button.addEventList
 document.querySelectorAll("[data-page-link]").forEach((button) => button.addEventListener("click", () => selectPage(button.dataset.pageLink)));
 document.querySelectorAll("[data-export]").forEach((button) => button.addEventListener("click", () => downloadPaperLog(button.dataset.export)));
 document.querySelectorAll("[data-filter]").forEach((button) => button.addEventListener("click", () => { tradeFilter = button.dataset.filter; document.querySelectorAll(".filter").forEach((item) => item.classList.toggle("active", item.dataset.filter === tradeFilter)); renderTradeTable(); }));
-selectPage("dashboard"); void refreshSnapshot(); if (!judgeDemo) window.setInterval(() => { void refreshSnapshot(); }, 10000);
+selectPage("dashboard");
+if (judgeDemo) {
+  void refreshSnapshot();
+} else {
+  createSnapshotPolling({
+    document,
+    getAgent: () => snapshot.agent,
+    refresh: refreshSnapshot,
+  }).start();
+}
