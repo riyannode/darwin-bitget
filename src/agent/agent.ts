@@ -84,6 +84,7 @@ import { resolveExternalFlowReadModel } from "../trading/external-flow-read-mode
 import { classifyProviderLifecycle, summarizeProviderLifecycleFillQuantities, type ProviderLifecycleClassification, type ProviderLifecycleHistory, type ProviderLifecycleEvidence, type ProviderLifecycleCandidateOrder, type ProviderLifecycleCandidateFill } from "../trading/provider-lifecycle-reconciliation.js";
 import { type ProviderPerformanceLifecycle, type ProviderPerformanceTotals } from "../trading/provider-performance.js";
 import { ProviderPerformanceMaterializationError, loadProviderPerformanceMaterializationState, providerPerformanceMigrationProgress, resolveProviderPerformanceMaterializedTotals, runProviderPerformanceMigrationBatch, type ProviderPerformanceLifecycleRow, type ProviderPerformanceRevisions } from "../trading/provider-performance-materializer.js";
+import { boundedDiagnosticText, safeDiagnosticMessage } from "../shared/failure-diagnostics.js";
 
 class ProviderLifecycleClassificationError extends Error {
   public constructor(readonly classification: ProviderLifecycleClassification, readonly reason: string) {
@@ -158,18 +159,6 @@ function resolveProviderPerformanceRows(
   return new Map(rows.map((row) => [row.historyKey, lifecycles.get(row.history.providerPositionHistoryId ?? "") ?? null]));
 }
 
-const MAX_FAILURE_DIAGNOSTIC_LENGTH = 240;
-
-function boundedDiagnosticText(value: unknown, limit = MAX_FAILURE_DIAGNOSTIC_LENGTH): string {
-  return String(value ?? "").replace(/\s+/g, " ").replace(/Bearer\s+[^\s,;]+/gi, "Bearer [REDACTED]").replace(/((?:api[_-]?key|token|secret|password)\s*[=:]\s*)[^\s,;]+/gi, "$1[REDACTED]").slice(0, limit);
-}
-
-function safeDiagnosticMessage(value: unknown, fallback: string): string {
-  const text = boundedDiagnosticText(value);
-  if (!text || /(prompt|system\s+message|api[_-]?key|bearer\s|secret|password|authorization)/i.test(text)) return fallback;
-  return text;
-}
-
 export function failureDiagnostic(error: unknown): Record<string, string> {
   if (error instanceof ZodError) {
     const issues = error.issues.slice(0, 3);
@@ -193,8 +182,11 @@ export function failureDiagnostic(error: unknown): Record<string, string> {
   const rawMessage = error instanceof Error ? error.message : "Unknown runtime error";
   const normalizedMessage = boundedDiagnosticText(rawMessage);
   const candidateCode = normalizedMessage.split(":", 1)[0]?.trim() ?? "";
-  const code = /^[A-Z][A-Z0-9_]{1,79}$/.test(candidateCode) ? candidateCode : "RUNTIME_ERROR";
-  const detail = normalizedMessage.includes(":") ? normalizedMessage.slice(normalizedMessage.indexOf(":") + 1).trim() : "Runtime error";
+  const canonicalCode = /^[A-Z][A-Z0-9_]{1,79}$/.test(candidateCode);
+  const code = canonicalCode ? candidateCode : "RUNTIME_ERROR";
+  const detail = canonicalCode && normalizedMessage.includes(":")
+    ? normalizedMessage.slice(normalizedMessage.indexOf(":") + 1).trim()
+    : normalizedMessage;
   const parserStage = error instanceof QwenJsonError ? error.diagnostic.parserStage : undefined;
   return { category: "RUNTIME_ERROR", code, message: safeDiagnosticMessage(detail, "Runtime error"), ...(parserStage ? { parserStage } : {}) };
 }

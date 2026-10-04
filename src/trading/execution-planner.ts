@@ -1,6 +1,7 @@
 import type { AccountSnapshot, Decision, DecisionExecutionRecord, EvidenceBundle } from "../types.js";
 import { financialWriteCount, MAX_FINANCIAL_WRITES_PER_CYCLE, orderCycleActions } from "../agent/decision.js";
 import type { CycleDecisionPlan } from "../types.js";
+import { safeDiagnosticMessage } from "../shared/failure-diagnostics.js";
 
 export interface CyclePlanExecutionCallbacks {
   refreshEvidence: (symbol: string) => Promise<EvidenceBundle | undefined>;
@@ -37,6 +38,31 @@ function symbolStillOpen(account: AccountSnapshot, decision: Decision): boolean 
   return account.positions.some((position) => position.symbol === decision.symbol && Number(position.quantity) > 0);
 }
 
+function stageFailure(stage: string, error: unknown, symbol?: string): Error {
+  const rawCause = error instanceof Error ? error.message : "Unknown runtime error";
+  const safeCause = safeDiagnosticMessage(rawCause, "Runtime error");
+  const safeSymbol = symbol ? safeDiagnosticMessage(symbol, "UNKNOWN_SYMBOL").slice(0, 80) : "";
+  return new Error(`${stage}${safeSymbol ? `:${safeSymbol}` : ""}:${safeCause}`);
+}
+
+async function refreshEvidence(callbacks: CyclePlanExecutionCallbacks, symbol: string): Promise<EvidenceBundle> {
+  try {
+    const bundle = await callbacks.refreshEvidence(symbol);
+    if (!bundle) throw new Error("EVIDENCE_READBACK_UNAVAILABLE");
+    return bundle;
+  } catch (error) {
+    throw stageFailure("EVIDENCE_REFRESH_FAILED", error, symbol);
+  }
+}
+
+async function refreshPortfolio(callbacks: CyclePlanExecutionCallbacks): Promise<AccountSnapshot> {
+  try {
+    return await callbacks.refreshPortfolio();
+  } catch (error) {
+    throw stageFailure("PORTFOLIO_REFRESH_FAILED", error);
+  }
+}
+
 /**
  * Serialize bounded plan execution. The next action is not evaluated until the
  * previous matched write has refreshed the provider portfolio.
@@ -56,8 +82,7 @@ export async function executeCyclePlan(plan: CycleDecisionPlan, callbacks: Cycle
   };
   const executeOne = async (decision: Decision, actionCategory: "POSITION_MANAGEMENT" | "NEW_ENTRY", parent?: Decision): Promise<{ record: DecisionExecutionRecord; bundle: EvidenceBundle }> => {
     if (financialWriteCount(decision.action) > 0 && financialWrites >= MAX_FINANCIAL_WRITES_PER_CYCLE) throw new Error("MAX_FINANCIAL_WRITES_PER_CYCLE");
-    const bundle = await callbacks.refreshEvidence(decision.symbol);
-    if (!bundle) throw new Error("EVIDENCE_READBACK_UNAVAILABLE");
+    const bundle = await refreshEvidence(callbacks, decision.symbol);
     const record = withParent(await callbacks.execute(decision, bundle, actionCategory, parent), parent);
     await persistRecord(record, bundle);
     return { record, bundle };
@@ -70,7 +95,7 @@ export async function executeCyclePlan(plan: CycleDecisionPlan, callbacks: Cycle
         callbacks.onAmbiguousWrite?.(close.record);
         return { records, finalPortfolio, stoppedAfterAmbiguity: true };
       }
-      finalPortfolio = await callbacks.refreshPortfolio();
+      finalPortfolio = await refreshPortfolio(callbacks);
       if (symbolStillOpen(finalPortfolio, decision)) {
         callbacks.onAmbiguousWrite?.(close.record);
         return { records, finalPortfolio, stoppedAfterAmbiguity: true };
@@ -83,7 +108,7 @@ export async function executeCyclePlan(plan: CycleDecisionPlan, callbacks: Cycle
       callbacks.onAmbiguousWrite?.(record);
       return { records, finalPortfolio, stoppedAfterAmbiguity: true };
     }
-    if (record.executionResult) finalPortfolio = await callbacks.refreshPortfolio();
+    if (record.executionResult) finalPortfolio = await refreshPortfolio(callbacks);
   }
   for (const decision of pendingReversals) {
     const open = await executeOne(reverseLeg(decision, decision.targetPositionSide === "LONG" ? "OPEN_LONG" : "OPEN_SHORT"), "NEW_ENTRY", decision);
@@ -91,7 +116,7 @@ export async function executeCyclePlan(plan: CycleDecisionPlan, callbacks: Cycle
       callbacks.onAmbiguousWrite?.(open.record);
       return { records, finalPortfolio, stoppedAfterAmbiguity: true };
     }
-    if (open.record.executionResult) finalPortfolio = await callbacks.refreshPortfolio();
+    if (open.record.executionResult) finalPortfolio = await refreshPortfolio(callbacks);
   }
   return { records, finalPortfolio, stoppedAfterAmbiguity: false };
 }
