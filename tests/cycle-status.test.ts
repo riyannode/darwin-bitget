@@ -215,6 +215,32 @@ describe("cycle status read model", () => {
 });
 
 describe("safe failure diagnostics", () => {
+  it("preserves a useful sanitized message for ordinary runtime errors", () => {
+    expect(failureDiagnostic(new Error("fetch failed"))).toEqual({
+      category: "RUNTIME_ERROR",
+      code: "RUNTIME_ERROR",
+      message: "fetch failed",
+    });
+  });
+
+  it("preserves a canonical application code and its useful message", () => {
+    expect(failureDiagnostic(new Error("PROVIDER_READ_FAILED: upstream unavailable"))).toEqual({
+      category: "RUNTIME_ERROR",
+      code: "PROVIDER_READ_FAILED",
+      message: "upstream unavailable",
+    });
+  });
+
+  it("falls back safely for bearer and quoted multiword credential messages", () => {
+    const bearerDiagnostic = failureDiagnostic(new Error("fetch failed: Bearer example-value"));
+    expect(bearerDiagnostic.message).toBe("Runtime error");
+    expect(JSON.stringify(bearerDiagnostic)).not.toContain("example-value");
+
+    const quotedCredentialDiagnostic = failureDiagnostic(new Error('provider error: password="two words"'));
+    expect(quotedCredentialDiagnostic.message).toBe("Runtime error");
+    expect(JSON.stringify(quotedCredentialDiagnostic)).not.toContain("two words");
+  });
+
   it("persists Qwen JSON_PARSE as a structured safe diagnostic field", () => {
     const diagnostic = failureDiagnostic(new QwenJsonError("QWEN_INVALID_JSON", { finishReason: "stop", textLength: 20, inputTokens: 10, outputTokens: 5, hasOpeningBrace: true, hasClosingBrace: true, parserStage: "JSON_PARSE" }));
     expect(diagnostic).toMatchObject({ category: "RUNTIME_ERROR", code: "QWEN_INVALID_JSON", parserStage: "JSON_PARSE" });
@@ -246,6 +272,11 @@ describe("safe failure diagnostics", () => {
     expect(diagnostic).toEqual({ category: "RUNTIME_ERROR", code: "QWEN_REQUEST_FAILED", message: "Runtime error" });
     expect(JSON.stringify(diagnostic)).not.toContain("super-secret-token");
     expect(JSON.stringify(diagnostic)).not.toContain("system message prompt");
+
+    const credentialDiagnostic = failureDiagnostic(new Error("fetch failed: api_key=secret-value Authorization: Bearer dummy-value"));
+    expect(credentialDiagnostic.message).toBe("Runtime error");
+    expect(JSON.stringify(credentialDiagnostic)).not.toContain("secret-value");
+    expect(JSON.stringify(credentialDiagnostic)).not.toContain("Authorization");
   });
 
   it("bounds Zod diagnostics and keeps only the first three issues", () => {

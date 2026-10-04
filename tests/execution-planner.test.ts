@@ -131,4 +131,47 @@ describe("sequential cycle execution planner", () => {
     expect(executed).toEqual(["CLOSE", "OPEN_SHORT"]);
     expect(resultValue.records[1]?.executionResult).toBeUndefined();
   });
+
+  it("identifies post-write portfolio refresh failures without retrying the write", async () => {
+    const close = decision("CLOSE", "METAUSDT");
+    let executeCalls = 0;
+    let persistCalls = 0;
+    let portfolioRefreshCalls = 0;
+
+    await expect(executeCyclePlan({ positionActions: [close] as CycleDecisionPlan["positionActions"], entryActions: [] }, {
+      refreshEvidence: async (symbol) => bundle(symbol, "100"),
+      execute: async (item) => { executeCalls += 1; return result(item); },
+      persist: async () => { persistCalls += 1; },
+      refreshPortfolio: async () => { portfolioRefreshCalls += 1; throw new Error("fetch failed"); },
+    })).rejects.toThrow("PORTFOLIO_REFRESH_FAILED:fetch failed");
+
+    expect(executeCalls).toBe(1);
+    expect(persistCalls).toBe(1);
+    expect(portfolioRefreshCalls).toBe(1);
+  });
+
+  it("identifies a later action evidence refresh failure by stage and symbol", async () => {
+    const metaClose = decision("CLOSE", "METAUSDT");
+    const tslaClose = decision("CLOSE", "TSLAUSDT");
+    const evidenceCalls: string[] = [];
+    let executeCalls = 0;
+    let persistCalls = 0;
+    let portfolioRefreshCalls = 0;
+
+    await expect(executeCyclePlan({ positionActions: [tslaClose, metaClose] as CycleDecisionPlan["positionActions"], entryActions: [] }, {
+      refreshEvidence: async (symbol) => {
+        evidenceCalls.push(symbol);
+        if (symbol === "TSLAUSDT") throw new Error("fetch failed: Authorization: Bearer secret-token");
+        return bundle(symbol, "100");
+      },
+      execute: async (item) => { executeCalls += 1; return result(item); },
+      persist: async () => { persistCalls += 1; },
+      refreshPortfolio: async () => { portfolioRefreshCalls += 1; return account("100"); },
+    })).rejects.toThrow("EVIDENCE_REFRESH_FAILED:TSLAUSDT:Runtime error");
+
+    expect(evidenceCalls).toEqual(["METAUSDT", "TSLAUSDT"]);
+    expect(executeCalls).toBe(1);
+    expect(persistCalls).toBe(1);
+    expect(portfolioRefreshCalls).toBe(1);
+  });
 });
