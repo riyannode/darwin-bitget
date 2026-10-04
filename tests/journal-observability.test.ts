@@ -323,7 +323,7 @@ describe("journal observability persistence", () => {
     vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
     vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
     vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
-    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "collectSymbolMarketEvidence").mockResolvedValue({ bundles: [bundle()], unavailable: [] });
     vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(account());
 
     const fake = {
@@ -362,7 +362,7 @@ describe("journal observability persistence", () => {
     vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
     vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
     vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
-    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "collectSymbolMarketEvidence").mockResolvedValue({ bundles: [bundle()], unavailable: [] });
     vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(account());
 
     const fake = cycleTestAgent(executor, events);
@@ -386,7 +386,7 @@ describe("journal observability persistence", () => {
     vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
     vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
     vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
-    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "collectSymbolMarketEvidence").mockResolvedValue({ bundles: [bundle()], unavailable: [] });
     vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(account());
 
     const fake = cycleTestAgent(executor, events);
@@ -433,7 +433,7 @@ describe("journal observability persistence", () => {
     vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
     vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
     vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
-    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "collectSymbolMarketEvidence").mockResolvedValue({ bundles: [bundle()], unavailable: [] });
     vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(account());
 
     const fake = cycleTestAgent(executor, events, ["LOCAL_EXPERIENCE_MISSING:CRCLUSDT:LONG"]);
@@ -473,7 +473,8 @@ describe("journal observability persistence", () => {
       },
       sql: executor.sql,
     } as unknown as { state: { paused: boolean } };
-    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "collectSymbolMarketEvidence").mockResolvedValue({ bundles: [bundle()], unavailable: [] });
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(bundle().account);
     vi.spyOn(BitgetClient.prototype, "getOrderDetailsRead").mockResolvedValue({ orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "3", cumExecQty: "3", avgPrice: "100", orderStatus: "filled", createdTime: "1789968749335" });
     vi.spyOn(BitgetClient.prototype, "getFillHistoryRead").mockResolvedValue({ list: [{ execId: "fill-open", orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "3", execPrice: "100", createdTime: "1789968749337" }] });
 
@@ -543,7 +544,7 @@ describe("journal observability persistence", () => {
     vi.spyOn(BitgetClient.prototype, "getOpenPositionSymbols").mockResolvedValue(["CRCLUSDT"]);
     vi.spyOn(BitgetClient.prototype, "getTradableInstruments").mockResolvedValue([instrument()]);
     vi.spyOn(BitgetClient.prototype, "collectLightweightScan").mockResolvedValue([]);
-    vi.spyOn(BitgetClient.prototype, "collectEvidence").mockResolvedValue([bundle()]);
+    vi.spyOn(BitgetClient.prototype, "collectSymbolMarketEvidence").mockResolvedValue({ bundles: [bundle()], unavailable: [] });
     vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValueOnce(account()).mockRejectedValue(new Error("POST_WRITE_REFRESH_FAILURE"));
 
     const fake = {

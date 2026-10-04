@@ -16,6 +16,29 @@ function decision(action: Action, marginAllocationPct = "10", leverage = "2", re
 function context(next: Decision, availableMargin = account.availableMargin, accountOverride: AccountSnapshot = account) { return { decision: next, instrument, account: { ...accountOverride, availableMargin }, market: { symbol: "BTCUSDT", lastPrice: "20000", bidPrice: "19999", askPrice: "20001", priceChange24h: "0", volume24h: "1000", observedAt: account.observedAt }, evidenceObservedAt: account.observedAt, openOrderSymbols: [], supportedUniverse: ["BTCUSDT"], emergencyStop: false, dailyDrawdownBlocked: false, now: new Date(account.observedAt) }; }
 
 describe("futures risk gate", () => {
+  it("blocks only financial actions for the symbol with an unresolved prior execution", () => {
+    const mstrDecision = { ...decision("OPEN_LONG"), symbol: "MSTRUSDT" };
+    const mstr = evaluateRiskGate(config, {
+      ...context(mstrDecision),
+      instrument: { ...instrument, symbol: "MSTRUSDT" },
+      market: { symbol: "MSTRUSDT", lastPrice: "20000", bidPrice: "19999", askPrice: "20001", priceChange24h: "0", volume24h: "1000", observedAt: account.observedAt },
+      supportedUniverse: ["MSTRUSDT", "HOODUSDT"],
+      unresolvedExecutionSymbols: ["MSTRUSDT"],
+    });
+    const hoodDecision = { ...decision("OPEN_LONG"), symbol: "HOODUSDT" };
+    const hood = evaluateRiskGate(config, {
+      ...context(hoodDecision),
+      instrument: { ...instrument, symbol: "HOODUSDT" },
+      market: { symbol: "HOODUSDT", lastPrice: "20000", bidPrice: "19999", askPrice: "20001", priceChange24h: "0", volume24h: "1000", observedAt: account.observedAt },
+      supportedUniverse: ["MSTRUSDT", "HOODUSDT"],
+      unresolvedExecutionSymbols: ["MSTRUSDT"],
+    });
+
+    expect(mstr.status).toBe("BLOCK");
+    expect(mstr.codes).toContain("UNRESOLVED_PRIOR_EXECUTION");
+    expect(hood.status).toBe("PASS");
+  });
+
   it("blocks public-only entries even when a position is already held", () => {
     for (const symbol of ["SOXLUSDT", "SNXXUSDT"]) {
       const next = context({ ...decision("OPEN_LONG"), symbol });

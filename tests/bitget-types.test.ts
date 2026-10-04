@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { accountForEvidenceSymbol, normalizeProviderProfitRate, parseAccount, parseDashboardPortfolio, parseFillSummary, parseInstruments, parsePositionHistorySummary, parseTicker } from "../src/bitget/types.js";
+import { accountForEvidenceSymbol, normalizeProviderProfitRate, parseAccount, parseDashboardPortfolio, parseFillSummary, parseInstruments, parseOpenOrders, parsePositionHistorySummary, parseTicker } from "../src/bitget/types.js";
 import type { Instrument, MarketSnapshot } from "../src/types.js";
 
 describe("Bitget provider readback", () => {
+  it.each([{}, { list: [{}] }, { data: "invalid" }])("rejects malformed provider open-order responses: %j", (response) => {
+    expect(() => parseOpenOrders(response)).toThrow("PROVIDER_OPEN_ORDERS_RESPONSE_INVALID");
+  });
+
   it("preserves tokenized stock metadata from the instrument catalog", () => {
     expect(parseInstruments([{ symbol: "NVDAUSDT", category: "USDT-FUTURES", symbolType: "stock", isRwa: "YES", status: "online", minOrderQty: "0.01", minOrderAmount: "5", maxOrderQty: "500", maxMarketOrderQty: "100", pricePrecision: "2", quantityPrecision: "2", sizeMultiplier: "0.01", minLeverage: "1", maxLeverage: "100" }])[0]).toMatchObject({ symbol: "NVDAUSDT", symbolType: "stock", isRwa: "YES", status: "online", minOrderQty: "0.01", maxOrderQty: "100", minOrderAmount: "5", leverageMin: "1", leverageMax: "100" });
   });

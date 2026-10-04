@@ -143,7 +143,7 @@ export function parseDashboardPortfolio(accountValue: unknown, positionsValue: u
   const positions = providerRows(positionsValue)
     .map(parseDashboardPosition)
     .filter((position) => hasPositionQuantity(position.quantity));
-  const orders = providerRows(openOrdersValue);
+  const orders = parseOpenOrders(openOrdersValue);
   const accountEquity = firstDecimal(account, ["usdtEquity", "accountEquity", "totalEquity", "equity"]) || sumAssetValues(assetRows, ["usdValue"]);
   if (!accountEquity || accountEquity === "0") throw new Error(`INVALID_PORTFOLIO_EQUITY_${Object.keys(account).sort().join("_") || "EMPTY"}`);
   const usdtAssets = assetRows.filter((row) => text(row.coin).toUpperCase() === "USDT");
@@ -208,6 +208,21 @@ export function accountForEvidenceSymbol(account: AccountSnapshot, symbol: strin
     positionNotional: position?.notional ?? "0",
     positionQuantity: position?.quantity ?? "0",
   };
+}
+
+export function parseOpenOrders(value: unknown): Record<string, unknown>[] {
+  let orders: Record<string, unknown>[];
+  if (Array.isArray(value)) {
+    orders = records(value);
+  } else {
+    const payload = record(value);
+    if (Array.isArray(payload.list)) orders = records(payload.list);
+    else if (Array.isArray(payload.data)) orders = records(payload.data);
+    else if (typeof payload.symbol === "string" && payload.symbol.trim().length > 0) orders = [payload];
+    else throw new Error("PROVIDER_OPEN_ORDERS_RESPONSE_INVALID");
+  }
+  if (orders.some((order) => typeof order.symbol !== "string" || order.symbol.trim().length === 0)) throw new Error("PROVIDER_OPEN_ORDERS_RESPONSE_INVALID");
+  return orders;
 }
 
 function providerRows(value: unknown): Record<string, unknown>[] {

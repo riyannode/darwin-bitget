@@ -1,9 +1,20 @@
 import { BitgetRestClient, loadConfig as loadBitgetConfig } from "@bitget-ai/bitget-agent-sdk";
 import type { AccountSnapshot, EvidenceBundle, ExecutionResult, ExecutionRequest, Instrument, MarketSnapshot, RuntimeConfig } from "../types.js";
 import { classifyMarketRegime } from "../trading/market-regime.js";
-import { accountForEvidenceSymbol, parseDashboardPortfolio, parseFillSummary, parseHistoricalBars, parseInstruments, parsePositionHistorySummary, parsePositionSymbols, parseTicker, record } from "./types.js";
+import { accountForEvidenceSymbol, parseDashboardPortfolio, parseFillSummary, parseHistoricalBars, parseInstruments, parseOpenOrders, parsePositionHistorySummary, parsePositionSymbols, parseTicker, record } from "./types.js";
 import type { ProviderLedgerReadParams } from "./provider-ledger.js";
 import { BitgetGatewayClient, PRIVATE_BITGET_OPERATIONS, type PrivateBitgetOperation } from "./gateway-client.js";
+
+export interface MarketEvidenceFailure {
+  symbol: string;
+  operation: string;
+  diagnostic: string;
+}
+
+export interface MarketEvidenceCollection {
+  bundles: EvidenceBundle[];
+  unavailable: MarketEvidenceFailure[];
+}
 
 export function formatBitgetReadFailure(operation: string, symbol = "ACCOUNT"): string {
   return `BITGET_READ_FAILED_${operation}_${symbol}`;
@@ -234,18 +245,29 @@ export class BitgetClient {
       this.callRead<unknown>("getPositionInfo", { category: this.category }),
       this.callRead<unknown>("getOpenOrders", buildOpenOrdersReadParams(this.category)).then((result) => ({ result })).catch((error: unknown) => ({ error })),
     ]);
-    const openOrdersFailure = "error" in openOrdersResult ? openOrdersResult.error : undefined;
-    const portfolio = parseDashboardPortfolio(accountResult.data, positionsResult.data, "error" in openOrdersResult ? { list: [] } : openOrdersResult.result.data, observedAt);
-    if (!(openOrdersFailure instanceof BitgetReadError)) return portfolio;
+    let openOrdersFailure: unknown = "error" in openOrdersResult ? openOrdersResult.error : undefined;
+    const openOrdersData = "error" in openOrdersResult ? undefined : openOrdersResult.result.data;
+    if (openOrdersFailure === undefined) {
+      try {
+        parseOpenOrders(openOrdersData);
+      } catch {
+        openOrdersFailure = new Error("PROVIDER_OPEN_ORDERS_RESPONSE_INVALID");
+      }
+    }
+    const portfolio = parseDashboardPortfolio(accountResult.data, positionsResult.data, openOrdersFailure === undefined ? openOrdersData : { list: [] }, observedAt);
+    if (openOrdersFailure === undefined) return portfolio;
+    const openOrdersReadFailure = openOrdersFailure instanceof BitgetReadError
+      ? {
+        operation: openOrdersFailure.operation,
+        ...(openOrdersFailure.details.code ? { code: openOrdersFailure.details.code } : {}),
+        ...(openOrdersFailure.details.message ? { message: openOrdersFailure.details.message } : {}),
+      }
+      : { operation: "getOpenOrders", code: "INVALID_RESPONSE", message: "PROVIDER_OPEN_ORDERS_RESPONSE_INVALID" };
     return {
       ...portfolio,
       openOrders: null,
       openOrderSymbols: [],
-      openOrdersReadFailure: {
-        operation: openOrdersFailure.operation,
-        ...(openOrdersFailure.details.code ? { code: openOrdersFailure.details.code } : {}),
-        ...(openOrdersFailure.details.message ? { message: openOrdersFailure.details.message } : {}),
-      },
+      openOrdersReadFailure,
     };
   }
 
@@ -256,7 +278,7 @@ export class BitgetClient {
   }
 
   public async getHistoricalBars(symbol: string, limit = 48) {
-    const result = await this.callRead<unknown>("getKlineCandlestickHistory", {
+    const result = await this.callMarketRead<unknown>("getKlineCandlestickHistory", {
       category: this.category,
       symbol,
       interval: "15m",
@@ -267,42 +289,61 @@ export class BitgetClient {
 
   public async getMarketSnapshot(symbol: string): Promise<MarketSnapshot> {
     const observedAt = new Date().toISOString();
-    const result = await this.callRead<unknown>("getTickers", { category: this.category, symbol });
+    const result = await this.callMarketRead<unknown>("getTickers", { category: this.category, symbol });
     return parseTicker(result.data, symbol, observedAt);
   }
 
-  public async collectEvidence(symbols: readonly string[]): Promise<EvidenceBundle[]> {
-    const instruments = await this.getInstruments();
+  public async getSymbolMarketEvidence(symbol: string, account: AccountSnapshot, instrument: Instrument): Promise<EvidenceBundle> {
+    if (instrument.symbol !== symbol) throw new Error("SYMBOL_INSTRUMENT_MISMATCH");
+    const market = await this.getMarketSnapshot(symbol);
+    const historicalBars = await this.getHistoricalBars(symbol);
+    const symbolAccount = accountForEvidenceSymbol(account, symbol);
+    const observedAt = new Date().toISOString();
+    return {
+      market,
+      account: symbolAccount,
+      instrument,
+      historicalBars,
+      marketRegime: classifyMarketRegime(market, historicalBars),
+      evidence: [
+        { source: "bitget", observedAt: market.observedAt, type: "TICKER", symbol, payload: market },
+        { source: "bitget", observedAt, type: "ACCOUNT_ASSETS", symbol, payload: account },
+        { source: "bitget", observedAt, type: "POSITIONS", symbol, payload: account.positions },
+        { source: "bitget", observedAt, type: "OPEN_ORDERS", symbol, payload: account.openOrderSymbols },
+        { source: "bitget", observedAt, type: "INSTRUMENT", symbol, payload: instrument },
+        { source: "bitget", observedAt, type: "HISTORICAL_BARS", symbol, payload: historicalBars },
+      ],
+    };
+  }
+
+  public async collectSymbolMarketEvidence(
+    symbols: readonly string[],
+    account: AccountSnapshot,
+    instruments: readonly Instrument[],
+  ): Promise<MarketEvidenceCollection> {
     const selected = symbols.map((symbol) => {
-      const instrument = this.demoInstruments.find((candidate) => candidate.symbol === symbol) ?? instruments.find((candidate) => candidate.symbol === symbol);
+      const instrument = instruments.find((candidate) => candidate.symbol === symbol);
       if (!instrument) throw new Error("SYMBOL_NOT_ALLOWED");
-      return instrument;
+      return { symbol, instrument };
     });
-    const accountResult = await this.callRead<unknown>("getAccountAssets", {});
-    const positionsResult = await this.callRead<unknown>("getPositionInfo", { category: this.category });
-    const openOrdersResult = await this.callRead<unknown>("getOpenOrders", buildOpenOrdersReadParams(this.category));
-    const canonicalAccount = parseDashboardPortfolio(accountResult.data, positionsResult.data, openOrdersResult.data, new Date().toISOString());
-    return Promise.all(selected.map(async (instrument) => {
-      const market = await this.getMarketSnapshot(instrument.symbol);
-      const historicalBars = await this.getHistoricalBars(instrument.symbol);
-      const account = accountForEvidenceSymbol(canonicalAccount, instrument.symbol);
-      const observedAt = new Date().toISOString();
-      return {
-          market,
-          account,
-          instrument,
-          historicalBars,
-          marketRegime: classifyMarketRegime(market, historicalBars),
-          evidence: [
-          { source: "bitget", observedAt: market.observedAt, type: "TICKER", symbol: instrument.symbol, payload: market },
-          { source: "bitget", observedAt, type: "ACCOUNT_ASSETS", symbol: instrument.symbol, payload: accountResult.data },
-          { source: "bitget", observedAt, type: "POSITIONS", symbol: instrument.symbol, payload: positionsResult.data },
-          { source: "bitget", observedAt, type: "OPEN_ORDERS", symbol: instrument.symbol, payload: openOrdersResult.data },
-          { source: "bitget", observedAt, type: "INSTRUMENT", symbol: instrument.symbol, payload: instrument },
-          { source: "bitget", observedAt, type: "HISTORICAL_BARS", symbol: instrument.symbol, payload: historicalBars },
-        ],
-      };
+    const results = await Promise.all(selected.map(async ({ symbol, instrument }) => {
+      try {
+        return { bundle: await this.getSymbolMarketEvidence(symbol, account, instrument) };
+      } catch (error) {
+        const providerError = error instanceof BitgetReadError ? error : null;
+        return {
+          failure: {
+            symbol,
+            operation: providerError?.operation ?? "marketEvidence",
+            diagnostic: providerError?.message ?? "MARKET_EVIDENCE_UNAVAILABLE",
+          },
+        };
+      }
     }));
+    return {
+      bundles: results.flatMap((result) => "bundle" in result ? [result.bundle] : []),
+      unavailable: results.flatMap((result) => "failure" in result ? [result.failure] : []),
+    };
   }
 
   public async placePaperOrder(request: ExecutionRequest): Promise<ExecutionResult> {
@@ -334,6 +375,19 @@ export class BitgetClient {
       const redact = (message: string | undefined) => message === undefined ? undefined : sanitizeProviderMessage(message);
       return { ...result, providerOperation: operation, ...(result.providerMessage ? { providerMessage: redact(result.providerMessage)! } : {}), ...(result.providerReadbackMessage ? { providerReadbackMessage: redact(result.providerReadbackMessage)! } : {}) };
     }
+  }
+
+  private async callMarketRead<T>(operation: string, params: Record<string, string>): Promise<{ data: T }> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await this.callRead<T>(operation, params);
+      } catch (error) {
+        lastError = error;
+        if (error instanceof BitgetReadError && (error.details.classification === "PROVIDER_REJECTED" || error.details.classification === "PROVIDER_NOT_FOUND")) break;
+      }
+    }
+    throw lastError;
   }
 
   private async callRead<T>(operation: string, params: Record<string, string>): Promise<{ data: T }> {
