@@ -1985,13 +1985,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const plan: CycleDecisionPlan = decisionSet.plan;
       journal.cyclePlan = plan;
       const marketEvidenceFailures = new Map<string, MarketEvidenceFailure>();
-      const execution = journal.positionDiscrepancies && journal.positionDiscrepancies.length > 0
-        ? (() => {
-          this.recordEvent("FINANCIAL_WRITES_STOPPED", cycleId, { code: "LOCAL_LIFECYCLE_UNRESOLVED" });
-          this.recordEvent("PLAN_REMAINING_ACTIONS_SKIPPED", cycleId, { code: "LOCAL_LIFECYCLE_UNRESOLVED" });
-          return { records: [], finalPortfolio: undefined, stoppedAfterAmbiguity: true };
-        })()
-        : await executeCyclePlan(plan, {
+      const execution = await executeCyclePlan(plan, {
         refreshEvidence: async (symbol) => {
           const account = await client.getDashboardPortfolio();
           const collection = await client.collectSymbolMarketEvidence([symbol], account, instruments);
