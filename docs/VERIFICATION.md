@@ -42,7 +42,7 @@ The current prompt contracts are `darwin-mandate-v7`, `darwin-candidate-v1`, `da
 
 ### PRODUCTION VERIFIED
 
-Only runtime observations after deployment belong here. A source test, Docker replay, or HOLD/no-entry cycle does not prove multi-write production execution. Production verification requires the exact deployed commit, `PROVIDER_LIVE` account/position reads, a healthy scheduler, and provider readback plus `MATCHED` reconciliation for any financial write. No multi-action financial execution is marked production-verified by this source change alone.
+Only runtime observations after deployment belong here. The live site is a read-only observation surface; verify its deployed commit against `/api/snapshot.commit` and inspect `/api/live/portfolio` for HTTP 200, `source=PROVIDER_LIVE`, valid `observedAt`, and current provider portfolio. A source test, Docker replay, or HOLD/no-entry cycle does not prove a financial write. Any claimed write requires provider readback and `MATCHED` reconciliation.
 
 ## Paper log evidence
 
@@ -53,12 +53,11 @@ GET /api/export/paper-log?format=json
 GET /api/export/paper-log?format=csv
 ```
 
-The current live PAPER log is read-only and available now through the JSON and CSV export endpoints above. It includes HOLD cycles, exports every semantic action separately with its action category and cycle-level discovery fields, records REVERSE's close and opposite-entry physical writes separately under the parent intent, excludes manual harness and Docker records, and preserves sanitized provider diagnostics. Performance aggregate state is separate from the export's bounded historical projection. It does not expose credentials, auth headers, passphrases, or model chain-of-thought. This current live export is not the frozen final competition export, which remains uncommitted until collection is complete.
+- The current live PAPER log is read-only and available through the JSON and CSV export endpoints above. It includes autonomous HOLD cycles, exports semantic actions separately, records REVERSE's physical writes under the parent intent, excludes manual harness and Docker records, and preserves sanitized provider diagnostics. Performance aggregate state is separate from the export's bounded historical projection. Final submission exports remain uncommitted until collection ends; validate them for secrets, API keys, authorization headers, passphrases, owner tokens, and raw model chain-of-thought before submission.
 
 ## Not claimed
 
 - No guaranteed profitability or meaningful Sharpe ratio when sample size is insufficient.
 - A Judge Demo replay is not a live provider session.
-- EVA evaluation is not part of the zero-credential demo.
 - Final competition-period metrics are not frozen.
 - A HOLD + no-entry cycle verifies scheduling/schema behavior only, not a multi-write path.

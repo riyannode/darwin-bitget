@@ -37,7 +37,7 @@ Cloudflare Worker → authenticated narrow gateway request → Cloudflare Tunnel
 → stable-egress gateway → Bitget Demo PAPER API
 ```
 
-Public market operations may remain direct because they do not require private Bitget credentials. The Worker never stores `BITGET_API_KEY`, `BITGET_SECRET_KEY`, or `BITGET_PASSPHRASE`; it stores only the gateway service secret plus backend-only Qwen, owner-control, and optional EVA secrets.
+Public market operations may remain direct because they do not require private Bitget credentials. The Worker never stores `BITGET_API_KEY`, `BITGET_SECRET_KEY`, or `BITGET_PASSPHRASE`; it stores only the gateway service secret plus backend-only Qwen and owner-control secrets.
 
 ## Cycle decision contract
 
@@ -73,6 +73,14 @@ Qwen proposes rationale, evidence references, position management, and new entri
 
 For each non-HOLD action the planner refreshes evidence, evaluates the risk gate, constructs one bounded request, persists idempotency, submits once, reads the provider result back, reconciles, and refreshes account/positions/open-orders before the next financial action. Financial writes are never parallelized. `INCREASE` opens only the existing side with `additionalMarginPct` and the provider's current leverage. `REVERSE` expands to a close leg, portfolio refresh, old-position absence check, fresh evidence, and only then a deterministic opposite-side entry gate. The order is `CLOSE/REVERSE-close → REDUCE → INCREASE → OPEN → REVERSE-open`; HOLD creates no financial write. Any ambiguous/unresolved result or reconciliation other than `MATCHED` stops all remaining financial writes without a blind retry.
 
+### Financial authority and market-evidence isolation
+
+- **Current financial truth:** canonical Bitget PAPER provider account reads own equity, balances/margin, positions, and open orders.
+- **Historical financial truth:** the Bitget provider ledger owns orders, fills, lifecycle history, realized/net PnL, fees, and funding.
+- **DARWIN local state:** Qwen reasoning, decisions, risk gates, journals, learning/reflections, attribution/read models, and audit state. Local state explains the agent's activity; it does not override Bitget provider truth.
+
+Canonical provider account reads are independent of symbol ticker/kline market evidence. If a symbol's PRE-WRITE market evidence fails, DARWIN records a skip for that symbol, performs no financial write for it, and continues unrelated symbol actions. Post-write reconciliation relies on canonical provider account/position readback and does not require ticker/kline availability. Ambiguous or unresolved execution remains fail-closed. Its quarantine is symbol-scoped: for example, MSTR can remain blocked as `UNRESOLVED_PRIOR_EXECUTION` while unrelated valid symbols continue.
+
 ## Persistence and compatibility
 
 New journals persist `cyclePlan`, `executionRecords`, and `discovery` metadata. Historical journals still use `decision`, `exitDecisions`, `executionResult`, `reconciliationResult`, and `exitExecutions`. `src/storage/journal-normalizer.ts` owns the compatibility seam: legacy journals and new cycle plans normalize into the same cycle/action representation for dashboard, paper-log export, and learning association. Historical data is not destructively migrated.
@@ -85,4 +93,4 @@ Each action keeps its own decision ID, cycle ID, symbol, side, evidence, executi
 
 ## Judge Demo boundary
 
-The Docker Judge Demo is a separate Node process under `demo/`. It uses local deterministic fixtures and the pure risk gate only. `JUDGE_DEMO=true` is required. It has no Bitget, Qwen, EVA, scheduler, Durable Object, or production-state access. Mutation endpoints fail with `DEMO_READ_ONLY`. The `hold` fixture shows `CRCLUSDT LONG → HOLD` alongside `NVDAUSDT → OPEN_LONG` as recorded replay evidence; it submits no order.
+The Docker Judge Demo is a separate Node process under `demo/`. It uses local deterministic fixtures and the pure risk gate only. `JUDGE_DEMO=true` is required. It has no Bitget, Qwen, scheduler, Durable Object, or production-state access. Mutation endpoints fail with `DEMO_READ_ONLY`. Every portfolio is recorded replay evidence: freshness is `JOURNAL_FALLBACK` and account equity source is `UNAVAILABLE`, never `PROVIDER_LIVE`. The `hold` fixture shows `CRCLUSDT LONG → HOLD` alongside `NVDAUSDT → OPEN_LONG`; it submits no order.

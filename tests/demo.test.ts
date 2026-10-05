@@ -9,10 +9,16 @@ describe("zero-credential judge demo fixtures", () => {
     expect(snapshot.executionEvidence?.executionStatus).toBe("filled");
     expect(snapshot.executionEvidence?.reconciliationStatus).toBe("MATCHED");
     expect(snapshot.portfolioFreshness.source).toBe("JOURNAL_FALLBACK");
+    expect(snapshot.accountPerformance.equitySource).toBe("UNAVAILABLE");
     expect(snapshot.agent.status).toBe("PAUSED");
     expect(snapshot.performance.totalTrades).toBe(0);
     expect(snapshot.demo.preTradeAccount.positions).toHaveLength(0);
     expect(snapshot.demo.postTradeAccount.positions).toHaveLength(1);
+    for (const scenario of ["verified-open", "hold", "risk-reject"] as const) {
+      const replay = buildDemoSnapshot(scenario);
+      expect(replay.accountPerformance.equitySource).not.toBe("PROVIDER_LIVE");
+      expect(replay.portfolioFreshness.source).toBe("JOURNAL_FALLBACK");
+    }
   });
 
   it("keeps HOLD a no-write replay", () => {

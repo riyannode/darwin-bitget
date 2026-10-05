@@ -4,7 +4,7 @@
 
 - Docker with Compose support;
 - no `.env` file;
-- no Bitget, Qwen, EVA, Cloudflare, Vercel, owner token, or funded account;
+- no Bitget, Qwen, Cloudflare, Vercel, owner token, or funded account;
 - no production network access at runtime.
 
 ## Run
@@ -25,13 +25,12 @@ docker compose down -v --remove-orphans
 
 ## Environment contract
 
-The image requires `JUDGE_DEMO=true` and starts a local fixture server. If it is absent or false, the server exits. No secret environment variables are accepted or needed. The process does not initialize the Worker, Durable Object, Bitget SDK client, Qwen client, EVA client, or scheduler.
+The image requires `JUDGE_DEMO=true` and starts a local fixture server. If it is absent or false, the server exits. No secret environment variables are accepted or needed. The process does not initialize the Worker, Durable Object, Bitget SDK client, Qwen client, or scheduler.
 
 ## No-write guarantee
 
 - no Bitget order API is imported or called;
 - no Qwen request is made;
-- no EVA request is made;
 - no scheduler runs;
 - no production Durable Object is touched;
 - mutation endpoints return `DEMO_READ_ONLY`;
@@ -43,7 +42,7 @@ The image requires `JUDGE_DEMO=true` and starts a local fixture server. If it is
 - `/demo?scenario=hold` — recorded CRCLUSDT LONG management `HOLD` plus independent NVDAUSDT `OPEN_LONG` entry evaluation. The production contract also supports `INCREASE`, `REDUCE`, `CLOSE`, and `REVERSE` management intents; this fixture remains a no-write replay.
 - `/demo?scenario=risk-reject` — a deterministic proposal exceeding the real owner leverage boundary. The pure production risk gate returns `BLOCK`/`MAX_LEVERAGE`; no order is submitted.
 
-The demo also exposes `/api/demo/scenarios`, `/api/snapshot`, and clearly labeled replay downloads. Replay exports are not the final competition PAPER log.
+The demo also exposes `/api/demo/scenarios`, `/api/snapshot`, and clearly labeled replay downloads. Replay exports are not the final competition PAPER log. Replay equity is not sourced from a live provider; `accountPerformance.equitySource` is `UNAVAILABLE`, and portfolio freshness remains `JOURNAL_FALLBACK`.
 
 ## What judges can inspect
 
