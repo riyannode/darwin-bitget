@@ -31,9 +31,9 @@ docker compose up --build
 ```
 
 This path uses `JUDGE_DEMO=true`, local fixtures, and no production resources.
-It requires no Bitget, Qwen, EVA, owner-control, or funded-account
-credentials. Bitget order APIs, Qwen, EVA, scheduler financial work, and
-production Durable Object state are unavailable in this mode. Cleanup:
+It requires no Bitget, Qwen, owner-control, or funded-account credentials.
+Bitget order APIs, Qwen, scheduler financial work, and production Durable Object
+state are unavailable in this mode. Cleanup:
 
 ```bash
 docker compose down -v --remove-orphans
@@ -59,8 +59,8 @@ npm run build
 npm run deploy:dry
 ```
 
-Set only the gateway service secret, Qwen key, owner-control token, and any
-configured EVA secret as backend-only Cloudflare Worker secrets. The Worker must
+Set only the gateway service secret, Qwen key, and owner-control token as
+backend-only Cloudflare Worker secrets. The Worker must
 not store or receive `BITGET_API_KEY`, `BITGET_SECRET_KEY`, or `BITGET_PASSPHRASE`.
 Never place real values in
 the repository, browser, frontend bundle, public Vercel environment, logs, or
@@ -75,11 +75,6 @@ QWEN_API_KEY
 The stable gateway alone stores `BITGET_API_KEY`, `BITGET_SECRET_KEY`, and
 `BITGET_PASSPHRASE` in a restrictive environment file. It exposes only the
 narrow typed DARWIN actions and runs in Bitget Demo PAPER mode.
-
-Optional EVA configuration is separate and backend-only:
-`EVA_API_URL`, `EVA_GATEWAY_URL`, `EVA_AGENT_ID`, and `EVA_AGENT_API_KEY`.
-`EVA_AGENT_API_KEY` is a Worker secret. The agent ID is runtime configuration,
-not a frontend credential.
 
 ### Bitget transport and Worker deployment
 
@@ -98,7 +93,7 @@ autonomous orders.
 
 Fork/import the repository into Vercel, set the frontend API rewrite to the
 self-hosted Worker, deploy, and verify browser requests reach that Worker.
-The frontend needs no provider, model, owner-control, or EVA secret. Confirm
+The frontend needs no provider, model, or owner-control secret. Confirm
 the deployed rewrite does not still target the original production Worker.
 
 ## Pre-resume verification

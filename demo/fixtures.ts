@@ -25,7 +25,6 @@ export interface DemoSnapshot extends DashboardSnapshot {
     externalCalls: false;
     schedulerEnabled: false;
     qwenCalled: false;
-    evaCalled: false;
     preTradeAccount: AccountSnapshot;
     postTradeAccount: AccountSnapshot;
   };
@@ -206,7 +205,7 @@ function baseSnapshot(cycleId: string, proposed: Decision, cyclePlan: CycleDecis
       dailyPnl: {},
     },
     accountPerformance: {
-      equitySource: "PROVIDER_LIVE",
+      equitySource: "UNAVAILABLE",
       currentEquity: portfolio.portfolioEquity,
       externalFlowStatus: "UNVERIFIED",
       netExternalInflows: "UNAVAILABLE",
@@ -275,7 +274,6 @@ function baseSnapshot(cycleId: string, proposed: Decision, cyclePlan: CycleDecis
       externalCalls: false,
       schedulerEnabled: false,
       qwenCalled: false,
-      evaCalled: false,
       preTradeAccount,
       postTradeAccount,
     },

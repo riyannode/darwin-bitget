@@ -71,7 +71,7 @@ Cloudflare Worker → authenticated narrow gateway request → Cloudflare Tunnel
 Public market operations may remain direct. The Worker does not store
 `BITGET_API_KEY`, `BITGET_SECRET_KEY`, or `BITGET_PASSPHRASE`; those credentials
 remain in the stable-egress gateway. The Worker stores only backend-only gateway,
-Qwen, owner-control, and optional EVA secrets.
+Qwen, and owner-control secrets.
 
 The data boundary is explicit: provider-live `/api/live/portfolio` performs no Durable Object reads and reports current Bitget state; persisted `/api/snapshot` performance reports verified DARWIN aggregates; `/api/position-context` reports bounded structured decision evidence. These are not interchangeable and structured evidence is not hidden chain-of-thought.
 
@@ -100,7 +100,15 @@ Verified outcomes become experiences. Qwen reflection evaluates strategy, eviden
 
 ## Current production status
 
-The judge path is [https://darwin-bitget.vercel.app/](https://darwin-bitget.vercel.app/). It is a PAPER observability surface backed by a Cloudflare Worker/Durable Object and Bitget Demo UTA. The browser reads provider-only `/api/live/portfolio` approximately every 10 seconds, `/api/snapshot` approximately every 60 seconds, and bounded history endpoints lazily when pages open. Verify current provider state from `/api/live/portfolio`; this document is not a frozen performance report.
+The judge path is [https://darwin-bitget.vercel.app/](https://darwin-bitget.vercel.app/). It is a PAPER observability surface backed by a Cloudflare Worker/Durable Object and Bitget Demo UTA. The browser reads provider-only `/api/live/portfolio` approximately every 10 seconds, `/api/snapshot` approximately every 60 seconds, and bounded history endpoints lazily when pages open. Live values are mutable runtime observations, not frozen competition metrics.
+
+### Financial authority
+
+- **Current financial truth:** canonical Bitget PAPER account reads for equity, balances/margin, positions, and open orders.
+- **Historical financial truth:** Bitget provider ledger for orders, fills, lifecycle history, realized/net PnL, fees, and funding.
+- **DARWIN local state:** Qwen reasoning, decisions, risk gates, journals, learning/reflections, attribution/read models, and audit state. It does not override Bitget provider truth.
+
+Canonical provider account reads are independent of ticker/kline evidence. A symbol's PRE-WRITE market evidence failure records a skip, causes no financial write for that symbol, and does not stop unrelated symbol actions. Post-write reconciliation uses canonical provider account/position readback without ticker/kline dependency. Ambiguous/unresolved execution stays fail-closed and symbol-scoped; an MSTR `UNRESOLVED_PRIOR_EXECUTION` quarantine does not block unrelated valid symbols.
 
 ## Judge material
 
@@ -125,20 +133,38 @@ The judge path is [https://darwin-bitget.vercel.app/](https://darwin-bitget.verc
 
 The Docker Judge Demo is not a live Bitget session. It exists to make the architecture reproducible without sharing credentials.
 
+## Live current metrics
+
+The live site and production exports represent current autonomous PAPER evidence and may change as collection continues. Read current provider portfolio from `/api/live/portfolio`; read runtime state from `/api/snapshot`. Do not treat a live PnL value as permanent architecture truth or as frozen final results.
+
+## Frozen final submission metrics
+
+Not yet frozen. Freeze only after the owner confirms the collection period has ended. Final metrics must be calculated from provider-verified closed trades only; exclude open unrealized PnL, unresolved/failed execution, and Docker/manual replay evidence.
+
+## Final PAPER export freeze
+
+Until collection is confirmed complete, leave `submissions/paper-log-final.json` and `submissions/paper-log-final.csv` absent and uncommitted. After confirmation:
+
+1. Download the JSON and CSV from the live production endpoints: `/api/export/paper-log?format=json` and `/api/export/paper-log?format=csv`.
+2. Validate JSON parsing and CSV headers/rows; reconcile the export summary and trade count.
+3. Inspect every exported field for credentials/secrets, API keys, authorization headers, passphrases, owner tokens, and raw model chain-of-thought. Reject rather than redact-and-publish any unsafe export.
+4. Confirm the records are autonomous production evidence only. Exclude Docker replay and manual harness records.
+5. Calculate final metrics from provider-verified closed trades only; do not count open positions, unresolved writes, or unverified PnL.
+6. Save the validated untouched exports at the two reserved paths, review the diff and secret scan, then submit them for final review.
+
 ## Evidence status
 
-Verified facts are listed in [docs/VERIFICATION.md](VERIFICATION.md). The manual NVDA lifecycle is execution-path verification only, not autonomous Worker history. Final competition log and performance metrics remain pending.
+Verified facts and the live read-only smoke status are listed in [docs/VERIFICATION.md](VERIFICATION.md). Production PAPER evidence is distinct from deterministic Docker replay. Final competition log and performance metrics remain pending.
 
 ## Honest limitations
 
 - PAPER behavior is not proof of live-money performance.
 - The final collection-period log is not frozen.
 - Provider availability and instrument universe can change.
-- EVA evaluation is optional and outside the zero-credential demo.
 
 ## Final submission checklist
 
-- [ ] Continue collecting autonomous PAPER history.
+- [ ] Confirm the collection period has ended.
 - [ ] Export the complete final competition log from Durable Object history.
 - [ ] Validate closed verified trades only for final metrics.
 - [ ] Recheck production SHA, `snapshot.commit`, and a successful `/api/live/portfolio` read with HTTP success, `source=PROVIDER_LIVE`, valid `observedAt`, and provider portfolio/readback available.
