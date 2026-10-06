@@ -5,7 +5,8 @@ import { loadConfig } from "../config.js";
 import { BitgetClient, type MarketEvidenceFailure } from "../bitget/client.js";
 import { createProviderOriginReadSummary, emitProviderOriginReadSummary, syncProviderLedger, PROVIDER_FINANCIAL_CATEGORIES, PROVIDER_TRADE_LIFECYCLE_CATEGORY } from "../bitget/provider-sync.js";
 import { MANDATE_VERSION, PROMPT_VERSIONS, TRADING_MANDATE } from "./mandate.js";
-import { assertOpenPositionCountWithinPlanLimit, buildEvidenceSymbols, calculateActionCapacity, countOpenPositionLifecycles, decide, filterNewEntryMarketCandidates, rankMarketCandidates, selectEntryCandidates } from "./decision.js";
+import { assertOpenPositionCountWithinPlanLimit, buildEvidenceSymbols, calculateActionCapacity, countOpenPositionLifecycles, decide, filterNewEntryMarketCandidates, rankMarketCandidates, selectDeterministicEntryCandidates } from "./decision.js";
+import { runTimedCyclePhase } from "./cycle-phase-timing.js";
 import { QwenJsonError } from "./qwen.js";
 import { reconcileTradingSchedule, reconcileProviderLedgerSchedule, PROVIDER_LEDGER_INTERVAL_SECONDS, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES, type SchedulerReconciliationResult } from "./scheduler.js";
 import { authorizeOwner } from "./owner-auth.js";
@@ -1902,28 +1903,31 @@ export class TraderAgent extends Agent<Env, AgentState> {
     this.recordEvent("CYCLE_STARTED", cycleId);
     try {
       const client = new BitgetClient(config);
-      const initialPortfolio = await client.getDashboardPortfolio();
+      const initialPortfolio = await runTimedCyclePhase("INITIAL_PORTFOLIO", () => client.getDashboardPortfolio());
       const livePositions = initialPortfolio.positions.filter((position) => Number(position.quantity) > 0);
       const openPositionSymbols = [...new Set(livePositions.map((position) => position.symbol))];
       const openPositionCount = countOpenPositionLifecycles(livePositions);
-      const instruments = await client.getTradableInstruments().catch(() => {
+      const instruments = await runTimedCyclePhase("INSTRUMENTS", () => client.getTradableInstruments().catch(() => {
         this.recordEvent("DEMO_UNIVERSE_UNAVAILABLE", cycleId);
         return [];
-      });
+      }));
       if (instruments.length === 0 && openPositionCount === 0) throw new Error("NO_TRADABLE_INSTRUMENTS");
       const supportedUniverse = instruments.map((instrument) => instrument.symbol);
       const allLessons = loadUsableLessons(this);
       const experiences = loadExperiences(this);
-      const scan = await client.collectLightweightScan(instruments);
-      const newEntryMarketCandidates = filterNewEntryMarketCandidates(scan, openPositionSymbols);
-      const rankedScan = rankMarketCandidates(newEntryMarketCandidates);
+      const { scan, rankedScan } = await runTimedCyclePhase("MARKET_SCAN", async () => {
+        const scan = await client.collectLightweightScan(instruments);
+        const newEntryMarketCandidates = filterNewEntryMarketCandidates(scan, openPositionSymbols);
+        return { scan, rankedScan: rankMarketCandidates(newEntryMarketCandidates) };
+      });
       this.recordEvent("MARKET_SCAN", cycleId, { symbols: String(scan.length), preRanked: String(rankedScan.length) });
       this.setState({ ...this.state, runtimeStatus: "ANALYZING", currentStage: "ANALYZING" });
-      const selectedEntryCandidateSymbols = await selectEntryCandidates(config, supportedUniverse, rankedScan, openPositionCount);
+      const remainingEntrySlots = calculateActionCapacity(openPositionCount).remainingEntrySlots;
+      const selectedEntryCandidateSymbols = selectDeterministicEntryCandidates(rankedScan, supportedUniverse, openPositionSymbols, remainingEntrySlots);
+      if (remainingEntrySlots === 0) this.recordEvent("CANDIDATE_SELECTION_SKIPPED", cycleId, { code: "CAPACITY_SATURATED", openPositionCount: String(openPositionCount), source: "DETERMINISTIC_RANK" });
+      else this.recordEvent("CANDIDATE_SELECTED", cycleId, { symbols: selectedEntryCandidateSymbols.join(","), source: "DETERMINISTIC_RANK" });
       const evidenceSymbols = buildEvidenceSymbols(openPositionSymbols, selectedEntryCandidateSymbols);
-      if (calculateActionCapacity(openPositionCount).remainingEntrySlots === 0) this.recordEvent("CANDIDATE_SELECTION_SKIPPED", cycleId, { code: "CAPACITY_SATURATED", openPositionCount: String(openPositionCount) });
-      else this.recordEvent("CANDIDATE_SELECTED", cycleId, { symbols: selectedEntryCandidateSymbols.join(",") });
-      const evidenceCollection = await client.collectSymbolMarketEvidence(evidenceSymbols, initialPortfolio, instruments);
+      const evidenceCollection = await runTimedCyclePhase("MARKET_EVIDENCE", () => client.collectSymbolMarketEvidence(evidenceSymbols, initialPortfolio, instruments));
       for (const unavailable of evidenceCollection.unavailable) this.recordEvent("MARKET_EVIDENCE_UNAVAILABLE", cycleId, {
         symbol: unavailable.symbol,
         providerOperation: unavailable.operation,
@@ -1975,35 +1979,38 @@ export class TraderAgent extends Agent<Env, AgentState> {
         }
       }
       if (backtest) { saveBacktest(this, backtest); journal.backtest = backtest; this.recordEvent("BACKTEST_COMPLETED", cycleId); }
-      const positionHistoryReconstructionRequired = experiences.some((experience) => experience.outcomeStatus === "OPEN" && !experience.maximumFavorableExcursionBasis);
-      try {
-        console.log(JSON.stringify({ event: "POSITION_HISTORY_RECONSTRUCTION", required: positionHistoryReconstructionRequired }));
-      } catch {
-        // Cycle telemetry must not affect trading behavior.
-      }
-      const lifecycleHistory = positionHistoryReconstructionRequired
-        ? loadAllAutonomousJournals(this, undefined, undefined, "scheduled_cycle", "position_management_full_journal_history")
-        : [];
-      const positionManagementState = this.refreshPositionManagementState(experiences, openPositions, bundles, new Date().toISOString(), lifecycleHistory);
+      const positionManagementState = await runTimedCyclePhase("POSITION_MANAGEMENT", () => {
+        const positionHistoryReconstructionRequired = experiences.some((experience) => experience.outcomeStatus === "OPEN" && !experience.maximumFavorableExcursionBasis);
+        try {
+          console.log(JSON.stringify({ event: "POSITION_HISTORY_RECONSTRUCTION", required: positionHistoryReconstructionRequired }));
+        } catch {
+          // Cycle telemetry must not affect trading behavior.
+        }
+        const lifecycleHistory = positionHistoryReconstructionRequired
+          ? loadAllAutonomousJournals(this, undefined, undefined, "scheduled_cycle", "position_management_full_journal_history")
+          : [];
+        return this.refreshPositionManagementState(experiences, openPositions, bundles, new Date().toISOString(), lifecycleHistory);
+      });
       journal.positionManagementState = positionManagementState;
       journal.promptVersions = { mandate: PROMPT_VERSIONS.mandate, decision: PROMPT_VERSIONS.decision };
       const openExperiences = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
       const executionCapacityHints = buildExecutionCapacityHints(bundles, config.ownerPolicy.maxLeverage);
-      const researchEvidence = await this.collectResearchEvidence(
+      const researchEvidence = await runTimedCyclePhase("RESEARCH", () => this.collectResearchEvidence(
         config,
         bundles,
         openPositionSymbols,
         selectedEntryCandidateSymbols,
         cycleId,
-      );
+      ));
       const context = { bundles, supportedUniverse, openPositionSymbols, entryCandidateSymbols: selectedEntryCandidateSymbols, experiences, openExperiences, lessons, openPositions, positionManagementState, observedAt: new Date().toISOString(), mandate: TRADING_MANDATE, ...(researchEvidence === undefined ? {} : { researchEvidence }), executionCapacityHints };
-      let decisionSet: Awaited<ReturnType<typeof decide>>;
-      try {
-        decisionSet = await decide(config, context, cycleId);
-      } catch (error) {
-        if (error instanceof ZodError) failureStage = "decision_schema_validation";
-        throw error;
-      }
+      const decisionSet = await runTimedCyclePhase("DECISION_QWEN", async () => {
+        try {
+          return await decide(config, context, cycleId);
+        } catch (error) {
+          if (error instanceof ZodError) failureStage = "decision_schema_validation";
+          throw error;
+        }
+      });
       if (decisionSet.ignoredLessonIds.length) this.recordEvent("LESSON_REFERENCE_IGNORED", cycleId, { count: String(decisionSet.ignoredLessonIds.length), ids: decisionSet.ignoredLessonIds.slice(0, 8).join(",") });
       journal.marketContext = { scan, deep: bundles.map((candidate) => ({ market: candidate.market, regime: candidate.marketRegime })) };
       journal.portfolio = account;
@@ -2012,7 +2019,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const plan: CycleDecisionPlan = decisionSet.plan;
       journal.cyclePlan = plan;
       const marketEvidenceFailures = new Map<string, MarketEvidenceFailure>();
-      const execution = await executeCyclePlan(plan, {
+      const execution = await runTimedCyclePhase("EXECUTION_PLAN", () => executeCyclePlan(plan, {
         refreshEvidence: async (symbol) => {
           const account = await client.getDashboardPortfolio();
           const collection = await client.collectSymbolMarketEvidence([symbol], account, instruments);
@@ -2052,24 +2059,26 @@ export class TraderAgent extends Agent<Env, AgentState> {
             diagnostic: safeDiagnosticMessage(failure?.diagnostic, "Market evidence unavailable"),
           });
         },
+      }));
+      return await runTimedCyclePhase("FINALIZE", async () => {
+        journal.executionRecords = execution.records;
+        journal.discovery = { ...discovery, financialWritesPerformed: execution.records.filter((record) => Boolean(record.executionResult)).length };
+        if (execution.finalPortfolio) journal.portfolio = execution.finalPortfolio;
+        this.persistPerformanceEquity(execution.finalPortfolio?.portfolioEquity ?? account.portfolioEquity, execution.finalPortfolio?.observedAt ?? account.observedAt);
+        this.setState({ ...this.state, runtimeStatus: "REFLECTING", currentStage: "REFLECTING" });
+        const backtestLesson = backtest ? createBacktestLesson(backtest) : undefined;
+        journal.createdLessons = [...journal.createdLessons, ...(backtestLesson ? [backtestLesson.lessonId] : [])];
+        if (backtestLesson) saveLesson(this, backtestLesson);
+        if (backtestLesson) this.recordEvent("LESSON_CREATED", cycleId, { source: "BACKTEST_REPLAY" });
+        journal.completedAt = new Date().toISOString();
+        journal.durationMs = Math.max(0, new Date(journal.completedAt).getTime() - new Date(startedAt).getTime());
+        this.recordEvent("CYCLE_COMPLETED", cycleId, { durationMs: String(journal.durationMs) });
+        saveJournal(this, journal);
+        saveCycle(this, cycleId, "COMPLETED", startedAt, journal.completedAt);
+        saveLatestValidCyclePlan(this, { cycleId, plan, ...(journal.discovery ? { discovery: journal.discovery } : {}), startedAt, completedAt: journal.completedAt });
+        this.setState({ ...this.state, runtimeStatus: drawdown.blocked ? "COOLDOWN" : "ONLINE", currentStage: drawdown.blocked ? "COOLDOWN" : "ONLINE", lastStatus: "COMPLETED", cycleStartedAt: null });
+        return journal;
       });
-      journal.executionRecords = execution.records;
-      journal.discovery = { ...discovery, financialWritesPerformed: execution.records.filter((record) => Boolean(record.executionResult)).length };
-      if (execution.finalPortfolio) journal.portfolio = execution.finalPortfolio;
-      this.persistPerformanceEquity(execution.finalPortfolio?.portfolioEquity ?? account.portfolioEquity, execution.finalPortfolio?.observedAt ?? account.observedAt);
-      this.setState({ ...this.state, runtimeStatus: "REFLECTING", currentStage: "REFLECTING" });
-      const backtestLesson = backtest ? createBacktestLesson(backtest) : undefined;
-      journal.createdLessons = [...journal.createdLessons, ...(backtestLesson ? [backtestLesson.lessonId] : [])];
-      if (backtestLesson) saveLesson(this, backtestLesson);
-      if (backtestLesson) this.recordEvent("LESSON_CREATED", cycleId, { source: "BACKTEST_REPLAY" });
-      journal.completedAt = new Date().toISOString();
-      journal.durationMs = Math.max(0, new Date(journal.completedAt).getTime() - new Date(startedAt).getTime());
-      this.recordEvent("CYCLE_COMPLETED", cycleId, { durationMs: String(journal.durationMs) });
-      saveJournal(this, journal);
-      saveCycle(this, cycleId, "COMPLETED", startedAt, journal.completedAt);
-      saveLatestValidCyclePlan(this, { cycleId, plan, ...(journal.discovery ? { discovery: journal.discovery } : {}), startedAt, completedAt: journal.completedAt });
-      this.setState({ ...this.state, runtimeStatus: drawdown.blocked ? "COOLDOWN" : "ONLINE", currentStage: drawdown.blocked ? "COOLDOWN" : "ONLINE", lastStatus: "COMPLETED", cycleStartedAt: null });
-      return journal;
     } catch (error) {
       journal.completedAt = new Date().toISOString();
       journal.durationMs = Math.max(0, new Date(journal.completedAt).getTime() - new Date(startedAt).getTime());

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertOpenPositionCountWithinPlanLimit, buildCycleDecisionPlanSchema, buildDecisionPrompt, calculateActionCapacity, countOpenPositionLifecycles, cycleDecisionPlanSchema, buildEvidenceSymbols, filterNewEntryMarketCandidates, MAX_FINANCIAL_WRITES_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, selectEntryCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
+import { assertOpenPositionCountWithinPlanLimit, buildCycleDecisionPlanSchema, buildDecisionPrompt, calculateActionCapacity, countOpenPositionLifecycles, cycleDecisionPlanSchema, buildEvidenceSymbols, filterNewEntryMarketCandidates, MAX_FINANCIAL_WRITES_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, selectDeterministicEntryCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
 import type { AccountSnapshot, CycleDecisionPlan, Decision, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot, PositionManagementState, PositionSnapshot } from "../src/types.js";
 import { buildDecisionTaskPrompt, DECISION_TASK_PROMPT, PROMPT_VERSIONS } from "../src/agent/mandate.js";
 
@@ -140,6 +140,9 @@ describe("cycle decision plan contract", () => {
 
   it("accepts an empty no-write plan when no positions or opportunities exist", () => {
     expect(() => validateCycleDecisionPlan(plan(), context([], []))).not.toThrow();
+    const holdOnly = plan([decision("HOLD", "CRCLUSDT", "LONG")], []);
+    expect(() => validateCycleDecisionPlan(holdOnly, context([position("CRCLUSDT")], []))).not.toThrow();
+    expect(holdOnly.entryActions).toEqual([]);
   });
 
   it("keeps remaining entry capacity aligned with the five-position cap", () => {
@@ -166,38 +169,25 @@ describe("cycle decision plan contract", () => {
     expect(MAX_TOTAL_ACTIONS_PER_CYCLE).toBe(5);
   });
 
-  it("skips candidate selection and unrelated evidence at saturated capacity", async () => {
-    let candidateSelectorCalls = 0;
-    const selected = await selectEntryCandidates({} as never, ["NVDAUSDT"], [snapshot("NVDAUSDT")], 5, async () => {
-      candidateSelectorCalls += 1;
-      return ["NVDAUSDT"];
-    });
-    expect(candidateSelectorCalls).toBe(0);
-    expect(selected).toEqual([]);
-    expect(buildEvidenceSymbols(["CRCLUSDT", "SKHYUSDT", "HOODUSDT", "MSTRUSDT", "COINUSDT"], selected)).toEqual(["CRCLUSDT", "SKHYUSDT", "HOODUSDT", "MSTRUSDT", "COINUSDT"]);
+  it("returns no entry candidates when remaining capacity is zero", () => {
+    expect(selectDeterministicEntryCandidates([snapshot("NVDAUSDT")], ["NVDAUSDT"], [], 0)).toEqual([]);
   });
 
-  it("preserves candidate selection below saturated capacity", async () => {
-    let candidateSelectorCalls = 0;
-    const selected = await selectEntryCandidates({} as never, ["NVDAUSDT"], [snapshot("NVDAUSDT")], 4, async () => {
-      candidateSelectorCalls += 1;
-      return ["NVDAUSDT"];
-    });
-    expect(candidateSelectorCalls).toBe(1);
-    expect(selected).toEqual(["NVDAUSDT"]);
+  it("selects the first two ranked candidates without changing rank order", () => {
+    const ranked = rankMarketCandidates([snapshot("LOWUSDT", "1", "1"), snapshot("TOPUSDT", "5", "100"), snapshot("MIDUSDT", "3", "30")]);
+    const selected = selectDeterministicEntryCandidates(ranked, ["LOWUSDT", "TOPUSDT", "MIDUSDT"], [], 2);
+    expect(selected).toEqual(["TOPUSDT", "MIDUSDT"]);
   });
 
-  it("filters held symbols from new-entry selection while preserving their management evidence", async () => {
-    const pool = filterNewEntryMarketCandidates([snapshot("METAUSDT"), snapshot("NVDAUSDT")], ["METAUSDT"]);
-    expect(pool.map((item) => item.symbol)).toEqual(["NVDAUSDT"]);
-    let selectorInput: string[] = [];
-    const selected = await selectEntryCandidates({} as never, ["METAUSDT", "NVDAUSDT"], pool, 1, async (_config, _universe, ranked) => {
-      selectorInput = ranked.map((item) => item.symbol);
-      return ["NVDAUSDT"];
-    });
-    expect(selectorInput).toEqual(["NVDAUSDT"]);
-    expect(selected).toEqual(["NVDAUSDT"]);
-    expect(buildEvidenceSymbols(["METAUSDT"], selected)).toEqual(["METAUSDT", "NVDAUSDT"]);
+  it("excludes currently open and unsupported symbols without changing remaining rank order", () => {
+    const ranked = [snapshot("OPENUSDT"), snapshot("UNSUPPORTEDUSDT"), snapshot("FIRSTUSDT"), snapshot("SECONDUSDT")];
+    const selected = selectDeterministicEntryCandidates(ranked, ["OPENUSDT", "FIRSTUSDT", "SECONDUSDT"], ["OPENUSDT"], 2);
+    expect(selected).toEqual(["FIRSTUSDT", "SECONDUSDT"]);
+    expect(buildEvidenceSymbols(["OPENUSDT"], selected)).toEqual(["OPENUSDT", "FIRSTUSDT", "SECONDUSDT"]);
+  });
+
+  it("bounds shortlist length by the total action capacity", () => {
+    expect(selectDeterministicEntryCandidates(Array.from({ length: 7 }, (_, index) => snapshot(`S${index}USDT`)), Array.from({ length: 7 }, (_, index) => `S${index}USDT`), [], 99)).toHaveLength(MAX_TOTAL_ACTIONS_PER_CYCLE);
   });
 
   it("enforces capacity in the generated model schema before semantic execution", () => {
@@ -254,6 +244,11 @@ describe("cycle decision plan contract", () => {
     const testContext = { ...context([position("CRCLUSDT")], entries.map((entry) => entry.symbol)), supportedUniverse: ["CRCLUSDT", ...entries.map((entry) => entry.symbol)] };
     expect(MAX_FINANCIAL_WRITES_PER_CYCLE).toBe(5);
     expect(() => validateCycleDecisionPlan(value, testContext)).toThrow("MAX_FINANCIAL_WRITES_PER_CYCLE");
+  });
+
+  it("includes selected candidate evidence in the final decision prompt", () => {
+    const prompt = JSON.parse(buildDecisionPrompt(context([], ["NVDAUSDT"]), "cycle-1")) as { entryCandidateEvidence: Array<{ symbol: string; market: { lastPrice: string } }> };
+    expect(prompt.entryCandidateEvidence).toEqual([expect.objectContaining({ symbol: "NVDAUSDT", market: expect.objectContaining({ lastPrice: "100" }) })]);
   });
 
   it("labels management and entry evidence separately in the prompt", () => {
