@@ -112,15 +112,15 @@ export function loadProviderDataRevisions(executor: SqlExecutor, categories: rea
   }]));
 }
 
-export function resolveProviderOrigin(executor: SqlExecutor, providerOrderId: string | null, clientOid: string | null, fallback: ProviderOrigin = "UNATTRIBUTED"): ProviderOrigin {
+export function resolveProviderOrigin(executor: SqlExecutor, providerOrderId: string | null, clientOid: string | null, fallback: ProviderOrigin = "UNATTRIBUTED", path = "scheduled_provider_sync"): ProviderOrigin {
   if (clientOid) {
-    const idempotency = executor.sql<{ client_order_id: string }>`SELECT client_order_id FROM idempotency WHERE client_order_id = ${clientOid} LIMIT 1`;
+    const idempotency = executeMeasuredSql<{ client_order_id: string }>(executor, path, "provider_sync_origin_client_oid_lookup")`SELECT client_order_id FROM idempotency WHERE client_order_id = ${clientOid} LIMIT 1`;
     if (idempotency.length > 0) return "DARWIN";
   }
   if (providerOrderId) {
-    const idempotency = executor.sql<{ provider_order_id: string }>`SELECT provider_order_id FROM idempotency WHERE provider_order_id = ${providerOrderId} LIMIT 1`;
+    const idempotency = executeMeasuredSql<{ provider_order_id: string }>(executor, path, "provider_sync_origin_provider_order_lookup")`SELECT provider_order_id FROM idempotency WHERE provider_order_id = ${providerOrderId} LIMIT 1`;
     if (idempotency.length > 0) return "DARWIN";
-    const existing = executor.sql<{ origin: ProviderOrigin }>`SELECT origin FROM provider_orders WHERE provider_order_id = ${providerOrderId} LIMIT 1`;
+    const existing = executeMeasuredSql<{ origin: ProviderOrigin }>(executor, path, "provider_sync_origin_fallback_lookup")`SELECT origin FROM provider_orders WHERE provider_order_id = ${providerOrderId} LIMIT 1`;
     if (existing[0]?.origin) return existing[0].origin;
   }
   return fallback;
