@@ -15,6 +15,8 @@ import {
   upsertProviderFinancialRecord,
   upsertProviderOrder,
   upsertProviderPositionHistory,
+  type ProviderOriginReadObserver,
+  type ProviderOriginReadQueryName,
   type ProviderResourceCheckpoint,
   type ProviderSyncCheckpoints,
   type ProviderSyncState,
@@ -26,6 +28,48 @@ const PROVIDER_HISTORY_SAFETY_MS = 60 * 1000;
 const DEFAULT_INITIAL_LOOKBACK_MS = MAX_PROVIDER_HISTORY_MS;
 export const PROVIDER_TRADE_LIFECYCLE_CATEGORY = "USDT-FUTURES" as const;
 export const PROVIDER_FINANCIAL_CATEGORIES = ["USDT-FUTURES", "OTHER", "SPOT", "MARGIN", "COIN-FUTURES", "USDC-FUTURES"] as const;
+
+export type ProviderSyncTelemetryPath = "scheduled_provider_sync" | "/api/provider-ledger/backfill";
+
+export interface ProviderOriginReadSummary {
+  path: ProviderSyncTelemetryPath;
+  totals: Record<ProviderOriginReadQueryName, { calls: number; rowsRead: number }>;
+}
+
+const PROVIDER_ORIGIN_QUERY_NAMES: ProviderOriginReadQueryName[] = [
+  "provider_sync_origin_client_oid_lookup",
+  "provider_sync_origin_provider_order_lookup",
+  "provider_sync_origin_fallback_lookup",
+];
+
+export function createProviderOriginReadSummary(path: ProviderSyncTelemetryPath): ProviderOriginReadSummary {
+  return {
+    path,
+    totals: {
+      provider_sync_origin_client_oid_lookup: { calls: 0, rowsRead: 0 },
+      provider_sync_origin_provider_order_lookup: { calls: 0, rowsRead: 0 },
+      provider_sync_origin_fallback_lookup: { calls: 0, rowsRead: 0 },
+    },
+  };
+}
+
+export function emitProviderOriginReadSummary(summary: ProviderOriginReadSummary): void {
+  for (const queryName of PROVIDER_ORIGIN_QUERY_NAMES) {
+    const { calls, rowsRead } = summary.totals[queryName];
+    if (calls === 0) continue;
+    try {
+      console.log(JSON.stringify({ event: "DO_SQL_READ_SUMMARY", path: summary.path, queryName, calls, rowsRead }));
+    } catch {
+      // Provider telemetry must not affect synchronization behavior.
+    }
+  }
+}
+
+function recordProviderOriginRead(summary: ProviderOriginReadSummary, queryName: ProviderOriginReadQueryName, rowsRead: number): void {
+  const total = summary.totals[queryName];
+  total.calls += 1;
+  total.rowsRead += rowsRead;
+}
 
 const DEFAULT_RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_OVERLAP_MS = 15 * 60 * 1000;
@@ -45,6 +89,8 @@ export interface ProviderLedgerReadClient {
 export interface ProviderLedgerSyncOptions {
   category: string;
   mode: "backfill" | "recent";
+  telemetryPath?: ProviderSyncTelemetryPath;
+  originReadSummary?: ProviderOriginReadSummary;
   financialRecordsOnly?: boolean;
   now?: Date;
   initialLookbackMs?: number;
@@ -83,6 +129,22 @@ export async function syncProviderLedger(
   executor: SqlExecutor,
   options: ProviderLedgerSyncOptions,
 ): Promise<ProviderLedgerSyncResult> {
+  const telemetryPath = options.telemetryPath ?? (options.mode === "backfill" ? "/api/provider-ledger/backfill" : "scheduled_provider_sync");
+  const originReadSummary = options.originReadSummary ?? createProviderOriginReadSummary(telemetryPath);
+  try {
+    return await syncProviderLedgerRun(client, executor, options, telemetryPath, originReadSummary);
+  } finally {
+    if (!options.originReadSummary) emitProviderOriginReadSummary(originReadSummary);
+  }
+}
+
+async function syncProviderLedgerRun(
+  client: ProviderLedgerReadClient,
+  executor: SqlExecutor,
+  options: ProviderLedgerSyncOptions,
+  telemetryPath: ProviderSyncTelemetryPath,
+  originReadSummary: ProviderOriginReadSummary,
+): Promise<ProviderLedgerSyncResult> {
   const now = options.now ?? new Date();
   const observedAt = now.toISOString();
   const previous = loadProviderSyncState(executor, options.category);
@@ -96,6 +158,7 @@ export async function syncProviderLedger(
     maxPages: Math.max(1, options.maxPagesPerRun ?? DEFAULT_MAX_PAGES_PER_RUN),
     maxRows: Math.max(1, options.maxRowsPerRun ?? DEFAULT_MAX_ROWS_PER_RUN),
   };
+  const onOriginRowsRead: ProviderOriginReadObserver = (queryName, rowsRead) => recordProviderOriginRead(originReadSummary, queryName, rowsRead);
 
   const run = async (name: ResourceName, read: (params: ProviderLedgerReadParams) => Promise<unknown>, processRow: (row: Record<string, unknown>) => boolean): Promise<void> => {
     let totals = { pages: 0, rows: 0, malformedRows: 0 };
@@ -144,21 +207,21 @@ export async function syncProviderLedger(
 
   if (!options.financialRecordsOnly) {
     await run("historyOrders", client.getOrderHistoryRead.bind(client), (row) => {
-      const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid), "PROVIDER_EXTERNAL");
+      const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid), "PROVIDER_EXTERNAL", telemetryPath, onOriginRowsRead);
       const record = normalizeProviderOrder(row, origin, observedAt);
       if (!record) return false;
       upsertProviderOrder(executor, record, observedAt);
       return true;
     });
     await run("fills", client.getFillHistoryWindowRead.bind(client), (row) => {
-      const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid));
+      const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid), "UNATTRIBUTED", telemetryPath, onOriginRowsRead);
       const record = normalizeProviderFill(row, origin, observedAt);
       if (!record) return false;
       upsertProviderFill(executor, record, observedAt);
       return true;
     });
     await run("positionHistory", client.getPositionHistoryRead.bind(client), (row) => {
-      const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid));
+      const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid), "UNATTRIBUTED", telemetryPath, onOriginRowsRead);
       const record = normalizeProviderPositionHistory(row, observedAt, origin);
       if (!record) return false;
       upsertProviderPositionHistory(executor, record, observedAt);
@@ -166,7 +229,7 @@ export async function syncProviderLedger(
     });
   }
   await run("financialRecords", client.getFinancialRecordsRead.bind(client), (row) => {
-    const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid));
+    const origin = resolveProviderOrigin(executor, text(row.orderId), text(row.clientOid), "UNATTRIBUTED", telemetryPath, onOriginRowsRead);
     const record = normalizeProviderFinancialRecord(row, observedAt, origin);
     if (!record) return false;
     upsertProviderFinancialRecord(executor, record, observedAt);

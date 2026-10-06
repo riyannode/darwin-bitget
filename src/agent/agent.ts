@@ -3,7 +3,7 @@ import { ZodError } from "zod";
 import type { ActivityEvent, BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionManagementState, PositionSnapshot, PositionSide, ProviderExecutionFact, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient, type MarketEvidenceFailure } from "../bitget/client.js";
-import { syncProviderLedger, PROVIDER_FINANCIAL_CATEGORIES, PROVIDER_TRADE_LIFECYCLE_CATEGORY } from "../bitget/provider-sync.js";
+import { createProviderOriginReadSummary, emitProviderOriginReadSummary, syncProviderLedger, PROVIDER_FINANCIAL_CATEGORIES, PROVIDER_TRADE_LIFECYCLE_CATEGORY } from "../bitget/provider-sync.js";
 import { MANDATE_VERSION, PROMPT_VERSIONS, TRADING_MANDATE } from "./mandate.js";
 import { assertOpenPositionCountWithinPlanLimit, buildEvidenceSymbols, calculateActionCapacity, countOpenPositionLifecycles, decide, filterNewEntryMarketCandidates, rankMarketCandidates, selectEntryCandidates } from "./decision.js";
 import { QwenJsonError } from "./qwen.js";
@@ -689,13 +689,20 @@ export class TraderAgent extends Agent<Env, AgentState> {
   private readonly researchRouter = new ResearchRouter();
   private readonly researchExecutor = new ResearchExecutor();
 
-  public measuredSql<T>(path: string, queryName: string, strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[] {
+  public measuredSql<T>(
+    path: string,
+    queryName: string,
+    strings: TemplateStringsArray,
+    values: (string | number | boolean | null)[],
+    onRowsRead?: (rowsRead: number) => void,
+  ): T[] {
     const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
     const cursor = this.ctx.storage.sql.exec<Record<string, SqlStorageValue>>(query, ...values);
     const rows = cursor.toArray();
     const rowsRead = cursor.rowsRead;
     try {
-      console.log(JSON.stringify({ event: "DO_SQL_READ", path, queryName, rowsRead }));
+      if (onRowsRead) onRowsRead(rowsRead);
+      else console.log(JSON.stringify({ event: "DO_SQL_READ", path, queryName, rowsRead }));
     } catch {
       // Read telemetry must not affect the request.
     }
@@ -880,13 +887,20 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const storedPerformance = loadPerformanceAggregate<PerformanceAggregate>(this);
       const baselineAt = isPerformanceAggregate(storedPerformance) ? storedPerformance.performanceBaselineAt : null;
       const results = [];
-      for (const category of PROVIDER_FINANCIAL_CATEGORIES) {
-        results.push(await syncProviderLedger(new BitgetClient(config), this, {
-          category,
-          mode: "backfill",
-          financialRecordsOnly: category !== "USDT-FUTURES",
-          ...(baselineAt ? { coverageStartAt: baselineAt } : {}),
-        }));
+      const originReadSummary = createProviderOriginReadSummary("/api/provider-ledger/backfill");
+      try {
+        for (const category of PROVIDER_FINANCIAL_CATEGORIES) {
+          results.push(await syncProviderLedger(new BitgetClient(config), this, {
+            category,
+            mode: "backfill",
+            telemetryPath: "/api/provider-ledger/backfill",
+            originReadSummary,
+            financialRecordsOnly: category !== "USDT-FUTURES",
+            ...(baselineAt ? { coverageStartAt: baselineAt } : {}),
+          }));
+        }
+      } finally {
+        emitProviderOriginReadSummary(originReadSummary);
       }
       const diagnostics = [...providerLedgerDiagnosticsBatch(this, PROVIDER_FINANCIAL_CATEGORIES, "/api/provider-ledger/backfill").values()];
       return json({ source: "PROVIDER_READ_ONLY_BACKFILL", baselineAt, results, categories: diagnostics.map((entry) => ({ category: entry.category, rowCount: entry.counts.financialRecords, sync: entry.sync, coverage: entry.sync?.financialRecordCoverage ?? null })) });
@@ -956,6 +970,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   public async runScheduledProviderSync(): Promise<void> {
+    const originReadSummary = createProviderOriginReadSummary("scheduled_provider_sync");
     try {
       ensureStorageInitialized(this);
       const config = loadConfig(this.env, this.ensureActivePolicy());
@@ -965,6 +980,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
         results.push(await syncProviderLedger(client, this, {
           category,
           mode: "recent",
+          telemetryPath: "scheduled_provider_sync",
+          originReadSummary,
           ...(category === PROVIDER_TRADE_LIFECYCLE_CATEGORY ? {} : { financialRecordsOnly: true }),
           recentWindowMs: 24 * 60 * 60 * 1000,
           overlapMs: 15 * 60 * 1000,
@@ -980,6 +997,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
       });
     } catch (error) {
       this.recordEventBestEffort("PROVIDER_SYNC_FAILED", "CONTROL", failureDiagnostic(error));
+    } finally {
+      emitProviderOriginReadSummary(originReadSummary);
     }
   }
 

@@ -21,11 +21,21 @@ import {
   recordIdempotency,
   recordProviderOrderReference,
 } from "../src/storage/store.js";
+import {
+  createProviderOriginReadSummary,
+  emitProviderOriginReadSummary,
+  syncProviderLedger,
+  type ProviderLedgerReadClient,
+} from "../src/bitget/provider-sync.js";
 import { resolveProviderOrigin } from "../src/storage/provider-ledger.js";
 
 type SqlValue = string | number | boolean | null;
 
-function makeExecutor(db: DatabaseSync, measured = false): SqlExecutor {
+function makeExecutor(
+  db: DatabaseSync,
+  measured = false,
+  rowsReadForQuery?: (query: string, returnedRows: number) => number,
+): SqlExecutor {
   const run = <T>(query: string, values: SqlValue[]): T[] => {
     const normalized = query.trimStart().toUpperCase();
     const sqliteValues = values.map((value) => typeof value === "boolean" ? Number(value) : value) as (string | number | null)[];
@@ -48,7 +58,7 @@ function makeExecutor(db: DatabaseSync, measured = false): SqlExecutor {
       sql: {
         exec(query: string, ...values: SqlValue[]) {
           const rows = run<Record<string, unknown>>(query, values);
-          return { toArray: () => rows, rowsRead: rows.length, rowsWritten: 0 };
+          return { toArray: () => rows, rowsRead: rowsReadForQuery?.(query, rows.length) ?? rows.length, rowsWritten: 0 };
         },
       },
     },
@@ -175,5 +185,79 @@ describe("existing Durable Object SQL read telemetry", () => {
     expect(encoded).not.toContain(financialPayload);
     expect(encoded).not.toContain("PRIVATEUSDT");
     db.close();
+  });
+
+  it("aggregates origin-read measurements into three bounded summaries per invocation and separates paths", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const paths = ["scheduled_provider_sync", "/api/provider-ledger/backfill"] as const;
+
+    for (const path of paths) {
+      const db = new DatabaseSync(":memory:");
+      const raw = makeExecutor(db);
+      ensureStorage(raw);
+      const executor = makeExecutor(db, true, (query) => query.includes("provider_orders") ? 3 : 2);
+      const originReadSummary = createProviderOriginReadSummary(path);
+      const client: ProviderLedgerReadClient = {
+        async getOrderHistoryRead() { throw new Error("UNEXPECTED_ORDER_READ"); },
+        async getFillHistoryWindowRead() { throw new Error("UNEXPECTED_FILL_READ"); },
+        async getPositionHistoryRead() { throw new Error("UNEXPECTED_POSITION_READ"); },
+        async getFinancialRecordsRead(params) {
+          return {
+            list: [1, 2].map((index) => ({
+              id: `private-record-${params.category}-${index}`,
+              category: params.category,
+              type: "FEE",
+              ts: "2026-10-06T00:00:00.000Z",
+              orderId: `private-order-${params.category}-${index}`,
+              clientOid: `private-client-${params.category}-${index}`,
+              symbol: "PRIVATEUSDT",
+              amount: "9876.543",
+            })),
+            cursor: null,
+          };
+        },
+      };
+
+      for (const category of ["SPOT", "OTHER"]) {
+        await syncProviderLedger(client, executor, {
+          category,
+          mode: "recent",
+          financialRecordsOnly: true,
+          now: new Date("2026-10-06T00:00:00.000Z"),
+          recentWindowMs: 60 * 60 * 1000,
+          telemetryPath: path,
+          originReadSummary,
+        });
+      }
+      emitProviderOriginReadSummary(originReadSummary);
+      db.close();
+    }
+
+    const records = telemetry(logSpy);
+    const queryNames = [
+      "provider_sync_origin_client_oid_lookup",
+      "provider_sync_origin_provider_order_lookup",
+      "provider_sync_origin_fallback_lookup",
+    ];
+    expect(records).toHaveLength(paths.length * queryNames.length);
+    for (const path of paths) {
+      const summaries = records.filter((record) => record.path === path);
+      expect(summaries.map(({ queryName }) => queryName)).toEqual(queryNames);
+      expect(summaries.map(({ calls, rowsRead }) => ({ calls, rowsRead }))).toEqual([
+        { calls: 4, rowsRead: 8 },
+        { calls: 4, rowsRead: 8 },
+        { calls: 4, rowsRead: 12 },
+      ]);
+      for (const summary of summaries) {
+        expect(summary.event).toBe("DO_SQL_READ_SUMMARY");
+        expect(Object.keys(summary).sort()).toEqual(["calls", "event", "path", "queryName", "rowsRead"]);
+      }
+    }
+    const encoded = JSON.stringify(records);
+    expect(encoded).not.toContain("private-record-");
+    expect(encoded).not.toContain("private-order-");
+    expect(encoded).not.toContain("private-client-");
+    expect(encoded).not.toContain("PRIVATEUSDT");
+    expect(encoded).not.toContain("9876.543");
   });
 });
