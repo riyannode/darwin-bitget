@@ -1924,6 +1924,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
       this.setState({ ...this.state, runtimeStatus: "ANALYZING", currentStage: "ANALYZING" });
       const remainingEntrySlots = calculateActionCapacity(openPositionCount).remainingEntrySlots;
       const selectedEntryCandidateSymbols = selectDeterministicEntryCandidates(rankedScan, supportedUniverse, openPositionSymbols, remainingEntrySlots);
+      if (remainingEntrySlots === 0) this.recordEvent("CANDIDATE_SELECTION_SKIPPED", cycleId, { code: "CAPACITY_SATURATED", openPositionCount: String(openPositionCount), source: "DETERMINISTIC_RANK" });
+      else this.recordEvent("CANDIDATE_SELECTED", cycleId, { symbols: selectedEntryCandidateSymbols.join(","), source: "DETERMINISTIC_RANK" });
       const evidenceSymbols = buildEvidenceSymbols(openPositionSymbols, selectedEntryCandidateSymbols);
       const evidenceCollection = await runTimedCyclePhase("MARKET_EVIDENCE", () => client.collectSymbolMarketEvidence(evidenceSymbols, initialPortfolio, instruments));
       for (const unavailable of evidenceCollection.unavailable) this.recordEvent("MARKET_EVIDENCE_UNAVAILABLE", cycleId, {

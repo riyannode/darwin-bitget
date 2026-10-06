@@ -277,6 +277,20 @@ describe("paper log export", () => {
     expect(exported.failureBreakdown.byStage.decision).toBe(1);
   });
 
+  it("attributes a failed cycle after deterministic candidate planning to candidate_selection", () => {
+    const current = journal(78, "HOLD");
+    current.cycleId = "cycle-candidate-fail";
+    const events: ActivityEvent[] = [
+      { eventId: "candidate-1", type: "CYCLE_STARTED", cycleId: current.cycleId, createdAt: current.startedAt },
+      { eventId: "candidate-2", type: "CANDIDATE_SELECTED", cycleId: current.cycleId, createdAt: "2026-09-12T00:00:01.000Z", metadata: { source: "DETERMINISTIC_RANK", symbols: "NVDAUSDT,COINUSDT" } },
+      { eventId: "candidate-3", type: "CYCLE_FAILED", cycleId: current.cycleId, createdAt: "2026-09-12T00:00:02.000Z", metadata: { category: "RUNTIME_ERROR", code: "RUNTIME_ERROR" } },
+    ];
+    const exported = buildPaperLogExport({ generatedAt: "2026-09-12T00:03:00.000Z", period: { start: null, end: null }, environment: "test", model: "qwen3.8-max", version: "0.3.0", commit: "abc123", cycles: [{ cycleId: current.cycleId, status: "FAILED", startedAt: current.startedAt, completedAt: current.completedAt ?? null }], journals: [current], experiences: [], events });
+    expect(exported.cycles[0]?.failure?.lastSuccessfulEvent).toBe("CANDIDATE_SELECTED");
+    expect(exported.cycles[0]?.failure?.stage).toBe("candidate_selection");
+    expect(exported.failureBreakdown.byStage.candidate_selection).toBe(1);
+  });
+
   it("uses explicit decision schema validation telemetry without treating it as the last successful event", () => {
     const current = journal(77, "HOLD");
     current.cycleId = "cycle-schema-fail";
