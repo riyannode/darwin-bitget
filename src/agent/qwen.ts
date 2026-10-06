@@ -206,7 +206,7 @@ export async function generateQwenJson<T>(config: RuntimeConfig, schema: z.ZodTy
         ...baseTelemetry,
         outerMalformedRetry: retrying || attempt > 0,
         malformedReason,
-        finalStatus: retrying || attempt > 0 ? "MALFORMED_RETRY" : "OTHER_ERROR",
+        finalStatus: retrying ? "MALFORMED_RETRY" : "OTHER_ERROR",
       });
       if (retrying) continue;
       throw error;
@@ -233,7 +233,7 @@ export async function generateQwenJson<T>(config: RuntimeConfig, schema: z.ZodTy
         ...baseTelemetry,
         outerMalformedRetry: retrying || attempt > 0,
         malformedReason,
-        finalStatus: retrying || attempt > 0 ? "MALFORMED_RETRY" : "OTHER_ERROR",
+        finalStatus: retrying ? "MALFORMED_RETRY" : "OTHER_ERROR",
       });
       if (retrying) continue;
       throw jsonError;

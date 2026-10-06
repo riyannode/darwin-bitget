@@ -89,12 +89,41 @@ describe("bounded Qwen JSON handling", () => {
     })).rejects.toMatchObject({ code: "QWEN_INVALID_JSON", diagnostic: { parserStage: "JSON_PARSE" } });
     expect(mockedGenerateText).toHaveBeenCalledTimes(2);
     expect(telemetry).toHaveLength(2);
-    expect(telemetry[1]).toMatchObject({ attempt: 2, outerMalformedRetry: true, malformedReason: "json_parse", finalStatus: "MALFORMED_RETRY" });
+    expect(telemetry[0]).toMatchObject({ attempt: 1, outerMalformedRetry: true, malformedReason: "json_parse", finalStatus: "MALFORMED_RETRY" });
+    expect(telemetry[1]).toMatchObject({ attempt: 2, outerMalformedRetry: true, malformedReason: "json_parse", finalStatus: "OTHER_ERROR" });
   });
 
   it("reports response JSON extraction failures separately", async () => {
     mockedGenerateText.mockResolvedValue(result("not json") as never);
     await expect(generateQwenJson(config, schema, "system", "prompt")).rejects.toMatchObject({ code: "QWEN_INVALID_JSON", diagnostic: { parserStage: "RESPONSE_JSON_EXTRACTION" } });
+  });
+
+  it("retries response extraction failures and reports both attempt statuses", async () => {
+    const telemetry: Array<Record<string, unknown>> = [];
+    mockedGenerateText
+      .mockResolvedValueOnce(result("not json") as never)
+      .mockResolvedValueOnce(result('{"value":"recovered"}') as never);
+    await expect(generateQwenJson(config, schema, "system", "prompt", {
+      retryMalformedJson: true,
+      onAttemptTelemetry: (event) => telemetry.push(event as unknown as Record<string, unknown>),
+    })).resolves.toEqual({ value: "recovered" });
+    expect(mockedGenerateText).toHaveBeenCalledTimes(2);
+    expect(telemetry[0]).toMatchObject({ attempt: 1, outerMalformedRetry: true, malformedReason: "extraction", finalStatus: "MALFORMED_RETRY" });
+    expect(telemetry[1]).toMatchObject({ attempt: 2, outerMalformedRetry: true, malformedReason: "extraction", finalStatus: "SUCCESS" });
+  });
+
+  it("reports a terminal extraction failure as OTHER_ERROR after the retry", async () => {
+    const telemetry: Array<Record<string, unknown>> = [];
+    mockedGenerateText
+      .mockResolvedValueOnce(result("not json") as never)
+      .mockResolvedValueOnce(result("still not json") as never);
+    await expect(generateQwenJson(config, schema, "system", "prompt", {
+      retryMalformedJson: true,
+      onAttemptTelemetry: (event) => telemetry.push(event as unknown as Record<string, unknown>),
+    })).rejects.toMatchObject({ code: "QWEN_INVALID_JSON", diagnostic: { parserStage: "RESPONSE_JSON_EXTRACTION" } });
+    expect(mockedGenerateText).toHaveBeenCalledTimes(2);
+    expect(telemetry[0]).toMatchObject({ attempt: 1, finalStatus: "MALFORMED_RETRY", malformedReason: "extraction" });
+    expect(telemetry[1]).toMatchObject({ attempt: 2, outerMalformedRetry: true, finalStatus: "OTHER_ERROR", malformedReason: "extraction" });
   });
 
   it("classifies length-finished output as QWEN_OUTPUT_TRUNCATED", async () => {
