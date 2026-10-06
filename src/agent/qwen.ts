@@ -4,10 +4,34 @@ import { z } from "zod";
 import type { RuntimeConfig } from "../types.js";
 import { QWEN_DATA_BOUNDARY } from "./mandate.js";
 
+export type QwenTelemetryFinalStatus = "SUCCESS" | "MALFORMED_RETRY" | "SCHEMA_ERROR" | "TIMEOUT" | "PROVIDER_ERROR" | "TRUNCATED" | "OTHER_ERROR";
+export type QwenMalformedReason = "extraction" | "json_parse" | null;
+
+export interface QwenAttemptTelemetry {
+  attempt: number;
+  durationMs: number;
+  staticPromptChars: number;
+  staticPromptBytes: number;
+  dynamicPromptChars: number;
+  dynamicPromptBytes: number;
+  totalPromptChars: number;
+  totalPromptBytes: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  finishReason?: string;
+  outerMalformedRetry: boolean;
+  malformedReason: QwenMalformedReason;
+  sdkMaxRetries: 2;
+  sdkInternalRetryAttempts: "UNOBSERVABLE";
+  finalStatus: QwenTelemetryFinalStatus;
+}
+
 interface QwenRequestOptions {
   maxOutputTokens?: number;
   timeoutMs?: number;
   retryMalformedJson?: boolean;
+  onAttemptTelemetry?: (telemetry: QwenAttemptTelemetry) => void;
 }
 
 export type QwenJsonErrorCode = "QWEN_OUTPUT_TRUNCATED" | "QWEN_INVALID_JSON";
@@ -87,32 +111,131 @@ function responseJson(text: string): string {
   return normalized.slice(start, end + 1);
 }
 
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function emitAttemptTelemetry(
+  callback: QwenRequestOptions["onAttemptTelemetry"],
+  input: Omit<QwenAttemptTelemetry, "sdkMaxRetries" | "sdkInternalRetryAttempts">,
+): void {
+  if (!callback) return;
+  try {
+    callback({ ...input, sdkMaxRetries: 2, sdkInternalRetryAttempts: "UNOBSERVABLE" });
+  } catch {
+    // Observability must never affect generation or trading behavior.
+  }
+}
+
+function statusForProviderError(error: unknown): QwenTelemetryFinalStatus {
+  const name = error instanceof Error ? error.name : "";
+  return name === "AbortError" || name === "TimeoutError" ? "TIMEOUT" : "PROVIDER_ERROR";
+}
+
 export async function generateQwenJson<T>(config: RuntimeConfig, schema: z.ZodType<T>, system: string, prompt: string, options: QwenRequestOptions = {}): Promise<T> {
   if (!config.qwenApiKey) throw new Error("QWEN_CREDENTIALS_REQUIRED");
   const provider = createOpenAICompatible({ name: "qwen", apiKey: config.qwenApiKey, baseURL: config.qwenBaseUrl });
   const schemaText = JSON.stringify(z.toJSONSchema(schema, { target: "draft-07", unrepresentable: "any" }));
+  const systemPrompt = `${QWEN_DATA_BOUNDARY}\n${system}\nReturn valid JSON only. Match this JSON Schema: ${schemaText}`;
+  const staticPromptChars = systemPrompt.length;
+  const staticPromptBytes = utf8Bytes(systemPrompt);
   const maxAttempts = options.retryMalformedJson === true ? 2 : 1;
+  let malformedReason: QwenMalformedReason = null;
+
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const attemptPrompt = attempt === 0 ? prompt : `${prompt}\n\nPrevious response was not valid JSON. Return exactly one valid JSON object matching the schema, with no markdown or surrounding text.`;
-    const result = await generateText({ model: provider.chatModel(config.qwenModel), system: `${QWEN_DATA_BOUNDARY}\n${system}\nReturn valid JSON only. Match this JSON Schema: ${schemaText}`, prompt: attemptPrompt, maxOutputTokens: options.maxOutputTokens ?? 1600, temperature: 0, providerOptions: { qwen: { enable_thinking: false } }, abortSignal: AbortSignal.timeout(options.timeoutMs ?? 45_000) });
+    const dynamicPromptChars = attemptPrompt.length;
+    const dynamicPromptBytes = utf8Bytes(attemptPrompt);
+    const startedAt = Date.now();
+    let result: Awaited<ReturnType<typeof generateText>>;
+    try {
+      result = await generateText({ model: provider.chatModel(config.qwenModel), system: systemPrompt, prompt: attemptPrompt, maxOutputTokens: options.maxOutputTokens ?? 1600, temperature: 0, maxRetries: 2, providerOptions: { qwen: { enable_thinking: false } }, abortSignal: AbortSignal.timeout(options.timeoutMs ?? 45_000) });
+    } catch (error) {
+      emitAttemptTelemetry(options.onAttemptTelemetry, {
+        attempt: attempt + 1,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        staticPromptChars,
+        staticPromptBytes,
+        dynamicPromptChars,
+        dynamicPromptBytes,
+        totalPromptChars: staticPromptChars + dynamicPromptChars,
+        totalPromptBytes: staticPromptBytes + dynamicPromptBytes,
+        outerMalformedRetry: attempt > 0,
+        malformedReason,
+        finalStatus: statusForProviderError(error),
+      });
+      throw error;
+    }
+
     const diagnostic = diagnosticFor(result, result.text);
-    if (isTruncatedFinishReason(diagnostic.finishReason)) throw new QwenJsonError("QWEN_OUTPUT_TRUNCATED", diagnostic);
+    const usage = record(result.usage);
+    const totalTokens = finiteNumber(usage.totalTokens);
+    const telemetryTokens = {
+      ...(diagnostic.inputTokens === undefined ? {} : { inputTokens: diagnostic.inputTokens }),
+      ...(diagnostic.outputTokens === undefined ? {} : { outputTokens: diagnostic.outputTokens }),
+      ...(totalTokens === undefined ? {} : { totalTokens }),
+    };
+    const baseTelemetry = {
+      attempt: attempt + 1,
+      durationMs: Math.max(0, Date.now() - startedAt),
+      staticPromptChars,
+      staticPromptBytes,
+      dynamicPromptChars,
+      dynamicPromptBytes,
+      totalPromptChars: staticPromptChars + dynamicPromptChars,
+      totalPromptBytes: staticPromptBytes + dynamicPromptBytes,
+      ...telemetryTokens,
+      finishReason: diagnostic.finishReason,
+      outerMalformedRetry: attempt > 0,
+      malformedReason,
+    };
+
+    if (isTruncatedFinishReason(diagnostic.finishReason)) {
+      emitAttemptTelemetry(options.onAttemptTelemetry, { ...baseTelemetry, finalStatus: "TRUNCATED" });
+      throw new QwenJsonError("QWEN_OUTPUT_TRUNCATED", diagnostic);
+    }
 
     let jsonText: string;
     try {
       jsonText = responseJson(result.text);
     } catch {
       const error = new QwenJsonError("QWEN_INVALID_JSON", { ...diagnostic, parserStage: "RESPONSE_JSON_EXTRACTION" });
-      if (attempt + 1 < maxAttempts) continue;
+      malformedReason = "extraction";
+      const retrying = attempt + 1 < maxAttempts;
+      emitAttemptTelemetry(options.onAttemptTelemetry, {
+        ...baseTelemetry,
+        outerMalformedRetry: retrying || attempt > 0,
+        malformedReason,
+        finalStatus: retrying ? "MALFORMED_RETRY" : "OTHER_ERROR",
+      });
+      if (retrying) continue;
       throw error;
     }
 
     try {
-      return schema.parse(JSON.parse(jsonText));
+      const parsed = schema.parse(JSON.parse(jsonText));
+      emitAttemptTelemetry(options.onAttemptTelemetry, {
+        ...baseTelemetry,
+        outerMalformedRetry: attempt > 0,
+        malformedReason,
+        finalStatus: "SUCCESS",
+      });
+      return parsed;
     } catch (error) {
-      if (error instanceof z.ZodError) throw error;
+      if (error instanceof z.ZodError) {
+        emitAttemptTelemetry(options.onAttemptTelemetry, { ...baseTelemetry, finalStatus: "SCHEMA_ERROR" });
+        throw error;
+      }
       const jsonError = new QwenJsonError("QWEN_INVALID_JSON", { ...diagnostic, parserStage: "JSON_PARSE" });
-      if (attempt + 1 < maxAttempts) continue;
+      malformedReason = "json_parse";
+      const retrying = attempt + 1 < maxAttempts;
+      emitAttemptTelemetry(options.onAttemptTelemetry, {
+        ...baseTelemetry,
+        outerMalformedRetry: retrying || attempt > 0,
+        malformedReason,
+        finalStatus: retrying ? "MALFORMED_RETRY" : "OTHER_ERROR",
+      });
+      if (retrying) continue;
       throw jsonError;
     }
   }
