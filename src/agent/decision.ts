@@ -10,12 +10,11 @@ import type {
   PositionSnapshot,
   RuntimeConfig,
 } from "../types.js";
-import { buildDecisionTaskPrompt, CANDIDATE_TASK_PROMPT, TRADING_MANDATE } from "./mandate.js";
+import { buildDecisionTaskPrompt } from "./mandate.js";
 import { generateQwenJson } from "./qwen.js";
 
 export const MAX_TOTAL_ACTIONS_PER_CYCLE = 5;
 export const MAX_FINANCIAL_WRITES_PER_CYCLE = 5;
-export const CANDIDATE_MAX_OUTPUT_TOKENS = 700;
 export const DECISION_MAX_OUTPUT_TOKENS = 3200;
 
 const decimalString = z.string().regex(/^\d+(?:\.\d{1,8})?$/);
@@ -85,11 +84,6 @@ function cycleDecisionPlanSchemaWithCapacity(positionActionMin: number, position
 export const cycleDecisionPlanSchema = cycleDecisionPlanSchemaWithCapacity(0, MAX_TOTAL_ACTIONS_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE);
 
 export type DecisionInput = z.infer<typeof decisionSchema>;
-
-const candidateSchema = z.object({
-  symbols: z.array(z.string().min(1)).min(1).max(5).refine((symbols) => new Set(symbols).size === symbols.length, "DUPLICATE_CANDIDATE"),
-  rationale: z.array(z.string().min(1).max(240)).max(8),
-});
 
 const MAX_CANDIDATE_POOL = 25;
 
@@ -205,35 +199,25 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
   });
 }
 
-export async function selectCandidates(
-  config: RuntimeConfig,
-  supportedUniverse: readonly string[],
-  scan: readonly MarketSnapshot[],
-): Promise<string[]> {
-  const candidateScan = scan.map((snapshot) => [snapshot.symbol, snapshot.lastPrice, snapshot.priceChange24h, snapshot.volume24h]);
-  const candidatePool = scan.map((snapshot) => snapshot.symbol);
-  const result = await generateQwenJson(config, candidateSchema, `${TRADING_MANDATE}\n${CANDIDATE_TASK_PROMPT}`, JSON.stringify({ candidatePool, scan: candidateScan }), { maxOutputTokens: CANDIDATE_MAX_OUTPUT_TOKENS, timeoutMs: 30_000, retryMalformedJson: true });
-  const candidates = result.symbols;
-  if (candidates.some((symbol) => !supportedUniverse.includes(symbol) || !candidatePool.includes(symbol))) throw new Error("SYMBOL_NOT_ALLOWED");
-  return candidates;
-}
-
-type CandidateSelector = (config: RuntimeConfig, supportedUniverse: readonly string[], scan: readonly MarketSnapshot[]) => Promise<string[]>;
-
 export function filterNewEntryMarketCandidates(rankedScan: readonly MarketSnapshot[], openPositionSymbols: readonly string[]): MarketSnapshot[] {
   const openSymbols = new Set(openPositionSymbols);
   return rankedScan.filter((candidate) => !openSymbols.has(candidate.symbol));
 }
 
-export async function selectEntryCandidates(
-  config: RuntimeConfig,
-  supportedUniverse: readonly string[],
+export function selectDeterministicEntryCandidates(
   rankedScan: readonly MarketSnapshot[],
-  openPositionCount: number,
-  candidateSelector: CandidateSelector = selectCandidates,
-): Promise<string[]> {
-  if (calculateActionCapacity(openPositionCount).remainingEntrySlots === 0) return [];
-  return rankedScan.length ? candidateSelector(config, supportedUniverse, rankedScan) : [];
+  supportedUniverse: readonly string[],
+  openPositionSymbols: readonly string[],
+  remainingEntrySlots: number,
+): string[] {
+  const boundedSlots = Math.min(MAX_TOTAL_ACTIONS_PER_CYCLE, Math.max(0, Math.floor(remainingEntrySlots)));
+  if (boundedSlots === 0 || rankedScan.length === 0) return [];
+  const supportedSymbols = new Set(supportedUniverse);
+  const openSymbols = new Set(openPositionSymbols);
+  return rankedScan
+    .filter((candidate) => supportedSymbols.has(candidate.symbol) && !openSymbols.has(candidate.symbol))
+    .slice(0, boundedSlots)
+    .map((candidate) => candidate.symbol);
 }
 
 export function buildEvidenceSymbols(openPositionSymbols: readonly string[], selectedEntryCandidateSymbols: readonly string[]): string[] {

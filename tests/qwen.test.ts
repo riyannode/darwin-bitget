@@ -3,7 +3,7 @@ import { z } from "zod";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText } from "ai";
 import { generateQwenJson, QwenJsonError } from "../src/agent/qwen.js";
-import { CANDIDATE_MAX_OUTPUT_TOKENS, DECISION_MAX_OUTPUT_TOKENS } from "../src/agent/decision.js";
+import { DECISION_MAX_OUTPUT_TOKENS } from "../src/agent/decision.js";
 import type { RuntimeConfig } from "../src/types.js";
 
 vi.mock("@ai-sdk/openai-compatible", () => ({
@@ -105,8 +105,7 @@ describe("bounded Qwen JSON handling", () => {
 });
 
 describe("Qwen call budgets", () => {
-  it("keeps decision and candidate budgets distinct", () => {
+  it("keeps the final decision output budget configured", () => {
     expect(DECISION_MAX_OUTPUT_TOKENS).toBe(3200);
-    expect(CANDIDATE_MAX_OUTPUT_TOKENS).toBe(700);
   });
 });
