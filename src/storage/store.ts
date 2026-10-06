@@ -223,8 +223,11 @@ export function loadExperiencesForDecisionIds(executor: SqlExecutor, decisionIds
   });
 }
 
-export function loadOpenExperiences(executor: SqlExecutor, limit = MAX_HISTORY_LIMIT): TradeExperience[] {
-  const rows = executor.sql<ExperienceRow>`SELECT payload FROM experiences WHERE outcome_status = 'OPEN' ORDER BY created_at DESC, experience_id ASC LIMIT ${clampHistoryLimit(limit, MAX_HISTORY_LIMIT)}`;
+export function loadOpenExperiences(executor: SqlExecutor, limit = MAX_HISTORY_LIMIT, path?: string, queryName?: string): TradeExperience[] {
+  const query = path
+    ? (strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) => executeMeasuredSql<ExperienceRow>(executor, path, queryName ?? "open_experiences")(strings, ...values)
+    : (strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) => executor.sql<ExperienceRow>(strings, ...values);
+  const rows = query`SELECT payload FROM experiences WHERE outcome_status = 'OPEN' ORDER BY created_at DESC, experience_id ASC LIMIT ${clampHistoryLimit(limit, MAX_HISTORY_LIMIT)}`;
   return rows.flatMap((row) => {
     try {
       const experience = parseExperience(JSON.parse(row.payload));
@@ -384,8 +387,8 @@ export function loadJournalForExactDecisionCycle(executor: SqlExecutor, cycleId:
   }
 }
 
-export function loadAllExperiences(executor: SqlExecutor): TradeExperience[] {
-  const rows = executor.sql<ExperienceRow>`SELECT payload FROM experiences ORDER BY created_at ASC, experience_id ASC`;
+export function loadAllExperiences(executor: SqlExecutor, path = "/api/export/paper-log", queryName = "paper_log_all_experiences"): TradeExperience[] {
+  const rows = executeMeasuredSql<ExperienceRow>(executor, path, queryName)`SELECT payload FROM experiences ORDER BY created_at ASC, experience_id ASC`;
   return rows.flatMap((row) => {
     try {
       return [parseExperience(JSON.parse(row.payload))];
@@ -561,8 +564,11 @@ export function saveLatestValidCyclePlan(executor: SqlExecutor, readModel: Lates
   `;
 }
 
-export function loadLatestCompletedCyclePlanFromHistory(executor: SqlExecutor): LatestValidCyclePlan | null {
-  const rows = executor.sql<CompletedCyclePlanRow>`
+export function loadLatestCompletedCyclePlanFromHistory(executor: SqlExecutor, path?: string, queryName?: string): LatestValidCyclePlan | null {
+  const query = path
+    ? (strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) => executeMeasuredSql<CompletedCyclePlanRow>(executor, path, queryName ?? "latest_completed_cycle_plan_from_history")(strings, ...values)
+    : (strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) => executor.sql<CompletedCyclePlanRow>(strings, ...values);
+  const rows = query`
     SELECT c.cycle_id, c.status, c.started_at, c.completed_at, j.payload
     FROM cycles AS c
     INNER JOIN journals AS j ON j.cycle_id = c.cycle_id
@@ -693,8 +699,11 @@ export function loadLatestJournal(executor: SqlExecutor): TradingJournal | null 
   }
 }
 
-export function loadRecentJournals(executor: SqlExecutor, limit = 50): TradingJournal[] {
-  const rows = executor.sql<JournalRow>`SELECT payload FROM journals ORDER BY created_at DESC LIMIT ${clampHistoryLimit(limit, 50)}`;
+export function loadRecentJournals(executor: SqlExecutor, limit = 50, path?: string, queryName?: string): TradingJournal[] {
+  const query = path
+    ? (strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) => executeMeasuredSql<JournalRow>(executor, path, queryName ?? "recent_journals")(strings, ...values)
+    : (strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) => executor.sql<JournalRow>(strings, ...values);
+  const rows = query`SELECT payload FROM journals ORDER BY created_at DESC LIMIT ${clampHistoryLimit(limit, 50)}`;
   return rows.flatMap((row) => {
     try {
       return [JSON.parse(row.payload) as TradingJournal];
@@ -733,11 +742,16 @@ export function loadJournalBackfillPage(
   executor: SqlExecutor,
   afterCycleId: string | null,
   limit = 50,
+  path?: string,
+  queryName?: string,
 ): { journals: TradingJournal[]; nextCursor: string | null; hasMore: boolean } {
   const pageLimit = clampHistoryLimit(limit, 50);
+  const query = path
+    ? (strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) => executeMeasuredSql<JournalPageRow>(executor, path, queryName ?? "journal_backfill_page")(strings, ...values)
+    : (strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) => executor.sql<JournalPageRow>(strings, ...values);
   const rows = afterCycleId === null
-    ? executor.sql<JournalPageRow>`SELECT cycle_id, payload FROM journals ORDER BY cycle_id ASC LIMIT ${pageLimit + 1}`
-    : executor.sql<JournalPageRow>`SELECT cycle_id, payload FROM journals WHERE cycle_id > ${afterCycleId} ORDER BY cycle_id ASC LIMIT ${pageLimit + 1}`;
+    ? query`SELECT cycle_id, payload FROM journals ORDER BY cycle_id ASC LIMIT ${pageLimit + 1}`
+    : query`SELECT cycle_id, payload FROM journals WHERE cycle_id > ${afterCycleId} ORDER BY cycle_id ASC LIMIT ${pageLimit + 1}`;
   const hasMore = rows.length > pageLimit;
   const pageRows = hasMore ? rows.slice(0, pageLimit) : rows;
   const journals = pageRows.flatMap((row) => {
@@ -750,14 +764,21 @@ export function loadJournalBackfillPage(
   return { journals, nextCursor: pageRows[pageRows.length - 1]?.cycle_id ?? afterCycleId, hasMore };
 }
 
-export function loadAllAutonomousJournals(executor: SqlExecutor, from?: string, to?: string): TradingJournal[] {
+export function loadAllAutonomousJournals(
+  executor: SqlExecutor,
+  from?: string,
+  to?: string,
+  path = "/api/export/paper-log",
+  queryName = "paper_log_all_journals",
+): TradingJournal[] {
+  const query = executeMeasuredSql<JournalRow>(executor, path, queryName);
   const rows = from && to
-    ? executor.sql<JournalRow>`SELECT payload FROM journals WHERE created_at >= ${from} AND created_at <= ${to} ORDER BY created_at ASC, cycle_id ASC`
+    ? query`SELECT payload FROM journals WHERE created_at >= ${from} AND created_at <= ${to} ORDER BY created_at ASC, cycle_id ASC`
     : from
-      ? executor.sql<JournalRow>`SELECT payload FROM journals WHERE created_at >= ${from} ORDER BY created_at ASC, cycle_id ASC`
+      ? query`SELECT payload FROM journals WHERE created_at >= ${from} ORDER BY created_at ASC, cycle_id ASC`
       : to
-        ? executor.sql<JournalRow>`SELECT payload FROM journals WHERE created_at <= ${to} ORDER BY created_at ASC, cycle_id ASC`
-        : executor.sql<JournalRow>`SELECT payload FROM journals ORDER BY created_at ASC, cycle_id ASC`;
+        ? query`SELECT payload FROM journals WHERE created_at <= ${to} ORDER BY created_at ASC, cycle_id ASC`
+        : query`SELECT payload FROM journals ORDER BY created_at ASC, cycle_id ASC`;
   return rows.flatMap((row) => {
     try {
       const journal = JSON.parse(row.payload) as TradingJournal;
@@ -768,14 +789,15 @@ export function loadAllAutonomousJournals(executor: SqlExecutor, from?: string, 
   });
 }
 
-export function loadAllStoredCycles(executor: SqlExecutor, from?: string, to?: string): StoredCycle[] {
+export function loadAllStoredCycles(executor: SqlExecutor, from?: string, to?: string, path = "/api/export/paper-log", queryName = "paper_log_all_cycles"): StoredCycle[] {
+  const query = executeMeasuredSql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>(executor, path, queryName);
   const rows = from && to
-    ? executor.sql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at >= ${from} AND started_at <= ${to} ORDER BY started_at ASC, cycle_id ASC`
+    ? query`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at >= ${from} AND started_at <= ${to} ORDER BY started_at ASC, cycle_id ASC`
     : from
-      ? executor.sql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at >= ${from} ORDER BY started_at ASC, cycle_id ASC`
+      ? query`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at >= ${from} ORDER BY started_at ASC, cycle_id ASC`
       : to
-        ? executor.sql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at <= ${to} ORDER BY started_at ASC, cycle_id ASC`
-        : executor.sql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>`SELECT cycle_id, status, started_at, completed_at FROM cycles ORDER BY started_at ASC, cycle_id ASC`;
+        ? query`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at <= ${to} ORDER BY started_at ASC, cycle_id ASC`
+        : query`SELECT cycle_id, status, started_at, completed_at FROM cycles ORDER BY started_at ASC, cycle_id ASC`;
   return rows.map((row) => ({ cycleId: row.cycle_id, status: row.status, startedAt: row.started_at, completedAt: row.completed_at }));
 }
 
@@ -883,8 +905,8 @@ export function loadEventById(executor: SqlExecutor, eventId: string): ActivityE
   }
 }
 
-export function loadAllEvents(executor: SqlExecutor): ActivityEvent[] {
-  const rows = executor.sql<EventRow>`SELECT event_id, event_type, cycle_id, payload, created_at FROM events ORDER BY created_at ASC, event_id ASC`;
+export function loadAllEvents(executor: SqlExecutor, path = "/api/export/paper-log", queryName = "paper_log_all_events"): ActivityEvent[] {
+  const rows = executeMeasuredSql<EventRow>(executor, path, queryName)`SELECT event_id, event_type, cycle_id, payload, created_at FROM events ORDER BY created_at ASC, event_id ASC`;
   return rows.flatMap((row) => {
     try {
       const event = JSON.parse(row.payload) as ActivityEvent;

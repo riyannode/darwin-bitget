@@ -3,7 +3,7 @@ import { ZodError } from "zod";
 import type { ActivityEvent, BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionManagementState, PositionSnapshot, PositionSide, ProviderExecutionFact, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient, type MarketEvidenceFailure } from "../bitget/client.js";
-import { syncProviderLedger, PROVIDER_FINANCIAL_CATEGORIES, PROVIDER_TRADE_LIFECYCLE_CATEGORY } from "../bitget/provider-sync.js";
+import { createProviderOriginReadSummary, emitProviderOriginReadSummary, syncProviderLedger, PROVIDER_FINANCIAL_CATEGORIES, PROVIDER_TRADE_LIFECYCLE_CATEGORY } from "../bitget/provider-sync.js";
 import { MANDATE_VERSION, PROMPT_VERSIONS, TRADING_MANDATE } from "./mandate.js";
 import { assertOpenPositionCountWithinPlanLimit, buildEvidenceSymbols, calculateActionCapacity, countOpenPositionLifecycles, decide, filterNewEntryMarketCandidates, rankMarketCandidates, selectEntryCandidates } from "./decision.js";
 import { QwenJsonError } from "./qwen.js";
@@ -689,13 +689,20 @@ export class TraderAgent extends Agent<Env, AgentState> {
   private readonly researchRouter = new ResearchRouter();
   private readonly researchExecutor = new ResearchExecutor();
 
-  public measuredSql<T>(path: string, queryName: string, strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[] {
+  public measuredSql<T>(
+    path: string,
+    queryName: string,
+    strings: TemplateStringsArray,
+    values: (string | number | boolean | null)[],
+    onRowsRead?: (rowsRead: number) => void,
+  ): T[] {
     const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
     const cursor = this.ctx.storage.sql.exec<Record<string, SqlStorageValue>>(query, ...values);
     const rows = cursor.toArray();
     const rowsRead = cursor.rowsRead;
     try {
-      console.log(JSON.stringify({ event: "DO_SQL_READ", path, queryName, rowsRead }));
+      if (onRowsRead) onRowsRead(rowsRead);
+      else console.log(JSON.stringify({ event: "DO_SQL_READ", path, queryName, rowsRead }));
     } catch {
       // Read telemetry must not affect the request.
     }
@@ -880,13 +887,20 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const storedPerformance = loadPerformanceAggregate<PerformanceAggregate>(this);
       const baselineAt = isPerformanceAggregate(storedPerformance) ? storedPerformance.performanceBaselineAt : null;
       const results = [];
-      for (const category of PROVIDER_FINANCIAL_CATEGORIES) {
-        results.push(await syncProviderLedger(new BitgetClient(config), this, {
-          category,
-          mode: "backfill",
-          financialRecordsOnly: category !== "USDT-FUTURES",
-          ...(baselineAt ? { coverageStartAt: baselineAt } : {}),
-        }));
+      const originReadSummary = createProviderOriginReadSummary("/api/provider-ledger/backfill");
+      try {
+        for (const category of PROVIDER_FINANCIAL_CATEGORIES) {
+          results.push(await syncProviderLedger(new BitgetClient(config), this, {
+            category,
+            mode: "backfill",
+            telemetryPath: "/api/provider-ledger/backfill",
+            originReadSummary,
+            financialRecordsOnly: category !== "USDT-FUTURES",
+            ...(baselineAt ? { coverageStartAt: baselineAt } : {}),
+          }));
+        }
+      } finally {
+        emitProviderOriginReadSummary(originReadSummary);
       }
       const diagnostics = [...providerLedgerDiagnosticsBatch(this, PROVIDER_FINANCIAL_CATEGORIES, "/api/provider-ledger/backfill").values()];
       return json({ source: "PROVIDER_READ_ONLY_BACKFILL", baselineAt, results, categories: diagnostics.map((entry) => ({ category: entry.category, rowCount: entry.counts.financialRecords, sync: entry.sync, coverage: entry.sync?.financialRecordCoverage ?? null })) });
@@ -956,6 +970,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   public async runScheduledProviderSync(): Promise<void> {
+    const originReadSummary = createProviderOriginReadSummary("scheduled_provider_sync");
     try {
       ensureStorageInitialized(this);
       const config = loadConfig(this.env, this.ensureActivePolicy());
@@ -965,6 +980,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
         results.push(await syncProviderLedger(client, this, {
           category,
           mode: "recent",
+          telemetryPath: "scheduled_provider_sync",
+          originReadSummary,
           ...(category === PROVIDER_TRADE_LIFECYCLE_CATEGORY ? {} : { financialRecordsOnly: true }),
           recentWindowMs: 24 * 60 * 60 * 1000,
           overlapMs: 15 * 60 * 1000,
@@ -980,6 +997,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
       });
     } catch (error) {
       this.recordEventBestEffort("PROVIDER_SYNC_FAILED", "CONTROL", failureDiagnostic(error));
+    } finally {
+      emitProviderOriginReadSummary(originReadSummary);
     }
   }
 
@@ -1153,13 +1172,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
 
     const backfill = loadExecutionQuarantineBackfillState(this);
     if (backfill.complete) {
-      seedJournals(loadRecentJournals(this, 50));
+      seedJournals(loadRecentJournals(this, 50, "on_start", "on_start_quarantine_recent_journals"));
       return;
     }
 
     let cursor = backfill.cursor;
     while (true) {
-      const page = loadJournalBackfillPage(this, cursor, 50);
+      const page = loadJournalBackfillPage(this, cursor, 50, "on_start", "on_start_execution_quarantine_journal_page");
       seedJournals(page.journals);
       if (!page.hasMore) {
         saveExecutionQuarantineBackfillState(this, { complete: true, cursor: null }, new Date().toISOString());
@@ -1176,7 +1195,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const performance = loadPerformanceAggregate<PerformanceAggregate>(this);
     const positionContextBootstrapped = loadPositionContextBootstrap(this);
     if (migrateLatestValidPlan && !loadLatestValidCyclePlan(this)) {
-      const historicalLatestPlan = loadLatestCompletedCyclePlanFromHistory(this);
+      const historicalLatestPlan = loadLatestCompletedCyclePlanFromHistory(this, "on_start", "on_start_latest_completed_cycle_plan");
       if (historicalLatestPlan) saveLatestValidCyclePlan(this, historicalLatestPlan);
     }
     const needsPositionContextBootstrap = positionContextBootstrapped?.version !== POSITION_CONTEXT_READ_MODEL_VERSION;
@@ -1190,8 +1209,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
   }
 
   private readBootstrapHistory(): { journals: TradingJournal[]; experiences: TradeExperience[] } {
-    const openExperiences = loadOpenExperiences(this, 100);
-    const recentJournals = loadRecentJournals(this, 100);
+    const openExperiences = loadOpenExperiences(this, 100, "on_start", "on_start_bootstrap_open_experiences");
+    const recentJournals = loadRecentJournals(this, 100, "on_start", "on_start_bootstrap_recent_journals");
     const targetedJournals = loadJournalsForDecisionIds(this, openExperiences.map((experience) => experience.entryDecisionId), 100);
     const journals = [...new Map([...recentJournals, ...targetedJournals].map((journal) => [journal.cycleId, journal])).values()];
     const experiences = [...new Map([...loadExperiences(this, 100), ...openExperiences].map((experience) => [experience.experienceId, experience])).values()];
@@ -1460,7 +1479,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const rawFills = await client.getFillHistoryRead(order.orderId);
     const fill = parseProviderFillEvidence(rawFills, order);
     if (!fill) throw new Error("LATE_RECONCILIATION_FILL_INVALID");
-    const experiences = loadAllExperiences(this);
+    const experiences = loadAllExperiences(this, "late_reconciliation", "late_reconciliation_all_experiences");
     const existingExperience = experiences.find((experience) => experience.entryDecisionId === decisionId && experience.symbol === record.decision.symbol && experience.positionSide === record.decision.positionSide);
     const resolvedAt = new Date().toISOString();
     const result = reconcileLateExecution({
@@ -1482,7 +1501,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     saveExperience(this, result.experience, resolvedAt);
     savePositionContext(this, result.positionContext);
     savePerformanceAggregate(this, performance, resolvedAt);
-    const audited = loadAllEvents(this).some((event) => event.type === "LATE_EXECUTION_RECONCILED" && event.metadata?.originalCycleId === originalCycleId && event.metadata?.decisionId === decisionId);
+    const audited = loadAllEvents(this, "late_reconciliation", "late_reconciliation_all_events").some((event) => event.type === "LATE_EXECUTION_RECONCILED" && event.metadata?.originalCycleId === originalCycleId && event.metadata?.decisionId === decisionId);
     if (!audited) this.recordEvent("LATE_EXECUTION_RECONCILED", originalCycleId, result.auditMetadata);
     if (clearExecutionQuarantine(this, quarantineIdentity, resolvedAt)) this.recordEvent("EXECUTION_QUARANTINE_CLEARED", originalCycleId, { symbol: record.decision.symbol, decisionId, clientOrderId, code: "DETERMINISTIC_PROVIDER_RECONCILIATION" });
     return { status: result.status, experienceId: result.experience.experienceId };
@@ -1956,7 +1975,15 @@ export class TraderAgent extends Agent<Env, AgentState> {
         }
       }
       if (backtest) { saveBacktest(this, backtest); journal.backtest = backtest; this.recordEvent("BACKTEST_COMPLETED", cycleId); }
-      const lifecycleHistory = experiences.some((experience) => experience.outcomeStatus === "OPEN" && !experience.maximumFavorableExcursionBasis) ? loadAllAutonomousJournals(this) : [];
+      const positionHistoryReconstructionRequired = experiences.some((experience) => experience.outcomeStatus === "OPEN" && !experience.maximumFavorableExcursionBasis);
+      try {
+        console.log(JSON.stringify({ event: "POSITION_HISTORY_RECONSTRUCTION", required: positionHistoryReconstructionRequired }));
+      } catch {
+        // Cycle telemetry must not affect trading behavior.
+      }
+      const lifecycleHistory = positionHistoryReconstructionRequired
+        ? loadAllAutonomousJournals(this, undefined, undefined, "scheduled_cycle", "position_management_full_journal_history")
+        : [];
       const positionManagementState = this.refreshPositionManagementState(experiences, openPositions, bundles, new Date().toISOString(), lifecycleHistory);
       journal.positionManagementState = positionManagementState;
       journal.promptVersions = { mandate: PROMPT_VERSIONS.mandate, decision: PROMPT_VERSIONS.decision };

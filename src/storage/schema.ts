@@ -1,15 +1,22 @@
 export interface SqlExecutor {
   sql<T>(strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[];
-  measuredSql?<T>(path: string, queryName: string, strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[];
+  measuredSql?<T>(
+    path: string,
+    queryName: string,
+    strings: TemplateStringsArray,
+    values: (string | number | boolean | null)[],
+    onRowsRead?: (rowsRead: number) => void,
+  ): T[];
 }
 
 export function executeMeasuredSql<T>(
   executor: SqlExecutor,
   path: string,
   queryName: string,
+  onRowsRead?: (rowsRead: number) => void,
 ): (strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) => T[] {
   return (strings, ...values) => executor.measuredSql && "ctx" in executor && Boolean(executor.ctx)
-    ? executor.measuredSql(path, queryName, strings, ...values)
+    ? executor.measuredSql(path, queryName, strings, values, onRowsRead)
     : executor.sql(strings, ...values);
 }
 

@@ -342,8 +342,10 @@ describe("journal observability persistence", () => {
       sql: executor.sql,
     } as unknown as { state: unknown };
 
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
     const journal = await (TraderAgent.prototype as unknown as { runCycle: () => Promise<TradingJournal> }).runCycle.call(fake);
     const saved = journal as ObservableJournal;
+    expect(logSpy).toHaveBeenCalledWith(JSON.stringify({ event: "POSITION_HISTORY_RECONSTRUCTION", required: false }));
     expect(captured.context?.positionManagementState).toBe(lifecycleStateList);
     expect(saved.positionManagementState).toBe(lifecycleStateList);
     expect(saved.positionManagementState).toEqual([lifecycleState]);
