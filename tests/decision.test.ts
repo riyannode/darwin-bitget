@@ -246,16 +246,30 @@ describe("cycle decision plan contract", () => {
     expect(() => validateCycleDecisionPlan(value, testContext)).toThrow("MAX_FINANCIAL_WRITES_PER_CYCLE");
   });
 
-  it("includes selected candidate evidence in the final decision prompt", () => {
-    const prompt = JSON.parse(buildDecisionPrompt(context([], ["NVDAUSDT"]), "cycle-1")) as { entryCandidateEvidence: Array<{ symbol: string; market: { lastPrice: string } }> };
-    expect(prompt.entryCandidateEvidence).toEqual([expect.objectContaining({ symbol: "NVDAUSDT", market: expect.objectContaining({ lastPrice: "100" }) })]);
+  it("sends full evidence once and keeps open/entry symbols to identify its role", () => {
+    const existing = position("CRCLUSDT");
+    const payload = JSON.parse(buildDecisionPrompt(context([existing], ["NVDAUSDT"]), "cycle-1")) as {
+      deepEvidence: Array<{ symbol: string; market: { lastPrice: string } }>;
+      openPositionSymbols: string[];
+      entryCandidateSymbols: string[];
+      openPositionEvidence?: unknown;
+      entryCandidateEvidence?: unknown;
+    };
+    expect(payload.deepEvidence).toEqual(expect.arrayContaining([
+      expect.objectContaining({ symbol: "CRCLUSDT", market: expect.objectContaining({ lastPrice: "100" }) }),
+      expect.objectContaining({ symbol: "NVDAUSDT", market: expect.objectContaining({ lastPrice: "100" }) }),
+    ]));
+    expect(payload.openPositionSymbols).toContain("CRCLUSDT");
+    expect(payload.entryCandidateSymbols).toContain("NVDAUSDT");
+    expect(payload).not.toHaveProperty("openPositionEvidence");
+    expect(payload).not.toHaveProperty("entryCandidateEvidence");
   });
 
-  it("labels management and entry evidence separately in the prompt", () => {
+  it("keeps management and entry constraints while labeling evidence by symbol", () => {
     const existing = position("CRCLUSDT");
     const prompt = buildDecisionPrompt(context([existing]), "cycle-1");
-    expect(prompt).toContain('"openPositionEvidence"');
-    expect(prompt).toContain('"entryCandidateEvidence"');
+    expect(prompt).toContain('"openPositionSymbols":["CRCLUSDT"]');
+    expect(prompt).toContain('"entryCandidateSymbols":["NVDAUSDT"]');
     expect(prompt).toContain('"supportedUniverse"');
     expect(prompt).toContain('"maxTotalActionsPerCycle":5');
     expect(prompt).toContain('"maxFinancialWritesPerCycle":5');
@@ -264,7 +278,8 @@ describe("cycle decision plan contract", () => {
     expect(prompt).toContain('"openPositionCount":1');
     expect(prompt).toContain('"remainingEntrySlots":4');
     expect(prompt).toContain("entryActions.length MUST NOT exceed remainingEntrySlots");
-    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v9");
+    expect(PROMPT_VERSIONS.decision).toBe("darwin-decision-v10");
+    expect(DECISION_TASK_PROMPT).toContain("use openPositionSymbols and entryCandidateSymbols to distinguish existing-position and entry-candidate evidence");
     expect(DECISION_TASK_PROMPT).toContain('HOLD: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('INCREASE: positionSide = actual provider side, marginAllocationPct = "0"');
     expect(DECISION_TASK_PROMPT).toContain('REDUCE: positionSide = actual provider side, marginAllocationPct = "0"');

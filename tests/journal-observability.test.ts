@@ -276,19 +276,19 @@ describe("journal observability persistence", () => {
       ...baseJournal,
       cycleId: "cycle-observability",
       positionManagementState: [lifecycleState],
-      promptVersions: { mandate: "darwin-mandate-v7", decision: "darwin-decision-v9" },
+      promptVersions: { mandate: "darwin-mandate-v7", decision: "darwin-decision-v10" },
     };
 
     saveJournal(executor, journal);
 
     const loaded = loadRecentJournals(executor, 1)[0] as ObservableJournal;
     expect(loaded.positionManagementState).toEqual([lifecycleState]);
-    expect(loaded.promptVersions).toEqual({ mandate: "darwin-mandate-v7", decision: "darwin-decision-v9" });
+    expect(loaded.promptVersions).toEqual({ mandate: "darwin-mandate-v7", decision: "darwin-decision-v10" });
 
     const response = (TraderAgent.prototype as unknown as { getAgentJournal: (url: URL) => Response }).getAgentJournal.call({ sql: executor.sql }, new URL("https://example.test/agent-journal?limit=1"));
     const body = await response.json() as { journals: ObservableJournal[] };
     expect(body.journals[0]?.positionManagementState).toEqual([lifecycleState]);
-    expect(body.journals[0]?.promptVersions).toEqual({ mandate: "darwin-mandate-v7", decision: "darwin-decision-v9" });
+    expect(body.journals[0]?.promptVersions).toEqual({ mandate: "darwin-mandate-v7", decision: "darwin-decision-v10" });
     db.close();
   });
 
@@ -349,7 +349,7 @@ describe("journal observability persistence", () => {
     expect(captured.context?.positionManagementState).toBe(lifecycleStateList);
     expect(saved.positionManagementState).toBe(lifecycleStateList);
     expect(saved.positionManagementState).toEqual([lifecycleState]);
-    expect(saved.promptVersions).toEqual({ mandate: "darwin-mandate-v7", decision: "darwin-decision-v9" });
+    expect(saved.promptVersions).toEqual({ mandate: "darwin-mandate-v7", decision: "darwin-decision-v10" });
     expect(saved.executionRecords).toHaveLength(1);
     expect(saved.discovery?.financialWritesPerformed).toBe(0);
     expect((loadRecentJournals(executor, 1)[0] as ObservableJournal).positionManagementState).toEqual(captured.context?.positionManagementState);

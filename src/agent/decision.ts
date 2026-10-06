@@ -11,7 +11,7 @@ import type {
   RuntimeConfig,
 } from "../types.js";
 import { buildDecisionTaskPrompt } from "./mandate.js";
-import { generateQwenJson } from "./qwen.js";
+import { generateQwenJson, type QwenAttemptTelemetry } from "./qwen.js";
 
 export const MAX_TOTAL_ACTIONS_PER_CYCLE = 5;
 export const MAX_FINANCIAL_WRITES_PER_CYCLE = 5;
@@ -148,7 +148,6 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
     marketRegime: bundle.marketRegime ?? "UNKNOWN",
     historicalBars: bundle.historicalBars?.slice(-6) ?? [],
   }));
-  const bundleBySymbol = new Map(deepEvidence.map((bundle) => [bundle.symbol, bundle]));
   const researchPromptFields = context.researchEvidence === undefined ? {} : {
     researchEvidence: context.researchEvidence,
   };
@@ -170,8 +169,6 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
     openPositionSymbols: context.openPositionSymbols,
     entryCandidateSymbols: context.entryCandidateSymbols,
     ...actionCapacity,
-    openPositionEvidence: context.openPositionSymbols.map((symbol) => bundleBySymbol.get(symbol)).filter(Boolean),
-    entryCandidateEvidence: context.entryCandidateSymbols.map((symbol) => bundleBySymbol.get(symbol)).filter(Boolean),
     deepEvidenceSymbols: context.bundles.map((bundle) => bundle.instrument.symbol),
     deepEvidence,
     positionManagementState: context.positionManagementState ?? [],
@@ -320,7 +317,35 @@ export function boundExitDecisions(exitDecisions: readonly Decision[], openPosit
 
 export async function decide(config: RuntimeConfig, context: DecisionContext, cycleId: string): Promise<AutonomousDecisionSet> {
   const actionCapacity = calculateActionCapacity(liveOpenPositions(context.openPositions).length);
-  const generated = await generateQwenJson(config, buildCycleDecisionPlanSchema(actionCapacity.openPositionCount), `${context.mandate}\n${buildDecisionTaskPrompt(config.bitgetSignalEnabled === true, actionCapacity.openPositionCount, actionCapacity.remainingEntrySlots)}\nReturn positionActions and entryActions only. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, buildDecisionPrompt(context, cycleId), { maxOutputTokens: DECISION_MAX_OUTPUT_TOKENS, timeoutMs: 60_000, retryMalformedJson: true });
+  const experienceCount = context.experiences.filter((experience) => experience.outcomeStatus !== "EXECUTION_FAILURE" && experience.outcomeStatus !== "EXECUTION_UNRESOLVED").slice(-10).length;
+  const openExperienceCount = context.openExperiences.slice(-10).length;
+  const lessonCount = context.lessons.filter((lesson) => lesson.source !== "EXECUTION_FAILURE").length;
+  const contextPrompt = buildDecisionPrompt(context, cycleId);
+  const generated = await generateQwenJson(config, buildCycleDecisionPlanSchema(actionCapacity.openPositionCount), `${context.mandate}\n${buildDecisionTaskPrompt(config.bitgetSignalEnabled === true, actionCapacity.openPositionCount, actionCapacity.remainingEntrySlots)}\nReturn positionActions and entryActions only. Do not generate IDs or timestamps. Do not expose chain-of-thought.`, contextPrompt, {
+    maxOutputTokens: DECISION_MAX_OUTPUT_TOKENS,
+    timeoutMs: 60_000,
+    retryMalformedJson: true,
+    onAttemptTelemetry: (attempt: QwenAttemptTelemetry) => {
+      try {
+        console.log(JSON.stringify({
+          event: "FINAL_DECISION_QWEN_TELEMETRY",
+          cycleId,
+          model: config.qwenModel,
+          ...attempt,
+          supportedUniverseCount: context.supportedUniverse.length,
+          openPositionCount: actionCapacity.openPositionCount,
+          entryCandidateCount: context.entryCandidateSymbols.length,
+          deepEvidenceCount: context.bundles.length,
+          experienceCount,
+          openExperienceCount,
+          lessonCount,
+          researchEvidenceCount: context.researchEvidence?.length ?? 0,
+        }));
+      } catch {
+        // Cycle telemetry is best-effort and must not affect the decision.
+      }
+    },
+  });
   const createdAt = new Date().toISOString();
   const knownLessons = new Set(context.lessons.map((lesson) => lesson.lessonId));
   const ignoredLessonIds: string[] = [];
