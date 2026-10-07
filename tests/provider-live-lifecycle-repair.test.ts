@@ -365,7 +365,7 @@ describe("missing DARWIN lifecycle repair before decision", () => {
     db.close();
   });
 
-  it("1e2. repair leaves deterministic historical reconstruction available during management refresh", () => {
+  it("1e2. sparse repaired history preserves its observed peak with first-observation scope", () => {
     const { db, executor } = memoryExecutor();
     const identity = seedDarwinOpeningIdentity(executor);
     const agent = fakeAgent(executor, db);
@@ -383,9 +383,11 @@ describe("missing DARWIN lifecycle repair before decision", () => {
     const identities = new Map([[providerLivePositionLifecycleKey(positionSnapshot), identity]]);
     const states = refresh.call(agent, repaired, [positionSnapshot], [refreshBundle], OBSERVED_AT, lifecycleHistory, identities) as Array<{ maximumFavorableReturnPct: number; maximumFavorableReturnBasis: string; profitGivebackPct: number }>;
     expect(states[0]?.maximumFavorableReturnPct).toBeGreaterThan(10);
-    expect(states[0]).toMatchObject({ maximumFavorableReturnBasis: "SINCE_ENTRY" });
+    expect(states[0]).toMatchObject({ maximumFavorableReturnBasis: "SINCE_FIRST_DETERMINISTIC_OBSERVATION" });
     expect(states[0]?.profitGivebackPct).toBeGreaterThan(0);
-    expect(loadAllExperiences(executor)[0]).toMatchObject({ maximumFavorableExcursionBasis: "SINCE_ENTRY" });
+    expect(loadAllExperiences(executor)[0]).toMatchObject({ maximumFavorableExcursionBasis: "SINCE_FIRST_DETERMINISTIC_OBSERVATION" });
+    expect(Number(loadAllExperiences(executor)[0]!.maximumFavorableExcursion)).toBeGreaterThan(10);
+    expect(loadAllExperiences(executor)[0]!.maximumFavorableExcursionBasis).not.toBe("SINCE_ENTRY");
     db.close();
   });
 
