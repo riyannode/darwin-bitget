@@ -169,6 +169,28 @@ describe("sequential cycle execution planner", () => {
     expect(visible.stoppedAfterAmbiguity).toBe(true);
   });
 
+  it("blocks a drawdown reverse before either close or opposite entry executes", async () => {
+    const reverse: Decision = { ...decision("CLOSE", "CRCLUSDT"), decisionId: "reverse-drawdown", action: "REVERSE", marginAllocationPct: "10", targetPositionSide: "SHORT", reductionPct: null };
+    const executed: string[] = [];
+    const resultValue = await executeCyclePlan({ positionActions: [reverse] as CycleDecisionPlan["positionActions"], entryActions: [] }, {
+      refreshEvidence: async (symbol) => bundle(symbol, "100"),
+      execute: async (item, _currentBundle, _category, parent) => {
+        executed.push(item.action);
+        return parent?.action === "REVERSE"
+          ? { decision: item, riskGateResult: { status: "BLOCK", codes: ["DAILY_DRAWDOWN"], checkedAt: "2026-09-12T00:00:00.000Z" } }
+          : result(item);
+      },
+      persist: async () => undefined,
+      refreshPortfolio: async () => account("100"),
+    });
+
+    expect(resultValue.stoppedAfterAmbiguity).toBe(false);
+    expect(executed).toEqual(["CLOSE"]);
+    expect(resultValue.records).toHaveLength(1);
+    expect(resultValue.records[0]?.executionResult).toBeUndefined();
+    expect(resultValue.records[0]?.riskGateResult.codes).toContain("DAILY_DRAWDOWN");
+  });
+
   it("keeps a reverse closed when the opposite entry risk gate blocks", async () => {
     const reverse: Decision = { ...decision("CLOSE", "CRCLUSDT"), decisionId: "reverse-blocked", action: "REVERSE", marginAllocationPct: "10", targetPositionSide: "SHORT", reductionPct: null };
     const executed: string[] = [];

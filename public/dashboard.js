@@ -69,7 +69,7 @@ function renderAgent() {
   $("top-status").replaceChildren(); const dot = document.createElement("i"); $("top-status").append(dot, document.createTextNode(` ${agent.status}`));
   const statusColor = agent.status === "ERROR" ? "var(--danger)" : agent.status === "COOLDOWN" || agent.status === "PAUSED" ? "var(--warning)" : "var(--accent)";
   $("top-status").style.color = statusColor;
-  const cooldown = $("cooldown-notice"); cooldown.hidden = !snapshot.riskControls.drawdownBlocked; if (!cooldown.hidden) cooldown.textContent = `TRADING COOLDOWN · FINANCIAL WRITES PAUSED · RESUMES ${when(snapshot.riskControls.cooldownUntil)} · ${agent.currentStage === "COOLDOWN" ? "LEARNING / REPLAY CONTINUES" : "OBSERVATION CONTINUES"}`;
+  const cooldown = $("cooldown-notice"); cooldown.hidden = !snapshot.riskControls.drawdownBlocked; if (!cooldown.hidden) cooldown.textContent = `RUNTIME ${agent.status} · DAILY DRAWDOWN GUARD ACTIVE · RISK-INCREASING WRITES PAUSED · RESUMES ${when(snapshot.riskControls.cooldownUntil)} · ${agent.currentStage === "COOLDOWN" ? "LEARNING / REPLAY CONTINUES" : "OBSERVATION CONTINUES"}`;
 }
 
 function renderPerformance() {

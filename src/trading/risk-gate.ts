@@ -72,6 +72,7 @@ export interface RiskContext {
   supportedUniverse: readonly string[];
   emergencyStop: boolean;
   dailyDrawdownBlocked: boolean;
+  parentDecision?: Decision;
   positionDiscrepancies?: readonly string[];
   unresolvedExecutionSymbols?: readonly string[];
   now?: Date;
@@ -89,7 +90,9 @@ export function evaluateRiskGate(config: RuntimeConfig, context: RiskContext): R
   if (!context.supportedUniverse.includes(decision.symbol) && !managesPosition) addCode(codes, "SYMBOL_NOT_ALLOWED");
   if (instrument.symbol !== decision.symbol || instrument.status.toLowerCase() !== "online") addCode(codes, "INSTRUMENT_UNAVAILABLE");
   if (!isFresh(context.evidenceObservedAt, config.evidenceMaxAgeSeconds, now)) addCode(codes, "STALE_EVIDENCE");
-  if (context.dailyDrawdownBlocked) addCode(codes, "DAILY_DRAWDOWN");
+  const drawdownIncreasesExposure = ["OPEN_LONG", "OPEN_SHORT", "INCREASE", "REVERSE"].includes(decision.action)
+    || context.parentDecision?.action === "REVERSE";
+  if (context.dailyDrawdownBlocked && drawdownIncreasesExposure) addCode(codes, "DAILY_DRAWDOWN");
   if (context.positionDiscrepancies?.some((code) => code === `LOCAL_EXPERIENCE_MISSING:${decision.symbol}:${decision.positionSide ?? "NONE"}` || code === `PROVIDER_POSITION_MISSING:${decision.symbol}:${decision.positionSide ?? "NONE"}`)) addCode(codes, "LOCAL_LIFECYCLE_UNRESOLVED");
   if (decision.action !== "HOLD" && (account.openOrders === null || account.openOrdersReadFailure !== undefined)) addCode(codes, "OPEN_ORDERS_READ_UNAVAILABLE");
   if (decision.action !== "HOLD" && context.unresolvedExecutionSymbols?.includes(decision.symbol)) addCode(codes, "UNRESOLVED_PRIOR_EXECUTION");
