@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import { evaluateDrawdown } from "../src/trading/drawdown.js";
 import type { OwnerPolicy } from "../src/types.js";
 
@@ -65,5 +66,24 @@ describe("daily drawdown policy", () => {
     );
     expect(result.blocked).toBe(true);
     expect(result.code).toBe("DRAWDOWN_COOLDOWN");
+  });
+
+  it("presents the cooldown expiry as a recheck point rather than a guaranteed resume time", () => {
+    const dashboard = readFileSync(new URL("../public/dashboard.js", import.meta.url), "utf8");
+    expect(dashboard).toContain("RUNTIME ${agent.status} · DAILY DRAWDOWN GUARD ACTIVE · RISK-INCREASING WRITES PAUSED · NEXT RECHECK ${when(snapshot.riskControls.cooldownUntil)}");
+    expect(dashboard).not.toContain("RESUMES ${when(snapshot.riskControls.cooldownUntil)}");
+    expect(dashboard).not.toMatch(/WRITES PAUSED\s*·\s*RESUMES/);
+  });
+
+  it("keeps the cooldown timestamp a recheck point because a breach reopens a cooldown after expiry", () => {
+    const breached = evaluateDrawdown(
+      policy,
+      { date: "2026-09-12", baselineEquity: "1000", lastEquity: "900", cooldownUntil: "2026-09-12T02:00:00.000Z" },
+      "900",
+      new Date("2026-09-12T02:00:00.000Z"),
+    );
+    expect(breached.blocked).toBe(true);
+    expect(breached.code).toBe("DAILY_DRAWDOWN");
+    expect(breached.state.cooldownUntil).toBe("2026-09-12T03:00:00.000Z");
   });
 });
