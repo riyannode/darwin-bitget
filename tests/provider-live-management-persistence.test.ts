@@ -169,7 +169,7 @@ function nextCycleGate(agent: ReturnType<typeof fakeAgent>, executor: SqlExecuto
   const attributedLivePositionKeys = new Map<string, { decisionId: string; providerOrderId: string }>();
   for (const candidate of livePositions) {
     const identity = identities.get(providerLivePositionLifecycleKey(candidate));
-    if (identity) attributedLivePositionKeys.set(`${candidate.symbol}:${candidate.positionSide}`, identity);
+    if (identity) attributedLivePositionKeys.set(providerLivePositionLifecycleKey(candidate), identity);
   }
   const discrepancies = agent.recordPositionDiscrepancies(persisted, livePositions, "next-cycle", attributedLivePositionKeys);
   return evaluateRiskGate(config, {

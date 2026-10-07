@@ -60,6 +60,7 @@ import {
   saveExecutionQuarantine,
   clearExecutionQuarantine,
   saveActiveOwnerPolicy,
+  hasEvent,
   saveEvent,
   saveExperience,
   saveJournal,
@@ -77,7 +78,21 @@ import { reconcileExecution, isDefinitivelyRejectedExecution } from "../trading/
 import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal } from "../trading/decimal.js";
 import { buildPerformanceAccounting, classifiedWinRate, emptyPerformance, isPerformanceAggregate, migratePerformanceEquityObservations, PERFORMANCE_READ_MODEL_VERSION, POSITION_CONTEXT_READ_MODEL_VERSION, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate, type PerformanceObservation } from "../trading/performance.js";
 import { bootstrapPositionContexts, decisionReasoning, upsertPositionContext } from "./position-context.js";
-import { isDarwinOwnedExperience, managementOutcomeStatus, providerEntryTime, providerFact, providerManagementExperienceId, UNAVAILABLE_ATTRIBUTE } from "./provider-live-lifecycle.js";
+import {
+  darwinLifecycleExperienceId,
+  darwinLifecycleRepairEventId,
+  isDarwinOwnedExperience,
+  managementOutcomeStatus,
+  providerEntryTime,
+  providerFact,
+  providerManagementExperienceId,
+  remainingOpenState,
+  repairedDarwinOpenExperience,
+  resolveLifecycleExperience,
+  REPAIR_REASON,
+  UNAVAILABLE_ATTRIBUTE,
+  type ProviderLiveIdentity,
+} from "./provider-live-lifecycle.js";
 import { isReadbackOnlyExecutionMismatch, parseProviderFillEvidence, parseProviderOrderEvidence, reconcileLateExecution } from "../trading/late-reconciliation.js";
 import { EvaClient } from "../eva/client.js";
 import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
@@ -1970,7 +1985,14 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const attributedLivePositionKeys = new Map<string, { decisionId: string; providerOrderId: string }>();
       for (const position of openPositions) {
         const identity = livePositionIdentities.get(providerLivePositionLifecycleKey(position));
-        if (identity) attributedLivePositionKeys.set(`${position.symbol}:${position.positionSide}`, identity);
+        if (identity) attributedLivePositionKeys.set(providerLivePositionLifecycleKey(position), identity);
+      }
+      // A deterministically DARWIN-owned position with no local lifecycle is reconstructed before
+      // any decision or risk check, so its lifecycle is never left unresolved merely because no
+      // REDUCE or CLOSE has happened yet. No financial action is taken to cause this.
+      const repairedLifecycles = this.repairMissingDarwinLifecycles(experiences, openPositions, livePositionIdentities, cycleId, startedAt);
+      if (repairedLifecycles.length) {
+        journal.repairedLifecycles = repairedLifecycles.map((experience) => experience.experienceId);
       }
       journal.positionDiscrepancies = this.recordPositionDiscrepancies(experiences, openPositions, cycleId, attributedLivePositionKeys);
       recordLessonRetrieval(this, lessons.map((lesson) => lesson.lessonId), cycleId, startedAt);
@@ -2370,9 +2392,12 @@ export class TraderAgent extends Agent<Env, AgentState> {
       // The entry time is the provider's authoritative opening timestamp or explicitly unknown.
       // A management/readback timestamp is never the entry time.
       const entryTime = providerEntryTime(record.positionBefore);
+      // A lifecycle that stays OPEN must describe the remaining live provider position, never the
+      // reduced execution slice. The reduced slice stays in the execution and journal evidence.
+      const remaining = remainingOpenState(decision.action as "CLOSE" | "REDUCE", record.positionAfter);
       // A repaired DARWIN lifecycle is keyed by its real entry decision so repair is idempotent
       // under one identity and provenance is never rewritten across repeat management.
-      const experienceId = identity ? `darwin-lifecycle-repair:${identity.decisionId}` : providerManagementExperienceId(decision.symbol, positionSide);
+      const experienceId = identity ? darwinLifecycleExperienceId(identity.decisionId) : providerManagementExperienceId(decision.symbol, positionSide);
       const repairedExperience: TradeExperience = {
         experienceId,
         symbol: decision.symbol,
@@ -2386,10 +2411,10 @@ export class TraderAgent extends Agent<Env, AgentState> {
         exitDecisionId: decision.decisionId,
         exitPrice: executionResult.averageFillPrice ?? UNAVAILABLE_ATTRIBUTE,
         exitTime: executionResult.readBackAt ?? bundle.market.observedAt,
-        selectedLeverage: executionResult.leverage,
+        selectedLeverage: remaining.selectedLeverage,
         marginAllocationPct: UNAVAILABLE_ATTRIBUTE,
-        marginAllocated: executionResult.marginAllocated,
-        positionNotional: executionResult.positionNotional,
+        marginAllocated: remaining.marginAllocated,
+        positionNotional: remaining.positionNotional,
         realizedPnl: realizedPnl ?? UNAVAILABLE_ATTRIBUTE,
         realizedPnlPct: executionResult.realizedPnlPct ?? UNAVAILABLE_ATTRIBUTE,
         maximumFavorableExcursion: UNAVAILABLE_ATTRIBUTE,
@@ -2523,21 +2548,31 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (result.repaired) this.recordEventBestEffort("SCHEDULE_RESCHEDULED", "CONTROL", { intervalMinutes: String(intervalMinutes) });
   }
 
-  private recordPositionDiscrepancies(experiences: readonly TradeExperience[], positions: readonly PositionSnapshot[], cycleId: string, attributedLivePositionKeys: ReadonlyMap<string, { decisionId: string; providerOrderId: string }> = new Map()): string[] {
-    // Only an experience that deterministically carries DARWIN provenance satisfies the local
-    // lifecycle requirement. A synthetic provider-external management record must never make a
-    // provider-external position look like a DARWIN-owned one on a later cycle.
+  private recordPositionDiscrepancies(experiences: readonly TradeExperience[], positions: readonly PositionSnapshot[], cycleId: string, attributedLivePositionKeys: ReadonlyMap<string, ProviderLiveIdentity> = new Map()): string[] {
+    // A provider lifecycle is owned by a local experience only when its deterministic provenance
+    // matches. Symbol, side, and approximate time are not identity, so a stale DARWIN record that
+    // happens to share symbol+side must never be allowed to claim a provider position.
+    const resolvedFor = (position: PositionSnapshot): TradeExperience | undefined =>
+      resolveLifecycleExperience(experiences, position, attributedLivePositionKeys.get(providerLivePositionLifecycleKey(position)));
     const local = experiences.filter((experience) => isDarwinOwnedExperience(experience));
-    const localKeys = new Set(local.map((experience) => `${experience.symbol}:${experience.positionSide}`));
+    const localKeys = new Set(positions
+      .filter((position) => isPositiveDecimal(position.quantity))
+      .filter((position) => Boolean(resolvedFor(position)))
+      .map((position) => `${position.symbol}:${position.positionSide}`));
+    // A Darwin-owned record whose provider position is gone is still a real lifecycle gap.
+    const matchedExperienceIds = new Set(positions
+      .filter((position) => isPositiveDecimal(position.quantity))
+      .map((position) => resolvedFor(position)?.experienceId)
+      .filter((id): id is string => Boolean(id)));
     const providerKeys = new Set(positions.filter((position) => Number(position.quantity) > 0).map((position) => `${position.symbol}:${position.positionSide}`));
     const discrepancies: string[] = [];
     for (const experience of local) {
       const key = `${experience.symbol}:${experience.positionSide}`;
-      if (!providerKeys.has(key)) {
-        const code = `PROVIDER_POSITION_MISSING:${key}`;
-        discrepancies.push(code);
-        this.recordEvent("POSITION_STATE_DISCREPANCY", cycleId, { code, symbol: experience.symbol, positionSide: experience.positionSide ?? "UNKNOWN", experienceId: experience.experienceId });
-      }
+      if (providerKeys.has(key)) continue;
+      if (matchedExperienceIds.has(experience.experienceId)) continue;
+      const code = `PROVIDER_POSITION_MISSING:${key}`;
+      discrepancies.push(code);
+      this.recordEvent("POSITION_STATE_DISCREPANCY", cycleId, { code, symbol: experience.symbol, positionSide: experience.positionSide ?? "UNKNOWN", experienceId: experience.experienceId });
     }
     for (const position of positions.filter((candidate) => Number(candidate.quantity) > 0)) {
       const key = `${position.symbol}:${position.positionSide}`;
@@ -2548,19 +2583,91 @@ export class TraderAgent extends Agent<Env, AgentState> {
         // that issued them) proves a missing local experience is lost local state, not a
         // provider-external position. Only fall back to EXTERNAL_UNATTRIBUTED when no such
         // identity exists, so the audit trail never claims DARWIN positions are external.
-        const attributed = attributedLivePositionKeys.has(key);
+        const identity = attributedLivePositionKeys.get(providerLivePositionLifecycleKey(position));
         this.recordEvent("POSITION_STATE_DISCREPANCY", cycleId, {
           code,
           symbol: position.symbol,
           positionSide: position.positionSide,
           experienceId: "NONE",
-          classification: attributed ? "LOCAL_LIFECYCLE_INCOMPLETE" : "EXTERNAL_UNATTRIBUTED",
-          origin: attributed ? "DARWIN" : "PROVIDER_ONLY",
-          ...(attributed ? { decisionId: attributedLivePositionKeys.get(key)!.decisionId, providerOrderId: attributedLivePositionKeys.get(key)!.providerOrderId } : {}),
+          classification: identity ? "LOCAL_LIFECYCLE_INCOMPLETE" : "EXTERNAL_UNATTRIBUTED",
+          origin: identity ? "DARWIN" : "PROVIDER_ONLY",
+          ...(identity ? { decisionId: identity.decisionId, providerOrderId: identity.providerOrderId } : {}),
         });
+        // A DARWIN record for this symbol+side that does not match this provider lifecycle is
+        // reported explicitly rather than being silently treated as resolved.
+        const stale = local.filter((experience) => experience.symbol === position.symbol && experience.positionSide === position.positionSide);
+        for (const experience of stale) {
+          this.recordEvent("POSITION_IDENTITY_MISMATCH", cycleId, {
+            symbol: position.symbol,
+            positionSide: position.positionSide,
+            experienceId: experience.experienceId,
+            localEntryDecisionId: experience.entryDecisionId || UNAVAILABLE_ATTRIBUTE,
+            localProviderOrderId: experience.providerOrderId ?? UNAVAILABLE_ATTRIBUTE,
+            providerDecisionId: identity?.decisionId ?? UNAVAILABLE_ATTRIBUTE,
+            providerOrderId: identity?.providerOrderId ?? UNAVAILABLE_ATTRIBUTE,
+            reason: identity ? "PROVENANCE_DOES_NOT_MATCH_PROVIDER_IDENTITY" : "NO_DETERMINISTIC_PROVIDER_IDENTITY",
+          });
+        }
       }
     }
     return discrepancies;
+  }
+
+  /**
+   * Reconstruct a missing local OPEN lifecycle for a deterministically attributed DARWIN position
+   * before decisions or risk checks run, so a proven DARWIN position is never treated as
+   * lifecycle-unresolved while it waits for a REDUCE or CLOSE to trigger repair.
+   *
+   * This performs no financial action: it only reconstructs state the provider has already proven.
+   */
+  private repairMissingDarwinLifecycles(
+    experiences: TradeExperience[],
+    positions: readonly PositionSnapshot[],
+    identities: ReadonlyMap<string, ProviderLiveIdentity>,
+    cycleId: string,
+    observedAt: string,
+  ): TradeExperience[] {
+    const repaired: TradeExperience[] = [];
+    for (const position of positions.filter((candidate) => isPositiveDecimal(candidate.quantity))) {
+      const identity = identities.get(providerLivePositionLifecycleKey(position));
+      if (!identity) continue;
+      const existing = resolveLifecycleExperience(experiences, position, identity);
+      if (existing) continue;
+      const entryThesis = persistedEntryThesis(this, identity.decisionId, position.symbol, position.positionSide);
+      const experience = repairedDarwinOpenExperience({
+        identity,
+        position,
+        entryThesis,
+        realizedPnl: providerFact(position.realizedPnl),
+        realizedPnlPct: providerFact(position.unrealizedPnlPct),
+      });
+      experiences.push(experience);
+      repaired.push(experience);
+      saveExperience(this, experience, observedAt);
+      const eventId = darwinLifecycleRepairEventId(identity.decisionId);
+      // The experience write is idempotent on its key; the audit event records the repair once.
+      if (!hasEvent(this, eventId)) {
+        saveEvent(this, {
+          eventId,
+          type: "DARWIN_LIFECYCLE_REPAIRED",
+          cycleId,
+          createdAt: observedAt,
+          metadata: {
+            reason: REPAIR_REASON,
+            experienceId: experience.experienceId,
+            symbol: position.symbol,
+            positionSide: position.positionSide,
+            origin: "DARWIN",
+            entryDecisionId: identity.decisionId,
+            lifecycleOpeningOrderId: identity.providerOrderId,
+            entryTime: experience.entryTime,
+            entryPrice: experience.entryPrice,
+            entryThesisProvenance: entryThesis === UNAVAILABLE_ATTRIBUTE ? "UNAVAILABLE" : "PERSISTED_DARWIN_EVIDENCE",
+          },
+        });
+      }
+    }
+    return repaired;
   }
 
   private ensureActivePolicy(): OwnerPolicy {

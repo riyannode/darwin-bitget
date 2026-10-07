@@ -579,6 +579,8 @@ export interface TradingJournal {
   exitDecisions?: Decision[];
   exitExecutions?: DecisionExecutionRecord[];
   exitReflections?: ReflectionResult[];
+  /** Locally reconstructed DARWIN lifecycles repaired before decisions ran this cycle. */
+  repairedLifecycles?: string[];
   experienceIds?: string[];
   riskGateResult?: RiskGateResult;
   executionRequest?: ExecutionRequest;
