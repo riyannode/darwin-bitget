@@ -75,7 +75,7 @@ function renderAgent() {
 function renderPerformance() {
   const performance = snapshot.performance;
   const accounting = snapshot.performanceAccounting ?? {};
-  const values = [["NET PNL", money(accounting.netPnlSinceBaseline ?? performance.totalPnl)], ["WIN RATE", accounting.winRatePct && accounting.winRatePct !== "UNAVAILABLE" ? `${accounting.winRatePct}%` : "—"], ["DRAWDOWN", percent(accounting.currentDrawdownPct)], ["CLOSED TRADES", accounting.classifiedClosedTrades ?? performance.closedTrades ?? "—"], ["OPEN POSITIONS", (judgeDemo ? snapshot.portfolio : livePortfolio)?.positions?.length ?? 0]];
+  const values = [["NET PNL", money(accounting.netPnlSinceBaseline ?? performance.totalPnl)], ["WIN RATE", accounting.winRatePct && accounting.winRatePct !== "UNAVAILABLE" ? `${accounting.winRatePct}%` : "—"], ["CURRENT / PEAK DRAWDOWN", percent(accounting.currentDrawdownPct)], ["CLOSED TRADES", accounting.classifiedClosedTrades ?? performance.closedTrades ?? "—"], ["OPEN POSITIONS", (judgeDemo ? snapshot.portfolio : livePortfolio)?.positions?.length ?? 0]];
   const node = $("performance"); node.replaceChildren();
   values.forEach(([label, value]) => { const card = document.createElement("div"); card.className = "summary-card"; const title = document.createElement("small"); title.textContent = label; const content = document.createElement("strong"); content.textContent = text(value); card.append(title, content); node.append(card); });
   const source = accounting.source === "PROVIDER_LIVE" ? "PROVIDER_LIVE" : accounting.source === "PERSISTED_LEDGER" ? "PERSISTED" : "UNAVAILABLE";

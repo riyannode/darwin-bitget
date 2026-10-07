@@ -13,6 +13,26 @@ const policy: OwnerPolicy = {
 };
 
 describe("daily drawdown policy", () => {
+  it.each([
+    ["1000", "901", "10", false],
+    ["1000", "900", "10", true],
+    ["1000", "899", "10", true],
+    ["1000", "999", "10", false],
+    ["1000", "995", "10", false],
+    ["1000", "950", "5", true],
+    ["1000", "949.99", "5", true],
+    ["1000", "945.01", "5.5", false],
+    ["1000", "945", "5.5", true],
+  ] as const)("compares exact drawdown boundaries for baseline %s, equity %s, and limit %s%%", (baselineEquity, currentEquity, maxDailyDrawdownPct, blocked) => {
+    const result = evaluateDrawdown(
+      { ...policy, maxDailyDrawdownPct },
+      { date: "2026-09-12", baselineEquity, lastEquity: baselineEquity },
+      currentEquity,
+      new Date("2026-09-12T01:00:00.000Z"),
+    );
+    expect(result.blocked).toBe(blocked);
+  });
+
   it("sets a daily baseline and allows normal observation", () => {
     const result = evaluateDrawdown(policy, undefined, "1000", new Date("2026-09-12T00:00:00.000Z"));
     expect(result.blocked).toBe(false);
