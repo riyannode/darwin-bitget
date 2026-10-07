@@ -1,4 +1,21 @@
+import type { SqlExecutor } from "../storage/schema.js";
+import { loadPositionContext } from "../storage/store.js";
+import { providerLivePositionLifecycleKey } from "../storage/provider-ledger.js";
+import { resolveLifecycleExperience, type ProviderLiveIdentity } from "../agent/provider-live-lifecycle.js";
 import type { Action, MaximumFavorableExcursionBasis, PositionManagementState, PositionSide, PositionSnapshot, PositionContext, TradeExperience, TradingJournal } from "../types.js";
+
+/**
+ * A persisted PositionContext may only describe a lifecycle when symbol, side,
+ * entry decision, experience, and lifecycle status all agree.
+ */
+export function positionContextMatchesLifecycle(context: PositionContext | null, experience: TradeExperience): boolean {
+  return Boolean(context
+    && context.symbol === experience.symbol
+    && context.positionSide === experience.positionSide
+    && context.experienceId === experience.experienceId
+    && context.entryDecisionId === experience.entryDecisionId
+    && (context.lifecycleStatus === undefined || context.lifecycleStatus === "OPEN"));
+}
 
 const METRIC_DECIMAL_PLACES = 8;
 const MAX_PRIOR_MANAGEMENT_ACTIONS = 5;
@@ -66,6 +83,85 @@ export function reconstructMaximumFavorableReturnPct(
     peak = peak === null ? Math.max(observedReturn, 0) : Math.max(peak, observedReturn, 0);
   }
   return peak;
+}
+
+/**
+ * A lifecycle the trading cycle resolved this cycle: current provider-live,
+ * deterministically matched to an experience, and backed by a matching
+ * PositionContext. Only these may drive a bounded history read.
+ */
+export interface ResolvedPositionLifecycle {
+  symbol: string;
+  positionSide: PositionSide;
+  experience: TradeExperience;
+  /** Earliest provider-live entry time, when deterministically known. */
+  entryTime: string | null;
+  /** True when this lifecycle has no established excursion basis yet. */
+  requiresReconstruction: boolean;
+}
+
+/**
+ * Resolve the lifecycles the position-management phase acts on this cycle.
+ *
+ * A lifecycle qualifies only when it is current provider-live with a positive
+ * quantity, resolves to exactly one deterministic DARWIN experience, and is
+ * backed by a matching PositionContext. Stale historical OPEN experiences that
+ * match no live position are structurally excluded, so they can never decide
+ * whether the cycle reads history.
+ *
+ * This is a pure function of persisted state rather than agent state, so the
+ * reconstruction gate has exactly one definition shared by the cycle and tests.
+ */
+export function resolvePositionManagementLifecycles(
+  executor: SqlExecutor,
+  experiences: readonly TradeExperience[],
+  positions: readonly PositionSnapshot[],
+  liveIdentities: ReadonlyMap<string, ProviderLiveIdentity> = new Map(),
+): ResolvedPositionLifecycle[] {
+  const resolved: ResolvedPositionLifecycle[] = [];
+  for (const position of positions.filter((candidate) => Number(candidate.quantity) > 0)) {
+    // A provider-external management record carries no entry price or entry time, so lifecycle
+    // metrics cannot be derived from it. It is excluded here rather than failing the cycle.
+    const positionContext = loadPositionContext(executor, position.symbol, position.positionSide);
+    const experience = resolveLifecycleExperience(experiences, position, liveIdentities.get(providerLivePositionLifecycleKey(position)));
+    if (!experience || !positionContextMatchesLifecycle(positionContext, experience)) continue;
+    const entryTime = Date.parse(experience.entryTime);
+    resolved.push({
+      symbol: position.symbol,
+      positionSide: position.positionSide,
+      experience,
+      entryTime: Number.isFinite(entryTime) ? experience.entryTime : null,
+      requiresReconstruction: experience.outcomeStatus === "OPEN" && !experience.maximumFavorableExcursionBasis,
+    });
+  }
+  return resolved;
+}
+
+/**
+ * Whether the trading cycle must read bounded journal history this cycle.
+ *
+ * The gate considers only lifecycles that are simultaneously current
+ * provider-live, deterministically resolved, and backed by a matching
+ * PositionContext. A stale historical OPEN row for the same symbol and side is
+ * therefore incapable of forcing a history read, which is what previously made
+ * reconstruction repeat forever.
+ */
+export function positionHistoryReconstructionRequired(
+  lifecycles: readonly ResolvedPositionLifecycle[],
+): boolean {
+  return lifecycles.some((lifecycle) => lifecycle.requiresReconstruction);
+}
+
+/**
+ * Current provider-live, deterministically resolved, context-matched lifecycles.
+ *
+ * The bounded read is derived only from these, so unrelated and stale history can
+ * never widen the trading cycle's read.
+ */
+export function positionHistoryRequests(
+  lifecycles: readonly ResolvedPositionLifecycle[],
+): ResolvedPositionLifecycle[] {
+  return lifecycles.filter((lifecycle) => lifecycle.requiresReconstruction);
 }
 
 export function buildPositionManagementState(

@@ -86,6 +86,41 @@ export interface StoredCycle {
 
 export const MAX_HISTORY_LIMIT = 100;
 
+/**
+ * Hard row bound for the trading cycle's position-management history read.
+ *
+ * The 5-minute loop must never materialize an unbounded journal history inside a
+ * single Durable Object invocation: that is what exhausted the isolate memory
+ * limit in production. The bound is enforced by the SQL LIMIT below, so rows the
+ * query never returns are never JSON-decoded into memory.
+ *
+ * 300 rows is roughly a day of 5-minute cycles, which is generous coverage for
+ * reconstructing one open lifecycle's deterministic observations while keeping a
+ * single cycle's read two orders of magnitude below the failure point.
+ */
+export const HISTORY_ROW_HARD_LIMIT = 300;
+
+/** The maximum number of lifecycle requests a single bounded read may carry. */
+export const HISTORY_REQUEST_HARD_LIMIT = 24;
+
+const MAX_HISTORY_TIMESTAMP_LENGTH = 40;
+
+export interface PositionHistoryRequest {
+  symbol: string;
+  positionSide: PositionSide;
+  /** Earliest provider-live entry time; only journals at or after it are relevant. */
+  startAt: string | null;
+}
+
+function boundedHistoryRequest(request: PositionHistoryRequest): PositionHistoryRequest | null {
+  const symbol = typeof request.symbol === "string" ? request.symbol.trim() : "";
+  const positionSide = request.positionSide;
+  if (!symbol || symbol.length > 64) return null;
+  if (positionSide !== "LONG" && positionSide !== "SHORT") return null;
+  if (request.startAt !== null && (typeof request.startAt !== "string" || !request.startAt || request.startAt.length > MAX_HISTORY_TIMESTAMP_LENGTH)) return null;
+  return { symbol, positionSide, startAt: request.startAt ?? null };
+}
+
 const PERFORMANCE_STATE_KEY = "performance_aggregate";
 const POSITION_CONTEXT_BOOTSTRAP_KEY = "position_context_bootstrap";
 const LATEST_VALID_CYCLE_PLAN_STATE_KEY = "latest_valid_cycle_plan";
@@ -762,6 +797,80 @@ export function loadJournalBackfillPage(
     }
   });
   return { journals, nextCursor: pageRows[pageRows.length - 1]?.cycle_id ?? afterCycleId, hasMore };
+}
+
+export interface BoundedPositionHistory {
+  journals: TradingJournal[];
+  /** True when the bound was reached, so coverage is explicitly partial. */
+  truncated: boolean;
+}
+
+/**
+ * Bounded reconstruction history for the position-management path.
+ *
+ * This exists because the trading cycle must never materialize the full journal
+ * history: the unbounded read exceeded the Durable Object isolate memory limit in
+ * production and reset the isolate before the cycle could complete.
+ *
+ * The bound is enforced by the SQL `LIMIT` below, not by slicing in JavaScript.
+ * Only rows returned by this query are JSON-decoded, so an unbounded history of
+ * thousands of journals never becomes an in-memory array. There is deliberately
+ * no pagination loop: one trading cycle performs exactly one bounded read.
+ *
+ * Relevance is decided inside SQL from the requested provider-live lifecycles
+ * (symbol + side + earliest entry time), so unrelated history cannot pull the
+ * cycle's read back toward the full table.
+ */
+export function loadBoundedPositionManagementHistory(
+  executor: SqlExecutor,
+  requests: readonly PositionHistoryRequest[],
+  options: { limit?: number; path?: string; queryName?: string } = {},
+): BoundedPositionHistory {
+  const path = options.path ?? "scheduled_cycle";
+  const queryName = options.queryName ?? "position_management_bounded_history";
+  const bounded = [...new Map(
+    requests.map((request) => boundedHistoryRequest(request)).filter((request): request is PositionHistoryRequest => request !== null)
+      .map((request) => [`${request.positionSide}:${request.symbol}`, request]),
+  ).values()].slice(0, HISTORY_REQUEST_HARD_LIMIT);
+  if (bounded.length === 0) return { journals: [], truncated: false };
+
+  const requested = Number.isInteger(options.limit) && (options.limit as number) > 0
+    ? Math.min(options.limit as number, HISTORY_ROW_HARD_LIMIT)
+    : HISTORY_ROW_HARD_LIMIT;
+
+  const query = executeMeasuredSql<JournalRow>(executor, path, queryName);
+  // json_valid guards the payload column: a single malformed row would otherwise
+  // abort the whole cycle's read. Lifecycles with no usable startAt are excluded
+  // rather than widened into an unbounded read.
+  const rows = query`
+    SELECT DISTINCT j.payload FROM journals j
+    JOIN json_each(${JSON.stringify(bounded)}) req
+      ON j.created_at >= COALESCE(json_extract(req.value, '$.startAt'), '')
+     AND json_extract(j.payload, '$.mode') = 'AUTONOMOUS'
+     AND EXISTS (
+       SELECT 1 FROM json_each(j.payload, '$.portfolio.positions') p
+       WHERE json_extract(p.value, '$.symbol') = json_extract(req.value, '$.symbol')
+         AND json_extract(p.value, '$.positionSide') = json_extract(req.value, '$.positionSide')
+         AND CAST(json_extract(p.value, '$.quantity') AS REAL) > 0
+     )
+    WHERE json_valid(j.payload)
+    ORDER BY j.created_at DESC, j.cycle_id DESC
+    LIMIT ${requested + 1}
+  `;
+
+  // One extra row is requested only to detect truncation; it is never returned.
+  const truncated = rows.length > requested;
+  return {
+    journals: rows.slice(0, requested).flatMap((row) => {
+      try {
+        const journal = JSON.parse(row.payload) as TradingJournal;
+        return journal.mode === "AUTONOMOUS" ? [journal] : [];
+      } catch {
+        return [];
+      }
+    }),
+    truncated,
+  };
 }
 
 export function loadAllAutonomousJournals(
