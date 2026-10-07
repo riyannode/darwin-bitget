@@ -173,4 +173,23 @@ describe("provider-live unresolved lifecycle gate", () => {
     expect(evaluate(decision("OPEN_LONG"), { positionDiscrepancies: [] }).codes).not.toContain("LOCAL_LIFECYCLE_UNRESOLVED");
     expect(evaluate(decision("CLOSE"), { positionDiscrepancies: [...localMissing, ...providerMissing] }).codes).toContain("LOCAL_LIFECYCLE_UNRESOLVED");
   });
+
+  it("13. keeps emergency-stop, drawdown, open-order, and quarantine gates unchanged for every action", () => {
+    // Emergency stop blocks everything, including risk-reducing management.
+    for (const action of ["CLOSE", "REDUCE", "HOLD", "INCREASE", "REVERSE"] as const) {
+      expect(evaluate(decision(action), { emergencyStop: true }).codes).toContain("EMERGENCY_STOP");
+    }
+    // Drawdown still blocks every exposure-increasing action.
+    for (const action of ["INCREASE", "REVERSE", "OPEN_LONG"] as const) {
+      expect(evaluate(decision(action), { dailyDrawdownBlocked: true }).codes).toContain("DAILY_DRAWDOWN");
+    }
+    // Open-order read failure and quarantine still block management.
+    for (const action of ["CLOSE", "REDUCE"] as const) {
+      expect(evaluate(decision(action), { account: { ...livePositionAccount, openOrders: null } }).codes).toContain("OPEN_ORDERS_READ_UNAVAILABLE");
+      expect(evaluate(decision(action), { unresolvedExecutionSymbols: ["COINUSDT"] }).codes).toContain("UNRESOLVED_PRIOR_EXECUTION");
+    }
+    expect(evaluate(decision("CLOSE"), { openOrderSymbols: ["COINUSDT"] }).codes).toContain("DUPLICATE_ORDER");
+    expect(evaluate(decision("CLOSE"), { evidenceObservedAt: "2026-09-11T00:00:00.000Z" }).codes).toContain("STALE_EVIDENCE");
+    expect(evaluate(decision("CLOSE"), { instrument: { ...instrument, status: "offline" } }).codes).toContain("INSTRUMENT_UNAVAILABLE");
+  });
 });

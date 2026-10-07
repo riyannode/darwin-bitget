@@ -1,17 +1,28 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { hasEvent, loadAllExperiences, saveExperience } from "../src/storage/store.js";
+import { loadAllExperiences, saveExperience } from "../src/storage/store.js";
 import { TraderAgent } from "../src/agent/agent.js";
-import type { DecisionExecutionRecord, EvidenceBundle, TradingJournal } from "../src/types.js";
+import { isDarwinOwnedExperience } from "../src/agent/provider-live-lifecycle.js";
+import { loadProviderLiveOpeningOrderIdentities, providerLivePositionLifecycleKey } from "../src/storage/provider-ledger.js";
+import { evaluateRiskGate } from "../src/trading/risk-gate.js";
+import type { AccountSnapshot, Action, Decision, DecisionExecutionRecord, EvidenceBundle, Instrument, PositionSnapshot, RuntimeConfig, TradeExperience, TradingJournal } from "../src/types.js";
 
-// A provider-only CLOSE/REDUCE must produce an auditable persisted outcome without inventing a
-// DARWIN entry. These tests drive the real persistDecisionOutcome implementation.
+// A verified CLOSE/REDUCE on a provider-live position with no persisted local experience must
+// preserve the *true* provenance. Deterministic DARWIN identity repairs the lifecycle; only a
+// position with no identity at all is provider-external. A synthetic provider-external record
+// must never satisfy the local-lifecycle requirement on a later cycle.
 
 vi.mock("agents", () => ({ Agent: class {} }));
 
 const CYCLE_ID = "cycle-provider-only";
 const OBSERVED_AT = "2026-10-07T17:00:00.000Z";
+const OPENED_AT = "2026-10-05T14:25:48.407Z";
+const ENTRY_DECISION_ID = "decision-entry-darwin";
+const OPENING_ORDER_ID = "1491009757156626432";
+const ENTRY_OID = "darwin-entry-oid";
+const THESIS = "COIN shows accelerating bullish momentum with consecutive higher closes";
+const CATEGORY = "USDT-FUTURES";
 
 function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; executor: SqlExecutor } {
   const executor: SqlExecutor = {
@@ -30,12 +41,13 @@ function memoryExecutor(db = new DatabaseSync(":memory:")): { db: DatabaseSync; 
 function fakeAgent(executor: SqlExecutor, db: DatabaseSync) {
   return {
     sql: executor.sql,
-    env: { TRADING_MODE: "PAPER", PAPER_ONLY: "true", AGENT_MODE: "AUTONOMOUS", BITGET_CATEGORY: "USDT-FUTURES" },
+    env: { TRADING_MODE: "PAPER", PAPER_ONLY: "true", AGENT_MODE: "AUTONOMOUS", BITGET_CATEGORY: CATEGORY },
     state: { paused: false, runtimeStatus: "ONLINE" },
     ctx: { storage: { transactionSync: <T>(closure: () => T) => { db.exec("BEGIN IMMEDIATE"); try { const value = closure(); db.exec("COMMIT"); return value; } catch (error) { db.exec("ROLLBACK"); throw error; } } } },
     ensureActivePolicy: () => ({ paperOnly: true, maxSinglePositionMarginPct: "30", maxLeverage: "5", maxDailyDrawdownPct: "10", drawdownCooldownMinutes: 60, scanIntervalMinutes: 5, emergencyStop: false }),
     persistDecisionOutcome: (TraderAgent.prototype as unknown as { persistDecisionOutcome: (...args: unknown[]) => Promise<unknown> }).persistDecisionOutcome,
     recordEvent: (TraderAgent.prototype as unknown as { recordEvent: (type: string, cycleId: string, metadata?: Record<string, string>) => void }).recordEvent,
+    recordPositionDiscrepancies: (TraderAgent.prototype as unknown as { recordPositionDiscrepancies: (...args: unknown[]) => string[] }).recordPositionDiscrepancies,
     updatePositionContext: vi.fn(),
     updatePerformanceReadModel: vi.fn(),
   };
@@ -49,16 +61,32 @@ function bundle(): EvidenceBundle {
   } as unknown as EvidenceBundle;
 }
 
-function record(action: "CLOSE" | "REDUCE"): DecisionExecutionRecord {
+type PositionOverride = { openedAt?: string | undefined } & Partial<Omit<PositionSnapshot, "openedAt">>;
+
+function position(overrides: PositionOverride = {}): PositionSnapshot {
+  // An explicit `openedAt: undefined` must clear the field entirely (the "provider reported no
+  // opening time" case); otherwise the default authoritative openedAt applies.
+  const { openedAt, ...rest } = overrides;
+  const resolved = arguments.length > 0 && "openedAt" in overrides ? openedAt : OPENED_AT;
+  return {
+    symbol: "COINUSDT", positionSide: "LONG", quantity: "12.05", notional: "2157",
+    marginAllocated: "720", leverage: "3", entryPrice: "190.81", unrealizedPnl: "0",
+    realizedPnl: "0", ...rest,
+    ...(resolved === undefined ? {} : { openedAt: resolved }),
+  };
+}
+
+function record(action: "CLOSE" | "REDUCE", overrides: Partial<DecisionExecutionRecord> = {}): DecisionExecutionRecord {
   return {
     decision: {
       decisionId: "decision-close-1", cycleId: CYCLE_ID, action, positionSide: "LONG", symbol: "COINUSDT",
       marginAllocationPct: "0", additionalMarginPct: null, leverage: "3",
       reductionPct: action === "REDUCE" ? "50" : null, targetPositionSide: null, confidence: 0.7,
-      thesis: "manage unattributed live position", strategyThesis: "reduce risk",
+      thesis: "manage live position", strategyThesis: "reduce risk",
       supportingFactors: ["factor"], riskFactors: ["risk"], evidenceUsed: ["TICKER"], lessonsUsed: [], createdAt: OBSERVED_AT,
     },
     riskGateResult: { status: "PASS", codes: [], checkedAt: OBSERVED_AT },
+    positionBefore: position(),
     executionResult: {
       provider: "BITGET", providerOrderId: "provider-close-order", clientOrderId: "darwin-close-oid", symbol: "COINUSDT",
       action, positionSide: "LONG", providerSide: "sell", tradeSide: "close", marginAllocated: "0", leverage: "3",
@@ -66,15 +94,16 @@ function record(action: "CLOSE" | "REDUCE"): DecisionExecutionRecord {
       submittedAt: OBSERVED_AT, readBackAt: OBSERVED_AT, averageFillPrice: "179.06", realizedPnl: "-141.5875", realizedPnlPct: "-7.7",
     },
     reconciliationResult: { status: "MATCHED", codes: [], checkedAt: OBSERVED_AT },
+    ...overrides,
   } as unknown as DecisionExecutionRecord;
 }
 
-async function persist(agent: ReturnType<typeof fakeAgent>, action: "CLOSE" | "REDUCE", experiences: unknown[] = []) {
+async function persist(agent: ReturnType<typeof fakeAgent>, executionRecord: DecisionExecutionRecord, experiences: unknown[] = []) {
   const journal = { cycleId: CYCLE_ID, experienceIds: [] as string[], createdLessons: [] as string[] } as unknown as TradingJournal;
   await agent.persistDecisionOutcome.call(
     agent,
     { tradingMode: "PAPER" } as never,
-    record(action),
+    executionRecord,
     bundle(),
     experiences as never,
     [] as never,
@@ -86,128 +115,396 @@ async function persist(agent: ReturnType<typeof fakeAgent>, action: "CLOSE" | "R
   return journal;
 }
 
-describe("provider-only management persistence", () => {
-  it("10. persists an auditable provider-origin outcome for a successful CLOSE", async () => {
+/** Seed the deterministic DARWIN opening identity for the live position. */
+function seedDarwinOpeningIdentity(executor: SqlExecutor): void {
+  executor.sql`INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES (${ENTRY_OID}, ${"cycle-entry"}, ${ENTRY_DECISION_ID}, ${OPENING_ORDER_ID}, ${OPENED_AT})`;
+  executor.sql`INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (${OPENING_ORDER_ID}, ${ENTRY_OID}, ${CATEGORY}, ${"COINUSDT"}, ${"buy"}, ${"long"}, ${"open"}, ${"12.05"}, ${"12.05"}, ${"filled"}, ${OPENED_AT}, ${OPENED_AT}, ${"DARWIN"}, ${"{}"}, ${OPENED_AT}, ${OPENED_AT})`;
+  executor.sql`INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (${"fill-open"}, ${OPENING_ORDER_ID}, ${ENTRY_OID}, ${CATEGORY}, ${"COINUSDT"}, ${"buy"}, ${"long"}, ${"open"}, ${"12.05"}, ${"190.81"}, ${OPENED_AT}, ${"DARWIN"}, ${"{}"}, ${OPENED_AT}, ${OPENED_AT})`;
+}
+
+function auditEvents(executor: SqlExecutor, type: string): Array<Record<string, string>> {
+  return executor.sql<{ payload: string }>`SELECT payload FROM events WHERE event_type = ${type}`
+    .map((row) => (JSON.parse(row.payload) as { metadata?: Record<string, string> }).metadata ?? {});
+}
+
+// ---------------------------------------------------------------------------
+// Risk gate fixtures, used to prove the guard survives across cycles.
+// ---------------------------------------------------------------------------
+const config: RuntimeConfig = {
+  tradingMode: "PAPER", agentMode: "AUTONOMOUS",
+  ownerPolicy: { paperOnly: true, maxSinglePositionMarginPct: "30", maxLeverage: "5", maxDailyDrawdownPct: "10", drawdownCooldownMinutes: 60, scanIntervalMinutes: 5, emergencyStop: false },
+  evidenceMaxAgeSeconds: 90, bitgetCategory: CATEGORY, bitgetApiBaseUrl: "https://api.bitget.com",
+  qwenBaseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", qwenModel: "qwen3.8-max",
+};
+const instrument: Instrument = { symbol: "COINUSDT", category: CATEGORY, baseCoin: "COIN", quoteCoin: "USDT", marginCoin: "USDT", symbolType: "crypto", isRwa: "NO", status: "online", minOrderQty: "0.001", maxOrderQty: "100", minOrderAmount: "10", pricePrecision: 2, quantityPrecision: 3, quantityStep: "0.001", leverageMin: "1", leverageMax: "10" };
+
+function account(): AccountSnapshot {
+  return {
+    balance: "1000", availableBalance: "1000", availableMargin: "1000", marginUsage: "0",
+    positionNotional: "2157", totalPositionNotional: "2157", positionQuantity: "12.05",
+    portfolioEquity: "1000",
+    positions: [{ symbol: "COINUSDT", positionSide: "LONG", quantity: "12.05", notional: "2157", marginAllocated: "720", leverage: "3", entryPrice: "190.81", unrealizedPnl: "0", realizedPnl: "0" }],
+    realizedPnl: "0", unrealizedPnl: "0", openOrders: 0, openOrderSymbols: [], observedAt: OBSERVED_AT,
+  } as unknown as AccountSnapshot;
+}
+
+function decision(action: Action): Decision {
+  return {
+    decisionId: `decision-${action}`, cycleId: CYCLE_ID, action, positionSide: "LONG", symbol: "COINUSDT",
+    marginAllocationPct: "10", additionalMarginPct: action === "INCREASE" ? "5" : null, leverage: "3",
+    reductionPct: action === "REDUCE" ? "50" : null, targetPositionSide: action === "REVERSE" ? "SHORT" : null,
+    confidence: 0.7, thesis: "t", strategyThesis: "s", supportingFactors: ["f"], riskFactors: ["r"],
+    evidenceUsed: ["TICKER"], lessonsUsed: [], createdAt: OBSERVED_AT,
+  } as Decision;
+}
+
+/**
+ * The next cycle's real computation: call the actual recordPositionDiscrepancies with the
+ * identities the real evidence loader returns, then run the real risk gate for an action.
+ */
+function nextCycleGate(agent: ReturnType<typeof fakeAgent>, executor: SqlExecutor, action: Action) {
+  const persisted = loadAllExperiences(executor);
+  const livePositions = [position()];
+  const identities = loadProviderLiveOpeningOrderIdentities(executor, CATEGORY, livePositions, "/api/runCycle");
+  const attributedLivePositionKeys = new Map<string, { decisionId: string; providerOrderId: string }>();
+  for (const candidate of livePositions) {
+    const identity = identities.get(providerLivePositionLifecycleKey(candidate));
+    if (identity) attributedLivePositionKeys.set(`${candidate.symbol}:${candidate.positionSide}`, identity);
+  }
+  const discrepancies = agent.recordPositionDiscrepancies(persisted, livePositions, "next-cycle", attributedLivePositionKeys);
+  return evaluateRiskGate(config, {
+    decision: decision(action),
+    instrument,
+    account: account(),
+    market: { symbol: "COINUSDT", lastPrice: "190.81", bidPrice: "190.80", askPrice: "190.82", priceChange24h: "0", volume24h: "100", observedAt: OBSERVED_AT },
+    evidenceObservedAt: OBSERVED_AT,
+    openOrderSymbols: [],
+    supportedUniverse: ["COINUSDT"],
+    emergencyStop: false,
+    dailyDrawdownBlocked: false,
+    positionDiscrepancies: discrepancies,
+    now: new Date(OBSERVED_AT),
+  } as never);
+}
+
+describe("provider-live management provenance", () => {
+  it("1. persists a DARWIN-attributable CLOSE as DARWIN with deterministic identity and no external event", async () => {
     const { db, executor } = memoryExecutor();
+    seedDarwinOpeningIdentity(executor);
     const agent = fakeAgent(executor, db);
-    const journal = await persist(agent, "CLOSE");
+    const journal = await persist(agent, record("CLOSE"));
 
-    const experiences = loadAllExperiences(executor);
-    expect(experiences).toHaveLength(1);
-    const saved = experiences[0]!;
-    expect(saved.experienceId).toBe("provider-live:COINUSDT:LONG");
-    expect(saved.action).toBe("CLOSE");
-    expect(saved.outcomeStatus).toBe("CLOSED_UNCLASSIFIED");
-    expect(saved.realizedPnl).toBe("-141.5875");
-    expect(saved.realizedPnlVerified).toBe(true);
-    expect(saved.financialSource).toBe("PROVIDER_LEDGER");
-    expect(journal.experienceIds).toContain("provider-live:COINUSDT:LONG");
-
-    const audit = loadAllExperiences(executor).length === 1
-      ? executor.sql<{ payload: string }>`SELECT payload FROM events WHERE event_type = 'PROVIDER_EXTERNAL_MANAGEMENT_RECORDED'`
-      : [];
-    expect(audit).toHaveLength(1);
-    const metadata = JSON.parse(audit[0]!.payload).metadata as Record<string, string>;
-    expect(metadata.origin).toBe("PROVIDER_EXTERNAL");
-    expect(metadata.action).toBe("CLOSE");
-    expect(metadata.providerOrderId).toBe("provider-close-order");
-    expect(metadata.entryProvenance).toBe("UNATTRIBUTED_NO_LOCAL_ENTRY");
+    const saved = loadAllExperiences(executor)[0]!;
+    expect(saved.origin).toBe("DARWIN");
+    expect(saved.entryDecisionId).toBe(ENTRY_DECISION_ID);
+    expect(saved.providerOrderId).toBe(OPENING_ORDER_ID);
+    // Deterministic repair is idempotent under one identity.
+    expect(saved.experienceId).toBe(`darwin-lifecycle-repair:${ENTRY_DECISION_ID}`);
+    expect(journal.experienceIds).toContain(`darwin-lifecycle-repair:${ENTRY_DECISION_ID}`);
+    // A DARWIN-attributed position is never labelled external.
+    expect(auditEvents(executor, "PROVIDER_EXTERNAL_MANAGEMENT_RECORDED")).toHaveLength(0);
+    const repaired = auditEvents(executor, "DARWIN_LIFECYCLE_REPAIRED");
+    expect(repaired).toHaveLength(1);
+    expect(repaired[0]).toMatchObject({ origin: "DARWIN", entryDecisionId: ENTRY_DECISION_ID, lifecycleOpeningOrderId: OPENING_ORDER_ID, entryProvenance: "DETERMINISTIC_PROVIDER_IDENTITY" });
     db.close();
   });
 
-  it("10b. persists an auditable provider-origin outcome for a successful REDUCE", async () => {
+  it("2. keeps a DARWIN-attributable REDUCE as DARWIN after persistence and on the next cycle", async () => {
     const { db, executor } = memoryExecutor();
+    seedDarwinOpeningIdentity(executor);
     const agent = fakeAgent(executor, db);
-    const journal = await persist(agent, "REDUCE");
+    await persist(agent, record("REDUCE"));
 
     const saved = loadAllExperiences(executor)[0]!;
-    expect(saved.experienceId).toBe("provider-live:COINUSDT:LONG");
-    expect(saved.action).toBe("REDUCE");
+    expect(saved.origin).toBe("DARWIN");
     expect(saved.outcomeStatus).toBe("OPEN");
-    expect(journal.experienceIds).toContain("provider-live:COINUSDT:LONG");
+    // The repaired lifecycle is DARWIN-owned, so it counts locally on the next cycle.
+    expect(isDarwinOwnedExperience(saved)).toBe(true);
+    expect(nextCycleGate(agent, executor, "INCREASE").codes).not.toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+    expect(auditEvents(executor, "PROVIDER_EXTERNAL_MANAGEMENT_RECORDED")).toHaveLength(0);
     db.close();
   });
 
-  it("11. never fabricates a DARWIN entry decision, thesis, price, or ownership", async () => {
+  it("3. keeps a provider-external REDUCE externally attributed on the next cycle", async () => {
     const { db, executor } = memoryExecutor();
     const agent = fakeAgent(executor, db);
-    await persist(agent, "CLOSE");
+    await persist(agent, record("REDUCE"));
 
     const saved = loadAllExperiences(executor)[0]!;
-    expect(saved.entryDecisionId).toBe("");
-    expect(saved.entryPrice).toBe("UNAVAILABLE");
-    expect(saved.entryThesis).toBe("UNAVAILABLE");
     expect(saved.origin).toBe("PROVIDER_EXTERNAL");
-    expect(saved.lessonsUsed).toEqual([]);
-    expect(saved.evidenceAtEntry).toEqual([]);
-    // A provider-origin close must not be counted as a self-learning win or loss.
-    expect(["PROFITABLE", "LOSING", "BREAK_EVEN"]).not.toContain(saved.outcomeStatus);
+    expect(saved.outcomeStatus).toBe("OPEN");
+    // The synthetic record must not count as a DARWIN local lifecycle.
+    expect(isDarwinOwnedExperience(saved)).toBe(false);
     db.close();
   });
 
-  it("11b. does not overwrite an existing local experience for the same position", async () => {
+  it("4. blocks INCREASE on an external position after one REDUCE", async () => {
     const { db, executor } = memoryExecutor();
+    const agent = fakeAgent(executor, db);
+    await persist(agent, record("REDUCE"));
+    expect(nextCycleGate(agent, executor, "INCREASE").codes).toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+    db.close();
+  });
+
+  it("5. blocks REVERSE on an external position after one REDUCE", async () => {
+    const { db, executor } = memoryExecutor();
+    const agent = fakeAgent(executor, db);
+    await persist(agent, record("REDUCE"));
+    expect(nextCycleGate(agent, executor, "REVERSE").codes).toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+    db.close();
+  });
+
+  it("6. keeps the external guard persistent and idempotent across multiple REDUCEs and reload", async () => {
+    const { db, executor } = memoryExecutor();
+    const agent = fakeAgent(executor, db);
+    await persist(agent, record("REDUCE"));
+    await persist(agent, record("REDUCE"));
+    await persist(agent, record("REDUCE"));
+
+    // One identity, and it is still external after every repeat.
+    const persisted = loadAllExperiences(executor);
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]!.origin).toBe("PROVIDER_EXTERNAL");
+
+    // Simulate a worker restart: reload everything from storage and re-evaluate.
+    const reloaded = loadAllExperiences(executor).filter((experience) => isDarwinOwnedExperience(experience));
+    expect(reloaded).toHaveLength(0);
+    expect(nextCycleGate(agent, executor, "INCREASE").codes).toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+    expect(nextCycleGate(agent, executor, "REVERSE").codes).toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+    // Risk-reducing management stays available for a genuinely external position.
+    for (const action of ["CLOSE", "REDUCE", "HOLD"] as const) {
+      expect(nextCycleGate(agent, executor, action).codes).not.toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+    }
+    db.close();
+  });
+
+  it("7. persists an external CLOSE outcome without fabricated DARWIN provenance", async () => {
+    const { db, executor } = memoryExecutor();
+    const agent = fakeAgent(executor, db);
+    await persist(agent, record("CLOSE"));
+
+    const saved = loadAllExperiences(executor)[0]!;
+    expect(saved.origin).toBe("PROVIDER_EXTERNAL");
+    expect(saved.outcomeStatus).toBe("CLOSED_UNCLASSIFIED");
+    expect(saved.entryDecisionId).toBe("");
+    expect(saved.entryThesis).toBe("UNAVAILABLE");
+    expect(saved.lessonsUsed).toEqual([]);
+    expect(["PROFITABLE", "LOSING", "BREAK_EVEN"]).not.toContain(saved.outcomeStatus);
+    expect(auditEvents(executor, "PROVIDER_EXTERNAL_MANAGEMENT_RECORDED")[0]).toMatchObject({ origin: "PROVIDER_EXTERNAL", entryProvenance: "UNATTRIBUTED_NO_LOCAL_ENTRY" });
+    db.close();
+  });
+
+  it("8. never writes a management timestamp as the entry time", async () => {
+    const { db, executor } = memoryExecutor();
+    const agent = fakeAgent(executor, db);
+    // No provider openedAt at all.
+    await persist(agent, record("CLOSE", { positionBefore: position({ openedAt: undefined }) }));
+
+    const saved = loadAllExperiences(executor)[0]!;
+    expect(saved.entryTime).toBe("UNAVAILABLE");
+    expect(saved.entryTime).not.toBe(OBSERVED_AT);
+    expect(saved.exitTime).toBe(OBSERVED_AT);
+    db.close();
+  });
+
+  it("9. uses the authoritative provider openedAt as the entry time when available", async () => {
+    const { db, executor } = memoryExecutor();
+    const agent = fakeAgent(executor, db);
+    await persist(agent, record("REDUCE"));
+
+    const saved = loadAllExperiences(executor)[0]!;
+    expect(saved.entryTime).toBe(OPENED_AT);
+    expect(saved.entryTime).not.toBe(saved.exitTime);
+    db.close();
+  });
+
+  it("9b. never reuses the exit fill price as the entry price", async () => {
+    const { db, executor } = memoryExecutor();
+    const agent = fakeAgent(executor, db);
+    await persist(agent, record("REDUCE"));
+
+    const saved = loadAllExperiences(executor)[0]!;
+    expect(saved.exitPrice).toBe("179.06");
+    expect(saved.entryPrice).toBe("190.81");
+    expect(saved.entryPrice).not.toBe(saved.exitPrice);
+
+    // With no provider entry price the field stays unavailable rather than borrowing the exit.
+    const { db: db2, executor: executor2 } = memoryExecutor();
+    const agent2 = fakeAgent(executor2, db2);
+    await persist(agent2, record("REDUCE", { positionBefore: position({ entryPrice: "" }) }));
+    const noEntry = loadAllExperiences(executor2)[0]!;
+    expect(noEntry.entryPrice).toBe("UNAVAILABLE");
+    expect(noEntry.entryPrice).not.toBe(noEntry.exitPrice);
+    db.close();
+    db2.close();
+  });
+
+  it("10. does not claim PROVIDER_LEDGER for a value only backed by the verified execution path", async () => {
+    const { db, executor } = memoryExecutor();
+    const agent = fakeAgent(executor, db);
+    await persist(agent, record("CLOSE"));
+    // The realized PnL came from the execution readback, not a provider ledger history row.
+    expect(loadAllExperiences(executor)[0]!.financialSource).toBe("LOCAL");
+    db.close();
+  });
+
+  it("11. recovers the persisted entry thesis instead of inventing one", async () => {
+    const { db, executor } = memoryExecutor();
+    seedDarwinOpeningIdentity(executor);
     saveExperience(executor, {
-      experienceId: "local-open-1", symbol: "COINUSDT", positionSide: "LONG", action: "OPEN_LONG",
-      entryDecisionId: "decision-open", entryPrice: "190.81", entryTime: "2026-10-05T14:25:48.407Z",
-      exitDecisionId: "", exitPrice: "", exitTime: "", selectedLeverage: "3", marginAllocationPct: "10",
+      experienceId: "prior-open", symbol: "COINUSDT", positionSide: "LONG", action: "OPEN_LONG",
+      entryDecisionId: ENTRY_DECISION_ID, entryPrice: "190.81", entryTime: OPENED_AT,
+      exitDecisionId: "", exitPrice: "0", exitTime: "", selectedLeverage: "3", marginAllocationPct: "10",
       marginAllocated: "720", positionNotional: "2157", realizedPnl: "0", realizedPnlPct: "0",
-      maximumFavorableExcursion: "0", maximumAdverseExcursion: "0", drawdownContribution: "0", liquidationDistance: "0",
-      entryThesis: "local thesis", exitThesis: "", evidenceAtEntry: ["TICKER"], evidenceAtExit: [], lessonsUsed: [],
-      marketContext: "VOLATILITY_EXPANSION", outcomeStatus: "OPEN",
-    } as never, OBSERVED_AT);
+      maximumFavorableExcursion: "0", maximumAdverseExcursion: "0", drawdownContribution: "0",
+      liquidationDistance: "0", entryThesis: THESIS, exitThesis: "", evidenceAtEntry: ["TICKER"],
+      evidenceAtExit: [], lessonsUsed: [], marketContext: "VOLATILITY_EXPANSION", outcomeStatus: "PROFITABLE",
+    } as never, OPENED_AT);
 
     const agent = fakeAgent(executor, db);
-    await persist(agent, "CLOSE", [{
-      experienceId: "local-open-1", symbol: "COINUSDT", positionSide: "LONG", action: "OPEN_LONG", outcomeStatus: "OPEN",
-      entryDecisionId: "decision-open", entryPrice: "190.81", entryTime: "2026-10-05T14:25:48.407Z",
+    await persist(agent, record("CLOSE"));
+    expect(loadAllExperiences(executor).find((experience) => experience.experienceId === `darwin-lifecycle-repair:${ENTRY_DECISION_ID}`)!.entryThesis).toBe(THESIS);
+    db.close();
+  });
+
+  it("12. leaves the entry thesis unavailable when no DARWIN evidence can be recovered", async () => {
+    const { db, executor } = memoryExecutor();
+    seedDarwinOpeningIdentity(executor);
+    const agent = fakeAgent(executor, db);
+    await persist(agent, record("CLOSE"));
+    expect(loadAllExperiences(executor)[0]!.entryThesis).toBe("UNAVAILABLE");
+    db.close();
+  });
+
+  it("13. does not overwrite an existing local experience for the same position", async () => {
+    const { db, executor } = memoryExecutor();
+    const existing = {
+      experienceId: "local-open-1", symbol: "COINUSDT", positionSide: "LONG", action: "OPEN_LONG",
+      entryDecisionId: "decision-open", entryPrice: "190.81", entryTime: OPENED_AT,
       exitDecisionId: "", exitPrice: "", exitTime: "", selectedLeverage: "3", marginAllocationPct: "10",
       marginAllocated: "720", positionNotional: "2157", realizedPnl: "0", realizedPnlPct: "0",
       maximumFavorableExcursion: "0", maximumAdverseExcursion: "0", drawdownContribution: "0",
-      liquidationDistance: "0", entryThesis: "local thesis", exitThesis: "",
-      evidenceAtEntry: ["TICKER"], evidenceAtExit: [], lessonsUsed: [], marketContext: "VOLATILITY_EXPANSION",
-    }]);
+      liquidationDistance: "0", entryThesis: "local thesis", exitThesis: "", evidenceAtEntry: ["TICKER"],
+      evidenceAtExit: [], lessonsUsed: [], marketContext: "VOLATILITY_EXPANSION", outcomeStatus: "OPEN",
+    } as never as TradeExperience;
+    saveExperience(executor, existing, OBSERVED_AT);
 
-    const ids = loadAllExperiences(executor).map((experience) => experience.experienceId);
-    expect(ids).toContain("local-open-1");
-    expect(ids).not.toContain("provider-live:COINUSDT:LONG");
-    expect(loadAllExperiences(executor).find((e) => e.experienceId === "local-open-1")!.outcomeStatus).not.toBe("CLOSED_UNCLASSIFIED");
-    db.close();
-  });
-
-  it("12. records the provider-external management event idempotently under one identity", async () => {
-    const { db, executor } = memoryExecutor();
     const agent = fakeAgent(executor, db);
-    await persist(agent, "CLOSE");
-    await persist(agent, "REDUCE");
-
-    const experiences = loadAllExperiences(executor);
-    expect(experiences).toHaveLength(1);
-    const events = executor.sql<{ payload: string }>`SELECT payload FROM events WHERE event_type = 'PROVIDER_EXTERNAL_MANAGEMENT_RECORDED'`;
-    expect(events).toHaveLength(2);
-    expect(experiences[0]!.experienceId).toBe("provider-live:COINUSDT:LONG");
+    await persist(agent, record("CLOSE"), [existing]);
+    expect(loadAllExperiences(executor).map((experience) => experience.experienceId)).toEqual(["local-open-1"]);
     db.close();
   });
 
-  it("12b. does not record an outcome when the provider execution is unverified", async () => {
+  it("14. records nothing when the execution is unverified and nothing for an exposure increase", async () => {
     const { db, executor } = memoryExecutor();
     const agent = fakeAgent(executor, db);
     const unverified = record("CLOSE");
     (unverified.reconciliationResult as { status: string }).status = "PENDING";
-    const journal = { cycleId: CYCLE_ID, experienceIds: [] as string[] } as unknown as TradingJournal;
-    await agent.persistDecisionOutcome.call(agent, { tradingMode: "PAPER" } as never, unverified, bundle(), [], [] as never, CYCLE_ID, OBSERVED_AT, journal, false);
+    await persist(agent, unverified);
+    expect(loadAllExperiences(executor)).toHaveLength(0);
+
+    const increasing = record("CLOSE");
+    increasing.decision.action = "INCREASE";
+    await persist(agent, increasing);
     expect(loadAllExperiences(executor)).toHaveLength(0);
     db.close();
   });
 
-  it("12c. does not create a provider-origin record for an exposure-increasing action", async () => {
+  it("15. a synthetic provider-external record never becomes the current experience for a later action", async () => {
     const { db, executor } = memoryExecutor();
     const agent = fakeAgent(executor, db);
-    const journal = { cycleId: CYCLE_ID, experienceIds: [] as string[] } as unknown as TradingJournal;
-    const increasing = record("CLOSE");
-    increasing.decision.action = "INCREASE";
-    await agent.persistDecisionOutcome.call(agent, { tradingMode: "PAPER" } as never, increasing, bundle(), [], [] as never, CYCLE_ID, OBSERVED_AT, journal, false);
-    expect(loadAllExperiences(executor)).toHaveLength(0);
+    // Cycle 1: external REDUCE persists a synthetic OPEN record.
+    await persist(agent, record("REDUCE"));
+    const persisted = loadAllExperiences(executor);
+
+    // Cycle 2: the same synthetic record must not be treated as a local lifecycle, otherwise
+    // the ordinary local-experience branch would silently adopt it as DARWIN state.
+    const secondCycle = record("CLOSE");
+    secondCycle.decision.decisionId = "decision-close-2";
+    await persist(agent, secondCycle, persisted);
+
+    const saved = loadAllExperiences(executor);
+    expect(saved).toHaveLength(1);
+    // Still one external identity, still no DARWIN adoption.
+    expect(saved[0]!.experienceId).toBe("provider-live:COINUSDT:LONG");
+    expect(saved[0]!.origin).toBe("PROVIDER_EXTERNAL");
+    expect(saved[0]!.entryDecisionId).toBe("");
+    // The second cycle must take the provider-external branch again. Adopting the synthetic
+    // record as a local experience would instead run the ordinary CLOSE reflection path.
+    expect(auditEvents(executor, "PROVIDER_EXTERNAL_MANAGEMENT_RECORDED")).toHaveLength(2);
+    expect(auditEvents(executor, "REFLECTION_COMPLETED")).toHaveLength(0);
+    expect(saved[0]!.exitDecisionId).toBe("decision-close-2");
+    db.close();
+  });
+
+  it("16. the per-cycle position-management refresh skips a provider-external record instead of failing the cycle", () => {
+    const { db, executor } = memoryExecutor();
+    const agent = fakeAgent(executor, db);
+    const refresh = (TraderAgent.prototype as unknown as { refreshPositionManagementState: (...args: unknown[]) => unknown[] }).refreshPositionManagementState;
+
+    // The synthetic external record persisted by an external REDUCE has no usable entry price.
+    const external = {
+      experienceId: "provider-live:COINUSDT:LONG", symbol: "COINUSDT", positionSide: "LONG",
+      action: "REDUCE", entryDecisionId: "", entryPrice: "190.81", entryTime: OPENED_AT,
+      exitDecisionId: "decision-close-1", exitPrice: "179.06", exitTime: OBSERVED_AT,
+      selectedLeverage: "3", marginAllocationPct: "UNAVAILABLE", marginAllocated: "720",
+      positionNotional: "2157", realizedPnl: "-141.5875", realizedPnlPct: "-7.7",
+      maximumFavorableExcursion: "UNAVAILABLE", maximumAdverseExcursion: "UNAVAILABLE",
+      drawdownContribution: "UNAVAILABLE", liquidationDistance: "UNAVAILABLE",
+      entryThesis: "UNAVAILABLE", exitThesis: "x", evidenceAtEntry: [], evidenceAtExit: [],
+      lessonsUsed: [], marketContext: "VOLATILITY_EXPANSION", outcomeStatus: "OPEN",
+      lastAction: "REDUCE", origin: "PROVIDER_EXTERNAL", financialSource: "LOCAL",
+    } as unknown as TradeExperience;
+
+    const refreshBundle = { market: { symbol: "COINUSDT", lastPrice: "190.81", observedAt: OBSERVED_AT }, marketRegime: "VOLATILITY_EXPANSION" } as unknown as EvidenceBundle;
+    // Without the guard this throws INVALID_POSITION_MANAGEMENT_ENTRY_PRICE and fails the cycle.
+    const states = refresh.call(agent, [external], [position()], [refreshBundle], OBSERVED_AT, []);
+    expect(states).toEqual([]);
+    db.close();
+  });
+
+  // The three live production positions under audit: CRCLUSDT, SPCXUSDT, COINUSDT.
+  const LIVE_PRODUCTION_POSITIONS = [
+    { symbol: "CRCLUSDT", providerOrderId: "1490493208880631808" },
+    { symbol: "SPCXUSDT", providerOrderId: "1491008302198706231" },
+    { symbol: "COINUSDT", providerOrderId: "1491009757156626432" },
+  ] as const;
+
+  it("17. the three deterministic DARWIN positions never persist as PROVIDER_EXTERNAL", async () => {
+    const { db, executor } = memoryExecutor();
+    const agent = fakeAgent(executor, db);
+
+    for (const live of LIVE_PRODUCTION_POSITIONS) {
+      const openedAt = "2026-10-05T14:25:48.407Z";
+      const decisionId = `decision-entry-${live.symbol}`;
+      const oid = `darwin-entry-oid-${live.symbol}`;
+      executor.sql`INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES (${oid}, ${"cycle-entry"}, ${decisionId}, ${live.providerOrderId}, ${openedAt})`;
+      executor.sql`INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (${live.providerOrderId}, ${oid}, ${CATEGORY}, ${live.symbol}, ${"buy"}, ${"long"}, ${"open"}, ${"12.05"}, ${"12.05"}, ${"filled"}, ${openedAt}, ${openedAt}, ${"DARWIN"}, ${"{}"}, ${openedAt}, ${openedAt})`;
+      executor.sql`INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (${`fill-${live.symbol}`}, ${live.providerOrderId}, ${oid}, ${CATEGORY}, ${live.symbol}, ${"buy"}, ${"long"}, ${"open"}, ${"12.05"}, ${"190.81"}, ${openedAt}, ${"DARWIN"}, ${"{}"}, ${openedAt}, ${openedAt})`;
+
+      const execution = record("REDUCE", {
+        positionBefore: position({ symbol: live.symbol, openedAt }),
+        decision: {
+          ...record("REDUCE").decision,
+          symbol: live.symbol,
+          decisionId: `decision-reduce-${live.symbol}`,
+        } as never,
+        executionResult: { ...record("REDUCE").executionResult, symbol: live.symbol } as never,
+      });
+      await persist(agent, execution);
+    }
+
+    const saved = loadAllExperiences(executor);
+    expect(saved).toHaveLength(3);
+    for (const live of LIVE_PRODUCTION_POSITIONS) {
+      const row = saved.find((experience) => experience.symbol === live.symbol);
+      expect(row).toBeDefined();
+      expect(row!.origin).toBe("DARWIN");
+      expect(row!.providerOrderId).toBe(live.providerOrderId);
+      expect(row!.entryDecisionId).toBe(`decision-entry-${live.symbol}`);
+    }
+    expect(auditEvents(executor, "PROVIDER_EXTERNAL_MANAGEMENT_RECORDED")).toHaveLength(0);
+    expect(auditEvents(executor, "DARWIN_LIFECYCLE_REPAIRED")).toHaveLength(3);
     db.close();
   });
 });

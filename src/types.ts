@@ -266,6 +266,8 @@ export interface TradeExperience {
   financialSource?: "LOCAL" | "PROVIDER_LEDGER";
   origin?: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
   providerPositionHistoryId?: string;
+  /** Authoritative provider opening-order identity for a deterministically attributed lifecycle. */
+  providerOrderId?: string;
   closedQuantity?: string;
   cumRealisedPnl?: string;
   netProfit?: string;
