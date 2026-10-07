@@ -10,7 +10,7 @@ import { PROVIDER_FINANCIAL_CATEGORIES, syncProviderLedger } from "../src/bitget
 import { rebuildProviderPerformance } from "../src/trading/provider-performance.js";
 import { loadProviderPerformanceMaterializationState } from "../src/trading/provider-performance-materializer.js";
 import type { PerformanceAggregate } from "../src/trading/performance.js";
-import type { PositionContext, TradeExperience, TradingJournal } from "../src/types.js";
+import type { PositionContext, PositionSnapshot, TradeExperience, TradingJournal } from "../src/types.js";
 
 vi.mock("agents", () => ({ Agent: class {} }));
 vi.mock("../src/trading/execution.js", async () => {
@@ -123,6 +123,8 @@ function fakeAgent(executor: SqlExecutor, db: DatabaseSync, paused: boolean) {
     state: { paused, runtimeStatus: paused ? "PAUSED" : "ONLINE" },
     ctx: { storage: { transactionSync: <T>(closure: () => T) => { db.exec("BEGIN IMMEDIATE"); try { const value = closure(); db.exec("COMMIT"); return value; } catch (error) { db.exec("ROLLBACK"); throw error; } } } },
     ensureActivePolicy: () => ({ paperOnly: true, maxSinglePositionMarginPct: "30", maxLeverage: "5", maxDailyDrawdownPct: "10", drawdownCooldownMinutes: 60, scanIntervalMinutes: 5, emergencyStop: false }),
+    repairMissingDarwinLifecycles: (TraderAgent.prototype as unknown as { repairMissingDarwinLifecycles: (...args: unknown[]) => TradeExperience[] }).repairMissingDarwinLifecycles,
+    prepareDarwinLifecycleRepair: (TraderAgent.prototype as unknown as { prepareDarwinLifecycleRepair: (...args: unknown[]) => unknown }).prepareDarwinLifecycleRepair,
     repairProviderClosedLifecycle: TraderAgent.prototype.repairProviderClosedLifecycle,
     dryRunProviderClosedLifecycle: TraderAgent.prototype.dryRunProviderClosedLifecycle,
     getTradeHistory: (TraderAgent.prototype as unknown as { getTradeHistory: (url: URL) => Promise<Response> }).getTradeHistory,
@@ -165,6 +167,49 @@ async function runProviderPerformanceMigration(agent: ReturnType<typeof fakeAgen
 afterEach(() => vi.restoreAllMocks());
 
 describe("provider-first financial lifecycle resolution", () => {
+  it("proactively repairs both read models, then reconciles a later provider close by the same identity", async () => {
+    const { db, executor } = memoryExecutor();
+    insertProviderEvidence(executor);
+    const entryDecision = {
+      decisionId: ENTRY_DECISION_ID, cycleId: "cycle-entry", action: "OPEN_LONG", positionSide: "LONG", symbol: "SAMSUNGUSDT",
+      marginAllocationPct: "10", additionalMarginPct: null, leverage: "3", reductionPct: null, targetPositionSide: null,
+      confidence: 0.8, thesis: "persisted entry reasoning", strategyThesis: "persisted strategy",
+      supportingFactors: ["provider-linked entry"], riskFactors: ["risk evidence"], evidenceUsed: ["TICKER"], lessonsUsed: [], createdAt: OPENED_AT,
+    };
+    saveJournal(executor, { ...journal, cyclePlan: { positionActions: [], entryActions: [entryDecision as never] } });
+    const livePosition = {
+      symbol: "SAMSUNGUSDT", positionSide: "LONG", quantity: "7.51", entryPrice: "198.02", leverage: "3",
+      marginAllocated: "100", notional: "1490.13", unrealizedPnl: "12.5", realizedPnl: "0", openedAt: OPENED_AT,
+    } as unknown as PositionSnapshot;
+    const identities = loadProviderLiveOpeningOrderIdentities(executor, "USDT-FUTURES", [livePosition], "/api/runCycle");
+    const agent = fakeAgent(executor, db, true);
+    const experiences = loadAllExperiences(executor);
+    const repaired = agent.repairMissingDarwinLifecycles.call(agent, experiences, [livePosition], identities, "repair-cycle", CLOSED_AT);
+    expect(repaired).toHaveLength(1);
+    const repairedExperience = repaired[0]!;
+    const repairedContext = loadPositionContext(executor, "SAMSUNGUSDT", "LONG");
+    expect(repairedContext).toMatchObject({
+      experienceId: repairedExperience.experienceId,
+      entryDecisionId: ENTRY_DECISION_ID,
+      lifecycleStatus: "OPEN",
+      entryReasoning: expect.objectContaining({ thesis: "persisted entry reasoning", decisionId: ENTRY_DECISION_ID, cycleId: "cycle-entry" }),
+    });
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: CLOSED_AT } as never);
+
+    const result = await agent.repairProviderClosedLifecycle.call(agent, repairedExperience.experienceId, HISTORY_ID);
+
+    expect(result).toEqual({ status: "RECONCILED", experienceId: repairedExperience.experienceId, providerPositionHistoryId: HISTORY_ID });
+    expect(loadAllExperiences(executor).find((row) => row.experienceId === repairedExperience.experienceId)?.outcomeStatus).toBe("PROFITABLE");
+    expect(loadPositionContext(executor, "SAMSUNGUSDT", "LONG")).toMatchObject({
+      experienceId: repairedExperience.experienceId,
+      entryDecisionId: ENTRY_DECISION_ID,
+      lifecycleStatus: "CLOSED",
+      closedProviderPositionHistoryId: HISTORY_ID,
+    });
+    expect(executePaperOrder).not.toHaveBeenCalled();
+    db.close();
+  });
+
   it("fails snapshot closed when the provider performance materialization is absent instead of replaying history", async () => {
     const { db, executor, queries } = memoryExecutor();
     insertProviderEvidence(executor);

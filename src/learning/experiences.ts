@@ -37,6 +37,7 @@ const experienceSchema = z.object({
   financialSource: z.enum(["LOCAL", "PROVIDER_LEDGER"]).optional(),
   origin: z.enum(["DARWIN", "PROVIDER_EXTERNAL", "UNATTRIBUTED"]).optional(),
   providerPositionHistoryId: z.string().optional(),
+  providerOrderId: z.string().optional(),
   closedQuantity: z.string().optional(),
   cumRealisedPnl: z.string().optional(),
   netProfit: z.string().optional(),

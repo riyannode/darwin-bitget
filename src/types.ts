@@ -266,6 +266,8 @@ export interface TradeExperience {
   financialSource?: "LOCAL" | "PROVIDER_LEDGER";
   origin?: "DARWIN" | "PROVIDER_EXTERNAL" | "UNATTRIBUTED";
   providerPositionHistoryId?: string;
+  /** Authoritative provider opening-order identity for a deterministically attributed lifecycle. */
+  providerOrderId?: string;
   closedQuantity?: string;
   cumRealisedPnl?: string;
   netProfit?: string;
@@ -577,6 +579,8 @@ export interface TradingJournal {
   exitDecisions?: Decision[];
   exitExecutions?: DecisionExecutionRecord[];
   exitReflections?: ReflectionResult[];
+  /** Locally reconstructed DARWIN lifecycles repaired before decisions ran this cycle. */
+  repairedLifecycles?: string[];
   experienceIds?: string[];
   riskGateResult?: RiskGateResult;
   executionRequest?: ExecutionRequest;

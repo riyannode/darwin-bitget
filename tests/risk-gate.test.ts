@@ -134,10 +134,27 @@ describe("futures risk gate", () => {
     expect(result.status).toBe("PASS");
   });
 
-  it("fails closed when the provider position has no usable local lifecycle", () => {
-    const result = evaluateRiskGate(config, { ...context(decision("REDUCE", "0", "1", "20")), positionDiscrepancies: ["LOCAL_EXPERIENCE_MISSING:BTCUSDT:LONG"] });
+  it("still fails closed for exposure-increasing actions when the provider position has no usable local lifecycle", () => {
+    for (const action of ["INCREASE", "REVERSE"] as const) {
+      const result = evaluateRiskGate(config, { ...context(decision(action, "0", "1", null, "5", "LONG", action === "REVERSE" ? "SHORT" : null)), positionDiscrepancies: ["LOCAL_EXPERIENCE_MISSING:BTCUSDT:LONG"] });
+      expect(result.status).toBe("BLOCK");
+      expect(result.codes).toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+    }
+  });
+
+  it("fails closed when the provider position is missing locally but present on the provider", () => {
+    const result = evaluateRiskGate(config, { ...context(decision("REDUCE", "0", "1", "20")), positionDiscrepancies: ["PROVIDER_POSITION_MISSING:BTCUSDT:LONG"] });
     expect(result.status).toBe("BLOCK");
     expect(result.codes).toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+  });
+
+  it("allows risk-reducing management of a live provider position with no local experience", () => {
+    // A live provider position may be missing its local experience. CLOSE/REDUCE/HOLD only
+    // reduce or observe risk, so they pass this gate while every other gate still applies.
+    for (const action of ["CLOSE", "REDUCE", "HOLD"] as const) {
+      const result = evaluateRiskGate(config, { ...context(decision(action, "0", "1", action === "REDUCE" ? "20" : null)), positionDiscrepancies: ["LOCAL_EXPERIENCE_MISSING:BTCUSDT:LONG"] });
+      expect(result.codes).not.toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+    }
   });
 
   it("calculates INCREASE post-action margin against the hard cap", () => {

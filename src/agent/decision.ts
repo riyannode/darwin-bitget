@@ -112,6 +112,7 @@ export function rankMarketCandidates(scan: readonly MarketSnapshot[], limit = MA
 
 export function buildDecisionPrompt(context: DecisionContext, cycleId: string): string {
   const actionCapacity = calculateActionCapacity(liveOpenPositions(context.openPositions).length);
+  const currentOpenExperienceIds = new Set(context.openExperiences.map((experience) => experience.experienceId));
   const account = context.bundles[0]?.account;
   const portfolio = account ? {
     portfolioEquity: account.portfolioEquity,
@@ -173,7 +174,7 @@ export function buildDecisionPrompt(context: DecisionContext, cycleId: string): 
     deepEvidence,
     positionManagementState: context.positionManagementState ?? [],
     openExperiences: context.openExperiences.slice(-10),
-    experiences: context.experiences.filter((experience) => experience.outcomeStatus !== "EXECUTION_FAILURE" && experience.outcomeStatus !== "EXECUTION_UNRESOLVED").slice(-10),
+    experiences: context.experiences.filter((experience) => experience.outcomeStatus !== "EXECUTION_FAILURE" && experience.outcomeStatus !== "EXECUTION_UNRESOLVED" && (experience.outcomeStatus !== "OPEN" || currentOpenExperienceIds.has(experience.experienceId))).slice(-10),
     operationalEvidence: context.experiences.filter((experience) => experience.outcomeStatus === "EXECUTION_FAILURE" || experience.outcomeStatus === "EXECUTION_UNRESOLVED").slice(-10).map((experience) => ({ experienceId: experience.experienceId, symbol: experience.symbol, classification: experience.outcomeStatus, strategyOutcome: "UNASSESSED" })),
     lessons: context.lessons.filter((lesson) => lesson.source !== "EXECUTION_FAILURE"),
     executionCapacityHints: context.executionCapacityHints ?? [],
