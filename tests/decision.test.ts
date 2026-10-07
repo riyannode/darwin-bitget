@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { assertOpenPositionCountWithinPlanLimit, buildCycleDecisionPlanSchema, buildDecisionPrompt, calculateActionCapacity, countOpenPositionLifecycles, cycleDecisionPlanSchema, buildEvidenceSymbols, filterNewEntryMarketCandidates, MAX_FINANCIAL_WRITES_PER_CYCLE, MAX_TOTAL_ACTIONS_PER_CYCLE, orderCycleActions, rankMarketCandidates, selectDeterministicEntryCandidates, validateCycleDecisionPlan } from "../src/agent/decision.js";
-import type { AccountSnapshot, CycleDecisionPlan, Decision, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot, PositionManagementState, PositionSnapshot } from "../src/types.js";
+import type { AccountSnapshot, CycleDecisionPlan, Decision, DecisionContext, EvidenceBundle, Instrument, MarketSnapshot, PositionManagementState, PositionSnapshot, TradeExperience } from "../src/types.js";
 import { buildDecisionTaskPrompt, DECISION_TASK_PROMPT, PROMPT_VERSIONS } from "../src/agent/mandate.js";
 
 function snapshot(symbol: string, change = "1", volume = "100"): MarketSnapshot {
@@ -34,6 +34,17 @@ function context(positions: PositionSnapshot[], entrySymbols: string[] = ["NVDAU
   return { bundles: symbols.map((symbol) => bundle(symbol, positions)), supportedUniverse: ["NVDAUSDT", "COINUSDT", "CRCLUSDT"], openPositionSymbols: positions.map((item) => item.symbol), entryCandidateSymbols: entrySymbols, experiences: [], openExperiences: [], lessons: [], observedAt: "2026-09-12T00:00:00.000Z", mandate: "mandate", openPositions: positions, positionManagementState };
 }
 
+function openExperience(experienceId: string, outcomeStatus: TradeExperience["outcomeStatus"] = "OPEN"): TradeExperience {
+  return {
+    experienceId, symbol: "COINUSDT", positionSide: "LONG", action: "OPEN_LONG", entryDecisionId: `entry-${experienceId}`,
+    entryPrice: "190.81", entryTime: "2026-09-12T00:00:00.000Z", exitDecisionId: "", exitPrice: "0", exitTime: "",
+    selectedLeverage: "3", marginAllocationPct: "10", marginAllocated: "700", positionNotional: "2100",
+    realizedPnl: "0", realizedPnlPct: "0", maximumFavorableExcursion: "UNAVAILABLE", maximumAdverseExcursion: "UNAVAILABLE",
+    drawdownContribution: "UNAVAILABLE", liquidationDistance: "UNAVAILABLE", entryThesis: experienceId, exitThesis: "",
+    evidenceAtEntry: [], evidenceAtExit: [], lessonsUsed: [], marketContext: "UNKNOWN", outcomeStatus, origin: "DARWIN",
+  } as TradeExperience;
+}
+
 function plan(positionActions: Decision[] = [], entryActions: Decision[] = []): CycleDecisionPlan {
   return { positionActions: positionActions as CycleDecisionPlan["positionActions"], entryActions: entryActions as CycleDecisionPlan["entryActions"] };
 }
@@ -46,6 +57,45 @@ describe("market candidate pre-ranking", () => {
 });
 
 describe("cycle decision plan contract", () => {
+  it("serializes only resolved current OPEN lifecycles while preserving completed history", () => {
+    const stale = openExperience("stale-darwin-open");
+    const current = openExperience("repaired-current-open");
+    const completed = openExperience("completed-history", "PROFITABLE");
+    const decisionContext = {
+      ...context([position("COINUSDT")], []),
+      experiences: [stale, completed, current],
+      openExperiences: [current],
+    };
+
+    const prompt = JSON.parse(buildDecisionPrompt(decisionContext, "cycle-1")) as {
+      openExperiences: TradeExperience[];
+      experiences: TradeExperience[];
+    };
+
+    expect(prompt.openExperiences.map((experience) => experience.experienceId)).toEqual(["repaired-current-open"]);
+    expect(prompt.experiences.map((experience) => experience.experienceId)).toEqual(["completed-history", "repaired-current-open"]);
+    expect(JSON.stringify(prompt)).not.toContain("stale-darwin-open");
+  });
+
+  it("does not serialize stale local OPEN history as current for an external live position", () => {
+    const stale = openExperience("stale-darwin-open");
+    const decisionContext = {
+      ...context([position("COINUSDT")], []),
+      experiences: [stale],
+      openExperiences: [],
+    };
+
+    const prompt = JSON.parse(buildDecisionPrompt(decisionContext, "cycle-1")) as {
+      openExperiences: TradeExperience[];
+      experiences: TradeExperience[];
+    };
+
+    expect(prompt.openExperiences).toEqual([]);
+    expect(prompt.experiences).toEqual([]);
+    expect(JSON.stringify(prompt)).not.toContain("stale-darwin-open");
+  });
+
+
   it("represents one existing CRCL LONG as HOLD", () => {
     const existing = position("CRCLUSDT");
     const value = plan([decision("HOLD", "CRCLUSDT", "LONG")]);

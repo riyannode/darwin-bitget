@@ -356,6 +356,54 @@ describe("missing DARWIN lifecycle repair before decision", () => {
     db.close();
   });
 
+  it("1e. repairs unknown excursion metrics without claiming zero or since-entry history", () => {
+    const { db, executor } = memoryExecutor();
+    seedDarwinOpeningIdentity(executor);
+    const { repaired } = runRepair(fakeAgent(executor, db), executor, [position()]);
+    expect(repaired[0]).toMatchObject({ maximumFavorableExcursion: "UNAVAILABLE", maximumAdverseExcursion: "UNAVAILABLE" });
+    expect(repaired[0]).not.toHaveProperty("maximumFavorableExcursionBasis");
+    db.close();
+  });
+
+  it("1e2. repair leaves deterministic historical reconstruction available during management refresh", () => {
+    const { db, executor } = memoryExecutor();
+    const identity = seedDarwinOpeningIdentity(executor);
+    const agent = fakeAgent(executor, db);
+    const { repaired } = runRepair(agent, executor, [position()]);
+    const refresh = (TraderAgent.prototype as unknown as { refreshPositionManagementState: (...args: unknown[]) => unknown[] }).refreshPositionManagementState;
+    const positionSnapshot = position({ markPrice: "106", unrealizedPnl: "91.26" });
+    const lifecycleHistory = [{
+      cycleId: "cycle-observed-peak", agentVersion: "test", promptVersion: "test", model: "test", mode: "AUTONOMOUS" as const,
+      startedAt: "2026-10-06T17:00:00.000Z", completedAt: "2026-10-06T17:00:01.000Z",
+      portfolio: { positions: [{ symbol: "COINUSDT", positionSide: "LONG", quantity: "12.05" }], observedAt: "2026-10-06T17:00:00.000Z" } as never,
+      marketContext: { deep: [{ market: { symbol: "COINUSDT", lastPrice: "210", observedAt: "2026-10-06T17:00:00.000Z" } }] },
+      retrievedLessons: [], createdLessons: [],
+    }] as TradingJournal[];
+    const refreshBundle = { ...bundle(), market: { ...bundle().market, lastPrice: "202", observedAt: OBSERVED_AT } };
+    const identities = new Map([[providerLivePositionLifecycleKey(positionSnapshot), identity]]);
+    const states = refresh.call(agent, repaired, [positionSnapshot], [refreshBundle], OBSERVED_AT, lifecycleHistory, identities) as Array<{ maximumFavorableReturnPct: number; maximumFavorableReturnBasis: string; profitGivebackPct: number }>;
+    expect(states[0]?.maximumFavorableReturnPct).toBeGreaterThan(10);
+    expect(states[0]).toMatchObject({ maximumFavorableReturnBasis: "SINCE_ENTRY" });
+    expect(states[0]?.profitGivebackPct).toBeGreaterThan(0);
+    expect(loadAllExperiences(executor)[0]).toMatchObject({ maximumFavorableExcursionBasis: "SINCE_ENTRY" });
+    db.close();
+  });
+
+  it("1e3. unproven repaired history stays unknown and is excluded from profit-giveback state", () => {
+    const { db, executor } = memoryExecutor();
+    const identity = seedDarwinOpeningIdentity(executor);
+    const agent = fakeAgent(executor, db);
+    const { repaired } = runRepair(agent, executor, [position()]);
+    const refresh = (TraderAgent.prototype as unknown as { refreshPositionManagementState: (...args: unknown[]) => unknown[] }).refreshPositionManagementState;
+    const currentPosition = position({ markPrice: "202" });
+    const identities = new Map([[providerLivePositionLifecycleKey(currentPosition), identity]]);
+    const states = refresh.call(agent, repaired, [currentPosition], [bundle()], OBSERVED_AT, [], identities);
+    expect(states).toEqual([]);
+    expect(loadAllExperiences(executor)[0]).toMatchObject({ maximumFavorableExcursion: "UNAVAILABLE", maximumAdverseExcursion: "UNAVAILABLE" });
+    expect(loadAllExperiences(executor)[0]).not.toHaveProperty("maximumFavorableExcursionBasis");
+    db.close();
+  });
+
   it("1e. repair does not map unrealized PnL percentage to realized PnL percentage", () => {
     const { db, executor } = memoryExecutor();
     seedDarwinOpeningIdentity(executor);

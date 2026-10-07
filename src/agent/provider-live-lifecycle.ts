@@ -130,8 +130,7 @@ export function repairedDarwinOpenExperience(input: {
   const { identity, position, entryThesis } = input;
   const entryTime = providerEntryTime(position);
   const entryPrice = providerFact(position.entryPrice);
-  // Excursion is only measurable from a real entry price at a real entry time.
-  const excursionKnown = hasDerivableEntryPrice(entryPrice) && entryTime !== UNAVAILABLE_ATTRIBUTE;
+  // Entry price/time establish the denominator and window, not the historical peak or trough.
   return {
     experienceId: darwinLifecycleExperienceId(identity.decisionId),
     symbol: position.symbol,
@@ -149,9 +148,8 @@ export function repairedDarwinOpenExperience(input: {
     positionNotional: providerFact(position.notional),
     realizedPnl: input.realizedPnl,
     realizedPnlPct: input.realizedPnlPct,
-    maximumFavorableExcursion: excursionKnown ? "0" : UNAVAILABLE_ATTRIBUTE,
-    ...(excursionKnown ? { maximumFavorableExcursionBasis: "SINCE_ENTRY" as const } : {}),
-    maximumAdverseExcursion: excursionKnown ? "0" : UNAVAILABLE_ATTRIBUTE,
+    maximumFavorableExcursion: UNAVAILABLE_ATTRIBUTE,
+    maximumAdverseExcursion: UNAVAILABLE_ATTRIBUTE,
     drawdownContribution: UNAVAILABLE_ATTRIBUTE,
     liquidationDistance: UNAVAILABLE_ATTRIBUTE,
     entryThesis: providerFact(entryThesis),

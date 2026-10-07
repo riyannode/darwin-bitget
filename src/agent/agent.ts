@@ -1297,6 +1297,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (!experience.maximumFavorableExcursionBasis) {
         const historicalPeak = reconstructMaximumFavorableReturnPct(position, experience, lifecycleHistory);
         if (historicalPeak !== null) experienceForRefresh = { ...experience, maximumFavorableExcursion: String(Math.max(Number(experience.maximumFavorableExcursion) || 0, historicalPeak)), maximumFavorableExcursionBasis: "SINCE_ENTRY" };
+        else if (experience.maximumFavorableExcursion === "UNAVAILABLE") continue;
       }
       const result = buildPositionManagementState(position, experienceForRefresh, currentPrice, bundle?.market.observedAt ?? observedAt, positionContext);
       if (result.experience !== experience) {
