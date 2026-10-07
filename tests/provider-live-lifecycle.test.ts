@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isDarwinOwnedExperience, managementOutcomeStatus, providerEntryTime, providerFact, providerManagementExperienceId } from "../src/agent/provider-live-lifecycle.js";
+import { isDarwinOwnedExperience, managementOutcomeStatus, matchesProviderIdentity, providerEntryTime, providerFact, providerManagementExperienceId, resolveLifecycleExperience } from "../src/agent/provider-live-lifecycle.js";
 import type { TradeExperience } from "../src/types.js";
 
 // The lifecycle attribution rules are the single place that decides whether a persisted
@@ -19,6 +19,21 @@ function experience(overrides: Partial<TradeExperience> = {}): TradeExperience {
 }
 
 describe("provider-live lifecycle attribution rules", () => {
+  it("requires every available lifecycle identity field to agree", () => {
+    const identity = { decisionId: "decision-entry", providerOrderId: "provider-order" };
+    const decisionOnly = experience({ entryDecisionId: identity.decisionId });
+    const orderOnly = experience({ entryDecisionId: "", providerOrderId: identity.providerOrderId });
+    const decisionMatchOrderConflict = experience({ entryDecisionId: identity.decisionId, providerOrderId: "other-provider-order" });
+    const orderMatchDecisionConflict = experience({ entryDecisionId: "other-decision", providerOrderId: identity.providerOrderId });
+
+    expect(matchesProviderIdentity(decisionOnly, identity)).toBe(true);
+    expect(matchesProviderIdentity(orderOnly, identity)).toBe(true);
+    expect(matchesProviderIdentity(decisionMatchOrderConflict, identity)).toBe(false);
+    expect(matchesProviderIdentity(orderMatchDecisionConflict, identity)).toBe(false);
+    expect(resolveLifecycleExperience([decisionMatchOrderConflict], { symbol: "COINUSDT", positionSide: "LONG" }, identity)).toBeUndefined();
+    expect(resolveLifecycleExperience([orderMatchDecisionConflict], { symbol: "COINUSDT", positionSide: "LONG" }, identity)).toBeUndefined();
+  });
+
   it("counts only an OPEN experience as a local lifecycle", () => {
     expect(isDarwinOwnedExperience(experience())).toBe(true);
     for (const outcomeStatus of ["CLOSED_UNCLASSIFIED", "PROFITABLE", "LOSING", "BREAK_EVEN", "BLOCKED", "EXECUTION_FAILURE", "EXECUTION_UNRESOLVED"] as const) {

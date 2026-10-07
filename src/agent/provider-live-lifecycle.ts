@@ -58,8 +58,21 @@ export function isDarwinOwnedExperience(experience: TradeExperience): boolean {
  * deterministic identity. Symbol, side, and approximate time are not identity.
  */
 export function matchesProviderIdentity(experience: TradeExperience, identity: ProviderLiveIdentity): boolean {
-  if (experience.entryDecisionId === identity.decisionId) return true;
-  return Boolean(experience.providerOrderId) && experience.providerOrderId === identity.providerOrderId;
+  const hasDecisionId = Boolean(experience.entryDecisionId);
+  const hasProviderOrderId = Boolean(experience.providerOrderId);
+  if (!hasDecisionId && !hasProviderOrderId) return false;
+  if (hasDecisionId && experience.entryDecisionId !== identity.decisionId) return false;
+  if (hasProviderOrderId && experience.providerOrderId !== identity.providerOrderId) return false;
+  return experience.entryDecisionId === identity.decisionId || experience.providerOrderId === identity.providerOrderId;
+}
+
+/** A partial identity match with another populated field disagreeing is a hard ownership conflict. */
+export function conflictsProviderIdentity(experience: TradeExperience, identity: ProviderLiveIdentity): boolean {
+  const decisionMatches = Boolean(experience.entryDecisionId) && experience.entryDecisionId === identity.decisionId;
+  const orderMatches = Boolean(experience.providerOrderId) && experience.providerOrderId === identity.providerOrderId;
+  const decisionConflicts = Boolean(experience.entryDecisionId) && experience.entryDecisionId !== identity.decisionId;
+  const orderConflicts = Boolean(experience.providerOrderId) && experience.providerOrderId !== identity.providerOrderId;
+  return (decisionMatches && orderConflicts) || (orderMatches && decisionConflicts);
 }
 
 /**

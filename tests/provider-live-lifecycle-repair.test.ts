@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { hasEvent, loadAllEvents, loadAllExperiences, saveExperience } from "../src/storage/store.js";
+import { hasEvent, loadAllEvents, loadAllExperiences, loadPositionContext, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
 import { loadProviderLiveOpeningOrderIdentities, providerLivePositionLifecycleKey } from "../src/storage/provider-ledger.js";
 import { TraderAgent } from "../src/agent/agent.js";
 import { darwinLifecycleExperienceId, isDarwinOwnedExperience } from "../src/agent/provider-live-lifecycle.js";
@@ -50,6 +50,7 @@ function fakeAgent(executor: SqlExecutor, db: DatabaseSync) {
     ctx: { storage: { transactionSync: <T>(closure: () => T) => { db.exec("BEGIN IMMEDIATE"); try { const value = closure(); db.exec("COMMIT"); return value; } catch (error) { db.exec("ROLLBACK"); throw error; } } } },
     ensureActivePolicy: () => ({ paperOnly: true, maxSinglePositionMarginPct: "30", maxLeverage: "5", maxDailyDrawdownPct: "10", drawdownCooldownMinutes: 60, scanIntervalMinutes: 5, emergencyStop: false }),
     repairMissingDarwinLifecycles: (TraderAgent.prototype as unknown as { repairMissingDarwinLifecycles: (...args: unknown[]) => TradeExperience[] }).repairMissingDarwinLifecycles,
+    prepareDarwinLifecycleRepair: (TraderAgent.prototype as unknown as { prepareDarwinLifecycleRepair: (...args: unknown[]) => unknown }).prepareDarwinLifecycleRepair,
     persistDecisionOutcome: (TraderAgent.prototype as unknown as { persistDecisionOutcome: (...args: unknown[]) => Promise<unknown> }).persistDecisionOutcome,
     recordEvent: (TraderAgent.prototype as unknown as { recordEvent: (type: string, cycleId: string, metadata?: Record<string, string>) => void }).recordEvent,
     recordPositionDiscrepancies: (TraderAgent.prototype as unknown as { recordPositionDiscrepancies: (...args: unknown[]) => string[] }).recordPositionDiscrepancies,
@@ -73,15 +74,27 @@ function position(overrides: PositionOverride = {}): PositionSnapshot {
 }
 
 /** Seed the deterministic DARWIN opening identity that ties a live position to an entry decision. */
-function seedDarwinOpeningIdentity(executor: SqlExecutor, options: { symbol?: string; decisionId?: string; providerOrderId?: string; oid?: string; openedAt?: string } = {}): { decisionId: string; providerOrderId: string } {
+function seedDarwinOpeningIdentity(executor: SqlExecutor, options: { symbol?: string; decisionId?: string; providerOrderId?: string; oid?: string; openedAt?: string; includeEntryDecision?: boolean; entryThesis?: string; entryCycleId?: string } = {}): { decisionId: string; providerOrderId: string } {
   const symbol = options.symbol ?? "COINUSDT";
   const decisionId = options.decisionId ?? "decision-entry";
   const providerOrderId = options.providerOrderId ?? "1491009757156626432";
   const oid = options.oid ?? "darwin-entry-oid";
   const openedAt = options.openedAt ?? OPENED_AT;
-  executor.sql`INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES (${oid}, ${"cycle-entry"}, ${decisionId}, ${providerOrderId}, ${openedAt})`;
+  const entryCycleId = options.entryCycleId ?? "cycle-entry";
+  executor.sql`INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES (${oid}, ${entryCycleId}, ${decisionId}, ${providerOrderId}, ${openedAt})`;
   executor.sql`INSERT INTO provider_orders (provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, qty, cum_exec_qty, order_status, created_time, updated_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (${providerOrderId}, ${oid}, ${CATEGORY}, ${symbol}, ${"buy"}, ${"long"}, ${"open"}, ${"12.05"}, ${"12.05"}, ${"filled"}, ${openedAt}, ${openedAt}, ${"DARWIN"}, ${"{}"}, ${openedAt}, ${openedAt})`;
   executor.sql`INSERT INTO provider_fills (exec_id, provider_order_id, client_oid, category, symbol, side, pos_side, trade_side, exec_qty, exec_price, created_time, origin, raw_provider_json, first_seen_at, last_seen_at) VALUES (${`fill-${providerOrderId}`}, ${providerOrderId}, ${oid}, ${CATEGORY}, ${symbol}, ${"buy"}, ${"long"}, ${"open"}, ${"12.05"}, ${"190.81"}, ${openedAt}, ${"DARWIN"}, ${"{}"}, ${openedAt}, ${openedAt})`;
+  if (options.includeEntryDecision !== false) {
+    const entryDecision = { ...decision("OPEN_LONG"), decisionId, cycleId: entryCycleId, symbol, createdAt: openedAt, thesis: options.entryThesis ?? THESIS };
+    const [existingJournalRow] = executor.sql<{ payload: string }>`SELECT payload FROM journals WHERE cycle_id = ${entryCycleId} LIMIT 1`;
+    const existingJournal = existingJournalRow ? JSON.parse(existingJournalRow.payload) as TradingJournal : undefined;
+    saveJournal(executor, {
+      ...(existingJournal ?? {} as TradingJournal),
+      cycleId: entryCycleId, agentVersion: "test", promptVersion: "test", model: "test", mode: "AUTONOMOUS",
+      startedAt: openedAt, completedAt: openedAt, retrievedLessons: [], createdLessons: [],
+      cyclePlan: { positionActions: [], entryActions: [...(existingJournal?.cyclePlan?.entryActions ?? []), entryDecision as never] },
+    });
+  }
   return { decisionId, providerOrderId };
 }
 
@@ -126,6 +139,7 @@ function cycleAgent(executor: SqlExecutor, db: DatabaseSync) {
     recordEvent: () => undefined,
     // Real implementations: repair ordering and identity matching are what is under test.
     repairMissingDarwinLifecycles: (TraderAgent.prototype as unknown as { repairMissingDarwinLifecycles: (...args: unknown[]) => TradeExperience[] }).repairMissingDarwinLifecycles,
+    prepareDarwinLifecycleRepair: (TraderAgent.prototype as unknown as { prepareDarwinLifecycleRepair: (...args: unknown[]) => unknown }).prepareDarwinLifecycleRepair,
     recordPositionDiscrepancies: (TraderAgent.prototype as unknown as { recordPositionDiscrepancies: (...args: unknown[]) => string[] }).recordPositionDiscrepancies,
     refreshPositionManagementState: () => [],
     reconcileLateExecutions: async () => undefined,
@@ -312,6 +326,159 @@ describe("missing DARWIN lifecycle repair before decision", () => {
     db.close();
   });
 
+  it("1c. runCycle excludes stale same-side DARWIN OPEN records from Qwen context", async () => {
+    const { db, executor } = memoryExecutor();
+    const identity = seedDarwinOpeningIdentity(executor);
+    saveExperience(executor, {
+      experienceId: "stale-darwin-open", symbol: "COINUSDT", positionSide: "LONG", action: "OPEN_LONG",
+      entryDecisionId: "stale-entry", entryPrice: "190.81", entryTime: OPENED_AT, exitDecisionId: "", exitPrice: "0", exitTime: "",
+      selectedLeverage: "3", marginAllocationPct: "10", marginAllocated: "700", positionNotional: "2100", realizedPnl: "0", realizedPnlPct: "0",
+      maximumFavorableExcursion: "0", maximumAdverseExcursion: "0", drawdownContribution: "0", liquidationDistance: "0",
+      entryThesis: "historical stale record", exitThesis: "", evidenceAtEntry: [], evidenceAtExit: [], lessonsUsed: [], marketContext: "UNKNOWN", outcomeStatus: "OPEN", origin: "DARWIN",
+    } as unknown as TradeExperience, OBSERVED_AT);
+    const seen = await runRealCycle(cycleAgent(executor, db), executor, [position()]);
+    expect(seen.decisionsAtRepairTime).toEqual([darwinLifecycleExperienceId(identity.decisionId)]);
+    expect(seen.decisionsAtRepairTime).not.toContain("stale-darwin-open");
+    db.close();
+  });
+
+  it("1d. an external live position cannot inherit a stale same-side DARWIN experience", async () => {
+    const { db, executor } = memoryExecutor();
+    saveExperience(executor, {
+      experienceId: "stale-darwin-open", symbol: "COINUSDT", positionSide: "LONG", action: "OPEN_LONG",
+      entryDecisionId: "stale-entry", entryPrice: "190.81", entryTime: OPENED_AT, exitDecisionId: "", exitPrice: "0", exitTime: "",
+      selectedLeverage: "3", marginAllocationPct: "10", marginAllocated: "700", positionNotional: "2100", realizedPnl: "0", realizedPnlPct: "0",
+      maximumFavorableExcursion: "0", maximumAdverseExcursion: "0", drawdownContribution: "0", liquidationDistance: "0",
+      entryThesis: "historical stale record", exitThesis: "", evidenceAtEntry: [], evidenceAtExit: [], lessonsUsed: [], marketContext: "UNKNOWN", outcomeStatus: "OPEN", origin: "DARWIN",
+    } as unknown as TradeExperience, OBSERVED_AT);
+    const seen = await runRealCycle(cycleAgent(executor, db), executor, [position()]);
+    expect(seen.decisionsAtRepairTime).toEqual([]);
+    db.close();
+  });
+
+  it("1e. repair does not map unrealized PnL percentage to realized PnL percentage", () => {
+    const { db, executor } = memoryExecutor();
+    seedDarwinOpeningIdentity(executor);
+    const { repaired } = runRepair(fakeAgent(executor, db), executor, [position({ unrealizedPnlPct: "12.5" })]);
+    expect(repaired[0]!.realizedPnlPct).toBe("UNAVAILABLE");
+    expect(repaired[0]!.outcomeStatus).toBe("OPEN");
+    expect(["PROFITABLE", "LOSING", "BREAK_EVEN"]).not.toContain(repaired[0]!.outcomeStatus);
+    db.close();
+  });
+
+  it("1f. repairs the current PositionContext from the exact persisted entry Decision", () => {
+    const { db, executor } = memoryExecutor();
+    const identity = seedDarwinOpeningIdentity(executor);
+    const { repaired } = runRepair(fakeAgent(executor, db), executor, [position()]);
+    const experience = repaired[0]!;
+    const context = loadPositionContext(executor, "COINUSDT", "LONG");
+    expect(context).toMatchObject({
+      symbol: experience.symbol,
+      positionSide: experience.positionSide,
+      experienceId: experience.experienceId,
+      entryDecisionId: identity.decisionId,
+      lifecycleStatus: "OPEN",
+      updatedAt: OBSERVED_AT,
+    });
+    expect(context?.entryReasoning).toEqual({
+      action: "OPEN_LONG", thesis: THESIS, strategyThesis: "s", supportingFactors: ["f"], riskFactors: ["r"],
+      evidenceUsed: ["TICKER"], lessonsUsed: [], confidence: 0.7, cycleId: "cycle-entry",
+      decisionId: identity.decisionId, createdAt: OPENED_AT, additionalMarginPct: null, targetPositionSide: null,
+      entryPrice: experience.entryPrice, entryTime: experience.entryTime, experienceId: experience.experienceId,
+    });
+    expect(context).not.toHaveProperty("closedAt");
+    expect(context).not.toHaveProperty("closedProviderPositionHistoryId");
+    db.close();
+  });
+
+  it("1g. an existing context for the exact entry keeps its management history and clears stale closed markers", () => {
+    const { db, executor } = memoryExecutor();
+    const identity = seedDarwinOpeningIdentity(executor);
+    const oldExperienceId = "old-experience-key";
+    const oldReasoning = { action: "OPEN_LONG" as const, thesis: "t", strategyThesis: "s", supportingFactors: ["f"], riskFactors: ["r"], evidenceUsed: ["TICKER"], lessonsUsed: [], confidence: 0.7, cycleId: "cycle-entry", decisionId: identity.decisionId, createdAt: OPENED_AT, experienceId: oldExperienceId };
+    const managementEvent = { ...oldReasoning, action: "REDUCE" as const, decisionId: "existing-management" };
+    savePositionContext(executor, { symbol: "COINUSDT", positionSide: "LONG", experienceId: oldExperienceId, entryDecisionId: identity.decisionId, entryReasoning: oldReasoning, managementEvents: [managementEvent], lifecycleStatus: "CLOSED", closedAt: OBSERVED_AT, closedProviderPositionHistoryId: "stale-history", updatedAt: OPENED_AT });
+    const { repaired } = runRepair(fakeAgent(executor, db), executor, [position()]);
+    const context = loadPositionContext(executor, "COINUSDT", "LONG");
+    expect(context).toMatchObject({ experienceId: repaired[0]!.experienceId, entryDecisionId: identity.decisionId, lifecycleStatus: "OPEN", managementEvents: [managementEvent], updatedAt: OBSERVED_AT });
+    expect(context?.entryReasoning).toMatchObject({ decisionId: identity.decisionId, experienceId: repaired[0]!.experienceId, thesis: THESIS });
+    expect(context).not.toHaveProperty("closedAt");
+    expect(context).not.toHaveProperty("closedProviderPositionHistoryId");
+    db.close();
+  });
+
+  it("1h. missing persisted reasoning leaves the lifecycle incomplete without fabricating either read model", () => {
+    const { db, executor } = memoryExecutor();
+    seedDarwinOpeningIdentity(executor, { includeEntryDecision: false });
+    const result = runRepair(fakeAgent(executor, db), executor, [position()]);
+    expect(result.repaired).toEqual([]);
+    expect(result.experiences).toEqual([]);
+    expect(loadPositionContext(executor, "COINUSDT", "LONG")).toBeNull();
+    expect(auditEvents(executor, "DARWIN_LIFECYCLE_REPAIR_INCOMPLETE")).toMatchObject([{ reason: "PERSISTED_ENTRY_DECISION_UNAVAILABLE" }]);
+    expect(result.discrepancies).toContain("LOCAL_EXPERIENCE_MISSING:COINUSDT:LONG");
+    expect(gate("INCREASE", result.discrepancies).codes).toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+    db.close();
+  });
+
+  it("1h2. a persisted entry Decision with blank reasoning is incomplete and blocks exposure increases", () => {
+    const { db, executor } = memoryExecutor();
+    seedDarwinOpeningIdentity(executor, { entryThesis: "" });
+    const result = runRepair(fakeAgent(executor, db), executor, [position()]);
+    expect(result.repaired).toEqual([]);
+    expect(result.experiences).toEqual([]);
+    expect(loadPositionContext(executor, "COINUSDT", "LONG")).toBeNull();
+    expect(auditEvents(executor, "DARWIN_LIFECYCLE_REPAIR_INCOMPLETE")).toMatchObject([{ reason: "PERSISTED_ENTRY_REASONING_UNAVAILABLE" }]);
+    expect(gate("INCREASE", result.discrepancies).codes).toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+    db.close();
+  });
+
+  it("1h3. a persisted entry Decision without a cycle identity is incomplete and blocks exposure increases", () => {
+    const { db, executor } = memoryExecutor();
+    seedDarwinOpeningIdentity(executor, { entryCycleId: "" });
+    const result = runRepair(fakeAgent(executor, db), executor, [position()]);
+    expect(result.repaired).toEqual([]);
+    expect(result.experiences).toEqual([]);
+    expect(loadPositionContext(executor, "COINUSDT", "LONG")).toBeNull();
+    expect(auditEvents(executor, "DARWIN_LIFECYCLE_REPAIR_INCOMPLETE")).toMatchObject([{ reason: "PERSISTED_ENTRY_REASONING_UNAVAILABLE" }]);
+    expect(gate("INCREASE", result.discrepancies).codes).toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+    db.close();
+  });
+
+  it("1i. a stale same-symbol/side PositionContext is not adopted and blocks increases", () => {
+    const { db, executor } = memoryExecutor();
+    const identity = seedDarwinOpeningIdentity(executor);
+    const first = runRepair(fakeAgent(executor, db), executor, [position()]);
+    const existingExperience = first.repaired[0]!;
+    const stale = { symbol: "COINUSDT", positionSide: "LONG" as const, experienceId: "stale-exp", entryDecisionId: "old-entry", entryReasoning: { action: "OPEN_LONG" as const, thesis: "old", strategyThesis: "old", supportingFactors: [], riskFactors: [], evidenceUsed: [], lessonsUsed: [], confidence: 0.5, cycleId: "old-cycle", decisionId: "old-entry", experienceId: "stale-exp", createdAt: OPENED_AT }, managementEvents: [], lifecycleStatus: "CLOSED" as const, closedAt: OBSERVED_AT, closedProviderPositionHistoryId: "old-history", updatedAt: OPENED_AT };
+    savePositionContext(executor, stale);
+    const result = runRepair(fakeAgent(executor, db), executor, [position()]);
+    expect(result.repaired).toEqual([]);
+    expect(result.experiences).toContainEqual(existingExperience);
+    expect(loadPositionContext(executor, "COINUSDT", "LONG")).toEqual(stale);
+    expect(auditEvents(executor, "DARWIN_LIFECYCLE_REPAIR_IDENTITY_CONFLICT")).toMatchObject([{ expectedEntryDecisionId: identity.decisionId, existingEntryDecisionId: "old-entry" }]);
+    expect(result.discrepancies).toContain("POSITION_CONTEXT_IDENTITY_UNRESOLVED:COINUSDT:LONG");
+    expect(gate("INCREASE", result.discrepancies).codes).toContain("LOCAL_LIFECYCLE_UNRESOLVED");
+    db.close();
+  });
+
+  it("1j. experience, context and repair event roll back together when the audit write fails", () => {
+    const { db, executor } = memoryExecutor();
+    seedDarwinOpeningIdentity(executor);
+    const agent = fakeAgent(executor, db);
+    const originalSql = agent.sql;
+    agent.sql = ((strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) => {
+      const query = strings.join("?");
+      if (query.includes("INSERT INTO events")) throw new Error("TEST_AUDIT_WRITE_FAILURE");
+      return originalSql(strings, ...values);
+    }) as typeof agent.sql;
+    const identities = loadProviderLiveOpeningOrderIdentities(executor, CATEGORY, [position()], "/api/runCycle");
+    expect(() => agent.repairMissingDarwinLifecycles.call(agent, [], [position()], identities, CYCLE_ID, OBSERVED_AT)).toThrow("TEST_AUDIT_WRITE_FAILURE");
+    expect(loadAllExperiences(executor)).toEqual([]);
+    expect(loadPositionContext(executor, "COINUSDT", "LONG")).toBeNull();
+    expect(loadAllEvents(executor).filter((event) => event.type === "DARWIN_LIFECYCLE_REPAIRED")).toEqual([]);
+    db.close();
+  });
+
   it("2. requires no CLOSE or REDUCE to occur, and records no financial write", () => {
     const { db, executor } = memoryExecutor();
     seedDarwinOpeningIdentity(executor);
@@ -382,6 +549,15 @@ describe("missing DARWIN lifecycle repair before decision", () => {
       expect(row?.origin).toBe("DARWIN");
       expect(row?.providerOrderId).toBe(live.providerOrderId);
       expect(row?.outcomeStatus).toBe("OPEN");
+      expect(row?.entryThesis).toBe(THESIS);
+      expect(loadPositionContext(executor, live.symbol, "LONG")).toMatchObject({
+        symbol: live.symbol,
+        positionSide: "LONG",
+        experienceId: row?.experienceId,
+        entryDecisionId: `decision-entry-${live.symbol}`,
+        lifecycleStatus: "OPEN",
+        entryReasoning: expect.objectContaining({ decisionId: `decision-entry-${live.symbol}`, thesis: THESIS }),
+      });
     }
     expect(auditEvents(executor, "DARWIN_LIFECYCLE_REPAIRED")).toHaveLength(3);
     expect(auditEvents(executor, "PROVIDER_EXTERNAL_MANAGEMENT_RECORDED")).toHaveLength(0);
@@ -397,14 +573,19 @@ describe("missing DARWIN lifecycle repair before decision", () => {
     // The first cycle repairs; later cycles must find nothing left to repair.
     const first = runRepair(agent, executor, [position()]);
     expect(first.repaired).toHaveLength(1);
+    const firstContext = loadPositionContext(executor, "COINUSDT", "LONG");
     for (let cycle = 0; cycle < 2; cycle += 1) {
-      const { repaired } = runRepair(agent, executor, [position()]);
+      const reloadedAgent = fakeAgent(executor, db);
+      const { repaired } = runRepair(reloadedAgent, executor, [position()]);
       expect(repaired).toHaveLength(0);
     }
     const persisted = loadAllExperiences(executor);
+    const persistedContext = loadPositionContext(executor, "COINUSDT", "LONG");
     expect(persisted).toHaveLength(1);
     expect(persisted[0]!.experienceId).toBe(darwinLifecycleExperienceId(identity.decisionId));
-    // The audit event is written once, not once per cycle.
+    expect(persistedContext).toEqual(firstContext);
+    expect(persistedContext).toMatchObject({ experienceId: persisted[0]!.experienceId, entryDecisionId: identity.decisionId, lifecycleStatus: "OPEN" });
+    // The audit event is written once, not once per cycle or worker restart.
     expect(auditEvents(executor, "DARWIN_LIFECYCLE_REPAIRED")).toHaveLength(1);
     db.close();
   });
@@ -480,13 +661,13 @@ it("6c. never repairs a lifecycle for a position with no live provider quantity"
     db.close();
   });
 
-  it("6f. a repaired lifecycle invents no thesis, lesson, decision or financial result", () => {
+  it("6f. a repaired lifecycle uses only persisted entry reasoning and invents no lesson, decision or financial result", () => {
     const { db, executor } = memoryExecutor();
     seedDarwinOpeningIdentity(executor);
     const agent = fakeAgent(executor, db);
     const { repaired } = runRepair(agent, executor, [position()]);
     const saved = repaired[0]!;
-    expect(saved.entryThesis).toBe("UNAVAILABLE");
+    expect(saved.entryThesis).toBe(THESIS);
     expect(saved.lessonsUsed).toEqual([]);
     expect(saved.evidenceAtEntry).toEqual([]);
     expect(saved.exitDecisionId).toBe("");
@@ -587,8 +768,14 @@ describe("identity must be deterministic, not symbol+side", () => {
     } as never, OBSERVED_AT);
 
     const { repaired, discrepancies } = runRepair(agent, executor, [position()]);
-    // No repair needed and no unresolved gap, because provenance matches.
-    expect(repaired).toHaveLength(0);
+    // Entry provenance already matches. The repair completes only the missing PositionContext read model.
+    expect(repaired).toHaveLength(1);
+    expect(repaired[0]!.experienceId).toBe("matching-open");
+    expect(loadPositionContext(executor, "COINUSDT", "LONG")).toMatchObject({
+      experienceId: "matching-open",
+      entryDecisionId: identity.decisionId,
+      lifecycleStatus: "OPEN",
+    });
     expect(discrepancies).not.toContain("LOCAL_EXPERIENCE_MISSING:COINUSDT:LONG");
     expect(gate("INCREASE", discrepancies).codes).not.toContain("LOCAL_LIFECYCLE_UNRESOLVED");
     db.close();
@@ -750,7 +937,7 @@ describe("REDUCE persists the remaining position, not the reduced slice", () => 
     await persist(agent, managementRecord("CLOSE", { positionAfter: position({ quantity: "0", notional: "0", marginAllocated: "0" }) }));
 
     const saved = loadAllExperiences(executor)[0]!;
-    expect(saved.outcomeStatus).toBe("CLOSED_UNCLASSIFIED");
+    expect(saved.outcomeStatus).toBe("LOSING");
     expect(saved.positionNotional).toBe("UNAVAILABLE");
     expect(saved.marginAllocated).toBe("UNAVAILABLE");
     db.close();

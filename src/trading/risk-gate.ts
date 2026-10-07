@@ -103,7 +103,9 @@ export function evaluateRiskGate(config: RuntimeConfig, context: RiskContext): R
   const exposureIncreasing = ["OPEN_LONG", "OPEN_SHORT", "INCREASE", "REVERSE"].includes(decision.action)
     || context.parentDecision?.action === "REVERSE";
   const riskReducingOnly = ["CLOSE", "REDUCE", "HOLD"].includes(decision.action) && context.parentDecision?.action !== "REVERSE";
+  const unresolvedPositionContext = context.positionDiscrepancies?.includes(`POSITION_CONTEXT_IDENTITY_UNRESOLVED:${decision.symbol}:${decision.positionSide ?? "NONE"}`) === true;
   if (missingLocalExperience && (!riskReducingOnly || exposureIncreasing)) addCode(codes, "LOCAL_LIFECYCLE_UNRESOLVED");
+  if (unresolvedPositionContext && exposureIncreasing) addCode(codes, "LOCAL_LIFECYCLE_UNRESOLVED");
   if (missingProviderPosition) addCode(codes, "LOCAL_LIFECYCLE_UNRESOLVED");
   if (decision.action !== "HOLD" && (account.openOrders === null || account.openOrdersReadFailure !== undefined)) addCode(codes, "OPEN_ORDERS_READ_UNAVAILABLE");
   if (decision.action !== "HOLD" && context.unresolvedExecutionSymbols?.includes(decision.symbol)) addCode(codes, "UNRESOLVED_PRIOR_EXECUTION");
