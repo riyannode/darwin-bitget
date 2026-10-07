@@ -49,9 +49,9 @@ export function evaluateDrawdown(
   const current = scaled(currentEquity);
   if (baseline <= 0n || current < 0n) throw new Error("INVALID_PORTFOLIO_EQUITY");
   const nextState: DailyDrawdownState = { date, baselineEquity, lastEquity: currentEquity };
-  const threshold = BigInt(policy.maxDailyDrawdownPct.replace(".", "").padEnd(8, "0"));
+  const threshold = scaled(policy.maxDailyDrawdownPct);
   const reached = current < baseline
-    && (baseline - current) * 100n >= baseline * threshold / 10n ** 8n;
+    && (baseline - current) * 100n * 10n ** 8n >= baseline * threshold;
   if (!reached) return { blocked: false, code: "NONE", state: nextState };
   const cooldownUntil = existing?.date === date ? existing.cooldownUntil : undefined;
   if (cooldownUntil && now.getTime() < new Date(cooldownUntil).getTime()) {

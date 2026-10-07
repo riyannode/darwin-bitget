@@ -2204,7 +2204,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     positionDiscrepancies: readonly string[] = [],
   ): Promise<DecisionExecutionRecord> {
     const unresolvedExecutionSymbols = loadExecutionQuarantines(this).map((entry) => entry.symbol);
-    const riskGateResult = evaluateRiskGate(config, { decision, instrument: bundle.instrument, account: bundle.account, market: bundle.market, evidenceObservedAt: bundle.market.observedAt, openOrderSymbols: bundle.account.openOrderSymbols, supportedUniverse, emergencyStop: this.state.emergencyStop || config.ownerPolicy.emergencyStop, dailyDrawdownBlocked, positionDiscrepancies, unresolvedExecutionSymbols });
+    const riskGateResult = evaluateRiskGate(config, { decision, instrument: bundle.instrument, account: bundle.account, market: bundle.market, evidenceObservedAt: bundle.market.observedAt, openOrderSymbols: bundle.account.openOrderSymbols, supportedUniverse, emergencyStop: this.state.emergencyStop || config.ownerPolicy.emergencyStop, dailyDrawdownBlocked, ...(parentDecision ? { parentDecision } : {}), positionDiscrepancies, unresolvedExecutionSymbols });
     this.recordEvent("DECISION_CREATED", cycleId, { action: decision.action, symbol: decision.symbol, decisionType });
     this.recordEvent(riskGateResult.status === "PASS" ? "RISK_GATE_PASS" : "RISK_GATE_BLOCK", cycleId, { codes: riskGateResult.codes.join(","), decisionType, symbol: decision.symbol });
     if (riskGateResult.codes.includes("OPEN_ORDERS_READ_UNAVAILABLE")) {

@@ -30,6 +30,8 @@ The Worker requires `TRADING_MODE=PAPER`, `PAPER_ONLY=true`, and `AGENT_MODE=AUT
 
 The owner policy defaults to 30% maximum single-position margin allocation, 5x maximum leverage, 10% daily drawdown, 60-minute cooldown, 5-minute scan cadence, and emergency stop disabled. Runtime policy/control mutations require `OWNER_CONTROL_TOKEN` and persist in the Durable Object.
 
+Daily drawdown baseline is the first valid provider `portfolioEquity` observed for the UTC date; a new baseline is set when the date derived from `now.toISOString().slice(0, 10)` changes. The guard computes `((baselineEquity - currentEquity) / baselineEquity) * 100` using exact fixed-point arithmetic and blocks only when current equity is below baseline and the result is at least `maxDailyDrawdownPct`. This daily guard is distinct from the dashboard's current/peak account drawdown metric, which compares latest equity with persisted peak equity.
+
 ## Safe first start
 
 Before `START` or `RESUME` on a self-hosted Worker, verify:

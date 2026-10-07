@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { evaluateRiskGate } from "../src/trading/risk-gate.js";
+import { evaluateDrawdown } from "../src/trading/drawdown.js";
 import type { AccountSnapshot, Action, Decision, Instrument, RuntimeConfig } from "../src/types.js";
 
 const config: RuntimeConfig = {
@@ -58,10 +59,69 @@ describe("futures risk gate", () => {
     expect(result.codes).toEqual(expect.arrayContaining(["MAX_SINGLE_POSITION_MARGIN_PCT", "INSUFFICIENT_MARGIN"]));
   });
 
-  it("keeps financial actions blocked during daily drawdown cooldown", () => {
-    const result = evaluateRiskGate(config, { ...context(decision("OPEN_LONG")), dailyDrawdownBlocked: true });
+  it.each([
+    ["OPEN_LONG", "LONG"],
+    ["OPEN_SHORT", "SHORT"],
+    ["INCREASE", "LONG"],
+    ["REVERSE", "LONG"],
+  ] as const)("blocks %s during daily drawdown", (action, side) => {
+    const next = decision(action, "10", "2", null, action === "INCREASE" ? "5" : null, side, action === "REVERSE" ? "SHORT" : null);
+    const result = evaluateRiskGate(config, { ...context(next), dailyDrawdownBlocked: true });
     expect(result.status).toBe("BLOCK");
     expect(result.codes).toContain("DAILY_DRAWDOWN");
+  });
+
+  it.each([
+    ["REDUCE", decision("REDUCE", "0", "1", "20")],
+    ["CLOSE", decision("CLOSE", "0", "1")],
+  ] as const)("allows %s through the daily drawdown gate", (_action, next) => {
+    const result = evaluateRiskGate(config, { ...context(next), dailyDrawdownBlocked: true });
+    expect(result.status).toBe("PASS");
+    expect(result.codes).not.toContain("DAILY_DRAWDOWN");
+  });
+
+  it("blocks a reverse close leg during drawdown so the reversal cannot partially execute", () => {
+    const reverse = decision("REVERSE", "10", "2", null, null, "LONG", "SHORT");
+    const closeLeg = { ...reverse, decisionId: "decision-1:close", action: "CLOSE" as const, marginAllocationPct: "0", reductionPct: "100" };
+    const result = evaluateRiskGate(config, { ...context(closeLeg), dailyDrawdownBlocked: true, parentDecision: reverse });
+    expect(result.status).toBe("BLOCK");
+    expect(result.codes).toContain("DAILY_DRAWDOWN");
+  });
+
+  it("does not block HOLD solely for daily drawdown", () => {
+    const result = evaluateRiskGate(config, { ...context(decision("HOLD", "0", "1")), dailyDrawdownBlocked: true });
+    expect(result.status).toBe("PASS");
+    expect(result.codes).not.toContain("DAILY_DRAWDOWN");
+  });
+
+  it("keeps emergency stop and unrelated lifecycle gates for exits during drawdown", () => {
+    const reduce = decision("REDUCE", "0", "1", "20");
+    const emergency = evaluateRiskGate(config, { ...context(reduce), emergencyStop: true, dailyDrawdownBlocked: true });
+    expect(emergency.status).toBe("BLOCK");
+    expect(emergency.codes).toContain("EMERGENCY_STOP");
+    expect(emergency.codes).not.toContain("DAILY_DRAWDOWN");
+
+    const unresolved = evaluateRiskGate(config, { ...context(reduce), dailyDrawdownBlocked: true, unresolvedExecutionSymbols: ["BTCUSDT"] });
+    expect(unresolved.status).toBe("BLOCK");
+    expect(unresolved.codes).toContain("UNRESOLVED_PRIOR_EXECUTION");
+    expect(unresolved.codes).not.toContain("DAILY_DRAWDOWN");
+  });
+
+  it("keeps exits live when an expired cooldown is recreated while drawdown persists", () => {
+    const first = evaluateDrawdown(config.ownerPolicy, undefined, "1000", new Date("2026-09-12T00:00:00.000Z"));
+    const breached = evaluateDrawdown(config.ownerPolicy, first.state, "900", new Date("2026-09-12T01:00:00.000Z"));
+    const afterExpiry = evaluateDrawdown(config.ownerPolicy, breached.state, "900", new Date("2026-09-12T02:00:00.000Z"));
+
+    expect(afterExpiry.blocked).toBe(true);
+    expect(afterExpiry.code).toBe("DAILY_DRAWDOWN");
+    expect(afterExpiry.state.cooldownUntil).toBe("2026-09-12T03:00:00.000Z");
+    for (const next of [decision("REDUCE", "0", "1", "20"), decision("CLOSE", "0", "1")]) {
+      const result = evaluateRiskGate(config, { ...context(next), dailyDrawdownBlocked: afterExpiry.blocked });
+      expect(result.status).toBe("PASS");
+      expect(result.codes).not.toContain("DAILY_DRAWDOWN");
+    }
+    const opening = evaluateRiskGate(config, { ...context(decision("OPEN_LONG")), dailyDrawdownBlocked: afterExpiry.blocked });
+    expect(opening.codes).toContain("DAILY_DRAWDOWN");
   });
 
   it("does not impose a fixed profit or loss exit rule", () => {
