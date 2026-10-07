@@ -18,6 +18,7 @@ import {
   loadLatestBacktest,
   loadLatestJournal,
   loadAllAutonomousJournals,
+  loadBoundedPositionManagementHistory,
   loadAllEvents,
   loadEventById,
   loadAllExperiences,
@@ -101,7 +102,7 @@ import { availableResearchCapabilities } from "../research/capabilities.js";
 import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../research/executor.js";
 import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
-import { buildPositionManagementState, reconstructMaximumFavorableReturnPct } from "../trading/position-management.js";
+import { buildPositionManagementState, positionContextMatchesLifecycle, positionHistoryReconstructionRequired, positionHistoryRequests, reconstructMaximumFavorableReturnPct, resolvePositionManagementLifecycles } from "../trading/position-management.js";
 import { providerLedgerDiagnostics, providerLedgerDiagnosticsBatch, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadRecentProviderPositionHistories, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, providerLivePositionLifecycleKey, loadProviderSyncStates, loadProviderDataRevisions, ProviderLifecycleIdentityLookupError, type ProviderLifecycleEvidenceRequest } from "../storage/provider-ledger.js";
 import { calculateNetPnlSinceBaseline, isFinancialRecordCoverageComplete } from "../trading/external-flow.js";
 import { resolveExternalFlowReadModel } from "../trading/external-flow-read-model.js";
@@ -1297,7 +1298,15 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (!experience.maximumFavorableExcursionBasis) {
         const historicalPeak = reconstructMaximumFavorableReturnPct(position, experience, lifecycleHistory);
         if (historicalPeak !== null) experienceForRefresh = { ...experience, maximumFavorableExcursion: String(Math.max(Number(experience.maximumFavorableExcursion) || 0, historicalPeak)), maximumFavorableExcursionBasis: "SINCE_FIRST_DETERMINISTIC_OBSERVATION" };
-        else if (experience.maximumFavorableExcursion === "UNAVAILABLE") continue;
+        else if (experience.maximumFavorableExcursion === "UNAVAILABLE") {
+          // CASE B: no usable prior historical observation exists, so the current
+          // provider-backed market observation is itself the first deterministic
+          // observation. buildPositionManagementState below derives the excursion
+          // from that observation and stamps the basis, so the next cycle's gate is
+          // false and no further history scan is requested. No historical MFE/MAE is
+          // invented: only the current observation is used.
+          experienceForRefresh = experience;
+        }
       }
       const result = buildPositionManagementState(position, experienceForRefresh, currentPrice, bundle?.market.observedAt ?? observedAt, positionContext);
       if (result.experience !== experience) {
@@ -2023,14 +2032,25 @@ export class TraderAgent extends Agent<Env, AgentState> {
       }
       if (backtest) { saveBacktest(this, backtest); journal.backtest = backtest; this.recordEvent("BACKTEST_COMPLETED", cycleId); }
       const positionManagementState = await runTimedCyclePhase("POSITION_MANAGEMENT", () => {
-        const positionHistoryReconstructionRequired = experiences.some((experience) => experience.outcomeStatus === "OPEN" && !experience.maximumFavorableExcursionBasis);
+        // Reconstruction is scoped to lifecycles that are current provider-live,
+        // deterministically resolved, and context-matched. Every persisted OPEN
+        // experience is no longer a trigger, so a stale row cannot keep forcing a
+        // history read in later cycles.
+        const lifecycles = resolvePositionManagementLifecycles(this, experiences, openPositions, attributedLivePositionKeys);
+        const reconstructionRequired = positionHistoryReconstructionRequired(lifecycles);
         try {
-          console.log(JSON.stringify({ event: "POSITION_HISTORY_RECONSTRUCTION", required: positionHistoryReconstructionRequired }));
+          console.log(JSON.stringify({ event: "POSITION_HISTORY_RECONSTRUCTION", required: reconstructionRequired }));
         } catch {
           // Cycle telemetry must not affect trading behavior.
         }
-        const lifecycleHistory = positionHistoryReconstructionRequired
-          ? loadAllAutonomousJournals(this, undefined, undefined, "scheduled_cycle", "position_management_full_journal_history")
+        // Bounded read: the hard limit is applied by SQL, so only the rows actually
+        // relevant to current provider-live lifecycles are decoded into memory.
+        const lifecycleHistory = reconstructionRequired
+          ? loadBoundedPositionManagementHistory(this, positionHistoryRequests(lifecycles).map((lifecycle) => ({
+            symbol: lifecycle.symbol,
+            positionSide: lifecycle.positionSide,
+            startAt: lifecycle.entryTime,
+          })), { path: "scheduled_cycle", queryName: "position_management_bounded_history" }).journals
           : [];
         return this.refreshPositionManagementState(experiences, openPositions, bundles, new Date().toISOString(), lifecycleHistory, attributedLivePositionKeys);
       });
@@ -2889,15 +2909,6 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (previous.scanIntervalMinutes !== next.scanIntervalMinutes && !this.state.paused && !next.emergencyStop) await this.reconcileScheduler(intervalMinutes, { ensureSchedule: true });
     return this.getDashboardSnapshot();
   }
-}
-
-function positionContextMatchesLifecycle(context: PositionContext | null, experience: TradeExperience): boolean {
-  return Boolean(context
-    && context.symbol === experience.symbol
-    && context.positionSide === experience.positionSide
-    && context.experienceId === experience.experienceId
-    && context.entryDecisionId === experience.entryDecisionId
-    && (context.lifecycleStatus === undefined || context.lifecycleStatus === "OPEN"));
 }
 
 function persistedDarwinEntryDecision(executor: SqlExecutor, decisionId: string, symbol: string, positionSide: PositionSide): Decision | undefined {

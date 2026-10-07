@@ -391,7 +391,11 @@ describe("missing DARWIN lifecycle repair before decision", () => {
     db.close();
   });
 
-  it("1e3. unproven repaired history stays unknown and is excluded from profit-giveback state", () => {
+  // Previously this asserted that a repaired lifecycle with no proven history stayed
+  // unresolved forever, which is precisely what forced a full history scan every cycle.
+  // The current provider-backed observation is now itself the first deterministic
+  // observation, so the lifecycle converges and no historical MFE/MAE is invented.
+  it("1e3. unproven repaired history converges on the current observation without inventing history", () => {
     const { db, executor } = memoryExecutor();
     const identity = seedDarwinOpeningIdentity(executor);
     const agent = fakeAgent(executor, db);
@@ -399,10 +403,14 @@ describe("missing DARWIN lifecycle repair before decision", () => {
     const refresh = (TraderAgent.prototype as unknown as { refreshPositionManagementState: (...args: unknown[]) => unknown[] }).refreshPositionManagementState;
     const currentPosition = position({ markPrice: "202" });
     const identities = new Map([[providerLivePositionLifecycleKey(currentPosition), identity]]);
-    const states = refresh.call(agent, repaired, [currentPosition], [bundle()], OBSERVED_AT, [], identities);
-    expect(states).toEqual([]);
-    expect(loadAllExperiences(executor)[0]).toMatchObject({ maximumFavorableExcursion: "UNAVAILABLE", maximumAdverseExcursion: "UNAVAILABLE" });
-    expect(loadAllExperiences(executor)[0]).not.toHaveProperty("maximumFavorableExcursionBasis");
+    const states = refresh.call(agent, repaired, [currentPosition], [bundle()], OBSERVED_AT, [], identities) as Array<{ maximumFavorableReturnBasis: string; maximumFavorableReturnPct: number }>;
+
+    // Current observation is the first deterministic one: basis is established and scoped.
+    expect(states[0]).toMatchObject({ maximumFavorableReturnBasis: "SINCE_FIRST_DETERMINISTIC_OBSERVATION" });
+    expect(loadAllExperiences(executor)[0]).toMatchObject({ maximumFavorableExcursionBasis: "SINCE_FIRST_DETERMINISTIC_OBSERVATION" });
+    // Coverage since entry is never claimed, and MAE stays unknown rather than fabricated.
+    expect(loadAllExperiences(executor)[0]!.maximumFavorableExcursionBasis).not.toBe("SINCE_ENTRY");
+    expect(loadAllExperiences(executor)[0]).toMatchObject({ maximumAdverseExcursion: "UNAVAILABLE" });
     db.close();
   });
 
