@@ -1,6 +1,6 @@
 import { Agent } from "agents";
 import { ZodError } from "zod";
-import type { ActivityEvent, BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionManagementState, PositionSnapshot, PositionSide, ProviderExecutionFact, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
+import type { ActivityEvent, BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, ExperienceOutcomeStatus, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionManagementState, PositionSnapshot, PositionSide, ProviderExecutionFact, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
 import { BitgetClient, type MarketEvidenceFailure } from "../bitget/client.js";
 import { createProviderOriginReadSummary, emitProviderOriginReadSummary, syncProviderLedger, PROVIDER_FINANCIAL_CATEGORIES, PROVIDER_TRADE_LIFECYCLE_CATEGORY } from "../bitget/provider-sync.js";
@@ -1960,7 +1960,16 @@ export class TraderAgent extends Agent<Env, AgentState> {
         this.recordEvent("PLAN_REJECTED", cycleId, { code: "OPEN_POSITION_COUNT_EXCEEDS_PLAN_LIMIT", openPositionCount: String(openPositions.filter((position) => Number(position.quantity) > 0).length), maxActions: "5" });
         throw error;
       }
-      journal.positionDiscrepancies = this.recordPositionDiscrepancies(experiences, openPositions, cycleId);
+      // Deterministic provider identity decides whether a missing local experience is lost local
+      // state (DARWIN-attributable) or a genuinely provider-external position. It is keyed by
+      // the full lifecycle key, so re-key it to symbol:side for the discrepancy audit.
+      const livePositionIdentities = loadProviderLiveOpeningOrderIdentities(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, openPositions, "/api/runCycle");
+      const attributedLivePositionKeys = new Map<string, { decisionId: string; providerOrderId: string }>();
+      for (const position of openPositions) {
+        const identity = livePositionIdentities.get(providerLivePositionLifecycleKey(position));
+        if (identity) attributedLivePositionKeys.set(`${position.symbol}:${position.positionSide}`, identity);
+      }
+      journal.positionDiscrepancies = this.recordPositionDiscrepancies(experiences, openPositions, cycleId, attributedLivePositionKeys);
       recordLessonRetrieval(this, lessons.map((lesson) => lesson.lessonId), cycleId, startedAt);
       const drawdown = evaluateDrawdown(config.ownerPolicy, loadDailyDrawdownState(this), account.portfolioEquity, new Date());
       saveDailyDrawdownState(this, drawdown.state, new Date().toISOString());
@@ -2336,6 +2345,69 @@ export class TraderAgent extends Agent<Env, AgentState> {
       journal.experienceIds = [...(journal.experienceIds ?? []), updatedExperience.experienceId];
       return {};
     }
+    // A provider-live position can be CLOSEd or REDUCEd without any local experience when its
+    // lifecycle was never attributed locally. The provider is the financial source of truth, so
+    // the verified execution is recorded as an auditable provider-origin outcome. This never
+    // invents an entry thesis, entry decision, entry price, or DARWIN ownership: the entry stays
+    // unavailable and origin stays PROVIDER_EXTERNAL, so no self-learning or entry-level lesson
+    // is derived from it.
+    if (!currentExperience && isManagementDecision && verified && executionResult && ["CLOSE", "REDUCE"].includes(decision.action)) {
+      const providerOriginManagementId = `provider-live:${decision.symbol}:${decision.positionSide ?? "NONE"}`;
+      const realizedPnl = isDecimal(executionResult.realizedPnl) ? executionResult.realizedPnl : undefined;
+      // Realized PnL is recorded verbatim when the provider confirms it. DARWIN cannot classify a
+      // win/loss from an entry it never made, so the status stays unclassified either way.
+      const outcomeStatus: ExperienceOutcomeStatus = decision.action === "CLOSE" ? "CLOSED_UNCLASSIFIED" : "OPEN";
+      const providerExperience: TradeExperience = {
+        experienceId: providerOriginManagementId,
+        symbol: decision.symbol,
+        positionSide: decision.positionSide,
+        action: decision.action,
+        entryDecisionId: "",
+        entryPrice: "UNAVAILABLE",
+        entryTime: executionResult.readBackAt ?? bundle.market.observedAt,
+        exitDecisionId: decision.decisionId,
+        exitPrice: executionResult.averageFillPrice ?? "UNAVAILABLE",
+        exitTime: executionResult.readBackAt ?? bundle.market.observedAt,
+        selectedLeverage: executionResult.leverage,
+        marginAllocationPct: "UNAVAILABLE",
+        marginAllocated: executionResult.marginAllocated,
+        positionNotional: executionResult.positionNotional,
+        realizedPnl: realizedPnl ?? "UNAVAILABLE",
+        realizedPnlPct: executionResult.realizedPnlPct ?? "UNAVAILABLE",
+        maximumFavorableExcursion: "UNAVAILABLE",
+        maximumAdverseExcursion: "UNAVAILABLE",
+        drawdownContribution: "UNAVAILABLE",
+        liquidationDistance: "UNAVAILABLE",
+        entryThesis: "UNAVAILABLE",
+        exitThesis: `Provider-confirmed ${decision.action} of an unattributed live position; no local entry lifecycle exists.`,
+        evidenceAtEntry: [],
+        evidenceAtExit: bundle.evidence.map((evidence) => evidence.type),
+        lessonsUsed: [],
+        marketContext: bundle.marketRegime ?? "UNKNOWN",
+        outcomeStatus,
+        lastAction: decision.action,
+        realizedPnlVerified: Boolean(realizedPnl),
+        financialSource: "PROVIDER_LEDGER",
+        origin: "PROVIDER_EXTERNAL",
+        ...(executionResult.fees ? { fees: executionResult.fees } : {}),
+        ...(executionResult.funding ? { funding: executionResult.funding } : {}),
+      };
+      saveExperience(this, providerExperience, startedAt);
+      journal.experienceId = providerExperience.experienceId;
+      journal.experienceIds = [...(journal.experienceIds ?? []), providerExperience.experienceId];
+      this.recordEvent("PROVIDER_EXTERNAL_MANAGEMENT_RECORDED", cycleId, {
+        experienceId: providerExperience.experienceId,
+        symbol: decision.symbol,
+        positionSide: decision.positionSide ?? "UNKNOWN",
+        action: decision.action,
+        origin: "PROVIDER_EXTERNAL",
+        providerOrderId: executionResult.providerOrderId ?? "UNAVAILABLE",
+        clientOrderId: executionResult.clientOrderId,
+        realizedPnlVerified: String(Boolean(realizedPnl)),
+        entryProvenance: "UNATTRIBUTED_NO_LOCAL_ENTRY",
+      });
+      return {};
+    }
     if (!currentExperience || !executionResult) return {};
     const realizedPnl = isDecimal(executionResult.realizedPnl) ? executionResult.realizedPnl : undefined;
     const historyPnlIsCumulative = executionResult.realizedPnlSource === "POSITION_HISTORY_NET_PROFIT" || executionResult.realizedPnlSource === "POSITION_HISTORY_PNL";
@@ -2424,7 +2496,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (result.repaired) this.recordEventBestEffort("SCHEDULE_RESCHEDULED", "CONTROL", { intervalMinutes: String(intervalMinutes) });
   }
 
-  private recordPositionDiscrepancies(experiences: readonly TradeExperience[], positions: readonly PositionSnapshot[], cycleId: string): string[] {
+  private recordPositionDiscrepancies(experiences: readonly TradeExperience[], positions: readonly PositionSnapshot[], cycleId: string, attributedLivePositionKeys: ReadonlyMap<string, { decisionId: string; providerOrderId: string }> = new Map()): string[] {
     const local = experiences.filter((experience) => experience.outcomeStatus === "OPEN");
     const localKeys = new Set(local.map((experience) => `${experience.symbol}:${experience.positionSide}`));
     const providerKeys = new Set(positions.filter((position) => Number(position.quantity) > 0).map((position) => `${position.symbol}:${position.positionSide}`));
@@ -2442,7 +2514,20 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (!localKeys.has(key)) {
         const code = `LOCAL_EXPERIENCE_MISSING:${key}`;
         discrepancies.push(code);
-        this.recordEvent("POSITION_STATE_DISCREPANCY", cycleId, { code, symbol: position.symbol, positionSide: position.positionSide, experienceId: "NONE", classification: "EXTERNAL_UNATTRIBUTED", origin: "PROVIDER_ONLY" });
+        // Deterministic provider identity (DARWIN order+fill origin joined to the clientOid
+        // that issued them) proves a missing local experience is lost local state, not a
+        // provider-external position. Only fall back to EXTERNAL_UNATTRIBUTED when no such
+        // identity exists, so the audit trail never claims DARWIN positions are external.
+        const attributed = attributedLivePositionKeys.has(key);
+        this.recordEvent("POSITION_STATE_DISCREPANCY", cycleId, {
+          code,
+          symbol: position.symbol,
+          positionSide: position.positionSide,
+          experienceId: "NONE",
+          classification: attributed ? "LOCAL_LIFECYCLE_INCOMPLETE" : "EXTERNAL_UNATTRIBUTED",
+          origin: attributed ? "DARWIN" : "PROVIDER_ONLY",
+          ...(attributed ? { decisionId: attributedLivePositionKeys.get(key)!.decisionId, providerOrderId: attributedLivePositionKeys.get(key)!.providerOrderId } : {}),
+        });
       }
     }
     return discrepancies;

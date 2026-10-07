@@ -93,7 +93,18 @@ export function evaluateRiskGate(config: RuntimeConfig, context: RiskContext): R
   const drawdownIncreasesExposure = ["OPEN_LONG", "OPEN_SHORT", "INCREASE", "REVERSE"].includes(decision.action)
     || context.parentDecision?.action === "REVERSE";
   if (context.dailyDrawdownBlocked && drawdownIncreasesExposure) addCode(codes, "DAILY_DRAWDOWN");
-  if (context.positionDiscrepancies?.some((code) => code === `LOCAL_EXPERIENCE_MISSING:${decision.symbol}:${decision.positionSide ?? "NONE"}` || code === `PROVIDER_POSITION_MISSING:${decision.symbol}:${decision.positionSide ?? "NONE"}`)) addCode(codes, "LOCAL_LIFECYCLE_UNRESOLVED");
+  // A position may be missing local lifecycle state on either side of the join. Only the
+  // provider-external case (live provider position, no local experience) is safe to manage:
+  // CLOSE/REDUCE/HOLD only reduce or observe risk. Anything that increases exposure, or a
+  // reverse whose close leg would leave an opposite-side opening, stays blocked until the
+  // lifecycle is deterministically attributed. Every other gate still applies below.
+  const missingLocalExperience = context.positionDiscrepancies?.includes(`LOCAL_EXPERIENCE_MISSING:${decision.symbol}:${decision.positionSide ?? "NONE"}`) === true;
+  const missingProviderPosition = context.positionDiscrepancies?.includes(`PROVIDER_POSITION_MISSING:${decision.symbol}:${decision.positionSide ?? "NONE"}`) === true;
+  const exposureIncreasing = ["OPEN_LONG", "OPEN_SHORT", "INCREASE", "REVERSE"].includes(decision.action)
+    || context.parentDecision?.action === "REVERSE";
+  const riskReducingOnly = ["CLOSE", "REDUCE", "HOLD"].includes(decision.action) && context.parentDecision?.action !== "REVERSE";
+  if (missingLocalExperience && (!riskReducingOnly || exposureIncreasing)) addCode(codes, "LOCAL_LIFECYCLE_UNRESOLVED");
+  if (missingProviderPosition) addCode(codes, "LOCAL_LIFECYCLE_UNRESOLVED");
   if (decision.action !== "HOLD" && (account.openOrders === null || account.openOrdersReadFailure !== undefined)) addCode(codes, "OPEN_ORDERS_READ_UNAVAILABLE");
   if (decision.action !== "HOLD" && context.unresolvedExecutionSymbols?.includes(decision.symbol)) addCode(codes, "UNRESOLVED_PRIOR_EXECUTION");
   if (decision.action === "HOLD") return { status: codes.length === 0 ? "PASS" : "BLOCK", codes, checkedAt: now.toISOString() };
