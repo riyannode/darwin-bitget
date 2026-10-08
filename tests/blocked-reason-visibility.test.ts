@@ -5,7 +5,7 @@ import { saveExperience, saveJournal } from "../src/storage/store.js";
 import { blockedRiskGateResult } from "../src/storage/journal-normalizer.js";
 import { TraderAgent } from "../src/agent/agent.js";
 import { BitgetClient } from "../src/bitget/client.js";
-import type { DecisionExecutionRecord, EntryDecision, RiskGateResult, TradeExperience, TradingJournal } from "../src/types.js";
+import type { DecisionExecutionRecord, EntryDecision, PositionManagementDecision, RiskGateResult, TradeExperience, TradingJournal } from "../src/types.js";
 
 vi.mock("agents", () => ({ Agent: class {} }));
 
@@ -48,6 +48,14 @@ function decision(decisionId: string, cycleId: string): EntryDecision {
   };
 }
 
+function managementDecision(decisionId: string, cycleId: string, action: "CLOSE" | "REDUCE" = "CLOSE"): PositionManagementDecision {
+  return {
+    ...decision(decisionId, cycleId),
+    action,
+    reductionPct: action === "REDUCE" ? "50" : null,
+  };
+}
+
 function blockedExperience(decisionId: string, overrides: Partial<TradeExperience> = {}): TradeExperience {
   return {
     experienceId: "exp-blocked", symbol: "SAMSUNGUSDT", positionSide: "LONG", action: "OPEN_LONG",
@@ -73,6 +81,17 @@ function blockedJournal(decisionId: string, codes: string[], overrides: Partial<
   };
 }
 
+function journalWithGate(decisionId: string, result: RiskGateResult, cycleId = "cycle-blocked"): TradingJournal {
+  const current = decision(decisionId, cycleId);
+  return {
+    cycleId, agentVersion: "test", model: "test", mode: "AUTONOMOUS",
+    startedAt: AT, completedAt: AT, retrievedLessons: [], createdLessons: [],
+    cyclePlan: { positionActions: [], entryActions: [current] },
+    executionRecords: [{ decision: current, riskGateResult: result }],
+    experienceIds: ["exp-blocked"], experienceId: "exp-blocked",
+  };
+}
+
 async function tradeHistory(executor: SqlExecutor, db: DatabaseSync): Promise<Array<Record<string, unknown>>> {
   const agent = fakeAgent(executor, db) as never;
   const response = await (agent as { onRequest: (request: Request) => Promise<Response> }).onRequest.call(agent, new Request("https://example.test/trade-history?limit=25"));
@@ -81,6 +100,29 @@ async function tradeHistory(executor: SqlExecutor, db: DatabaseSync): Promise<Ar
 }
 
 describe("blocked proposal risk gate reason", () => {
+  it.each(["CLOSE", "REDUCE"] as const)("retrieves a BLOCKED %s decision by exitDecisionId and returns its persisted evaluation", async (action) => {
+    const { db, executor } = memoryExecutor();
+    const decisionId = `dec-blocked-${action.toLowerCase()}`;
+    const codes = ["DAILY_DRAWDOWN", "STALE_EVIDENCE", "MIN_ORDER_AMOUNT"];
+    const management = managementDecision(decisionId, "cycle-management", action);
+    const journal: TradingJournal = {
+      cycleId: "cycle-management", agentVersion: "test", model: "test", mode: "AUTONOMOUS",
+      startedAt: AT, completedAt: AT, retrievedLessons: [], createdLessons: [],
+      cyclePlan: { positionActions: [management], entryActions: [] },
+      executionRecords: [{ decision: management, riskGateResult: { status: "BLOCK", codes, checkedAt: AT } }],
+    };
+    saveJournal(executor, journal);
+    saveExperience(executor, blockedExperience("", {
+      experienceId: `exp-blocked-${action.toLowerCase()}`, action, lastAction: action,
+      entryDecisionId: "", exitDecisionId: decisionId,
+    }), AT);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: AT } as never);
+
+    const [trade] = await tradeHistory(executor, db);
+    expect(trade).toMatchObject({ status: "BLOCKED", action, blockedReasonCodes: codes, riskGateCheckedAt: AT });
+    db.close();
+  });
+
   it("surfaces every persisted gate code on the BLOCKED trade row", async () => {
     const { db, executor } = memoryExecutor();
     const codes = ["DAILY_DRAWDOWN", "STALE_EVIDENCE", "MIN_ORDER_AMOUNT"];
@@ -138,12 +180,57 @@ describe("blocked proposal risk gate reason", () => {
   });
 
   it("refuses attribution when two journals disagree about the same decision", () => {
-    const journalA = blockedJournal("dec-conflict", ["DAILY_DRAWDOWN"]);
-    const journalB: TradingJournal = {
-      ...blockedJournal("dec-conflict", ["MIN_ORDER_AMOUNT"]),
-      cycleId: "cycle-blocked-b",
-    };
+    const journalA = journalWithGate("dec-conflict", { status: "BLOCK", codes: ["DAILY_DRAWDOWN"], checkedAt: AT });
+    const journalB = journalWithGate("dec-conflict", { status: "BLOCK", codes: ["MIN_ORDER_AMOUNT"], checkedAt: AT });
     expect(blockedRiskGateResult(blockedExperience("dec-conflict"), [journalA, journalB])).toBeUndefined();
+  });
+
+  it("rejects PASS and BLOCK evaluations for the same decision identity", () => {
+    const blocked = { status: "BLOCK", codes: ["DAILY_DRAWDOWN"], checkedAt: AT } satisfies RiskGateResult;
+    const passed = { status: "PASS", codes: [], checkedAt: AT } satisfies RiskGateResult;
+    expect(blockedRiskGateResult(blockedExperience("dec-status-conflict"), [
+      journalWithGate("dec-status-conflict", blocked), journalWithGate("dec-status-conflict", passed),
+    ])).toBeUndefined();
+  });
+
+  it("rejects a legacy journal-level PASS conflicting with its execution-record BLOCK", () => {
+    const journal = journalWithGate("dec-internal-conflict", { status: "BLOCK", codes: ["DAILY_DRAWDOWN"], checkedAt: AT });
+    journal.decision = journal.cyclePlan!.entryActions[0]!;
+    journal.riskGateResult = { status: "PASS", codes: [], checkedAt: AT };
+    expect(blockedRiskGateResult(blockedExperience("dec-internal-conflict"), [journal])).toBeUndefined();
+  });
+
+  it("rejects evaluations with conflicting persisted decision identity", () => {
+    const result = { status: "BLOCK", codes: ["DAILY_DRAWDOWN"], checkedAt: AT } satisfies RiskGateResult;
+    const experience = blockedExperience("dec-identity-conflict");
+    expect(blockedRiskGateResult(experience, [
+      journalWithGate("dec-identity-conflict", result, "cycle-identity-a"),
+      journalWithGate("dec-identity-conflict", result, "cycle-identity-b"),
+    ])).toBeUndefined();
+  });
+
+  it("rejects a persisted BLOCK whose decision cycle conflicts with its journal cycle", () => {
+    const journal = journalWithGate("dec-cycle-mismatch", { status: "BLOCK", codes: ["DAILY_DRAWDOWN"], checkedAt: AT });
+    journal.cycleId = "cycle-container-mismatch";
+    expect(blockedRiskGateResult(blockedExperience("dec-cycle-mismatch"), [journal])).toBeUndefined();
+  });
+
+  it("rejects BLOCK evaluations with conflicting evaluation timestamps", () => {
+    const first = { status: "BLOCK", codes: ["DAILY_DRAWDOWN"], checkedAt: AT } satisfies RiskGateResult;
+    const second = { status: "BLOCK", codes: ["DAILY_DRAWDOWN"], checkedAt: "2026-10-08T03:01:00.000Z" } satisfies RiskGateResult;
+    expect(blockedRiskGateResult(blockedExperience("dec-time-conflict"), [
+      journalWithGate("dec-time-conflict", first), journalWithGate("dec-time-conflict", second),
+    ])).toBeUndefined();
+  });
+
+  it("preserves a unique authoritative BLOCK evaluation", () => {
+    const result = { status: "BLOCK", codes: ["DAILY_DRAWDOWN", "STALE_EVIDENCE"], checkedAt: AT } satisfies RiskGateResult;
+    expect(blockedRiskGateResult(blockedExperience("dec-unique"), [journalWithGate("dec-unique", result)])).toEqual(result);
+  });
+
+  it("returns no attribution without a journal or decision identity", () => {
+    expect(blockedRiskGateResult(blockedExperience("dec-absent"), [])).toBeUndefined();
+    expect(blockedRiskGateResult(blockedExperience(""), [journalWithGate("dec-unrelated", { status: "BLOCK", codes: ["DAILY_DRAWDOWN"], checkedAt: AT })])).toBeUndefined();
   });
 
   it("ignores a gate that reported BLOCK with no codes", () => {

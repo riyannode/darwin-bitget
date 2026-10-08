@@ -1800,7 +1800,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const reasoningDecisionIds = [...new Set([
       ...historyDecisionIds.values(),
       ...[...openPositionIdentities.values()].map((identity) => identity.decisionId),
-      ...recentExperiences.map((experience) => experience.entryDecisionId),
+      ...recentExperiences.flatMap((experience) => [experience.entryDecisionId, experience.exitDecisionId]),
     ])];
     const targetedExperiences = loadExperiencesForDecisionIds(this, reasoningDecisionIds, Math.min(reasoningDecisionIds.length, 100), "/api/trade-history");
     const experiencesById = new Map([...recentExperiences, ...targetedExperiences].map((experience) => [experience.experienceId, experience]));
