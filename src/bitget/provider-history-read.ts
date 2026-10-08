@@ -97,7 +97,8 @@ async function readResource(
         if (totalPages >= maxPages) throw new Error("PROVIDER_HISTORY_PAGE_BUDGET_EXCEEDED");
         const params: ProviderLedgerReadParams = {
           category: options.category,
-          ...(resource === "financialRecords" ? {} : { symbol: options.symbol }),
+          // Bitget fill-history is category-wide; the gateway and provider contract do not accept a symbol filter.
+          ...(resource === "financialRecords" || resource === "fills" ? {} : { symbol: options.symbol }),
           startTime: String(window.fromMs),
           endTime: String(window.throughMs),
           limit: String(PAGE_SIZE),
@@ -174,7 +175,30 @@ export async function readBoundedProviderHistory(
 
   for (const resource of resources) {
     const resourceResult = await readResource(client, resource, options, coveredFromMs, throughMs, maxPages, maxRows);
-    result.rows[resource] = resourceResult.rows;
+    if (resource === "fills") {
+      let missingSymbol = false;
+      let invalidSymbol = false;
+      result.rows.fills = resourceResult.rows.filter((row) => {
+        if (!("symbol" in row) || row.symbol === null || row.symbol === undefined) {
+          missingSymbol = true;
+          return false;
+        }
+        if (typeof row.symbol !== "string") {
+          invalidSymbol = true;
+          return false;
+        }
+        const rowSymbol = row.symbol.trim();
+        if (!rowSymbol) {
+          missingSymbol = true;
+          return false;
+        }
+        return rowSymbol.toUpperCase() === options.symbol.toUpperCase();
+      });
+      if (missingSymbol) result.errors.push("fills:PROVIDER_FILL_SYMBOL_MISSING");
+      if (invalidSymbol) result.errors.push("fills:PROVIDER_FILL_SYMBOL_INVALID");
+    } else {
+      result.rows[resource] = resourceResult.rows;
+    }
     result.checkpoints[resource] = resourceResult.checkpoints;
     result.errors.push(...resourceResult.errors);
   }
