@@ -33,6 +33,12 @@ export function subtractDecimal(left: string, right: string): string {
   return decimalText(leftInteger - rightInteger, scale);
 }
 
+export function multiplyDecimal(left: string, right: string): string {
+  const leftValue = parseDecimal(left);
+  const rightValue = parseDecimal(right);
+  return decimalText(leftValue.integer * rightValue.integer, leftValue.scale + rightValue.scale);
+}
+
 export function isDecimal(value: string | undefined): value is string {
   return typeof value === "string" && /^[+-]?\d+(?:\.\d+)?$/.test(value.trim());
 }

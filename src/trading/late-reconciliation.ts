@@ -1,6 +1,8 @@
 import type { DecisionExecutionRecord, PositionContext, PositionSide, PositionSnapshot, TradeExperience } from "../types.js";
-import { compareDecimal, isPositiveDecimal } from "./decimal.js";
+import { addDecimal, compareDecimal, isPositiveDecimal, multiplyDecimal } from "./decimal.js";
 import { upsertPositionContext } from "../agent/position-context.js";
+import { classifyProviderLifecycle, providerWeightedEntryPriceMatches, type ProviderLifecycleEvidence } from "./provider-lifecycle-reconciliation.js";
+import { resolveProviderLifecycleSide } from "./provider-lifecycle-side.js";
 
 const READBACK_ONLY_CODES = new Set(["POSITION_READBACK_UNAVAILABLE", "POSITION_READBACK_MISSING"]);
 
@@ -35,7 +37,10 @@ export interface LateExecutionReconciliationInput {
   record: DecisionExecutionRecord;
   order: ProviderOrderEvidence;
   fill: ProviderFillEvidence;
+  fills?: readonly ProviderFillEvidence[];
   currentPosition: PositionSnapshot;
+  currentPositionLifecycle?: ProviderLifecycleEvidence;
+  allowUnknownProviderExecution?: boolean;
   existingExperience?: TradeExperience;
   existingContext?: PositionContext | null;
   resolvedAt: string;
@@ -154,6 +159,52 @@ export interface ProviderFillEvidenceReadback {
   invalidProviderRowCount: number;
 }
 
+export type ProviderFillAggregation =
+  | { valid: true; fills: ProviderFillEvidence[]; executedQuantity: string; executedValue: string; averageFillPrice: string }
+  | { valid: false; code: "PROVIDER_FILL_SET_EMPTY" | "PROVIDER_FILL_ID_DUPLICATE" | "PROVIDER_FILL_IDENTITY_MISMATCH" | "PROVIDER_FILL_SIDE_MISMATCH" | "PROVIDER_FILL_QUANTITY_MISMATCH" | "PROVIDER_FILL_PRICE_MISMATCH" };
+
+export function aggregateProviderFillEvidence(
+  fills: readonly ProviderFillEvidence[],
+  order: ProviderOrderEvidence,
+  expectedQuantity: string,
+  expectedAveragePrice: string,
+  expectedLifecycleSide: "OPEN" | "CLOSE",
+): ProviderFillAggregation {
+  if (fills.length === 0) return { valid: false, code: "PROVIDER_FILL_SET_EMPTY" };
+  const fillIds = new Set<string>();
+  for (const fill of fills) {
+    if (fillIds.has(fill.fillId)) return { valid: false, code: "PROVIDER_FILL_ID_DUPLICATE" };
+    fillIds.add(fill.fillId);
+    if (fill.orderId !== order.orderId || fill.clientOid !== order.clientOid || fill.symbol !== order.symbol
+      || fill.side !== order.side || fill.positionSide !== order.positionSide) {
+      return { valid: false, code: "PROVIDER_FILL_IDENTITY_MISMATCH" };
+    }
+    if (resolveProviderLifecycleSide(fill.side, fill.positionSide, fill.tradeSide) !== expectedLifecycleSide
+      || resolveProviderLifecycleSide(order.side, order.positionSide, order.tradeSide) !== expectedLifecycleSide) {
+      return { valid: false, code: "PROVIDER_FILL_SIDE_MISMATCH" };
+    }
+  }
+  let executedQuantity: string;
+  let executedValue: string;
+  try {
+    executedQuantity = fills.reduce((sum, fill) => addDecimal(sum, fill.quantity), "0");
+    executedValue = fills.reduce((sum, fill) => addDecimal(sum, multiplyDecimal(fill.quantity, fill.price)), "0");
+  } catch {
+    return { valid: false, code: "PROVIDER_FILL_QUANTITY_MISMATCH" };
+  }
+  if (!isPositiveDecimal(expectedQuantity) || !isPositiveDecimal(order.quantity) || !isPositiveDecimal(order.executedQuantity)
+    || compareDecimal(order.quantity, expectedQuantity) !== 0 || compareDecimal(order.executedQuantity, expectedQuantity) !== 0
+    || compareDecimal(executedQuantity, expectedQuantity) !== 0) {
+    return { valid: false, code: "PROVIDER_FILL_QUANTITY_MISMATCH" };
+  }
+  const weightedFills = fills.map((fill) => ({ quantity: fill.quantity, execPrice: fill.price }));
+  if (!providerWeightedEntryPriceMatches(weightedFills, expectedAveragePrice)
+    || !providerWeightedEntryPriceMatches(weightedFills, order.averageFillPrice)) {
+    return { valid: false, code: "PROVIDER_FILL_PRICE_MISMATCH" };
+  }
+  return { valid: true, fills: [...fills].sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.fillId.localeCompare(right.fillId)), executedQuantity, executedValue, averageFillPrice: expectedAveragePrice };
+}
+
 export function parseProviderFillEvidenceRows(value: unknown): ProviderFillEvidenceReadback {
   const rows = record(value).list;
   if (!Array.isArray(rows)) return { records: [], providerRowCount: 0, invalidProviderRowCount: 0 };
@@ -188,29 +239,54 @@ export function isReadbackOnlyExecutionMismatch(record: DecisionExecutionRecord)
 
 export function reconcileLateExecution(input: LateExecutionReconciliationInput): LateExecutionReconciliationResult {
   const { record, order, fill, currentPosition, existingExperience, existingContext, resolvedAt } = input;
+  const fills = input.fills ?? [fill];
   const decision = record.decision;
   const execution = record.executionResult;
-  if (!execution || !isReadbackOnlyExecutionMismatch(record)) throw new Error("LATE_RECONCILIATION_NOT_ELIGIBLE");
+  const unknownLateExecution = input.allowUnknownProviderExecution === true
+    && execution?.status === "unknown"
+    && record.reconciliationResult?.status === "UNKNOWN"
+    && record.executionRequest?.clientOrderId === execution.clientOrderId
+    && record.executionRequest.symbol === decision.symbol
+    && record.executionRequest.positionSide === decision.positionSide
+    && record.executionRequest.action === decision.action;
+  if (!execution || (!isReadbackOnlyExecutionMismatch(record) && !unknownLateExecution)) throw new Error("LATE_RECONCILIATION_NOT_ELIGIBLE");
   if (decision.action !== "OPEN_LONG" && decision.action !== "OPEN_SHORT") throw new Error("LATE_RECONCILIATION_NOT_OPEN");
   if (!decision.positionSide) throw new Error("LATE_RECONCILIATION_POSITION_SIDE_REQUIRED");
-  if (providerTimestampIso(order.createdAt) !== order.createdAt || providerTimestampIso(fill.createdAt) !== fill.createdAt) throw new Error("LATE_RECONCILIATION_TIMESTAMP_INVALID");
+  if (providerTimestampIso(order.createdAt) !== order.createdAt || fills.some((item) => providerTimestampIso(item.createdAt) !== item.createdAt)) throw new Error("LATE_RECONCILIATION_TIMESTAMP_INVALID");
 
   const expectedClientOid = execution.clientOrderId || record.executionRequest?.clientOrderId;
-  if (!expectedClientOid || order.clientOid !== expectedClientOid || fill.clientOid !== expectedClientOid) throw new Error("LATE_RECONCILIATION_CLIENT_ORDER_MISMATCH");
+  if (!expectedClientOid || order.clientOid !== expectedClientOid || fills.some((item) => item.clientOid !== expectedClientOid)) throw new Error("LATE_RECONCILIATION_CLIENT_ORDER_MISMATCH");
   if (execution.providerOrderId && order.orderId !== execution.providerOrderId) throw new Error("LATE_RECONCILIATION_PROVIDER_ORDER_MISMATCH");
-  if (fill.orderId !== order.orderId) throw new Error("LATE_RECONCILIATION_FILL_ORDER_MISMATCH");
-  if (order.symbol !== decision.symbol || fill.symbol !== decision.symbol || currentPosition.symbol !== decision.symbol) throw new Error("LATE_RECONCILIATION_SYMBOL_MISMATCH");
-  if (order.positionSide !== decision.positionSide || fill.positionSide !== decision.positionSide || currentPosition.positionSide !== decision.positionSide) throw new Error("LATE_RECONCILIATION_SIDE_MISMATCH");
+  if (fills.some((item) => item.orderId !== order.orderId)) throw new Error("LATE_RECONCILIATION_FILL_ORDER_MISMATCH");
+  if (order.symbol !== decision.symbol || fills.some((item) => item.symbol !== decision.symbol) || currentPosition.symbol !== decision.symbol) throw new Error("LATE_RECONCILIATION_SYMBOL_MISMATCH");
+  if (order.positionSide !== decision.positionSide || fills.some((item) => item.positionSide !== decision.positionSide) || currentPosition.positionSide !== decision.positionSide) throw new Error("LATE_RECONCILIATION_SIDE_MISMATCH");
   if (!isPositiveDecimal(currentPosition.quantity)) throw new Error("LATE_RECONCILIATION_POSITION_MISSING");
   if (order.status !== "filled") throw new Error("LATE_RECONCILIATION_ORDER_NOT_FILLED");
-  if (compareDecimal(order.quantity, order.executedQuantity) !== 0) throw new Error("LATE_RECONCILIATION_QUANTITY_MISMATCH");
-  if (compareDecimal(order.executedQuantity, execution.executedQuantity) !== 0 || compareDecimal(fill.quantity, execution.executedQuantity) !== 0) throw new Error("LATE_RECONCILIATION_QUANTITY_MISMATCH");
-  if (compareDecimal(order.executedQuantity, fill.quantity) !== 0) throw new Error("LATE_RECONCILIATION_FILL_QUANTITY_MISMATCH");
-  if (!isPositiveDecimal(order.averageFillPrice) || !isPositiveDecimal(fill.price) || compareDecimal(order.averageFillPrice, fill.price) !== 0) throw new Error("LATE_RECONCILIATION_PRICE_MISMATCH");
-  if (currentPosition.entryPrice && isPositiveDecimal(currentPosition.entryPrice) && compareDecimal(currentPosition.entryPrice, fill.price) !== 0) throw new Error("LATE_RECONCILIATION_POSITION_ENTRY_MISMATCH");
+  const expectedExecutedQuantity = unknownLateExecution ? record.executionRequest!.quantity : execution.executedQuantity;
+  if (compareDecimal(order.quantity, order.executedQuantity) !== 0 || compareDecimal(order.executedQuantity, expectedExecutedQuantity) !== 0) throw new Error("LATE_RECONCILIATION_QUANTITY_MISMATCH");
+  const expectedAveragePrice = execution.averageFillPrice ?? order.averageFillPrice;
+  if (!isPositiveDecimal(order.averageFillPrice) || !isPositiveDecimal(expectedAveragePrice)) throw new Error("LATE_RECONCILIATION_PRICE_MISMATCH");
+  const aggregate = aggregateProviderFillEvidence(fills, order, expectedExecutedQuantity, expectedAveragePrice, "OPEN");
+  if (!aggregate.valid) throw new Error(`LATE_RECONCILIATION_${aggregate.code}`);
   const expectedProviderSide = decision.positionSide === "LONG" ? "buy" : "sell";
-  if (order.side !== expectedProviderSide || fill.side !== expectedProviderSide) throw new Error("LATE_RECONCILIATION_PROVIDER_SIDE_MISMATCH");
-  if (!isOpeningTradeSide(order.tradeSide, decision.positionSide) || !isOpeningTradeSide(fill.tradeSide, decision.positionSide)) throw new Error("LATE_RECONCILIATION_TRADE_SIDE_MISMATCH");
+  if (order.side !== expectedProviderSide || fills.some((item) => item.side !== expectedProviderSide)) throw new Error("LATE_RECONCILIATION_PROVIDER_SIDE_MISMATCH");
+  if (!isOpeningTradeSide(order.tradeSide, decision.positionSide) || fills.some((item) => !isOpeningTradeSide(item.tradeSide, decision.positionSide!))) throw new Error("LATE_RECONCILIATION_TRADE_SIDE_MISMATCH");
+
+  if (input.currentPositionLifecycle) {
+    const lifecycle = input.currentPositionLifecycle;
+    const classification = classifyProviderLifecycle(lifecycle);
+    if (classification.classification !== "MATCHED_OPEN") throw new Error(`LATE_RECONCILIATION_CURRENT_POSITION_${classification.classification}_${classification.reason}`);
+    if (lifecycle.entryIdentity?.entryDecisionId !== decision.decisionId || lifecycle.entryIdentity.clientOid !== expectedClientOid
+      || lifecycle.entryIdentity.providerOrderId !== order.orderId) throw new Error("LATE_RECONCILIATION_CURRENT_POSITION_ENTRY_IDENTITY_MISMATCH");
+    const current = lifecycle.providerPositions.find((item) => item.symbol === currentPosition.symbol && item.positionSide === currentPosition.positionSide);
+    if (!current || compareDecimal(current.quantity, currentPosition.quantity) !== 0
+      || !current.entryPrice || !currentPosition.entryPrice || compareDecimal(current.entryPrice, currentPosition.entryPrice) !== 0) {
+      throw new Error("LATE_RECONCILIATION_CURRENT_POSITION_READBACK_MISMATCH");
+    }
+  } else if (currentPosition.entryPrice && isPositiveDecimal(currentPosition.entryPrice)
+    && compareDecimal(currentPosition.entryPrice, aggregate.averageFillPrice) !== 0) {
+    throw new Error("LATE_RECONCILIATION_POSITION_ENTRY_MISMATCH");
+  }
 
   if (existingExperience?.outcomeStatus === "OPEN" && existingExperience.entryDecisionId === decision.decisionId) {
     if (
@@ -224,18 +300,22 @@ export function reconcileLateExecution(input: LateExecutionReconciliationInput):
       status: "ALREADY_RECONCILED",
       experience: existingExperience,
       positionContext: existingContext,
-      auditMetadata: auditMetadata(record, existingExperience, order, resolvedAt),
+      auditMetadata: { ...auditMetadata(record, existingExperience, order, resolvedAt), fillCount: String(aggregate.fills.length), fillIds: aggregate.fills.map((item) => item.fillId).join(",") },
     };
   }
   if (existingExperience?.outcomeStatus === "OPEN" && existingExperience.entryDecisionId !== decision.decisionId) throw new Error("LATE_RECONCILIATION_CONTRADICTORY_OPEN_LIFECYCLE");
 
-  const experience = buildReconciledExperience(existingExperience, decision, execution, fill, currentPosition);
+  const firstFill = aggregate.fills[0]!;
+  const experience = buildReconciledExperience(existingExperience, decision, execution, firstFill, aggregate.averageFillPrice, aggregate.executedValue);
   const positionContext = upsertPositionContext(existingContext ?? null, decision, resolvedAt, experience);
   if (!positionContext) throw new Error("LATE_RECONCILIATION_CONTEXT_FAILED");
-  return { status: "RECONCILED", experience, positionContext, auditMetadata: auditMetadata(record, experience, order, resolvedAt) };
+  return {
+    status: "RECONCILED", experience, positionContext,
+    auditMetadata: { ...auditMetadata(record, experience, order, resolvedAt), fillCount: String(aggregate.fills.length), fillIds: aggregate.fills.map((item) => item.fillId).join(",") },
+  };
 }
 
-function buildReconciledExperience(existing: TradeExperience | undefined, decision: LateExecutionReconciliationInput["record"]["decision"], execution: NonNullable<DecisionExecutionRecord["executionResult"]>, fill: ProviderFillEvidence, position: PositionSnapshot): TradeExperience {
+function buildReconciledExperience(existing: TradeExperience | undefined, decision: LateExecutionReconciliationInput["record"]["decision"], execution: NonNullable<DecisionExecutionRecord["executionResult"]>, fill: ProviderFillEvidence, aggregateAveragePrice = fill.price, aggregateExecutedValue = execution.positionNotional): TradeExperience {
   const entryTime = fill.createdAt;
   return {
     ...(existing ?? {
@@ -259,15 +339,15 @@ function buildReconciledExperience(existing: TradeExperience | undefined, decisi
     positionSide: decision.positionSide,
     action: decision.action,
     entryDecisionId: decision.decisionId,
-    entryPrice: fill.price,
+    entryPrice: aggregateAveragePrice,
     entryTime,
     exitDecisionId: "",
     exitPrice: "0",
     exitTime: "",
     selectedLeverage: execution.leverage,
     marginAllocationPct: decision.marginAllocationPct,
-    marginAllocated: position.marginAllocated || execution.marginAllocated,
-    positionNotional: position.notional || execution.positionNotional,
+    marginAllocated: execution.marginAllocated,
+    positionNotional: aggregateExecutedValue,
     realizedPnl: "0",
     realizedPnlPct: "0",
     exitThesis: "",

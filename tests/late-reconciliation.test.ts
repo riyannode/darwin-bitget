@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DecisionExecutionRecord, PositionContext, PositionReasoning, PositionSnapshot, TradeExperience } from "../src/types.js";
-import { parseProviderFillEvidence, parseProviderFillEvidenceRows, parseProviderOrderEvidence, parseProviderOrderReadback, reconcileLateExecution } from "../src/trading/late-reconciliation.js";
+import { aggregateProviderFillEvidence, parseProviderFillEvidence, parseProviderFillEvidenceRows, parseProviderOrderEvidence, parseProviderOrderReadback, reconcileLateExecution, type ProviderFillEvidence } from "../src/trading/late-reconciliation.js";
+import type { ProviderLifecycleEvidence } from "../src/trading/provider-lifecycle-reconciliation.js";
 import { emptyPerformance, recordVerifiedOpen } from "../src/trading/performance.js";
 
 const decision = {
@@ -186,6 +187,47 @@ describe("late filled-open reconciliation", () => {
     expect(batch.invalidProviderRowCount).toBe(1);
   });
 
+  it("reconciles the original fill while independently validating a partially reduced, re-increased live position with a different average entry", () => {
+    const original = fill!;
+    const openedAt = original.createdAt;
+    const increaseOrder = { orderId: "increase-order", clientOid: "increase-oid", symbol: "CRCLUSDT", side: "buy" as const, positionSide: "LONG" as const, tradeSide: "open_long", quantity: "20", executedQuantity: "20", averageFillPrice: "68.86012", status: "filled" as const, createdAt: "2026-09-21T06:00:00.000Z" };
+    const reduceOrder = { orderId: "reduce-order", clientOid: "reduce-oid", symbol: "CRCLUSDT", side: "sell" as const, positionSide: "LONG" as const, tradeSide: "close_long", quantity: "26.16", executedQuantity: "26.16", averageFillPrice: "80", status: "filled" as const, createdAt: "2026-09-21T06:10:00.000Z" };
+    const increaseFill: ProviderFillEvidence = { fillId: "increase-fill", orderId: increaseOrder.orderId, clientOid: increaseOrder.clientOid, symbol: "CRCLUSDT", side: "buy", positionSide: "LONG", tradeSide: "open_long", quantity: "20", price: "68.86012", createdAt: increaseOrder.createdAt };
+    const reduceFill: ProviderFillEvidence = { fillId: "reduce-fill", orderId: reduceOrder.orderId, clientOid: reduceOrder.clientOid, symbol: "CRCLUSDT", side: "sell", positionSide: "LONG", tradeSide: "close_long", quantity: "26.16", price: "80", createdAt: reduceOrder.createdAt };
+    const lifecycle: ProviderLifecycleEvidence = {
+      experience: { ...unresolvedExperience, outcomeStatus: "OPEN" },
+      providerPositions: [{ ...position, quantity: "18.38", entryPrice: "81.67", openedAt }],
+      history: null,
+      entryIdentity: { entryDecisionId: decision.decisionId, clientOid: execution.clientOrderId, providerOrderId: execution.providerOrderId },
+      orders: [order!, increaseOrder, reduceOrder].map((item) => ({ providerOrderId: item.orderId, clientOid: item.clientOid, symbol: item.symbol, side: item.side, positionSide: item.positionSide, tradeSide: item.tradeSide, createdAt: item.createdAt, origin: "DARWIN" as const })),
+      fills: [original, increaseFill, reduceFill].map((item) => ({ fillId: item.fillId, providerOrderId: item.orderId, clientOid: item.clientOid, symbol: item.symbol, side: item.side, positionSide: item.positionSide, tradeSide: item.tradeSide, quantity: item.quantity, execPrice: item.price, createdAt: item.createdAt, origin: "DARWIN" as const })),
+      evidenceComplete: true,
+    };
+    const result = reconcileLateExecution(input({
+      currentPosition: { ...position, quantity: "18.38", entryPrice: "81.67" },
+      currentPositionLifecycle: lifecycle,
+      fills: [original, ...[]],
+    }));
+    expect(result.status).toBe("RECONCILED");
+    expect(result.experience.entryPrice).toBe("92.11");
+    expect(result.auditMetadata.providerOrderId).toBe("1485802113215123456");
+    expect(result.auditMetadata.fillIds).toBe("fill-1");
+  });
+
+  it("reconciles a matching late provider execution when the original local execution status is UNKNOWN", () => {
+    const unknownExecution = { ...execution, executedQuantity: "0", status: "unknown" as const };
+    const unknownRecord: DecisionExecutionRecord = {
+      ...record,
+      executionResult: unknownExecution,
+      reconciliationResult: { status: "UNKNOWN", codes: ["EXECUTION_UNKNOWN"], execution: unknownExecution },
+      executionRequest: { cycleId: decision.cycleId, decisionId: decision.decisionId, clientOrderId: execution.clientOrderId, symbol: "CRCLUSDT", action: "OPEN_LONG", positionSide: "LONG", providerSide: "buy", tradeSide: "open", marginAllocated: execution.marginAllocated, leverage: "3", positionNotional: execution.positionNotional, reductionPct: null, quantity: "24.54" },
+    };
+    const { existingExperience: _priorExperience, existingContext: _priorContext, ...unknownInput } = input({ record: unknownRecord, allowUnknownProviderExecution: true });
+    const result = reconcileLateExecution({ ...unknownInput, existingContext: null });
+    expect(result.status).toBe("RECONCILED");
+    expect(result.experience.entryPrice).toBe("92.11");
+  });
+
   it("transitions a provider-filled unresolved open into a usable OPEN lifecycle", () => {
     const result = reconcileLateExecution(input());
     expect(result.status).toBe("RECONCILED");
@@ -320,6 +362,71 @@ describe("late filled-open reconciliation", () => {
 
   it("rejects side mismatch", () => {
     expect(() => reconcileLateExecution(input({ order: { ...order!, positionSide: "SHORT" }, fill: { ...fill!, positionSide: "SHORT" } }))).toThrow("LATE_RECONCILIATION_SIDE_MISMATCH");
+  });
+
+  it("aggregates every partial fill exactly and rejects an identity or side alias mismatch", () => {
+    if (!order) throw new Error("fixture parse failed");
+    const twoFills: ProviderFillEvidence[] = [
+      { fillId: "part-1", orderId: order.orderId, clientOid: order.clientOid, symbol: order.symbol, side: "buy", positionSide: "LONG", tradeSide: "open", quantity: "10", price: "92.11", createdAt: "2026-09-21T05:32:29.336Z" },
+      { fillId: "part-2", orderId: order.orderId, clientOid: order.clientOid, symbol: order.symbol, side: "buy", positionSide: "LONG", tradeSide: "open_long", quantity: "14.54", price: "92.11", createdAt: "2026-09-21T05:32:29.337Z" },
+    ];
+    expect(aggregateProviderFillEvidence(twoFills, order, "24.54", "92.11", "OPEN")).toMatchObject({
+      valid: true, executedQuantity: "24.54", executedValue: "2260.3794", averageFillPrice: "92.11",
+    });
+    expect(aggregateProviderFillEvidence([{ ...twoFills[0]!, clientOid: "wrong-client" }], order, "10", "92.11", "OPEN"))
+      .toMatchObject({ valid: false, code: "PROVIDER_FILL_IDENTITY_MISMATCH" });
+    expect(aggregateProviderFillEvidence([{ ...twoFills[0]!, tradeSide: "open_short" }], order, "10", "92.11", "OPEN"))
+      .toMatchObject({ valid: false, code: "PROVIDER_FILL_SIDE_MISMATCH" });
+    expect(aggregateProviderFillEvidence(twoFills, { ...order, quantity: "25" }, "24.54", "92.11", "OPEN"))
+      .toMatchObject({ valid: false, code: "PROVIDER_FILL_QUANTITY_MISMATCH" });
+  });
+
+  it("reconciles the original OPEN fill separately from a verified changed current quantity and average entry", () => {
+    if (!order) throw new Error("fixture parse failed");
+    const originalFills: ProviderFillEvidence[] = [
+      { fillId: "crcl-open-1", orderId: order.orderId, clientOid: order.clientOid, symbol: order.symbol, side: "buy", positionSide: "LONG", tradeSide: "open_long", quantity: "14", price: "92.11", createdAt: "2026-09-21T05:32:29.336Z" },
+      { fillId: "crcl-open-2", orderId: order.orderId, clientOid: order.clientOid, symbol: order.symbol, side: "buy", positionSide: "LONG", tradeSide: "open", quantity: "10.54", price: "92.11", createdAt: "2026-09-21T05:32:29.337Z" },
+    ];
+    const currentPosition = { ...position, quantity: "18.38", entryPrice: "81.67", openedAt: "2026-09-21T05:32:29.335Z" };
+    const reduce = { providerOrderId: "crcl-reduce", clientOid: "crcl-reduce-oid", symbol: "CRCLUSDT", side: "sell", positionSide: "LONG", tradeSide: "close_long", createdAt: "2026-09-21T05:40:00.000Z", origin: "DARWIN" as const };
+    const increase = { providerOrderId: "crcl-increase", clientOid: "crcl-increase-oid", symbol: "CRCLUSDT", side: "buy", positionSide: "LONG", tradeSide: "open_long", createdAt: "2026-09-21T05:45:00.000Z", origin: "DARWIN" as const };
+    const lifecycle: ProviderLifecycleEvidence = {
+      experience: { ...unresolvedExperience, outcomeStatus: "OPEN", entryTime: "2026-09-21T05:32:29.335Z" },
+      providerPositions: [{ symbol: "CRCLUSDT", positionSide: "LONG", quantity: "18.38", entryPrice: "81.67", openedAt: "2026-09-21T05:32:29.335Z" }],
+      history: null,
+      entryIdentity: { entryDecisionId: decision.decisionId, clientOid: execution.clientOrderId, providerOrderId: execution.providerOrderId },
+      orders: [
+        { providerOrderId: order.orderId, clientOid: order.clientOid, symbol: order.symbol, side: order.side, positionSide: "LONG", tradeSide: "open_long", createdAt: order.createdAt, origin: "DARWIN" },
+        reduce, increase,
+      ],
+      fills: [
+        ...originalFills.map((item) => ({ providerOrderId: item.orderId, clientOid: item.clientOid, symbol: item.symbol, side: item.side, positionSide: item.positionSide, tradeSide: item.tradeSide, quantity: item.quantity, execPrice: item.price, createdAt: item.createdAt, origin: "DARWIN" as const })),
+        { providerOrderId: reduce.providerOrderId, clientOid: reduce.clientOid, symbol: reduce.symbol, side: reduce.side, positionSide: "LONG", tradeSide: reduce.tradeSide, quantity: "20", execPrice: "90", createdAt: reduce.createdAt, origin: "DARWIN" },
+        { providerOrderId: increase.providerOrderId, clientOid: increase.clientOid, symbol: increase.symbol, side: increase.side, positionSide: "LONG", tradeSide: increase.tradeSide, quantity: "13.84", execPrice: "78.24531791907514450867052023", createdAt: increase.createdAt, origin: "DARWIN" },
+      ],
+      evidenceComplete: true,
+    };
+    const result = reconcileLateExecution(input({
+      fill: originalFills[0]!, fills: originalFills, currentPosition, currentPositionLifecycle: lifecycle,
+    }));
+    expect(result.status).toBe("RECONCILED");
+    expect(result.experience).toMatchObject({ entryPrice: "92.11", positionNotional: "2260.3794", outcomeStatus: "OPEN" });
+    expect(result.auditMetadata).toMatchObject({ fillCount: "2", fillIds: "crcl-open-1,crcl-open-2" });
+  });
+
+  it("rejects multi-fill reconciliation when lifecycle coverage is incomplete", () => {
+    if (!order) throw new Error("fixture parse failed");
+    const openingFills: ProviderFillEvidence[] = [
+      { fillId: "part-1", orderId: order.orderId, clientOid: order.clientOid, symbol: order.symbol, side: "buy", positionSide: "LONG", tradeSide: "open_long", quantity: "10", price: "92.11", createdAt: "2026-09-21T05:32:29.336Z" },
+      { fillId: "part-2", orderId: order.orderId, clientOid: order.clientOid, symbol: order.symbol, side: "buy", positionSide: "LONG", tradeSide: "open_long", quantity: "14.54", price: "92.11", createdAt: "2026-09-21T05:32:29.337Z" },
+    ];
+    const incomplete: ProviderLifecycleEvidence = {
+      experience: { ...unresolvedExperience, outcomeStatus: "OPEN" },
+      providerPositions: [{ symbol: position.symbol, positionSide: position.positionSide, quantity: position.quantity, entryPrice: position.entryPrice, openedAt: "2026-09-21T05:32:29.335Z" }],
+      history: null, entryIdentity: null, orders: [], fills: [], evidenceComplete: false,
+    };
+    expect(() => reconcileLateExecution(input({ fill: openingFills[0]!, fills: openingFills, currentPositionLifecycle: incomplete })))
+      .toThrow("LATE_RECONCILIATION_CURRENT_POSITION_UNRESOLVED_PROVIDER_LIFECYCLE_EVIDENCE_TRUNCATED");
   });
 
   it("rejects quantity contradiction", () => {

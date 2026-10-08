@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
 import { loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderLifecycleHistoryCandidateIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, loadProviderPositionHistoryDecisionIds, loadProviderDataRevisions, loadProviderSyncState, saveProviderSyncState } from "../src/storage/provider-ledger.js";
 import { classifyProviderLifecycle } from "../src/trading/provider-lifecycle-reconciliation.js";
-import { hasEvent, loadAllEvents, loadAllExperiences, loadPositionContext, loadProviderLifecyclePerformanceReadModelCache, persistProviderLifecycleRepair, saveEvent, saveExperience, saveJournal, savePositionContext, saveProviderLifecyclePerformanceReadModelCache } from "../src/storage/store.js";
+import { hasEvent, loadAllEvents, loadAllExperiences, loadExecutionQuarantines, loadExecutionQuarantineResolution, loadPositionContext, loadProviderLifecyclePerformanceReadModelCache, persistProviderLifecycleRepair, saveEvent, saveExecutionQuarantine, saveExperience, saveJournal, savePositionContext, saveProviderLifecyclePerformanceReadModelCache } from "../src/storage/store.js";
 import { TraderAgent, resolveProviderTradeFacts } from "../src/agent/agent.js";
 import { BitgetClient } from "../src/bitget/client.js";
 import { PROVIDER_FINANCIAL_CATEGORIES, syncProviderLedger } from "../src/bitget/provider-sync.js";
@@ -2062,6 +2062,37 @@ describe("provider-first financial lifecycle resolution", () => {
       expect(loadAllEvents(executor)).toHaveLength(0);
       db.close();
     }
+  });
+
+  it("commits lifecycle repair, resolution marker, audit event, and exact quarantine clear atomically and idempotently", () => {
+    const { db, executor } = memoryExecutor();
+    const original = openExperience();
+    const context = positionContext();
+    saveExperience(executor, original, OPENED_AT);
+    savePositionContext(executor, context);
+    const identity = { symbol: "SAMSUNGUSDT", decisionId: "reduce-decision", cycleId: "cycle-reduce", clientOrderId: "client-reduce" };
+    saveExecutionQuarantine(executor, { ...identity, reason: "EXECUTION_UNKNOWN", createdAt: CLOSED_AT });
+    const closed = { ...original, outcomeStatus: "PROFITABLE" as const, realizedPnl: "33.19485709", financialSource: "PROVIDER_LEDGER" as const, providerPositionHistoryId: HISTORY_ID };
+    const closedContext = { ...context, lifecycleStatus: "CLOSED" as const, closedProviderPositionHistoryId: HISTORY_ID };
+    const audit = { eventId: `provider-lifecycle-repair:${EXPERIENCE_ID}:${HISTORY_ID}`, type: "PROVIDER_LIFECYCLE_REPAIRED", cycleId: "cycle-entry", createdAt: CLOSED_AT };
+    const resolution = { ...identity, providerOrderId: "provider-reduce", resolvedAt: CLOSED_AT };
+    const clearEvent = { eventId: "execution-quarantine-close-recovery:hash", type: "EXECUTION_QUARANTINE_CLEARED", cycleId: identity.cycleId, createdAt: CLOSED_AT, metadata: { decisionId: identity.decisionId, providerOrderId: resolution.providerOrderId } };
+    expect(() => persistProviderLifecycleRepair(executor, (closure) => transaction(db, () => { closure(); throw new Error("simulated-crash-before-commit"); }), original, context, closed, closedContext, audit, resolution, clearEvent)).toThrow("simulated-crash-before-commit");
+    expect(loadAllExperiences(executor)[0]).toEqual(original);
+    expect(loadPositionContext(executor, "SAMSUNGUSDT", "LONG")).toEqual(context);
+    expect(loadExecutionQuarantines(executor)).toEqual([{ ...identity, reason: "EXECUTION_UNKNOWN", createdAt: CLOSED_AT }]);
+    expect(loadExecutionQuarantineResolution(executor, identity)).toBeNull();
+    expect(loadAllEvents(executor)).toHaveLength(0);
+
+    expect(persistProviderLifecycleRepair(executor, (closure) => transaction(db, closure), original, context, closed, closedContext, audit, resolution, clearEvent)).toBe(true);
+    expect(loadAllExperiences(executor)[0]).toEqual(closed);
+    expect(loadPositionContext(executor, "SAMSUNGUSDT", "LONG")).toEqual(closedContext);
+    expect(loadExecutionQuarantines(executor)).toEqual([]);
+    expect(loadExecutionQuarantineResolution(executor, identity)).toMatchObject({ providerOrderId: "provider-reduce" });
+    expect(loadAllEvents(executor).map((event) => event.type).sort()).toEqual(["EXECUTION_QUARANTINE_CLEARED", "PROVIDER_LIFECYCLE_REPAIRED"]);
+    expect(persistProviderLifecycleRepair(executor, (closure) => transaction(db, closure), original, context, closed, closedContext, audit, resolution, clearEvent)).toBe(false);
+    expect(loadAllEvents(executor)).toHaveLength(2);
+    db.close();
   });
 
   it("rejects a stale competing repair for a different history ID", () => {

@@ -49,6 +49,7 @@ import {
   loadDailyDrawdownState,
   loadExecutionQuarantines,
   loadExecutionQuarantineResolution,
+  loadExecutionQuarantineRecoveryAuditEvents,
   loadExperiences,
   loadExperienceById,
   loadJournalsForExperienceIds,
@@ -80,7 +81,9 @@ import { loadOwnerPolicy, updateOwnerPolicy } from "../trading/policy.js";
 import { buildExecutionClientOrderId, buildExecutionRequest, executePaperOrder } from "../trading/execution.js";
 import { executeCyclePlan } from "../trading/execution-planner.js";
 import { reconcileExecution, isDefinitivelyRejectedExecution } from "../trading/reconcile.js";
-import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal } from "../trading/decimal.js";
+import { readBoundedProviderHistory } from "../bitget/provider-history-read.js";
+import { assessExecutionQuarantineHistory, assessExecutionQuarantineRecoveryReadiness, isCompleteBoundedProviderFillHistory, isExactQuarantineQuantityTransition } from "../trading/execution-quarantine-evidence.js";
+import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal, subtractDecimal } from "../trading/decimal.js";
 import { buildPerformanceAccounting, classifiedWinRate, emptyPerformance, isPerformanceAggregate, migratePerformanceEquityObservations, PERFORMANCE_READ_MODEL_VERSION, POSITION_CONTEXT_READ_MODEL_VERSION, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate, type PerformanceObservation } from "../trading/performance.js";
 import { bootstrapPositionContexts, decisionReasoning, entryReasoning, upsertPositionContext } from "./position-context.js";
 import {
@@ -99,7 +102,7 @@ import {
   UNAVAILABLE_ATTRIBUTE,
   type ProviderLiveIdentity,
 } from "./provider-live-lifecycle.js";
-import { isReadbackOnlyExecutionMismatch, parseProviderFillEvidence, parseProviderFillEvidenceRows, parseProviderOrderEvidence, parseProviderOrderReadback, reconcileLateExecution } from "../trading/late-reconciliation.js";
+import { aggregateProviderFillEvidence, isReadbackOnlyExecutionMismatch, parseProviderFillEvidence, parseProviderFillEvidenceRows, parseProviderOrderEvidence, parseProviderOrderReadback, reconcileLateExecution } from "../trading/late-reconciliation.js";
 import { EvaClient } from "../eva/client.js";
 import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
 import { availableResearchCapabilities } from "../research/capabilities.js";
@@ -108,11 +111,13 @@ import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
 import { buildPositionManagementState, positionContextMatchesLifecycle, positionHistoryReconstructionRequired, positionHistoryRequests, reconstructMaximumFavorableReturnPct, resolvePositionManagementLifecycles } from "../trading/position-management.js";
 import { loadExecutionQuarantineDiagnostics } from "../storage/execution-quarantine-diagnostics.js";
-import { providerLedgerDiagnostics, providerLedgerDiagnosticsBatch, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadRecentProviderPositionHistories, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, providerLivePositionLifecycleKey, loadProviderSyncStates, loadProviderDataRevisions, ProviderLifecycleIdentityLookupError, type ProviderLifecycleEvidenceRequest } from "../storage/provider-ledger.js";
+import { normalizeProviderFill, normalizeProviderOrder, normalizeProviderPositionHistory, providerPage, type ProviderOrigin } from "../bitget/provider-ledger.js";
+import { resolveProviderOrigin, providerLedgerDiagnostics, providerLedgerDiagnosticsBatch, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadRecentProviderPositionHistories, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, providerLivePositionLifecycleKey, loadProviderSyncStates, loadProviderDataRevisions, ProviderLifecycleIdentityLookupError, type ProviderLifecycleEvidenceRequest } from "../storage/provider-ledger.js";
 import { calculateNetPnlSinceBaseline, isFinancialRecordCoverageComplete } from "../trading/external-flow.js";
 import { resolveExternalFlowReadModel } from "../trading/external-flow-read-model.js";
-import { classifyProviderLifecycle, summarizeProviderLifecycleFillQuantities, type ProviderLifecycleClassification, type ProviderLifecycleHistory, type ProviderLifecycleEvidence, type ProviderLifecycleCandidateOrder, type ProviderLifecycleCandidateFill } from "../trading/provider-lifecycle-reconciliation.js";
+import { classifyProviderLifecycle, reconcileProviderLifecycleFinancials, reconstructProviderLifecycleTransitions, summarizeProviderLifecycleFillQuantities, type ProviderLifecycleClassification, type ProviderLifecycleHistory, type ProviderLifecycleEvidence, type ProviderLifecycleFill, type ProviderLifecycleCandidateOrder, type ProviderLifecycleCandidateFill } from "../trading/provider-lifecycle-reconciliation.js";
 import { type ProviderPerformanceLifecycle, type ProviderPerformanceTotals } from "../trading/provider-performance.js";
+import { resolveProviderLifecycleSide } from "../trading/provider-lifecycle-side.js";
 import { ProviderPerformanceMaterializationError, loadProviderPerformanceMaterializationState, providerPerformanceMigrationProgress, resolveProviderPerformanceMaterializedTotals, runProviderPerformanceMigrationBatch, type ProviderPerformanceLifecycleRow, type ProviderPerformanceRevisions } from "../trading/provider-performance-materializer.js";
 import { boundedDiagnosticText, safeDiagnosticMessage } from "../shared/failure-diagnostics.js";
 
@@ -718,6 +723,51 @@ function repairedLifecycleStateIsConsistent(
     && auditEvent.metadata.providerPositionHistoryId === providerPositionHistoryId);
 }
 
+function recoveredQuarantineAuditIsConsistent(
+  record: DecisionExecutionRecord,
+  identity: { symbol: string; cycleId: string; decisionId: string; clientOrderId: string },
+  providerOrderId: string,
+  context: PositionContext | null | undefined,
+  experience: TradeExperience | undefined,
+  audit: ReturnType<typeof loadExecutionQuarantineRecoveryAuditEvents>,
+  repairEvent?: ReturnType<typeof loadEventById>,
+): { evidenceHash: string; providerPositionHistoryId?: string } | null {
+  if (!audit.complete || !context || !experience || experience.symbol !== identity.symbol
+    || experience.positionSide !== record.decision.positionSide || context.experienceId !== experience.experienceId) return null;
+  const clearEvents = audit.cleared.filter((event) => event.metadata?.providerOrderId === providerOrderId);
+  if (audit.cleared.length !== 1 || clearEvents.length !== 1) return null;
+  const cleared = clearEvents[0]!;
+  const evidenceHash = cleared.metadata?.evidenceHash;
+  if (typeof evidenceHash !== "string" || !/^[a-f0-9]{64}$/.test(evidenceHash)
+    || cleared.metadata?.symbol !== identity.symbol
+    || cleared.metadata?.decisionId !== identity.decisionId || cleared.metadata?.clientOrderId !== identity.clientOrderId) return null;
+
+  if (record.decision.action === "OPEN_LONG" || record.decision.action === "OPEN_SHORT") {
+    const reconciled = audit.reconciled.filter((event) => event.metadata?.providerOrderId === providerOrderId);
+    if (audit.reconciled.length !== 1 || experience.entryDecisionId !== identity.decisionId || experience.outcomeStatus !== "OPEN"
+      || context.entryDecisionId !== identity.decisionId || cleared.eventId !== `q-cleared:${evidenceHash}`
+      || cleared.metadata?.code !== "AUTHORITATIVE_LIFECYCLE_RECONCILIATION") return null;
+    const recovery = reconciled[0]!;
+    if (recovery.eventId !== `q-recovery:${evidenceHash}` || recovery.metadata?.originalCycleId !== identity.cycleId
+      || recovery.metadata?.decisionId !== identity.decisionId || recovery.metadata?.clientOrderId !== identity.clientOrderId
+      || recovery.metadata?.evidenceHash !== evidenceHash) return null;
+    return { evidenceHash };
+  }
+
+  if (record.decision.action !== "REDUCE" && record.decision.action !== "CLOSE") return null;
+  if (audit.reconciled.length !== 0) return null;
+  const historyId = cleared.metadata?.providerPositionHistoryId;
+  if (typeof historyId !== "string" || !historyId || cleared.eventId !== `q-close:${evidenceHash}`
+    || cleared.metadata?.resolution !== "AUTHORITATIVE_REDUCE_CLOSE_LIFECYCLE"
+    || context.entryDecisionId !== experience.entryDecisionId || context.closedProviderPositionHistoryId !== historyId
+    || !repairEvent || !repairedLifecycleStateIsConsistent(experience, context, repairEvent, experience.experienceId, historyId)
+    || repairEvent.metadata?.quarantineDecisionId !== identity.decisionId
+    || repairEvent.metadata?.quarantineClientOrderId !== identity.clientOrderId
+    || repairEvent.metadata?.quarantineProviderOrderId !== providerOrderId
+    || repairEvent.metadata?.evidenceHash !== evidenceHash) return null;
+  return { evidenceHash, providerPositionHistoryId: historyId };
+}
+
 export class TraderAgent extends Agent<Env, AgentState> {
   private readonly researchRouter = new ResearchRouter();
   private readonly researchExecutor = new ResearchExecutor();
@@ -904,19 +954,32 @@ export class TraderAgent extends Agent<Env, AgentState> {
           enriched.push({ ...diagnostic, providerPositionReadback, providerReadback: { source: "DIRECT_PROVIDER_READBACK", status: "ORDER_NOT_FOUND_OR_INCOMPLETE", order: null, fills: [], matches: null } });
           continue;
         }
+        const expectedLifecycleSide = diagnostic.executionResult && diagnostic.decision?.positionSide
+          ? resolveProviderLifecycleSide(diagnostic.executionResult.providerSide, diagnostic.decision.positionSide, diagnostic.executionResult.tradeSide)
+          : "UNRESOLVED";
+        const orderLifecycleSide = resolveProviderLifecycleSide(order.side, order.positionSide, order.tradeSide);
         const orderMatches = {
           clientOrderId: order.clientOid === diagnostic.identity.clientOrderId,
-          providerOrderId: providerOrderId ? order.orderId === providerOrderId : null,
+          providerOrderId: providerOrderId ? order.orderId === providerOrderId : Boolean(order.orderId),
           symbol: order.symbol === diagnostic.identity.symbol,
           providerSide: diagnostic.executionResult?.providerSide ? order.side === diagnostic.executionResult.providerSide : null,
           positionSide: diagnostic.decision?.positionSide ? order.positionSide === diagnostic.decision.positionSide : null,
-          tradeSide: diagnostic.executionResult?.tradeSide ? order.tradeSide === diagnostic.executionResult.tradeSide : null,
-          status: diagnostic.executionResult?.status ? order.status === diagnostic.executionResult.status.toLowerCase() : null,
-          executedQuantity: diagnostic.executionResult?.executedQuantity ? decimalEqual(order.executedQuantity, diagnostic.executionResult.executedQuantity) : null,
-          averageFillPrice: diagnostic.executionResult?.averageFillPrice ? decimalEqual(order.averageFillPrice ?? undefined, diagnostic.executionResult.averageFillPrice) : null,
+          tradeSide: expectedLifecycleSide === "UNRESOLVED" || expectedLifecycleSide === "CONTRADICTORY"
+            ? false
+            : orderLifecycleSide === expectedLifecycleSide,
+          normalizedLifecycleSide: orderLifecycleSide,
+          status: diagnostic.executionResult?.status
+            ? diagnostic.executionResult.status === "unknown" ? order.status === "filled" : order.status === diagnostic.executionResult.status.toLowerCase()
+            : null,
+          executedQuantity: diagnostic.executionResult?.status !== "unknown" && diagnostic.executionResult?.executedQuantity
+            ? decimalEqual(order.executedQuantity, diagnostic.executionResult.executedQuantity) : null,
+          averageFillPrice: diagnostic.executionResult?.status !== "unknown" && diagnostic.executionResult?.averageFillPrice
+            ? decimalEqual(order.averageFillPrice ?? undefined, diagnostic.executionResult.averageFillPrice) : null,
         };
         const orderIdentityMatches = [orderMatches.clientOrderId, orderMatches.providerOrderId, orderMatches.symbol, orderMatches.providerSide, orderMatches.positionSide, orderMatches.tradeSide].every((match) => match === true);
-        const orderMatchesExecution = Object.values(orderMatches).every((match) => match === true);
+        const orderMatchesExecution = Object.entries(orderMatches)
+          .filter(([key, match]) => key !== "normalizedLifecycleSide" && match !== null)
+          .every(([, match]) => match === true);
         const rawFills = await client.getFillHistoryRead(order.orderId);
         const fillBatch = parseProviderFillEvidenceRows(rawFills);
         const fills = fillBatch.records;
@@ -926,28 +989,39 @@ export class TraderAgent extends Agent<Env, AgentState> {
         } catch {
           fillQuantityTotal = null;
         }
-        const fillMatches = fills.map((fill) => ({
-          fillId: fill.fillId,
-          clientOrderId: fill.clientOid === diagnostic.identity.clientOrderId,
-          providerOrderId: providerOrderId ? fill.orderId === order.orderId && fill.orderId === providerOrderId : null,
-          symbol: fill.symbol === diagnostic.identity.symbol,
-          providerSide: diagnostic.executionResult?.providerSide ? fill.side === diagnostic.executionResult.providerSide : null,
-          positionSide: diagnostic.decision?.positionSide ? fill.positionSide === diagnostic.decision.positionSide : null,
-          tradeSide: diagnostic.executionResult?.tradeSide ? fill.tradeSide === diagnostic.executionResult.tradeSide : null,
-          matchesQuarantineIdentity: orderIdentityMatches
-            && fill.clientOid === diagnostic.identity.clientOrderId
-            && Boolean(providerOrderId && fill.orderId === providerOrderId)
-            && fill.orderId === order.orderId
-            && fill.symbol === diagnostic.identity.symbol
-            && Boolean(diagnostic.executionResult?.providerSide && fill.side === diagnostic.executionResult.providerSide)
-            && Boolean(diagnostic.decision?.positionSide && fill.positionSide === diagnostic.decision.positionSide)
-            && Boolean(diagnostic.executionResult?.tradeSide && fill.tradeSide === diagnostic.executionResult.tradeSide),
-          quantity: fill.quantity,
-          price: fill.price,
-          createdAt: fill.createdAt,
-        }));
+        const fillMatches = fills.map((fill) => {
+          const fillLifecycleSide = resolveProviderLifecycleSide(fill.side, fill.positionSide, fill.tradeSide);
+          return {
+            fillId: fill.fillId,
+            clientOrderId: fill.clientOid === diagnostic.identity.clientOrderId,
+            providerOrderId: (!providerOrderId || fill.orderId === providerOrderId) && fill.orderId === order.orderId,
+            symbol: fill.symbol === diagnostic.identity.symbol,
+            providerSide: diagnostic.executionResult?.providerSide ? fill.side === diagnostic.executionResult.providerSide : null,
+            positionSide: diagnostic.decision?.positionSide ? fill.positionSide === diagnostic.decision.positionSide : null,
+            tradeSide: expectedLifecycleSide === "UNRESOLVED" || expectedLifecycleSide === "CONTRADICTORY"
+              ? false
+              : fillLifecycleSide === expectedLifecycleSide,
+            normalizedLifecycleSide: fillLifecycleSide,
+            matchesQuarantineIdentity: orderIdentityMatches
+              && fill.clientOid === diagnostic.identity.clientOrderId
+              && (!providerOrderId || fill.orderId === providerOrderId)
+              && fill.orderId === order.orderId
+              && fill.symbol === diagnostic.identity.symbol
+              && Boolean(diagnostic.executionResult?.providerSide && fill.side === diagnostic.executionResult.providerSide)
+              && Boolean(diagnostic.decision?.positionSide && fill.positionSide === diagnostic.decision.positionSide)
+              && expectedLifecycleSide !== "UNRESOLVED" && expectedLifecycleSide !== "CONTRADICTORY"
+              && fillLifecycleSide === expectedLifecycleSide,
+            quantity: fill.quantity,
+            price: fill.price,
+            createdAt: fill.createdAt,
+          };
+        });
         const allProviderFillRowsParsed = fillBatch.providerRowCount > 0 && fillBatch.invalidProviderRowCount === 0 && fills.length === fillBatch.providerRowCount;
         const allFillsMatchExactIdentity = allProviderFillRowsParsed && fillMatches.every((fill) => fill.matchesQuarantineIdentity);
+        const providerOrderEvidence = parseProviderOrderEvidence(rawOrder);
+        const providerLifecycleAggregate = providerOrderEvidence && (orderLifecycleSide === "OPEN" || orderLifecycleSide === "CLOSE")
+          ? aggregateProviderFillEvidence(fills, providerOrderEvidence, providerOrderEvidence.executedQuantity, providerOrderEvidence.averageFillPrice, orderLifecycleSide)
+          : null;
         enriched.push({
           ...diagnostic,
           providerPositionReadback,
@@ -958,19 +1032,35 @@ export class TraderAgent extends Agent<Env, AgentState> {
             fills: fillMatches,
             matches: {
               order: orderMatches,
+              orderMatchesExecution,
               matchingProviderFillRows: fillBatch.providerRowCount,
               invalidMatchingProviderFillRows: fillBatch.invalidProviderRowCount,
               allFillsMatchExactIdentity,
               fillClientOrderIds: fillBatch.providerRowCount > 0 && fillBatch.invalidProviderRowCount === 0 && fills.every((fill) => fill.clientOid === diagnostic.identity.clientOrderId),
-              fillOrderIds: Boolean(providerOrderId) && fillBatch.providerRowCount > 0 && fillBatch.invalidProviderRowCount === 0 && fills.every((fill) => fill.orderId === order.orderId && fill.orderId === providerOrderId),
+              fillOrderIds: !providerOrderId && fillBatch.providerRowCount > 0 && fillBatch.invalidProviderRowCount === 0
+                ? fills.every((fill) => fill.orderId === order.orderId)
+                : Boolean(providerOrderId) && fillBatch.providerRowCount > 0 && fillBatch.invalidProviderRowCount === 0 && fills.every((fill) => fill.orderId === order.orderId && fill.orderId === providerOrderId),
               fillSymbols: fillBatch.providerRowCount > 0 && fillBatch.invalidProviderRowCount === 0 && fills.every((fill) => fill.symbol === diagnostic.identity.symbol),
-              fillSides: fillBatch.providerRowCount > 0 && fillBatch.invalidProviderRowCount === 0 && fills.every((fill) => fill.side === order.side && fill.positionSide === order.positionSide && fill.tradeSide === order.tradeSide),
-              aggregateFillQuantity: allFillsMatchExactIdentity && orderMatchesExecution ? fillQuantityTotal : null,
-              aggregateFillQuantityMatchesExecution: fillBatch.providerRowCount === 0 || !diagnostic.executionResult?.executedQuantity
+              fillSides: fillBatch.providerRowCount > 0 && fillBatch.invalidProviderRowCount === 0 && fills.every((fill) => fill.side === order.side && fill.positionSide === order.positionSide && resolveProviderLifecycleSide(fill.side, fill.positionSide, fill.tradeSide) === orderLifecycleSide),
+              aggregateFillQuantity: allFillsMatchExactIdentity && providerLifecycleAggregate?.valid && fillQuantityTotal !== null ? fillQuantityTotal : null,
+              aggregateFillQuantityMatchesExecution: !diagnostic.executionResult?.executedQuantity || diagnostic.executionResult.status === "unknown"
                 ? null
-                : allFillsMatchExactIdentity && orderMatchesExecution && fillQuantityTotal !== null
+                : allFillsMatchExactIdentity && fillQuantityTotal !== null
                   ? decimalEqual(fillQuantityTotal, diagnostic.executionResult.executedQuantity)
                   : false,
+              aggregateProviderOrder: providerLifecycleAggregate?.valid ? {
+                status: "MATCHED",
+                fillCount: providerLifecycleAggregate.fills.length,
+                fillIds: providerLifecycleAggregate.fills.map((fill) => fill.fillId),
+                executedQuantity: providerLifecycleAggregate.executedQuantity,
+                executedValue: providerLifecycleAggregate.executedValue,
+                weightedAveragePrice: providerLifecycleAggregate.averageFillPrice,
+              } : providerLifecycleAggregate ? { status: "MISMATCH", code: providerLifecycleAggregate.code } : { status: "INCOMPLETE" },
+              aggregateFillWeightedPriceMatchesExecution: diagnostic.executionResult?.averageFillPrice
+                ? providerLifecycleAggregate?.valid === true && decimalEqual(providerLifecycleAggregate.averageFillPrice, diagnostic.executionResult.averageFillPrice)
+                : null,
+              orderTradeSideNormalized: orderLifecycleSide,
+              expectedTradeSideNormalized: expectedLifecycleSide,
             },
           },
         });
@@ -1087,11 +1177,25 @@ export class TraderAgent extends Agent<Env, AgentState> {
       }
       if (body.action === "PAUSE") await this.setPaused(true);
       if (body.action === "EMERGENCY_STOP") await this.setEmergencyStop(true);
+      if (body.action === "DRY_RUN_EXECUTION_QUARANTINE_RECOVERY") {
+        try {
+          return json(await this.dryRunExecutionQuarantineRecovery(body.cycleId, body.decisionId, body.evidenceThrough));
+        } catch (error) {
+          return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "EXECUTION_QUARANTINE_DRY_RUN_FAILED" : "EXECUTION_QUARANTINE_DRY_RUN_FAILED" }, 409);
+        }
+      }
       if (body.action === "RECONCILE_LATE_EXECUTION") {
         try {
-          return json({ reconciliation: await this.reconcileLateExecution(body.cycleId, body.decisionId) });
+          return json({ reconciliation: await this.reconcileLateExecution(body.cycleId, body.decisionId, body.evidenceHash, body.evidenceThrough) });
         } catch (error) {
           return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "LATE_RECONCILIATION_FAILED" : "LATE_RECONCILIATION_FAILED" }, 409);
+        }
+      }
+      if (body.action === "RECOVER_QUARANTINED_CLOSED_EXECUTION") {
+        try {
+          return json({ reconciliation: await this.recoverQuarantinedClosedExecution(body.cycleId, body.decisionId, body.evidenceHash, body.evidenceThrough) });
+        } catch (error) {
+          return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "CLOSED_LIFECYCLE_QUARANTINE_RECOVERY_FAILED" : "CLOSED_LIFECYCLE_QUARANTINE_RECOVERY_FAILED" }, 409);
         }
       }
       if (body.action === "REPAIR_PROVIDER_CLOSED_LIFECYCLE") {
@@ -1587,7 +1691,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     };
   }
 
-  public async repairProviderClosedLifecycle(experienceId: string, providerPositionHistoryId: string): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string; providerPositionHistoryId: string }> {
+  public async repairProviderClosedLifecycle(experienceId: string, providerPositionHistoryId: string, quarantineProof?: { identity: { symbol: string; decisionId: string; cycleId: string; clientOrderId: string }; providerOrderId: string; fillIds: string[]; executedQuantity: string; positionBefore?: string; positionAfter?: string; scannedOrders: Array<{ providerOrderId: string; createdAt: string }>; scannedFills: ProviderLifecycleFillEvidenceRow[]; evidenceHash: string; providerFillFinancials: Array<{ fillId: string; execPnl: string; feeTotal: string }>; providerPositionHistoryEvidence: ProviderLifecycleHistory }): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string; providerPositionHistoryId: string }> {
     if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
     ensureStorageInitialized(this);
     const experience = loadExperienceById(this, experienceId);
@@ -1596,8 +1700,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
     if (experience.financialSource === "PROVIDER_LEDGER" && experience.providerPositionHistoryId === providerPositionHistoryId && experience.outcomeStatus !== "OPEN") {
       const context = experience.positionSide ? loadPositionContext(this, experience.symbol, experience.positionSide) : null;
       const auditEvent = loadEventById(this, eventId);
-      if (!repairedLifecycleStateIsConsistent(experience, context, auditEvent, experienceId, providerPositionHistoryId)) {
-        throw new Error("PROVIDER_LIFECYCLE_REPAIR_STATE_INCONSISTENT");
+      if (!repairedLifecycleStateIsConsistent(experience, context, auditEvent, experienceId, providerPositionHistoryId)) throw new Error("PROVIDER_LIFECYCLE_REPAIR_STATE_INCONSISTENT");
+      if (quarantineProof) {
+        const priorResolution = loadExecutionQuarantineResolution(this, quarantineProof.identity);
+        const active = loadExecutionQuarantines(this).some((item) => item.symbol === quarantineProof.identity.symbol && item.decisionId === quarantineProof.identity.decisionId && item.cycleId === quarantineProof.identity.cycleId && item.clientOrderId === quarantineProof.identity.clientOrderId);
+        if (!priorResolution || priorResolution.providerOrderId !== quarantineProof.providerOrderId || active) throw new Error("EXECUTION_QUARANTINE_REPAIR_STATE_INCONSISTENT");
       }
       return { status: "ALREADY_RECONCILED", experienceId, providerPositionHistoryId };
     }
@@ -1616,6 +1723,48 @@ export class TraderAgent extends Agent<Env, AgentState> {
       throw new ProviderLifecycleClassificationError(reconciliation.classification, reconciliation.reason);
     }
     const history = evidence.history;
+    if (quarantineProof && !providerLifecycleHistoryMatches(history, quarantineProof.providerPositionHistoryEvidence)) throw new Error("CLOSED_LIFECYCLE_DIRECT_POSITION_HISTORY_MISMATCH");
+    const lifecycleFinancialRollup = quarantineProof ? reconcileProviderLifecycleFinancials(history, evidence.fills) : null;
+    if (lifecycleFinancialRollup && !lifecycleFinancialRollup.valid) throw new Error(lifecycleFinancialRollup.code);
+    if (quarantineProof) {
+      const historyStart = Date.parse(history.openingTime);
+      const historyEnd = Date.parse(history.closingTime);
+      const directOrderIds = quarantineProof.scannedOrders.filter((row) => isTimestampWithin(row.createdAt, historyStart, historyEnd)).map((row) => row.providerOrderId).sort();
+      const localOrderIds = evidence.orders.filter((row) => typeof row.createdAt === "string" && isTimestampWithin(row.createdAt, historyStart, historyEnd)).map((row) => row.providerOrderId).sort();
+      const directFills = quarantineProof.scannedFills.filter((row) => isTimestampWithin(row.createdAt, historyStart, historyEnd));
+      const localFills = evidence.fills.filter((row) => isTimestampWithin(row.createdAt, historyStart, historyEnd));
+      if (JSON.stringify(directOrderIds) !== JSON.stringify(localOrderIds) || !providerLifecycleFillsMatch(directFills, localFills)) throw new Error("CLOSED_LIFECYCLE_PROVIDER_LEDGER_COVERAGE_MISMATCH");
+      const qRecord = loadJournalForExactDecisionCycle(this, quarantineProof.identity.cycleId, quarantineProof.identity.decisionId);
+      const qEntry = qRecord && normalizeCycleDecisions(qRecord).records.find((candidate) => candidate.decision.decisionId === quarantineProof.identity.decisionId);
+      if (!qEntry || (qEntry.decision.action !== "REDUCE" && qEntry.decision.action !== "CLOSE") || qEntry.decision.symbol !== experience.symbol || qEntry.decision.positionSide !== experience.positionSide) throw new Error("CLOSED_LIFECYCLE_QUARANTINE_JOURNAL_MISMATCH");
+      const qOrders = evidence.orders.filter((order) => order.providerOrderId === quarantineProof.providerOrderId && order.clientOid === quarantineProof.identity.clientOrderId);
+      if (qOrders.length !== 1 || qOrders[0]?.symbol !== experience.symbol || qOrders[0]?.positionSide !== experience.positionSide || qOrders[0]?.origin !== "DARWIN" || resolveProviderLifecycleSide(qOrders[0].side, qOrders[0].positionSide, qOrders[0].tradeSide) !== "CLOSE") throw new Error("CLOSED_LIFECYCLE_QUARANTINE_ORDER_NOT_IN_LOCAL_LIFECYCLE");
+      const qFillSet = new Set(quarantineProof.fillIds);
+      const qFills = evidence.fills.filter((fill) => fill.fillId && qFillSet.has(fill.fillId));
+      if (qFills.length !== qFillSet.size || qFills.some((fill) => fill.providerOrderId !== quarantineProof.providerOrderId || fill.clientOid !== quarantineProof.identity.clientOrderId || fill.symbol !== experience.symbol || fill.positionSide !== experience.positionSide || fill.origin !== "DARWIN" || resolveProviderLifecycleSide(fill.side, fill.positionSide, fill.tradeSide) !== "CLOSE")) throw new Error("CLOSED_LIFECYCLE_QUARANTINE_FILLS_NOT_IN_LOCAL_LIFECYCLE");
+      const replay = reconstructProviderLifecycleTransitions(evidence);
+      if (!replay.ok) throw new ProviderLifecycleClassificationError(replay.classification, replay.reason);
+      const qTransitions = replay.transitions.filter((transition) => transition.fillId !== null && qFillSet.has(transition.fillId));
+      const qTransitionIndexes = qTransitions.map((transition) => replay.transitions.indexOf(transition));
+      const executedQuantity = qTransitions.reduce((sum, transition) => addDecimal(sum, subtractDecimal(transition.quantityBefore, transition.quantityAfter)), "0");
+      const quarantinePositionBefore = qTransitions[0]?.quantityBefore ?? null;
+      const quarantinePositionAfter = qTransitions.at(-1)?.quantityAfter ?? null;
+      if (qTransitions.length !== qFillSet.size || qTransitions.some((transition) => transition.lifecycleSide !== "CLOSE")
+        || compareDecimal(executedQuantity, quarantineProof.executedQuantity) !== 0
+        || !quarantinePositionBefore || !quarantinePositionAfter
+        || !isExactQuarantineQuantityTransition(quarantinePositionBefore, quarantinePositionAfter, quarantineProof.executedQuantity)
+        || qTransitionIndexes.some((index, offset) => offset > 0 && index !== qTransitionIndexes[offset - 1]! + 1)) {
+        throw new Error("CLOSED_LIFECYCLE_QUARANTINE_QUANTITY_TRANSITION_UNPROVEN");
+      }
+      if (quarantineProof.providerFillFinancials.length !== qFillSet.size || quarantineProof.providerFillFinancials.some((fill) => !qFillSet.has(fill.fillId) || !isDecimal(fill.execPnl) || !isDecimal(fill.feeTotal))) throw new Error("CLOSED_LIFECYCLE_QUARANTINE_FINANCIAL_EVIDENCE_INVALID");
+      const localQFinancials = new Map(qFills.map((fill) => [fill.fillId!, fill]));
+      if (quarantineProof.providerFillFinancials.some((fill) => {
+        const local = localQFinancials.get(fill.fillId);
+        return !local || !providerDecimalEvidenceMatches(fill.execPnl, local.execPnl) || !providerDecimalEvidenceMatches(fill.feeTotal, local.feeTotal);
+      })) throw new Error("CLOSED_LIFECYCLE_QUARANTINE_FINANCIAL_LEDGER_MISMATCH");
+      quarantineProof.positionBefore = quarantinePositionBefore;
+      quarantineProof.positionAfter = quarantinePositionAfter;
+    }
     const closedExperience = providerClosedExperience(experience, history, reconciliation.closedQuantity ?? "");
     const closedContext: PositionContext = {
       ...context,
@@ -1642,9 +1791,18 @@ export class TraderAgent extends Agent<Env, AgentState> {
         closedQuantity: reconciliation.closedQuantity ?? "",
         netProfit: history.netProfit ?? "",
         legacyLocalRealizedPnl: experience.realizedPnl,
+        ...(quarantineProof ? { quarantineDecisionId: quarantineProof.identity.decisionId, quarantineClientOrderId: quarantineProof.identity.clientOrderId, quarantineProviderOrderId: quarantineProof.providerOrderId, quarantineFillIds: JSON.stringify(quarantineProof.fillIds), quarantineExecutedQuantity: quarantineProof.executedQuantity, quarantinePositionBefore: quarantineProof.positionBefore ?? "", quarantinePositionAfter: quarantineProof.positionAfter ?? "", providerFillFinancials: JSON.stringify(quarantineProof.providerFillFinancials), providerLifecycleFinancialRollup: JSON.stringify(lifecycleFinancialRollup), evidenceHash: quarantineProof.evidenceHash } : {}),
       },
     };
-    const written = persistProviderLifecycleRepair(this, (closure) => this.ctx.storage.transactionSync(closure), experience, context, closedExperience, closedContext, event);
+    const quarantineResolution = quarantineProof ? { ...quarantineProof.identity, providerOrderId: quarantineProof.providerOrderId, resolvedAt: createdAt } : undefined;
+    const quarantineClearedEvent = quarantineProof ? {
+      eventId: `q-close:${quarantineProof.evidenceHash}`,
+      type: "EXECUTION_QUARANTINE_CLEARED",
+      cycleId: quarantineProof.identity.cycleId,
+      createdAt,
+      metadata: { ...quarantineProof.identity, providerOrderId: quarantineProof.providerOrderId, providerPositionHistoryId, resolution: "AUTHORITATIVE_REDUCE_CLOSE_LIFECYCLE", evidenceHash: quarantineProof.evidenceHash, executedQuantity: quarantineProof.executedQuantity, positionBefore: quarantineProof.positionBefore ?? "", positionAfter: quarantineProof.positionAfter ?? "", providerFillFinancials: JSON.stringify(quarantineProof.providerFillFinancials), providerLifecycleFinancialRollup: JSON.stringify(lifecycleFinancialRollup), providerNetProfit: history.netProfit ?? "", providerCloseFeeTotal: history.closeFeeTotal ?? "" },
+    } : undefined;
+    const written = persistProviderLifecycleRepair(this, (closure) => this.ctx.storage.transactionSync(closure), experience, context, closedExperience, closedContext, event, quarantineResolution, quarantineClearedEvent);
     if (!written) {
       const latest = loadExperienceById(this, experienceId);
       const latestContext = latest?.positionSide ? loadPositionContext(this, latest.symbol, latest.positionSide) : null;
@@ -1657,13 +1815,446 @@ export class TraderAgent extends Agent<Env, AgentState> {
     return { status: "RECONCILED", experienceId, providerPositionHistoryId };
   }
 
-  public async reconcileLateExecution(originalCycleId: string, decisionId: string): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string }> {
-    if (!this.state.paused) throw new Error("AGENT_MUST_BE_PAUSED");
+  public async dryRunExecutionQuarantineRecovery(originalCycleId: string, decisionId: string, throughInput?: string): Promise<Record<string, unknown>> {
+    if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
+    ensureStorageInitialized(this);
+    const journal = loadJournalForExactDecisionCycle(this, originalCycleId, decisionId);
+    if (!journal) throw new Error("EXECUTION_QUARANTINE_CYCLE_NOT_FOUND");
+    const record = normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === decisionId);
+    if (!record) throw new Error("EXECUTION_QUARANTINE_DECISION_NOT_FOUND");
+    const request = record.executionRequest;
+    const execution = record.executionResult;
+    const symbol = record.decision.symbol;
+    const positionSide = request?.positionSide ?? record.decision.positionSide;
+    const clientOrderId = request?.clientOrderId ?? execution?.clientOrderId;
+    if (!positionSide || !clientOrderId) throw new Error("EXECUTION_QUARANTINE_IDENTITY_INCOMPLETE");
+    const config = loadConfig(this.env, this.ensureActivePolicy());
+    const quarantine = loadExecutionQuarantineDiagnostics(this, [symbol], config.bitgetCategory)
+      .find((candidate) => candidate.identity.cycleId === originalCycleId
+        && candidate.identity.decisionId === decisionId
+        && candidate.identity.clientOrderId === clientOrderId);
+    if (!quarantine) {
+      const identity = { symbol, cycleId: originalCycleId, decisionId, clientOrderId };
+      const resolution = loadExecutionQuarantineResolution(this, identity);
+      const stillActive = loadExecutionQuarantines(this).some((item) => item.symbol === symbol && item.cycleId === originalCycleId && item.decisionId === decisionId && item.clientOrderId === clientOrderId);
+      if (resolution && !stillActive) {
+        const positionContext = positionSide ? loadPositionContext(this, symbol, positionSide) : null;
+        const recoveredExperience = positionContext?.experienceId ? loadExperienceById(this, positionContext.experienceId) : undefined;
+        const recoveryAudit = loadExecutionQuarantineRecoveryAuditEvents(this, identity);
+        const historyId = positionContext?.closedProviderPositionHistoryId;
+        const repairEvent = historyId && positionContext?.experienceId
+          ? loadEventById(this, providerLifecycleRepairEventId(positionContext.experienceId, historyId))
+          : undefined;
+        const recovered = recoveredQuarantineAuditIsConsistent(record, identity, resolution.providerOrderId, positionContext ?? undefined, recoveredExperience ?? undefined, recoveryAudit, repairEvent);
+        if (!recovered) throw new Error("EXECUTION_QUARANTINE_RESOLUTION_STATE_INCONSISTENT");
+        return { status: "ALREADY_RECOVERED", recoveryEligible: false, identity, evidenceHash: recovered.evidenceHash, experienceId: recoveredExperience?.experienceId ?? null, providerPositionHistoryId: recovered.providerPositionHistoryId ?? null, resolution };
+      }
+      throw new Error(resolution ? "EXECUTION_QUARANTINE_RESOLUTION_STATE_INCONSISTENT" : "EXECUTION_QUARANTINE_NOT_ACTIVE");
+    }
+
+    const experiences = loadAllExperiences(this, "execution_quarantine_recovery", "execution_quarantine_recovery_experiences");
+    const localExperience = experiences.find((candidate) => candidate.entryDecisionId === decisionId && candidate.symbol === symbol && candidate.positionSide === positionSide);
+    const context = loadPositionContext(this, symbol, positionSide);
+    const contextExperience = context?.experienceId ? loadExperienceById(this, context.experienceId) : undefined;
+    const startCandidates = [execution?.submittedAt, localExperience?.entryTime, contextExperience?.entryTime]
+      .filter((value): value is string => typeof value === "string" && Number.isFinite(Date.parse(value)));
+    const createdAt = record.decision.createdAt;
+    if (Number.isFinite(Date.parse(createdAt))) startCandidates.push(createdAt);
+    if (startCandidates.length === 0) throw new Error("EXECUTION_QUARANTINE_HISTORY_START_MISSING");
+    const from = new Date(Math.min(...startCandidates.map((value) => Date.parse(value)))).toISOString();
+    const now = new Date();
+    const through = throughInput ? new Date(throughInput) : now;
+    if (!Number.isFinite(through.getTime()) || through.getTime() > now.getTime() || through.getTime() < Date.parse(from)) throw new Error("EXECUTION_QUARANTINE_HISTORY_WINDOW_INVALID");
+    const history = await readBoundedProviderHistory(new BitgetClient(config), {
+      category: config.bitgetCategory,
+      symbol,
+      from,
+      through: through.toISOString(),
+      now,
+      maxPages: 24,
+      maxRows: 2_400,
+    });
+
+    let directOrder: ReturnType<typeof parseProviderOrderReadback> = null;
+    let directOrderRead = "NOT_ATTEMPTED";
+    try {
+      const raw = await new BitgetClient(config).getOrderDetailsRead(execution?.providerOrderId, clientOrderId);
+      directOrder = parseProviderOrderReadback(raw);
+      directOrderRead = directOrder ? "FOUND" : "UNPARSEABLE";
+    } catch (error) {
+      directOrderRead = providerReadFailureCode(error);
+    }
+    const parsedHistoryOrders = history.rows.orders.map((row) => parseProviderOrderReadback(row));
+    const invalidOrderRows = parsedHistoryOrders.filter((candidate) => candidate === null).length;
+    const ordersById = new Map<string, NonNullable<ReturnType<typeof parseProviderOrderReadback>>>();
+    for (const candidate of [...parsedHistoryOrders, directOrder]) {
+      if (!candidate) continue;
+      const prior = ordersById.get(candidate.orderId);
+      if (prior && JSON.stringify(prior) !== JSON.stringify(candidate)) throw new Error("EXECUTION_QUARANTINE_PROVIDER_ORDER_READBACK_CONFLICT");
+      ordersById.set(candidate.orderId, candidate);
+    }
+    const parsedFills = parseProviderFillEvidenceRows({ list: history.rows.fills });
+    const historyFillFinancials = new Map<string, { execPnl: string | null; feeTotal: string | null }>();
+    for (const row of history.rows.fills) {
+      const normalized = normalizeProviderFill({ ...row, category: config.bitgetCategory }, "UNATTRIBUTED", through.toISOString());
+      if (normalized) historyFillFinancials.set(normalized.execId, { execPnl: normalized.execPnl, feeTotal: normalized.feeTotal });
+    }
+    const invalidFillRows = parsedFills.invalidProviderRowCount;
+    const expectedLifecycleSide = request
+      ? resolveProviderLifecycleSide(request.providerSide, request.positionSide, request.tradeSide)
+      : execution && positionSide
+        ? resolveProviderLifecycleSide(execution.providerSide, positionSide, execution.tradeSide)
+        : "UNRESOLVED";
+    if (expectedLifecycleSide !== "OPEN" && expectedLifecycleSide !== "CLOSE") throw new Error("EXECUTION_QUARANTINE_TRADE_SIDE_INVALID");
+    const expectedQuantity = execution?.status === "filled" ? execution.executedQuantity : request?.quantity;
+    const expectedAveragePrice = execution?.status === "filled" ? execution.averageFillPrice : undefined;
+    const historyComplete = history.status === "COMPLETE" && invalidOrderRows === 0 && invalidFillRows === 0;
+    const assessment = assessExecutionQuarantineHistory({
+      identity: {
+        symbol,
+        clientOrderId,
+        ...(execution?.providerOrderId ? { providerOrderId: execution.providerOrderId } : {}),
+        positionSide,
+        lifecycleSide: expectedLifecycleSide,
+        ...(expectedQuantity ? { expectedQuantity } : {}),
+        ...(expectedAveragePrice ? { expectedAveragePrice } : {}),
+      },
+      orders: [...ordersById.values()],
+      fills: parsedFills.records,
+      historyComplete,
+      directOrderLookup: directOrderRead === "FOUND" ? "FOUND" : directOrderRead === "PROVIDER_NOT_FOUND" ? "PROVIDER_NOT_FOUND" : directOrderRead === "UNPARSEABLE" ? "UNPARSEABLE" : "TRANSIENT_FAILURE",
+      submittedAt: execution?.submittedAt ?? createdAt,
+      observedAt: through.toISOString(),
+    });
+
+    let portfolioRead: Record<string, unknown>;
+    let portfolioPositions: PositionSnapshot[] = [];
+    let currentPosition: Record<string, unknown> | null = null;
+    try {
+      const portfolio = await new BitgetClient(config).getDashboardPortfolio();
+      portfolioPositions = portfolio.positions;
+      const position = portfolio.positions.find((candidate) => candidate.symbol === symbol && candidate.positionSide === positionSide);
+      currentPosition = position ? {
+        symbol: position.symbol,
+        positionSide: position.positionSide,
+        quantity: position.quantity,
+        entryPrice: position.entryPrice,
+        openedAt: position.openedAt ?? null,
+      } : null;
+      portfolioRead = { status: "OK", observedAt: portfolio.observedAt };
+    } catch (error) {
+      portfolioRead = { status: "READ_ERROR", code: providerReadFailureCode(error) };
+    }
+    const idem = this.sql<{ client_order_id: string; provider_order_id: string | null; created_at: string }>`
+      SELECT client_order_id, provider_order_id, created_at FROM idempotency
+      WHERE decision_id = ${decisionId} ORDER BY created_at, client_order_id LIMIT 2
+    `;
+    const hashRows = (rows: Record<string, unknown>[]) => [...rows].sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+    const hashInput = JSON.stringify({
+      identity: quarantine.identity,
+      from,
+      through: through.toISOString(),
+      checkpoints: history.checkpoints,
+      historyRows: {
+        orders: hashRows(history.rows.orders),
+        fills: hashRows(history.rows.fills),
+        positionHistory: hashRows(history.rows.positionHistory),
+        financialRecords: hashRows(history.rows.financialRecords),
+      },
+      directOrderRead,
+      orders: [...ordersById.values()].sort((left, right) => left.orderId.localeCompare(right.orderId)),
+      fills: parsedFills.records.sort((left, right) => left.fillId.localeCompare(right.fillId)),
+      assessment: { status: assessment.status, reason: assessment.reason },
+      portfolioRead: { status: portfolioRead.status, code: portfolioRead.code ?? null },
+      currentPosition,
+      idempotency: idem,
+    });
+    const hashBytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(hashInput));
+    const evidenceHash = [...new Uint8Array(hashBytes)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const exactHistory = history.rows.positionHistory.filter((row) => String(row.symbol ?? "") === symbol
+      && String(row.posSide ?? row.positionSide ?? "").toUpperCase() === positionSide);
+    const positionHistoryEvidence = exactHistory.flatMap((row) => {
+      const normalized = normalizeProviderPositionHistory(row, through.toISOString(), "UNATTRIBUTED");
+      if (!normalized?.providerPositionHistoryId) return [];
+      return [{
+        providerPositionHistoryId: normalized.providerPositionHistoryId,
+        symbol: normalized.symbol,
+        positionSide: normalized.positionSide,
+        openingTime: normalized.openingTime,
+        closingTime: normalized.closingTime,
+        openTotalPos: normalized.openTotalPos,
+        closeTotalPos: normalized.closeTotalPos,
+        avgEntryPrice: normalized.avgEntryPrice,
+        avgExitPrice: normalized.avgExitPrice,
+        cumRealisedPnl: normalized.cumRealisedPnl,
+        netProfit: normalized.netProfit,
+        openFeeTotal: normalized.openFeeTotal,
+        closeFeeTotal: normalized.closeFeeTotal,
+        totalFunding: normalized.totalFunding,
+        cashDividend: normalized.cashDividend,
+        origin: "UNATTRIBUTED",
+      } satisfies ProviderLifecycleHistory];
+    });
+    const exactFinancialRows = history.rows.financialRecords.filter((row) => String(row.orderId ?? row.order_id ?? "") === (assessment.order?.orderId ?? "")
+      || String(row.clientOid ?? row.client_oid ?? "") === clientOrderId);
+    const isOpenAction = record.decision.action === "OPEN_LONG" || record.decision.action === "OPEN_SHORT";
+    const isClosedAction = record.decision.action === "REDUCE" || record.decision.action === "CLOSE";
+    let lifecycleClassification: ProviderLifecycleClassification | "UNRESOLVED" = "UNRESOLVED";
+    let lifecycleReason = "PROVIDER_LIFECYCLE_NOT_CLASSIFIED";
+    let lifecycleEvidenceComplete = false;
+    let lifecycleCoverageMatches = false;
+    if (portfolioRead.status === "OK" && historyComplete && (isOpenAction || isClosedAction)) {
+      try {
+        const lifecycleExperience = isOpenAction
+          ? localExperience ?? (currentPosition ? providerLiveProbeExperience(portfolioPositions.find((position) => position.symbol === symbol && position.positionSide === positionSide)!, decisionId) : undefined)
+          : contextExperience;
+        if (lifecycleExperience) {
+          let lifecycleHistoryId = "";
+          let directPositionHistoryMatches = isOpenAction;
+          if (isClosedAction) {
+            const localHistories = loadProviderPositionHistories(this, config.bitgetCategory, 500)
+              .filter((candidate) => candidate.symbol === symbol && candidate.positionSide === positionSide && isNearTimestamp(candidate.openingTime, lifecycleExperience.entryTime));
+            const localHistory = localHistories.length === 1 ? localHistories[0] : undefined;
+            const directMatches = localHistory?.providerPositionHistoryId
+              ? positionHistoryEvidence.filter((candidate) => candidate.providerPositionHistoryId === localHistory.providerPositionHistoryId)
+              : [];
+            lifecycleHistoryId = localHistory?.providerPositionHistoryId ?? "";
+            directPositionHistoryMatches = Boolean(localHistory && directMatches.length === 1 && providerLifecycleHistoryMatches(localHistory, directMatches[0]!));
+          }
+          const lifecycleEvidence = loadProviderLifecycleEvidence(
+            this,
+            lifecycleExperience,
+            config.bitgetCategory,
+            lifecycleHistoryId,
+            portfolioPositions,
+            context ? deterministicEntryIdentity(lifecycleExperience, context) : { entryDecisionId: lifecycleExperience.entryDecisionId, clientOid: clientOrderId },
+          );
+          const lifecycleResult = classifyProviderLifecycle(lifecycleEvidence);
+          lifecycleClassification = lifecycleResult.classification;
+          lifecycleReason = lifecycleResult.reason;
+          const currentLifecycleStart = isOpenAction
+            ? Date.parse(portfolioPositions.find((position) => position.symbol === symbol && position.positionSide === positionSide)?.openedAt ?? "")
+            : Date.parse(lifecycleExperience.entryTime);
+          const lifecycleStart = currentLifecycleStart;
+          const lifecycleEnd = through.getTime();
+          const directOrderIds = parsedHistoryOrders.filter((candidate) => candidate !== null && candidate.symbol === symbol
+            && candidate.positionSide === positionSide && isTimestampWithin(candidate.createdAt, lifecycleStart - 5_000, lifecycleEnd))
+            .map((candidate) => candidate!.orderId).sort();
+          const localOrderIds = lifecycleEvidence.orders.filter((candidate) => isTimestampWithin(candidate.createdAt ?? "", lifecycleStart - 5_000, lifecycleEnd))
+            .map((candidate) => candidate.providerOrderId).sort();
+          const directFills = parsedFills.records.filter((candidate) => candidate.symbol === symbol && candidate.positionSide?.toUpperCase() === positionSide
+            && isTimestampWithin(candidate.createdAt, lifecycleStart - 5_000, lifecycleEnd)).map((candidate) => ({
+              fillId: candidate.fillId,
+              providerOrderId: candidate.orderId,
+              clientOid: candidate.clientOid,
+              symbol: candidate.symbol,
+              side: candidate.side,
+              positionSide: candidate.positionSide,
+              tradeSide: candidate.tradeSide,
+              quantity: candidate.quantity,
+              execPrice: candidate.price,
+              execPnl: historyFillFinancials.get(candidate.fillId)?.execPnl ?? null,
+              feeTotal: historyFillFinancials.get(candidate.fillId)?.feeTotal ?? null,
+              createdAt: candidate.createdAt,
+              origin: "UNATTRIBUTED" as const,
+            }));
+          const localFills = lifecycleEvidence.fills.filter((candidate) => isTimestampWithin(candidate.createdAt, lifecycleStart - 5_000, lifecycleEnd));
+          lifecycleCoverageMatches = JSON.stringify(directOrderIds) === JSON.stringify(localOrderIds)
+            && providerLifecycleFillsMatch(directFills, localFills)
+            && directPositionHistoryMatches;
+          lifecycleEvidenceComplete = lifecycleEvidence.evidenceComplete !== false && lifecycleCoverageMatches;
+        }
+      } catch {
+        lifecycleClassification = "UNRESOLVED";
+        lifecycleReason = "LOCAL_PROVIDER_LIFECYCLE_RECONSTRUCTION_FAILED";
+        lifecycleEvidenceComplete = false;
+        lifecycleCoverageMatches = false;
+      }
+    }
+    const unknownLateExecution = execution?.status === "unknown"
+      && record.reconciliationResult?.status === "UNKNOWN"
+      && isOpenAction
+      && request?.clientOrderId === execution.clientOrderId
+      && request.symbol === symbol
+      && request.positionSide === positionSide
+      && request.action === record.decision.action;
+    const actionSpecificRequirementsMet = isOpenAction
+      ? Boolean(execution && (isReadbackOnlyExecutionMismatch(record) || unknownLateExecution))
+      : isClosedAction
+        && Boolean(request && request.clientOrderId === clientOrderId && request.positionSide === positionSide
+          && context && contextExperience?.outcomeStatus === "OPEN"
+          && context.entryDecisionId === contextExperience.entryDecisionId
+          && context.experienceId === contextExperience.experienceId);
+    const readiness = assessExecutionQuarantineRecoveryReadiness({
+      action: record.decision.action,
+      identityExact: quarantine.identity.symbol === symbol && quarantine.identity.cycleId === originalCycleId
+        && quarantine.identity.decisionId === decisionId && quarantine.identity.clientOrderId === clientOrderId,
+      historyComplete,
+      orderFound: directOrderRead === "FOUND" && assessment.status === "FOUND_EXACT",
+      fillsComplete: assessment.status === "FOUND_EXACT" && assessment.aggregate?.valid === true,
+      lifecycleClassification,
+      lifecycleEvidenceComplete,
+      actionSpecificRequirementsMet,
+      currentPositionRead: portfolioRead.status === "OK" ? "OK" : "ERROR",
+      currentPositionPresent: currentPosition !== null,
+      currentPositionUnchanged: lifecycleCoverageMatches,
+    });
+    const recoveryBlockers = [...new Set([
+      ...(!historyComplete ? history.errors[0] ? [history.errors[0]] : [] : []),
+      ...(assessment.status !== "FOUND_EXACT" ? [assessment.reason] : []),
+      ...readiness.blockers,
+    ])];
+    const recoveryBlocker = recoveryBlockers[0] ?? null;
+    return {
+      status: "DRY_RUN",
+      mode: "READ_ONLY",
+      recoveryEligible: readiness.recoveryEligible,
+      recoveryBlocker,
+      recoveryBlockers,
+      lifecycleClassification,
+      lifecycleReason,
+      evidenceHash,
+      evidenceThrough: through.toISOString(),
+      identity: quarantine.identity,
+      journal: { action: record.decision.action, executionStatus: execution?.status ?? null, reconciliation: record.reconciliationResult?.status ?? null },
+      directOrderRead,
+      providerHistory: {
+        status: historyComplete ? "COMPLETE" : "INCOMPLETE",
+        requestedFrom: history.requestedFrom,
+        requestedThrough: history.requestedThrough,
+        coveredFrom: history.coveredFrom,
+        coveredThrough: history.coveredThrough,
+        withinProviderRetention: history.withinProviderRetention,
+        checkpoints: history.checkpoints,
+        errors: history.errors,
+        parsedOrderRows: parsedHistoryOrders.length - invalidOrderRows,
+        invalidOrderRows,
+        parsedFillRows: parsedFills.records.length,
+        invalidFillRows,
+        matchingPositionHistoryRows: exactHistory.length,
+        positionHistoryEvidence,
+        matchingFinancialRows: exactFinancialRows.length,
+      },
+      orderSearch: {
+        status: assessment.status,
+        reason: assessment.reason,
+        authoritativeNotFound: assessment.authoritativeNotFound,
+        order: assessment.order ? {
+          providerOrderId: assessment.order.orderId,
+          clientOrderId: assessment.order.clientOid,
+          symbol: assessment.order.symbol,
+          side: assessment.order.side,
+          positionSide: assessment.order.positionSide,
+          tradeSide: assessment.order.tradeSide,
+          quantity: assessment.order.quantity,
+          executedQuantity: assessment.order.executedQuantity,
+          averageFillPrice: assessment.order.averageFillPrice,
+          status: assessment.order.status,
+          createdAt: assessment.order.createdAt,
+        } : null,
+        fills: assessment.fills.map((fill) => ({ fillId: fill.fillId, providerOrderId: fill.orderId, clientOrderId: fill.clientOid, quantity: fill.quantity, price: fill.price, side: fill.side, positionSide: fill.positionSide, tradeSide: fill.tradeSide, createdAt: fill.createdAt })),
+        aggregate: assessment.aggregate,
+      },
+      lifecycleEvidence: {
+        orders: parsedHistoryOrders.filter((order): order is NonNullable<typeof order> => order !== null && order.symbol === symbol && order.positionSide === positionSide).map((order) => ({ providerOrderId: order.orderId, createdAt: order.createdAt })).sort((left, right) => left.providerOrderId.localeCompare(right.providerOrderId)),
+        fills: parsedFills.records.filter((fill) => fill.symbol === symbol && fill.positionSide?.toUpperCase() === positionSide).map((fill) => ({ fillId: fill.fillId, providerOrderId: fill.orderId, clientOid: fill.clientOid, symbol: fill.symbol, side: fill.side, positionSide: fill.positionSide, tradeSide: fill.tradeSide, quantity: fill.quantity, execPrice: fill.price, execPnl: historyFillFinancials.get(fill.fillId)?.execPnl ?? null, feeTotal: historyFillFinancials.get(fill.fillId)?.feeTotal ?? null, createdAt: fill.createdAt })).sort((left, right) => left.fillId.localeCompare(right.fillId)),
+      },
+      currentPosition: { read: portfolioRead, position: currentPosition },
+      localContext: {
+        experienceId: localExperience?.experienceId ?? null,
+        experienceStatus: localExperience?.outcomeStatus ?? null,
+        entryDecisionId: localExperience?.entryDecisionId ?? null,
+        contextEntryDecisionId: context?.entryDecisionId ?? null,
+        idempotency: idem,
+        providerLedger: {
+          orders: quarantine.providerLedger.orders,
+          fills: quarantine.providerLedger.fills,
+        },
+      },
+    };
+  }
+
+  public async recoverQuarantinedClosedExecution(originalCycleId: string, decisionId: string, evidenceHash: string, evidenceThrough: string): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string; providerPositionHistoryId: string }> {
+    if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
+    const dryRun = await this.dryRunExecutionQuarantineRecovery(originalCycleId, decisionId, evidenceThrough);
+    if (dryRun.status === "ALREADY_RECOVERED") {
+      if (dryRun.evidenceHash !== evidenceHash) throw new Error("EXECUTION_QUARANTINE_EVIDENCE_CHANGED_REDRY_RUN_REQUIRED");
+      return { status: "ALREADY_RECONCILED", experienceId: String(dryRun.experienceId ?? ""), providerPositionHistoryId: String(dryRun.providerPositionHistoryId ?? "") };
+    }
+    if (dryRun.evidenceHash !== evidenceHash) throw new Error("EXECUTION_QUARANTINE_EVIDENCE_CHANGED_REDRY_RUN_REQUIRED");
+    if (dryRun.recoveryEligible !== true) throw new Error("EXECUTION_QUARANTINE_RECOVERY_NOT_ELIGIBLE");
+    if (dryRun.status !== "DRY_RUN" || dryRun.directOrderRead !== "FOUND" || (dryRun.orderSearch as { status?: string } | undefined)?.status !== "FOUND_EXACT") throw new Error("EXECUTION_QUARANTINE_PROVIDER_EVIDENCE_NOT_READY");
+    const historyCoverage = dryRun.providerHistory as { status?: string } | undefined;
+    const positionRead = dryRun.currentPosition as { read?: { status?: string }; position?: unknown } | undefined;
+    if (historyCoverage?.status !== "COMPLETE" || positionRead?.read?.status !== "OK" || positionRead.position !== null) throw new Error("CLOSED_LIFECYCLE_PROVIDER_COVERAGE_INCOMPLETE");
+    const journal = loadJournalForExactDecisionCycle(this, originalCycleId, decisionId);
+    if (!journal) throw new Error("EXECUTION_QUARANTINE_CYCLE_NOT_FOUND");
+    const record = normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === decisionId);
+    if (!record || (record.decision.action !== "REDUCE" && record.decision.action !== "CLOSE") || !record.decision.positionSide || !record.executionRequest) throw new Error("CLOSED_LIFECYCLE_QUARANTINE_ACTION_INVALID");
+    const identity = dryRun.identity as { symbol: string; decisionId: string; cycleId: string; clientOrderId: string } | undefined;
+    const foundOrder = (dryRun.orderSearch as { order?: { providerOrderId?: string; clientOrderId?: string; symbol?: string; side?: string; positionSide?: string; tradeSide?: string; executedQuantity?: string; averageFillPrice?: string; status?: string } | undefined } | undefined)?.order;
+    const fillRows = (dryRun.orderSearch as { fills?: Array<{ fillId: string; providerOrderId: string; clientOrderId: string; symbol: string; quantity: string; price: string; side: string; positionSide: string; tradeSide: string }> } | undefined)?.fills ?? [];
+    const fillIds = fillRows.map((fill) => fill.fillId);
+    if (!identity || !foundOrder?.providerOrderId || foundOrder.clientOrderId !== record.executionRequest.clientOrderId || foundOrder.symbol !== record.decision.symbol || !fillIds.length || new Set(fillIds).size !== fillIds.length) throw new Error("CLOSED_LIFECYCLE_QUARANTINE_IDENTITY_INCOMPLETE");
+    const lifecycleSide = resolveProviderLifecycleSide(foundOrder.side, foundOrder.positionSide, foundOrder.tradeSide);
+    if (lifecycleSide !== "CLOSE" || fillRows.some((fill) => fill.providerOrderId !== foundOrder.providerOrderId || fill.clientOrderId !== identity.clientOrderId || fill.symbol !== identity.symbol || fill.positionSide !== record.decision.positionSide || resolveProviderLifecycleSide(fill.side, fill.positionSide, fill.tradeSide) !== "CLOSE")) throw new Error("CLOSED_LIFECYCLE_QUARANTINE_FILL_IDENTITY_MISMATCH");
+    const expectedQuantity = record.executionResult?.status === "filled" ? record.executionResult.executedQuantity : record.executionRequest.quantity;
+    const expectedPrice = record.executionResult?.averageFillPrice ?? foundOrder.averageFillPrice;
+    const config = loadConfig(this.env, this.ensureActivePolicy());
+    const client = new BitgetClient(config);
+    const rawOrder = await client.getOrderDetailsRead(foundOrder.providerOrderId, identity.clientOrderId);
+    const exactOrder = parseProviderOrderEvidence(rawOrder);
+    if (!exactOrder || exactOrder.orderId !== foundOrder.providerOrderId || exactOrder.clientOid !== identity.clientOrderId || exactOrder.symbol !== identity.symbol || exactOrder.positionSide !== record.decision.positionSide) throw new Error("CLOSED_LIFECYCLE_QUARANTINE_ORDER_IDENTITY_MISMATCH");
+    const rawFillHistory = await client.getFillHistoryRead(exactOrder.orderId);
+    const fillBatch = parseProviderFillEvidenceRows(rawFillHistory);
+    if (!isCompleteBoundedProviderFillHistory(rawFillHistory, fillBatch.providerRowCount)
+      || fillBatch.providerRowCount === 0 || fillBatch.invalidProviderRowCount !== 0 || fillBatch.records.length !== fillBatch.providerRowCount) throw new Error("CLOSED_LIFECYCLE_QUARANTINE_FILL_HISTORY_INCOMPLETE");
+    const aggregate = aggregateProviderFillEvidence(fillBatch.records, exactOrder, expectedQuantity, expectedPrice ?? exactOrder.averageFillPrice, "CLOSE");
+    if (!aggregate.valid || fillIds.some((fillId) => !aggregate.fills.some((fill) => fill.fillId === fillId))) throw new Error("CLOSED_LIFECYCLE_QUARANTINE_FILL_AGGREGATE_MISMATCH");
+    const rawFillRows = providerPage(rawFillHistory).rows;
+    const providerFillFinancials = fillIds.map((fillId) => {
+      const raw = rawFillRows.find((row) => String(row.execId ?? row.exec_id ?? "") === fillId);
+      const normalized = raw && normalizeProviderFill({ ...raw, category: config.bitgetCategory }, "DARWIN", evidenceThrough);
+      if (!normalized?.execPnl || !normalized.feeTotal || !isDecimal(normalized.execPnl) || !isDecimal(normalized.feeTotal)) throw new Error("CLOSED_LIFECYCLE_QUARANTINE_FINANCIAL_EVIDENCE_MISSING");
+      return { fillId, execPnl: normalized.execPnl, feeTotal: normalized.feeTotal };
+    });
+    const context = loadPositionContext(this, record.decision.symbol, record.decision.positionSide);
+    const experience = context?.experienceId ? loadExperienceById(this, context.experienceId) : undefined;
+    if (!context || !experience || experience.outcomeStatus !== "OPEN" || context.entryDecisionId !== experience.entryDecisionId || (context.experienceId && context.experienceId !== experience.experienceId)) throw new Error("CLOSED_LIFECYCLE_LOCAL_CONTEXT_MISSING_OR_MISMATCHED");
+    const histories = loadProviderPositionHistories(this, config.bitgetCategory, 500).filter((history) => history.symbol === experience.symbol && history.positionSide === experience.positionSide && isNearTimestamp(history.openingTime, experience.entryTime));
+    if (histories.length !== 1 || !histories[0]?.providerPositionHistoryId) throw new Error(histories.length === 0 ? "CLOSED_LIFECYCLE_POSITION_HISTORY_NOT_FOUND" : "CLOSED_LIFECYCLE_POSITION_HISTORY_AMBIGUOUS");
+    const directHistoryRows = (dryRun.providerHistory as { positionHistoryEvidence?: ProviderLifecycleHistory[] } | undefined)?.positionHistoryEvidence ?? [];
+    const matchingDirectHistories = directHistoryRows.filter((history) => history.providerPositionHistoryId === histories[0]!.providerPositionHistoryId);
+    if (matchingDirectHistories.length !== 1 || !providerLifecycleHistoryMatches(histories[0]!, matchingDirectHistories[0]!)) throw new Error("CLOSED_LIFECYCLE_DIRECT_POSITION_HISTORY_MISSING_OR_MISMATCHED");
+    const lifecycleEvidence = dryRun.lifecycleEvidence as { orders?: Array<{ providerOrderId: string; createdAt: string }>; fills?: ProviderLifecycleFillEvidenceRow[] } | undefined;
+    const proof = { identity, providerOrderId: exactOrder.orderId, fillIds, executedQuantity: aggregate.executedQuantity, scannedOrders: lifecycleEvidence?.orders ?? [], scannedFills: lifecycleEvidence?.fills ?? [], evidenceHash, providerFillFinancials, providerPositionHistoryEvidence: matchingDirectHistories[0]! };
+    return this.repairProviderClosedLifecycle(experience.experienceId, histories[0].providerPositionHistoryId, proof);
+  }
+
+  public async reconcileLateExecution(originalCycleId: string, decisionId: string, evidenceHash: string, evidenceThrough: string): Promise<{ status: "RECONCILED" | "ALREADY_RECONCILED"; experienceId: string }> {
+    if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
+    const dryRun = await this.dryRunExecutionQuarantineRecovery(originalCycleId, decisionId, evidenceThrough);
+    if (dryRun.status === "ALREADY_RECOVERED") {
+      if (dryRun.evidenceHash !== evidenceHash) throw new Error("EXECUTION_QUARANTINE_EVIDENCE_CHANGED_REDRY_RUN_REQUIRED");
+      return { status: "ALREADY_RECONCILED", experienceId: String(dryRun.experienceId ?? "") };
+    }
+    if (dryRun.evidenceHash !== evidenceHash) throw new Error("EXECUTION_QUARANTINE_EVIDENCE_CHANGED_REDRY_RUN_REQUIRED");
+    if (dryRun.recoveryEligible !== true) throw new Error("EXECUTION_QUARANTINE_RECOVERY_NOT_ELIGIBLE");
+    if (dryRun.status !== "DRY_RUN" || (dryRun.orderSearch as { status?: string } | undefined)?.status !== "FOUND_EXACT") throw new Error("EXECUTION_QUARANTINE_PROVIDER_EVIDENCE_NOT_READY");
     const journal = loadJournalForExactDecisionCycle(this, originalCycleId, decisionId);
     if (!journal) throw new Error("LATE_RECONCILIATION_CYCLE_NOT_FOUND");
     const record = normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === decisionId);
-    if (!record || !isReadbackOnlyExecutionMismatch(record) || !record.executionResult) throw new Error("LATE_RECONCILIATION_RECORD_NOT_ELIGIBLE");
-    const client = new BitgetClient(loadConfig(this.env, this.ensureActivePolicy()));
+    if (!record) throw new Error("LATE_RECONCILIATION_RECORD_NOT_FOUND");
+    const unknownLateExecution = record.executionResult?.status === "unknown"
+      && record.reconciliationResult?.status === "UNKNOWN"
+      && (record.decision.action === "OPEN_LONG" || record.decision.action === "OPEN_SHORT")
+      && record.executionRequest?.clientOrderId === record.executionResult.clientOrderId
+      && record.executionRequest.symbol === record.decision.symbol
+      && record.executionRequest.positionSide === record.decision.positionSide
+      && record.executionRequest.action === record.decision.action;
+    if (!record.executionResult || (!isReadbackOnlyExecutionMismatch(record) && !unknownLateExecution)) throw new Error("LATE_RECONCILIATION_RECORD_NOT_ELIGIBLE");
+    const config = loadConfig(this.env, this.ensureActivePolicy());
+    const client = new BitgetClient(config);
     const portfolio = await client.getDashboardPortfolio();
     const position = portfolio.positions.find((candidate) => candidate.symbol === record.decision.symbol && candidate.positionSide === record.decision.positionSide);
     if (!position) throw new Error("LATE_RECONCILIATION_POSITION_MISSING");
@@ -1671,35 +2262,90 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const order = parseProviderOrderEvidence(rawOrder);
     if (!order) throw new Error("LATE_RECONCILIATION_ORDER_INVALID");
     const rawFills = await client.getFillHistoryRead(order.orderId);
-    const fill = parseProviderFillEvidence(rawFills, order);
-    if (!fill) throw new Error("LATE_RECONCILIATION_FILL_INVALID");
+    const fillBatch = parseProviderFillEvidenceRows(rawFills);
+    if (!isCompleteBoundedProviderFillHistory(rawFills, fillBatch.providerRowCount)
+      || fillBatch.providerRowCount === 0 || fillBatch.invalidProviderRowCount !== 0 || fillBatch.records.length !== fillBatch.providerRowCount) throw new Error("LATE_RECONCILIATION_FILL_SET_INCOMPLETE");
+    const fills = fillBatch.records;
+    const expectedLifecycleSide = resolveProviderLifecycleSide(record.executionResult.providerSide, record.executionResult.positionSide, record.executionResult.tradeSide);
+    if (expectedLifecycleSide !== "OPEN") throw new Error("LATE_RECONCILIATION_NOT_OPEN_EXECUTION");
+    const expectedExecutionQuantity = unknownLateExecution ? record.executionRequest!.quantity : record.executionResult.executedQuantity;
+    const aggregate = aggregateProviderFillEvidence(fills, order, expectedExecutionQuantity, record.executionResult.averageFillPrice ?? order.averageFillPrice, "OPEN");
+    if (!aggregate.valid) throw new Error(aggregate.code);
     const experiences = loadAllExperiences(this, "late_reconciliation", "late_reconciliation_all_experiences");
     const existingExperience = experiences.find((experience) => experience.entryDecisionId === decisionId && experience.symbol === record.decision.symbol && experience.positionSide === record.decision.positionSide);
+    const existingContext = loadPositionContext(this, record.decision.symbol, record.decision.positionSide!);
+    if (existingContext && existingContext.entryDecisionId !== decisionId) throw new Error("LATE_RECONCILIATION_POSITION_CONTEXT_IDENTITY_MISMATCH");
+    const lifecycleExperience = existingExperience ?? providerLiveProbeExperience(position, decisionId);
+    const lifecycleEvidence = loadProviderLifecycleEvidence(this, {
+      ...lifecycleExperience,
+      outcomeStatus: "OPEN",
+      entryDecisionId: decisionId,
+      entryTime: existingExperience?.entryTime || position.openedAt || record.executionResult.submittedAt,
+    }, config.bitgetCategory, "", portfolio.positions, {
+      entryDecisionId: decisionId,
+      clientOid: record.executionRequest?.clientOrderId ?? record.executionResult.clientOrderId,
+    });
+    const scanLifecycle = dryRun.lifecycleEvidence as { orders?: Array<{ providerOrderId: string; createdAt: string }>; fills?: ProviderLifecycleFillEvidenceRow[] } | undefined;
+    const lifeStart = Date.parse(position.openedAt ?? "");
+    const lifeEnd = Date.parse(evidenceThrough);
+    const directOrderIds = (scanLifecycle?.orders ?? []).filter((row) => isTimestampWithin(row.createdAt, lifeStart - 5_000, lifeEnd)).map((row) => row.providerOrderId).sort();
+    const localOrderIds = lifecycleEvidence.orders.filter((row) => typeof row.createdAt === "string" && isTimestampWithin(row.createdAt, lifeStart - 5_000, lifeEnd)).map((row) => row.providerOrderId).sort();
+    const directFills = (scanLifecycle?.fills ?? []).filter((row) => isTimestampWithin(row.createdAt, lifeStart - 5_000, lifeEnd));
+    const localFills = lifecycleEvidence.fills.filter((row) => isTimestampWithin(row.createdAt, lifeStart - 5_000, lifeEnd));
+    if (JSON.stringify(directOrderIds) !== JSON.stringify(localOrderIds) || !providerLifecycleFillsMatch(directFills, localFills)) throw new Error("LATE_RECONCILIATION_PROVIDER_LEDGER_COVERAGE_MISMATCH");
+    const lifecycle = classifyProviderLifecycle(lifecycleEvidence);
+    if (lifecycle.classification !== "MATCHED_OPEN") throw new ProviderLifecycleClassificationError(lifecycle.classification, lifecycle.reason);
+    if (lifecycleEvidence.entryIdentity?.providerOrderId !== order.orderId || lifecycleEvidence.entryIdentity.clientOid !== order.clientOid) throw new Error("LATE_RECONCILIATION_ENTRY_IDENTITY_MISMATCH");
     const resolvedAt = new Date().toISOString();
     const result = reconcileLateExecution({
       record,
       order,
-      fill,
+      fill: fills[0]!,
+      fills,
       currentPosition: position,
-      existingContext: loadPositionContext(this, record.decision.symbol, record.decision.positionSide!),
+      currentPositionLifecycle: lifecycleEvidence,
+      allowUnknownProviderExecution: unknownLateExecution,
+      existingContext,
       resolvedAt,
       ...(existingExperience ? { existingExperience } : {}),
     });
     const clientOrderId = record.executionRequest?.clientOrderId ?? record.executionResult.clientOrderId;
     const quarantineIdentity = { symbol: record.decision.symbol, decisionId, cycleId: originalCycleId, clientOrderId };
-    if (result.status === "ALREADY_RECONCILED") {
-      recordExecutionQuarantineResolution(this, { ...quarantineIdentity, providerOrderId: order.orderId, resolvedAt });
-      if (clearExecutionQuarantine(this, quarantineIdentity, resolvedAt)) this.recordEvent("EXECUTION_QUARANTINE_CLEARED", originalCycleId, { symbol: record.decision.symbol, decisionId, clientOrderId, code: "DETERMINISTIC_PROVIDER_RECONCILIATION" });
-      return { status: result.status, experienceId: result.experience.experienceId };
-    }
     const performance = this.performanceWithEquity(portfolio.portfolioEquity, resolvedAt);
-    saveExperience(this, result.experience, resolvedAt);
-    savePositionContext(this, result.positionContext);
-    savePerformanceAggregate(this, performance, resolvedAt);
-    const audited = loadAllEvents(this, "late_reconciliation", "late_reconciliation_all_events").some((event) => event.type === "LATE_EXECUTION_RECONCILED" && event.metadata?.originalCycleId === originalCycleId && event.metadata?.decisionId === decisionId);
-    if (!audited) this.recordEvent("LATE_EXECUTION_RECONCILED", originalCycleId, result.auditMetadata);
-    recordExecutionQuarantineResolution(this, { ...quarantineIdentity, providerOrderId: order.orderId, resolvedAt });
-    if (clearExecutionQuarantine(this, quarantineIdentity, resolvedAt)) this.recordEvent("EXECUTION_QUARANTINE_CLEARED", originalCycleId, { symbol: record.decision.symbol, decisionId, clientOrderId, code: "DETERMINISTIC_PROVIDER_RECONCILIATION" });
+    const recoveryEventId = `q-recovery:${evidenceHash}`;
+    const clearedEventId = `q-cleared:${evidenceHash}`;
+    const resolutionEvent = {
+      eventId: recoveryEventId,
+      type: "LATE_EXECUTION_RECONCILED",
+      cycleId: originalCycleId,
+      createdAt: resolvedAt,
+      metadata: { ...result.auditMetadata, originalCycleId, decisionId, clientOrderId, providerOrderId: order.orderId, evidenceHash },
+    };
+    const clearedEvent = {
+      eventId: clearedEventId,
+      type: "EXECUTION_QUARANTINE_CLEARED",
+      cycleId: originalCycleId,
+      createdAt: resolvedAt,
+      metadata: { symbol: record.decision.symbol, decisionId, clientOrderId, providerOrderId: order.orderId, code: "AUTHORITATIVE_LIFECYCLE_RECONCILIATION", evidenceHash },
+    };
+    this.ctx.storage.transactionSync(() => {
+      if (!this.state.paused || this.state.runtimeStatus !== "PAUSED") throw new Error("AGENT_MUST_BE_PAUSED");
+      const priorResolution = loadExecutionQuarantineResolution(this, quarantineIdentity);
+      if (priorResolution && priorResolution.providerOrderId !== order.orderId) throw new Error("EXECUTION_QUARANTINE_RESOLUTION_IDENTITY_CONFLICT");
+      const active = loadExecutionQuarantines(this).some((item) => item.symbol === quarantineIdentity.symbol
+        && item.decisionId === quarantineIdentity.decisionId && item.cycleId === quarantineIdentity.cycleId
+        && item.clientOrderId === quarantineIdentity.clientOrderId);
+      if (!active && !priorResolution) throw new Error("EXECUTION_QUARANTINE_NOT_ACTIVE");
+      if (result.status !== "ALREADY_RECONCILED") {
+        saveExperience(this, result.experience, resolvedAt);
+        savePositionContext(this, result.positionContext);
+        savePerformanceAggregate(this, performance, resolvedAt);
+      }
+      if (!loadEventById(this, recoveryEventId)) saveEvent(this, resolutionEvent);
+      recordExecutionQuarantineResolution(this, { ...quarantineIdentity, providerOrderId: order.orderId, resolvedAt });
+      if (active && !clearExecutionQuarantine(this, quarantineIdentity, resolvedAt)) throw new Error("EXECUTION_QUARANTINE_ATOMIC_CLEAR_FAILED");
+      if (!loadEventById(this, clearedEventId)) saveEvent(this, clearedEvent);
+    });
     return { status: result.status, experienceId: result.experience.experienceId };
   }
 
@@ -3226,11 +3872,74 @@ function calculateDrawdownPct(baseline: string, current: string): string {
   return (((equity - base) / base) * 100).toFixed(2);
 }
 
-function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string } | { action: "REPAIR_PROVIDER_CLOSED_LIFECYCLE"; experienceId: string; providerPositionHistoryId: string; dryRun?: boolean } {
+type ProviderLifecycleFillEvidenceRow = Pick<ProviderLifecycleFill, "fillId" | "providerOrderId" | "clientOid" | "symbol" | "side" | "positionSide" | "tradeSide" | "quantity" | "execPrice" | "execPnl" | "feeTotal" | "createdAt">;
+
+function providerDecimalEvidenceMatches(left: string | null | undefined, right: string | null | undefined): boolean {
+  if (left == null || right == null) return left == null && right == null;
+  try { return compareDecimal(left, right) === 0; } catch { return false; }
+}
+
+function providerLifecycleFillsMatch(directRows: readonly ProviderLifecycleFillEvidenceRow[], localRows: readonly ProviderLifecycleFillEvidenceRow[]): boolean {
+  const sortRows = (rows: readonly ProviderLifecycleFillEvidenceRow[]) => [...rows].sort((left, right) => (left.fillId ?? "").localeCompare(right.fillId ?? ""));
+  const direct = sortRows(directRows);
+  const local = sortRows(localRows);
+  if (direct.length === 0 || direct.length !== local.length) return false;
+  return direct.every((fill, index) => {
+    const other = local[index]!;
+    const samePosition = fill.positionSide?.toUpperCase() === other.positionSide?.toUpperCase();
+    const directLifecycleSide = resolveProviderLifecycleSide(fill.side, fill.positionSide, fill.tradeSide);
+    const localLifecycleSide = resolveProviderLifecycleSide(other.side, other.positionSide, other.tradeSide);
+    return fill.fillId === other.fillId && fill.providerOrderId === other.providerOrderId && fill.clientOid === other.clientOid
+      && fill.symbol === other.symbol && fill.side?.toLowerCase() === other.side?.toLowerCase() && samePosition
+      && directLifecycleSide === localLifecycleSide && directLifecycleSide !== "CONTRADICTORY" && directLifecycleSide !== "UNRESOLVED"
+      && fill.createdAt === other.createdAt
+      && providerDecimalEvidenceMatches(fill.quantity, other.quantity) && providerDecimalEvidenceMatches(fill.execPrice, other.execPrice)
+      && providerDecimalEvidenceMatches(fill.execPnl, other.execPnl) && providerDecimalEvidenceMatches(fill.feeTotal, other.feeTotal);
+  });
+}
+
+function isTimestampWithin(timestamp: string, startMs: number, endMs: number): boolean {
+  const value = Date.parse(timestamp);
+  return Number.isFinite(value) && Number.isFinite(startMs) && Number.isFinite(endMs) && value >= startMs && value <= endMs;
+}
+
+function isNearTimestamp(left: string, right: string, toleranceMs = 5_000): boolean {
+  const leftMs = Date.parse(left);
+  const rightMs = Date.parse(right);
+  return Number.isFinite(leftMs) && Number.isFinite(rightMs) && Math.abs(leftMs - rightMs) <= toleranceMs;
+}
+
+function providerLifecycleHistoryMatches(left: ProviderLifecycleHistory, right: ProviderLifecycleHistory): boolean {
+  if (left.providerPositionHistoryId !== right.providerPositionHistoryId || left.symbol !== right.symbol
+    || left.positionSide !== right.positionSide || left.openingTime !== right.openingTime || left.closingTime !== right.closingTime) return false;
+  const decimalKeys = ["openTotalPos", "closeTotalPos", "avgEntryPrice", "avgExitPrice", "cumRealisedPnl", "netProfit", "openFeeTotal", "closeFeeTotal", "totalFunding", "cashDividend"] as const;
+  return decimalKeys.every((key) => {
+    const a = left[key];
+    const b = right[key];
+    if (a === null || b === null) return a === b;
+    try { return compareDecimal(a, b) === 0; } catch { return false; }
+  });
+}
+
+function providerReadFailureCode(error: unknown): string {
+  if (typeof error === "object" && error !== null && "details" in error) {
+    const classification = (error as { details?: { classification?: unknown } }).details?.classification;
+    if (typeof classification === "string" && /^[A-Z0-9_-]{1,80}$/.test(classification)) return classification;
+  }
+  return "PROVIDER_READ_FAILED";
+}
+
+function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "DRY_RUN_EXECUTION_QUARANTINE_RECOVERY"; cycleId: string; decisionId: string; evidenceThrough?: string } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "RECOVER_QUARANTINED_CLOSED_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "REPAIR_PROVIDER_CLOSED_LIFECYCLE"; experienceId: string; providerPositionHistoryId: string; dryRun?: boolean } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const body = value as { action?: unknown; cycleId?: unknown; decisionId?: unknown; experienceId?: unknown; providerPositionHistoryId?: unknown; dryRun?: unknown };
+  const body = value as { action?: unknown; cycleId?: unknown; decisionId?: unknown; experienceId?: unknown; providerPositionHistoryId?: unknown; dryRun?: unknown; evidenceHash?: unknown; evidenceThrough?: unknown };
   if (body.action === "REPAIR_PROVIDER_CLOSED_LIFECYCLE") return typeof body.experienceId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.experienceId) && typeof body.providerPositionHistoryId === "string" && /^[A-Za-z0-9:_-]{1,128}$/.test(body.providerPositionHistoryId) && (body.dryRun === undefined || typeof body.dryRun === "boolean");
-  if (body.action === "RECONCILE_LATE_EXECUTION") return typeof body.cycleId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.cycleId) && typeof body.decisionId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.decisionId);
+  const validDecisionIdentity = typeof body.cycleId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.cycleId)
+    && typeof body.decisionId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.decisionId);
+  if (body.action === "DRY_RUN_EXECUTION_QUARANTINE_RECOVERY") return validDecisionIdentity
+    && (body.evidenceThrough === undefined || (typeof body.evidenceThrough === "string" && Number.isFinite(Date.parse(body.evidenceThrough))));
+  if (body.action === "RECONCILE_LATE_EXECUTION" || body.action === "RECOVER_QUARANTINED_CLOSED_EXECUTION") return validDecisionIdentity
+    && typeof body.evidenceHash === "string" && /^[a-f0-9]{64}$/.test(body.evidenceHash)
+    && typeof body.evidenceThrough === "string" && Number.isFinite(Date.parse(body.evidenceThrough));
   return body.action === "START" || body.action === "PAUSE" || body.action === "RESUME" || body.action === "EMERGENCY_STOP";
 }
 

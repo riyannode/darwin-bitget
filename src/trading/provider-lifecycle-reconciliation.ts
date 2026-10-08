@@ -52,6 +52,7 @@ export interface ProviderLifecycleOrder {
 }
 
 export interface ProviderLifecycleFill {
+  fillId?: string;
   providerOrderId: string;
   clientOid: string | null;
   symbol: string;
@@ -60,6 +61,8 @@ export interface ProviderLifecycleFill {
   tradeSide: string | null;
   quantity: string;
   execPrice: string;
+  execPnl?: string | null;
+  feeTotal?: string | null;
   createdAt: string;
   origin: ProviderEvidenceOrigin;
 }
@@ -269,8 +272,61 @@ function openingIdentityIsProven(evidence: ProviderLifecycleEvidence, openingTim
   return fills.length > 0 && fills.every((fill) => isPositiveDecimal(fill.quantity) && isNearTimestamp(fill.createdAt, openingTime));
 }
 
+export function reconcileProviderLifecycleFinancials(history: ProviderLifecycleHistory, fills: readonly ProviderLifecycleFill[]):
+  | { valid: true; realizedPnl: string; openFeeTotal: string; closeFeeTotal: string; netProfit: string }
+  | { valid: false; code: "PROVIDER_FINANCIAL_EVIDENCE_INCOMPLETE" | "PROVIDER_REALIZED_PNL_MISMATCH" | "PROVIDER_OPEN_FEE_MISMATCH" | "PROVIDER_CLOSE_FEE_MISMATCH" | "PROVIDER_NET_PROFIT_MISMATCH" } {
+  if (fills.length === 0 || !isDecimal(history.cumRealisedPnl ?? undefined) || !isDecimal(history.netProfit ?? undefined)
+    || !isDecimal(history.openFeeTotal ?? undefined) || !isDecimal(history.closeFeeTotal ?? undefined)
+    || !isDecimal(history.totalFunding ?? undefined) || !isDecimal(history.cashDividend ?? undefined)) {
+    return { valid: false, code: "PROVIDER_FINANCIAL_EVIDENCE_INCOMPLETE" };
+  }
+  let realizedPnl = "0";
+  let openFeeTotal = "0";
+  let closeFeeTotal = "0";
+  let openingFillCount = 0;
+  let closingFillCount = 0;
+  try {
+    for (const fill of fills) {
+      const lifecycleSide = resolveProviderLifecycleSide(fill.side, fill.positionSide, fill.tradeSide);
+      if ((lifecycleSide !== "OPEN" && lifecycleSide !== "CLOSE") || !isDecimal(fill.feeTotal ?? undefined)) {
+        return { valid: false, code: "PROVIDER_FINANCIAL_EVIDENCE_INCOMPLETE" };
+      }
+      if (lifecycleSide === "OPEN") {
+        openingFillCount += 1;
+        openFeeTotal = addDecimal(openFeeTotal, fill.feeTotal!);
+      } else {
+        if (!isDecimal(fill.execPnl ?? undefined)) return { valid: false, code: "PROVIDER_FINANCIAL_EVIDENCE_INCOMPLETE" };
+        closingFillCount += 1;
+        realizedPnl = addDecimal(realizedPnl, fill.execPnl!);
+        closeFeeTotal = addDecimal(closeFeeTotal, fill.feeTotal!);
+      }
+    }
+    if (openingFillCount === 0 || closingFillCount === 0) return { valid: false, code: "PROVIDER_FINANCIAL_EVIDENCE_INCOMPLETE" };
+    if (compareDecimal(realizedPnl, history.cumRealisedPnl!) !== 0) return { valid: false, code: "PROVIDER_REALIZED_PNL_MISMATCH" };
+    if (compareDecimal(openFeeTotal, history.openFeeTotal!) !== 0) return { valid: false, code: "PROVIDER_OPEN_FEE_MISMATCH" };
+    if (compareDecimal(closeFeeTotal, history.closeFeeTotal!) !== 0) return { valid: false, code: "PROVIDER_CLOSE_FEE_MISMATCH" };
+    const netProfit = [history.cumRealisedPnl!, history.openFeeTotal!, history.closeFeeTotal!, history.totalFunding!, history.cashDividend!]
+      .reduce((sum, value) => addDecimal(sum, value), "0");
+    if (compareDecimal(netProfit, history.netProfit!) !== 0) return { valid: false, code: "PROVIDER_NET_PROFIT_MISMATCH" };
+    return { valid: true, realizedPnl, openFeeTotal, closeFeeTotal, netProfit };
+  } catch {
+    return { valid: false, code: "PROVIDER_FINANCIAL_EVIDENCE_INCOMPLETE" };
+  }
+}
+
+export interface ProviderLifecycleFillTransition {
+  fillId: string | null;
+  providerOrderId: string;
+  clientOid: string | null;
+  lifecycleSide: "OPEN" | "CLOSE";
+  quantity: string;
+  quantityBefore: string;
+  quantityAfter: string;
+  createdAt: string;
+}
+
 type LifecycleFillReconstruction =
-  | { ok: true; openingFills: ProviderLifecycleFill[]; closingFills: ProviderLifecycleFill[]; openQuantity: string; closeQuantity: string; remainingQuantity: string }
+  | { ok: true; openingFills: ProviderLifecycleFill[]; closingFills: ProviderLifecycleFill[]; openQuantity: string; closeQuantity: string; remainingQuantity: string; transitions: ProviderLifecycleFillTransition[] }
   | { ok: false; classification: "PROVIDER_EXTERNAL" | "UNRESOLVED" | "CONTRADICTORY"; reason: string };
 
 function reconstructProviderLifecycleFills(evidence: ProviderLifecycleEvidence, openingTime: string, closingTime?: string): LifecycleFillReconstruction {
@@ -281,6 +337,12 @@ function reconstructProviderLifecycleFills(evidence: ProviderLifecycleEvidence, 
   const side = evidence.experience.positionSide;
   if (!side) return { ok: false, classification: "UNRESOLVED", reason: "LOCAL_POSITION_SIDE_MISSING" };
   const sameSymbolFills = evidence.fills.filter((fill) => fill.symbol === evidence.experience.symbol);
+  const observedFillIds = new Set<string>();
+  for (const fill of sameSymbolFills) {
+    if (!fill.fillId) continue;
+    if (observedFillIds.has(fill.fillId)) return { ok: false, classification: "CONTRADICTORY", reason: "PROVIDER_FILL_ID_DUPLICATE" };
+    observedFillIds.add(fill.fillId);
+  }
   if (sameSymbolFills.some((fill) => validTimestamp(fill.createdAt) === null)) return { ok: false, classification: "UNRESOLVED", reason: "PROVIDER_FILL_TIME_INVALID" };
   const entryIdentity = evidence.entryIdentity;
   const isInLifecycle = (fill: ProviderLifecycleFill): boolean => {
@@ -305,17 +367,58 @@ function reconstructProviderLifecycleFills(evidence: ProviderLifecycleEvidence, 
   const openingFills = fills.filter((fill) => lifecycleSideByFill.get(fill) === "OPEN");
   const closingFills = fills.filter((fill) => lifecycleSideByFill.get(fill) === "CLOSE");
   if (!openingFills.length) return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_OPENING_FILLS_MISSING" };
+  const ordered = [...fills].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt)
+    || left.providerOrderId.localeCompare(right.providerOrderId));
+  for (let index = 1; index < ordered.length; index += 1) {
+    const previous = ordered[index - 1]!;
+    const current = ordered[index]!;
+    if (Date.parse(previous.createdAt) === Date.parse(current.createdAt)
+      && lifecycleSideByFill.get(previous) !== lifecycleSideByFill.get(current)) {
+      return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_FILL_ORDER_AMBIGUOUS" };
+    }
+  }
   const openQuantity = exactSum(openingFills.map((fill) => fill.quantity));
   const closeQuantity = exactSum(closingFills.map((fill) => fill.quantity));
   if (openQuantity === null || closeQuantity === null) return { ok: false, classification: "CONTRADICTORY", reason: "LIFECYCLE_FILL_QUANTITY_INVALID" };
-  let remainingQuantity: string;
+  let remainingQuantity = "0";
+  let closedAt: number | null = null;
+  const transitions: ProviderLifecycleFillTransition[] = [];
   try {
-    remainingQuantity = subtractDecimal(openQuantity, closeQuantity);
+    for (const fill of ordered) {
+      const fillTime = Date.parse(fill.createdAt);
+      const lifecycleSide = lifecycleSideByFill.get(fill);
+      const quantityBefore = remainingQuantity;
+      if (closedAt !== null && fillTime > closedAt) {
+        return { ok: false, classification: "CONTRADICTORY", reason: "LIFECYCLE_CLOSED_BEFORE_SUBSEQUENT_FILL" };
+      }
+      if (lifecycleSide === "OPEN") {
+        remainingQuantity = addDecimal(remainingQuantity, fill.quantity);
+        closedAt = null;
+      } else if (lifecycleSide === "CLOSE") {
+        if (compareDecimal(fill.quantity, remainingQuantity) > 0) {
+          return { ok: false, classification: "CONTRADICTORY", reason: "LIFECYCLE_CLOSE_EXCEEDS_OPEN_QUANTITY" };
+        }
+        remainingQuantity = subtractDecimal(remainingQuantity, fill.quantity);
+        if (compareDecimal(remainingQuantity, "0") === 0) closedAt = fillTime;
+      } else {
+        return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_FILL_TRADE_SIDE_UNKNOWN" };
+      }
+      transitions.push({ fillId: fill.fillId ?? null, providerOrderId: fill.providerOrderId, clientOid: fill.clientOid, lifecycleSide, quantity: fill.quantity, quantityBefore, quantityAfter: remainingQuantity, createdAt: fill.createdAt });
+    }
   } catch {
     return { ok: false, classification: "CONTRADICTORY", reason: "LIFECYCLE_FILL_QUANTITY_INVALID" };
   }
-  if (compareDecimal(remainingQuantity, "0") < 0) return { ok: false, classification: "CONTRADICTORY", reason: "LIFECYCLE_CLOSE_EXCEEDS_OPEN_QUANTITY" };
-  return { ok: true, openingFills, closingFills, openQuantity, closeQuantity, remainingQuantity };
+  return { ok: true, openingFills, closingFills, openQuantity, closeQuantity, remainingQuantity, transitions };
+}
+
+export function reconstructProviderLifecycleTransitions(evidence: ProviderLifecycleEvidence):
+  | { ok: true; transitions: ProviderLifecycleFillTransition[] }
+  | { ok: false; classification: "PROVIDER_EXTERNAL" | "UNRESOLVED" | "CONTRADICTORY"; reason: string } {
+  const positions = evidence.providerPositions.filter((position) => position.symbol === evidence.experience.symbol && position.positionSide === evidence.experience.positionSide && isPositiveDecimal(position.quantity));
+  const openingTime = evidence.history?.openingTime ?? (positions.length === 1 ? positions[0]?.openedAt ?? undefined : undefined);
+  if (!openingTime) return { ok: false, classification: "UNRESOLVED", reason: "LIFECYCLE_OPEN_TIME_MISSING" };
+  const replay = reconstructProviderLifecycleFills(evidence, openingTime, evidence.history?.closingTime ?? undefined);
+  return replay.ok ? { ok: true, transitions: replay.transitions } : replay;
 }
 
 function verifyProviderQuantityTotals(
