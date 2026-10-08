@@ -401,6 +401,58 @@ export function loadJournalsForDecisionIds(executor: SqlExecutor, decisionIds: r
   return [...journals.values()].slice(0, clampHistoryLimit(limit, MAX_HISTORY_LIMIT) * 2);
 }
 
+export function loadJournalsForExperienceIds(executor: SqlExecutor, experienceIds: readonly string[], path = "/api/trade-history"): TradingJournal[] {
+  const requested = [...new Set(experienceIds)]
+    .filter((id) => typeof id === "string" && id.trim().length > 0 && id.length <= MAX_TARGETED_DECISION_ID_LENGTH)
+    .slice(0, MAX_HISTORY_LIMIT);
+  if (requested.length === 0) return [];
+
+  // Keep exact-link lookup bounded. If the sentinel row proves the result was truncated,
+  // return no candidates so callers cannot mistake a partial journal set for unique evidence.
+  const maxRows = Math.min(requested.length * 4, MAX_HISTORY_LIMIT * 2);
+  const requestedJson = JSON.stringify(requested);
+  const rows = executeMeasuredSql<JournalRow>(executor, path, "trade_history_experience_journal_enrichment_batch")`
+    WITH recent_journals AS MATERIALIZED (
+      SELECT cycle_id, payload FROM journals ORDER BY created_at DESC, cycle_id ASC LIMIT ${HISTORY_ROW_HARD_LIMIT}
+    ),
+    bounded_journals AS MATERIALIZED (
+      SELECT cycle_id, payload FROM recent_journals WHERE length(CAST(payload AS BLOB)) <= ${MAX_LOOKUP_JOURNAL_BYTES}
+    )
+    SELECT journal.payload
+    FROM bounded_journals AS journal
+    WHERE (
+        (CASE WHEN json_valid(journal.payload) THEN json_extract(journal.payload, '$.experienceId') ELSE NULL END)
+          IN (SELECT value FROM json_each(${requestedJson}))
+        OR EXISTS (
+          SELECT 1
+          FROM json_each(
+            CASE WHEN json_valid(journal.payload) THEN
+              CASE WHEN json_type(journal.payload, '$.experienceIds') = 'array'
+                THEN json_extract(journal.payload, '$.experienceIds') ELSE '[]' END
+            ELSE '[]' END
+          ) AS linked
+          WHERE linked.value IN (SELECT value FROM json_each(${requestedJson}))
+        )
+      )
+    ORDER BY journal.cycle_id ASC
+    LIMIT ${maxRows + 1}
+  `;
+  if (rows.length > maxRows) return [];
+
+  const journals = new Map<string, TradingJournal>();
+  for (const row of rows) {
+    try {
+      const journal = JSON.parse(row.payload) as TradingJournal;
+      if (typeof journal.cycleId !== "string" || !journal.cycleId) continue;
+      if (!requested.some((id) => journal.experienceId === id || (Array.isArray(journal.experienceIds) && journal.experienceIds.some((linkedId) => linkedId === id)))) continue;
+      journals.set(journal.cycleId, journal);
+    } catch {
+      // Ignore malformed historical journal rows during exact-link lookup.
+    }
+  }
+  return [...journals.values()];
+}
+
 export function loadJournalForExactDecisionCycle(executor: SqlExecutor, cycleId: string, decisionId: string): TradingJournal | null {
   if (!cycleId.trim() || cycleId.length > 256 || !decisionId.trim() || decisionId.length > MAX_TARGETED_DECISION_ID_LENGTH) return null;
   const rows = executor.sql<ExactJournalRow>`

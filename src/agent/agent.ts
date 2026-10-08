@@ -49,6 +49,7 @@ import {
   loadExecutionQuarantines,
   loadExperiences,
   loadExperienceById,
+  loadJournalsForExperienceIds,
   loadActiveOwnerPolicy,
   clampHistoryLimit,
   recordIdempotency,
@@ -1805,7 +1806,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const targetedExperiences = loadExperiencesForDecisionIds(this, reasoningDecisionIds, Math.min(reasoningDecisionIds.length, 100), "/api/trade-history");
     const experiencesById = new Map([...recentExperiences, ...targetedExperiences].map((experience) => [experience.experienceId, experience]));
     const experiences = [...experiencesById.values()];
-    const journals = loadJournalsForDecisionIds(this, reasoningDecisionIds, Math.min(reasoningDecisionIds.length * 2, 100), "/api/trade-history");
+    const linkedExperienceJournals = loadJournalsForExperienceIds(this, recentExperiences.map((experience) => experience.experienceId), "/api/trade-history");
+    const decisionJournals = loadJournalsForDecisionIds(this, reasoningDecisionIds, Math.min(reasoningDecisionIds.length * 2, 100), "/api/trade-history");
+    const journals = [...new Map([...linkedExperienceJournals, ...decisionJournals].map((journal) => [journal.cycleId, journal])).values()].slice(0, limit * 2);
     const recentLivePositionKeys = positions
       .filter((position) => position.openedAt && (position.positionSide === "LONG" || position.positionSide === "SHORT"))
       .sort((left, right) => (right.openedAt ?? "").localeCompare(left.openedAt ?? ""))
