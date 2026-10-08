@@ -33,6 +33,7 @@ import {
   loadRecentLessons,
   loadOpenExperiences,
   loadJournalsForDecisionIds,
+  loadJournalsForDecisionIdsDetailed,
   loadJournalForExactDecisionCycle,
   loadUsableLessons,
   loadPerformanceAggregate,
@@ -505,6 +506,7 @@ function tradeLogEntries(
   journals: readonly TradingJournal[],
   contexts: ReadonlyMap<string, PositionContext> = new Map(),
   financialFacts: ReadonlyMap<string, ResolvedProviderTradeFact> = new Map(),
+  blockedReasonEvidenceComplete = true,
 ): DashboardSnapshot["trades"] {
   const decisions = journals.flatMap((journal) => cyclePlanDecisions(journal));
   const verifiedOpenIds = verifiedLifecycleFacts(journals).verifiedOpenIds;
@@ -531,7 +533,7 @@ function tradeLogEntries(
     const financialStatus = experience.outcomeStatus === "BLOCKED" ? "BLOCKED" : isProviderClosed ? "CLOSED" : isProviderLive ? "OPEN" : providerExecution ? "EXECUTION_VERIFIED" : "UNRESOLVED";
     // Surface why a proposal was rejected, read only from the persisted gate evaluation. No
     // unique authoritative attribution means no reason field at all; never a guess.
-    const blockedGate = financialStatus === "BLOCKED" ? blockedRiskGateResult(experience, journals) : undefined;
+    const blockedGate = financialStatus === "BLOCKED" ? blockedRiskGateResult(experience, journals, blockedReasonEvidenceComplete) : undefined;
     return {
       tradeId: experience.experienceId,
       timestamp: isProviderClosed ? (closedAt ?? openedAt) : isProviderLive ? openedAt : providerExecution?.fills[0]?.filledAt ?? record?.decision.createdAt ?? "UNAVAILABLE",
@@ -1806,9 +1808,10 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const targetedExperiences = loadExperiencesForDecisionIds(this, reasoningDecisionIds, Math.min(reasoningDecisionIds.length, 100), "/api/trade-history");
     const experiencesById = new Map([...recentExperiences, ...targetedExperiences].map((experience) => [experience.experienceId, experience]));
     const experiences = [...experiencesById.values()];
-    const linkedExperienceJournals = loadJournalsForExperienceIds(this, recentExperiences.map((experience) => experience.experienceId), "/api/trade-history");
-    const decisionJournals = loadJournalsForDecisionIds(this, reasoningDecisionIds, Math.min(reasoningDecisionIds.length * 2, 100), "/api/trade-history");
-    const journals = [...new Map([...linkedExperienceJournals, ...decisionJournals].map((journal) => [journal.cycleId, journal])).values()].slice(0, limit * 2);
+    const linkedExperienceEvidence = loadJournalsForExperienceIds(this, recentExperiences.map((experience) => experience.experienceId), "/api/trade-history");
+    const decisionEvidence = loadJournalsForDecisionIdsDetailed(this, reasoningDecisionIds, 100, "/api/trade-history");
+    const blockedReasonEvidenceComplete = linkedExperienceEvidence.complete && decisionEvidence.complete;
+    const journals = [...new Map([...linkedExperienceEvidence.journals, ...decisionEvidence.journals].map((journal) => [journal.cycleId, journal])).values()];
     const recentLivePositionKeys = positions
       .filter((position) => position.openedAt && (position.positionSide === "LONG" || position.positionSide === "SHORT"))
       .sort((left, right) => (right.openedAt ?? "").localeCompare(left.openedAt ?? ""))
@@ -1821,7 +1824,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     ];
     const contexts = loadPositionContextsForKeys(this, contextKeys, Math.min(limit * 4, 400), "/api/trade-history");
     const resolved = resolveProviderTradeFacts(this, experiences, PROVIDER_TRADE_LIFECYCLE_CATEGORY, positions, { histories, historyDecisionIds, openPositionIdentities, positionContexts: contexts, queryPath: "/api/trade-history" });
-    const localTrades = tradeLogEntries(experiences, journals, contexts, resolved.facts).filter((trade) => {
+    const localTrades = tradeLogEntries(experiences, journals, contexts, resolved.facts, blockedReasonEvidenceComplete).filter((trade) => {
       const fact = experiences.find((experience) => experience.experienceId === trade.tradeId);
       const source = fact ? resolved.facts.get(fact.experienceId)?.source : undefined;
       return source !== "PROVIDER_LEDGER" && source !== "PROVIDER_LIVE";

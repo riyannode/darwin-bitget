@@ -93,8 +93,9 @@ export function effectiveRiskGateResult(journal: TradingJournal, decision: Decis
 export function blockedRiskGateResult(
   experience: Pick<TradeExperience, "experienceId" | "outcomeStatus" | "action" | "lastAction" | "entryDecisionId" | "exitDecisionId">,
   journals: readonly TradingJournal[],
+  evidenceComplete = true,
 ): RiskGateResult | undefined {
-  if (experience.outcomeStatus !== "BLOCKED") return undefined;
+  if (experience.outcomeStatus !== "BLOCKED" || !evidenceComplete) return undefined;
   const currentAction = experience.lastAction ?? experience.action;
   const managementAction = currentAction === "CLOSE" || currentAction === "REDUCE";
   const entryAction = currentAction === "OPEN_LONG" || currentAction === "OPEN_SHORT";
@@ -116,12 +117,13 @@ export function blockedRiskGateResult(
   const candidateDecisionIds = new Set<string>();
   for (const journal of relevantJournals) {
     for (const record of recordsFor(journal)) {
-      if (record.riskGateResult && (targetDecisionId ? record.decision.decisionId === targetDecisionId : record.decision.action === currentAction)) {
+      if (record.riskGateResult && record.decision.action === currentAction
+        && (targetDecisionId ? record.decision.decisionId === targetDecisionId : true)) {
         candidateDecisionIds.add(record.decision.decisionId);
       }
     }
-    if (journal.decision?.decisionId && journal.riskGateResult
-      && (targetDecisionId ? journal.decision.decisionId === targetDecisionId : journal.decision.action === currentAction)) {
+    if (journal.decision?.decisionId && journal.riskGateResult && journal.decision.action === currentAction
+      && (targetDecisionId ? journal.decision.decisionId === targetDecisionId : true)) {
       candidateDecisionIds.add(journal.decision.decisionId);
     }
   }
@@ -179,7 +181,8 @@ export function blockedRiskGateResult(
   if (ambiguous || [...identitiesByDecision.values()].some((identities) => identities.size !== 1)
     || [...groups.values()].some((group) => group.evaluations.size !== 1)) return undefined;
 
-  const candidates = [...groups.values()].filter((group) => linkedMode ? group.action === currentAction : group.decisionId === targetDecisionId);
+  const candidates = [...groups.values()].filter((group) => group.action === currentAction
+    && (linkedMode || group.decisionId === targetDecisionId));
   if (candidates.length !== 1) return undefined;
   const only = candidates[0]?.evaluations.values().next().value;
   return only?.status === "BLOCK" && only.codes.length > 0 ? only : undefined;

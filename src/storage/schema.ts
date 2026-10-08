@@ -157,11 +157,112 @@ function ensureProviderPerformanceChangeQueue(executor: SqlExecutor): void {
   END`;
 }
 
+function ensureJournalExperienceLookupTriggers(executor: SqlExecutor): void {
+  const [row] = executor.sql<JournalLookupSchemaVersionRow>`SELECT version FROM journal_decision_lookup_schema_version WHERE schema_key = 'journal_experience_lookup' LIMIT 1`;
+  if (Number(row?.version ?? 0) >= 1) return;
+
+  executor.sql`DROP TRIGGER IF EXISTS journals_experience_lookup_insert`;
+  executor.sql`DROP TRIGGER IF EXISTS journals_experience_lookup_update`;
+  executor.sql`DROP TRIGGER IF EXISTS journals_experience_lookup_delete`;
+  executor.sql`CREATE TRIGGER journals_experience_lookup_insert AFTER INSERT ON journals BEGIN
+    INSERT OR IGNORE INTO journal_experience_lookup (cycle_id, experience_id)
+    SELECT NEW.cycle_id, CASE WHEN json_valid(NEW.payload) THEN
+      CASE WHEN json_type(NEW.payload, '$.experienceId') = 'text' THEN json_extract(NEW.payload, '$.experienceId') ELSE NULL END
+      ELSE NULL END
+    WHERE length(CASE WHEN json_valid(NEW.payload) THEN
+      CASE WHEN json_type(NEW.payload, '$.experienceId') = 'text' THEN json_extract(NEW.payload, '$.experienceId') ELSE NULL END
+      ELSE NULL END) BETWEEN 1 AND 256
+    UNION
+    SELECT NEW.cycle_id, linked.value
+    FROM json_each(CASE WHEN json_valid(NEW.payload) THEN
+      CASE WHEN json_type(NEW.payload, '$.experienceIds') = 'array' THEN json_extract(NEW.payload, '$.experienceIds') ELSE '[]' END
+      ELSE '[]' END) AS linked
+    WHERE linked.type = 'text' AND length(linked.value) BETWEEN 1 AND 256;
+  END`;
+  executor.sql`CREATE TRIGGER journals_experience_lookup_update AFTER UPDATE OF payload ON journals BEGIN
+    DELETE FROM journal_experience_lookup WHERE cycle_id = NEW.cycle_id;
+    INSERT OR IGNORE INTO journal_experience_lookup (cycle_id, experience_id)
+    SELECT NEW.cycle_id, CASE WHEN json_valid(NEW.payload) THEN
+      CASE WHEN json_type(NEW.payload, '$.experienceId') = 'text' THEN json_extract(NEW.payload, '$.experienceId') ELSE NULL END
+      ELSE NULL END
+    WHERE length(CASE WHEN json_valid(NEW.payload) THEN
+      CASE WHEN json_type(NEW.payload, '$.experienceId') = 'text' THEN json_extract(NEW.payload, '$.experienceId') ELSE NULL END
+      ELSE NULL END) BETWEEN 1 AND 256
+    UNION
+    SELECT NEW.cycle_id, linked.value
+    FROM json_each(CASE WHEN json_valid(NEW.payload) THEN
+      CASE WHEN json_type(NEW.payload, '$.experienceIds') = 'array' THEN json_extract(NEW.payload, '$.experienceIds') ELSE '[]' END
+      ELSE '[]' END) AS linked
+    WHERE linked.type = 'text' AND length(linked.value) BETWEEN 1 AND 256;
+  END`;
+  executor.sql`CREATE TRIGGER journals_experience_lookup_delete AFTER DELETE ON journals BEGIN
+    DELETE FROM journal_experience_lookup WHERE cycle_id = OLD.cycle_id;
+  END`;
+  executor.sql`CREATE TABLE IF NOT EXISTS journal_experience_lookup_migration (
+    migration_key TEXT PRIMARY KEY,
+    cursor_cycle_id TEXT,
+    complete INTEGER NOT NULL
+  )`;
+  executor.sql`INSERT OR IGNORE INTO journal_experience_lookup_migration (migration_key, cursor_cycle_id, complete) VALUES ('experience-v1', NULL, 0)`;
+  executor.sql`INSERT OR REPLACE INTO journal_decision_lookup_schema_version (schema_key, version) VALUES ('journal_experience_lookup', 1)`;
+}
+
+const JOURNAL_EXPERIENCE_LOOKUP_BACKFILL_ROWS = 300;
+
+export function advanceJournalExperienceLookupBackfill(executor: SqlExecutor): boolean {
+  const [progress] = executor.sql<{ cursor_cycle_id: string | null; complete: number }>`
+    SELECT cursor_cycle_id, complete FROM journal_experience_lookup_migration WHERE migration_key = 'experience-v1' LIMIT 1
+  `;
+  if (!progress) return false;
+  if (progress.complete === 1) return true;
+
+  const pageRows = executor.sql<{ cycle_id: string }>`
+    SELECT cycle_id FROM journals
+    WHERE cycle_id > ${progress.cursor_cycle_id ?? ""}
+    ORDER BY cycle_id ASC
+    LIMIT ${JOURNAL_EXPERIENCE_LOOKUP_BACKFILL_ROWS + 1}
+  `;
+  const page = pageRows.slice(0, JOURNAL_EXPERIENCE_LOOKUP_BACKFILL_ROWS);
+  if (page.length === 0) return true;
+
+  const cycleIds = JSON.stringify(page.map((row) => row.cycle_id));
+  executor.sql`WITH page AS MATERIALIZED (
+    SELECT journal.cycle_id, journal.payload
+    FROM journals AS journal
+    WHERE journal.cycle_id IN (SELECT value FROM json_each(${cycleIds}))
+    ORDER BY journal.cycle_id ASC
+    LIMIT ${JOURNAL_EXPERIENCE_LOOKUP_BACKFILL_ROWS}
+  )
+  INSERT OR IGNORE INTO journal_experience_lookup (cycle_id, experience_id)
+  SELECT page.cycle_id,
+    CASE WHEN json_valid(page.payload) THEN
+      CASE WHEN json_type(page.payload, '$.experienceId') = 'text' THEN json_extract(page.payload, '$.experienceId') ELSE NULL END
+    ELSE NULL END
+  FROM page
+  WHERE length(CASE WHEN json_valid(page.payload) THEN
+    CASE WHEN json_type(page.payload, '$.experienceId') = 'text' THEN json_extract(page.payload, '$.experienceId') ELSE NULL END
+    ELSE NULL END) BETWEEN 1 AND 256
+  UNION
+  SELECT page.cycle_id, linked.value
+  FROM page,
+    json_each(CASE WHEN json_valid(page.payload) THEN
+      CASE WHEN json_type(page.payload, '$.experienceIds') = 'array' THEN json_extract(page.payload, '$.experienceIds') ELSE '[]' END
+    ELSE '[]' END) AS linked
+  WHERE linked.type = 'text' AND length(linked.value) BETWEEN 1 AND 256`;
+
+  const hasMore = pageRows.length > JOURNAL_EXPERIENCE_LOOKUP_BACKFILL_ROWS;
+  executor.sql`UPDATE journal_experience_lookup_migration
+    SET cursor_cycle_id = ${page[page.length - 1]!.cycle_id}, complete = ${hasMore ? 0 : 1}
+    WHERE migration_key = 'experience-v1'`;
+  return !hasMore;
+}
+
 export function ensureStorage(executor: SqlExecutor): void {
   executor.sql`CREATE TABLE IF NOT EXISTS cycles (cycle_id TEXT PRIMARY KEY, status TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT)`;
   executor.sql`CREATE TABLE IF NOT EXISTS journals (cycle_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS experiences (experience_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, outcome_status TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS journal_decision_lookup (cycle_id TEXT NOT NULL, decision_id TEXT NOT NULL, PRIMARY KEY (cycle_id, decision_id))`;
+  executor.sql`CREATE TABLE IF NOT EXISTS journal_experience_lookup (cycle_id TEXT NOT NULL, experience_id TEXT NOT NULL, PRIMARY KEY (cycle_id, experience_id))`;
   executor.sql`CREATE TABLE IF NOT EXISTS risk_state (state_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS backtests (backtest_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS lessons (lesson_id TEXT PRIMARY KEY, symbol_scope TEXT NOT NULL, market_regime TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`;
@@ -403,7 +504,9 @@ export function ensureStorage(executor: SqlExecutor): void {
   executor.sql`CREATE INDEX IF NOT EXISTS experiences_created_at_idx ON experiences(created_at DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS experiences_entry_decision_idx ON experiences(CASE WHEN json_valid(payload) THEN json_extract(payload, '$.entryDecisionId') END)`;
   executor.sql`CREATE INDEX IF NOT EXISTS journal_decision_lookup_decision_idx ON journal_decision_lookup(decision_id, cycle_id)`;
+  executor.sql`CREATE INDEX IF NOT EXISTS journal_experience_lookup_experience_idx ON journal_experience_lookup(experience_id, cycle_id)`;
   ensureJournalDecisionLookupTriggers(executor);
+  ensureJournalExperienceLookupTriggers(executor);
   executor.sql`CREATE INDEX IF NOT EXISTS position_context_symbol_idx ON position_context(symbol, position_side)`;
   executor.sql`CREATE INDEX IF NOT EXISTS events_created_at_idx ON events(created_at DESC)`;
   executor.sql`CREATE INDEX IF NOT EXISTS events_cycle_created_at_idx ON events(cycle_id, created_at DESC)`;

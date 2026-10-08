@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { saveExperience, saveJournal } from "../src/storage/store.js";
+import { saveExperience, saveJournal, loadJournalsForExperienceIds } from "../src/storage/store.js";
 import { blockedRiskGateResult } from "../src/storage/journal-normalizer.js";
 import { TraderAgent } from "../src/agent/agent.js";
 import { BitgetClient } from "../src/bitget/client.js";
@@ -12,8 +12,8 @@ vi.mock("agents", () => ({ Agent: class {} }));
 
 const AT = "2026-10-08T03:00:00.000Z";
 
-function memoryExecutor(db = new DatabaseSync(":memory:")) {
-  const executor: SqlExecutor = {
+function sqliteExecutor(db: DatabaseSync): SqlExecutor {
+  return {
     sql<T>(strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[] {
       const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
       const params = values.map((value) => (typeof value === "boolean" ? Number(value) : value)) as (string | number | null)[];
@@ -23,6 +23,10 @@ function memoryExecutor(db = new DatabaseSync(":memory:")) {
       return [];
     },
   };
+}
+
+function memoryExecutor(db = new DatabaseSync(":memory:")) {
+  const executor = sqliteExecutor(db);
   ensureStorage(executor);
   return { db, executor };
 }
@@ -105,14 +109,62 @@ function experienceLinkedJournal(experienceId: string, cycleId: string, position
   };
 }
 
-async function tradeHistory(executor: SqlExecutor, db: DatabaseSync): Promise<Array<Record<string, unknown>>> {
+async function tradeHistory(executor: SqlExecutor, db: DatabaseSync, limit = 25): Promise<Array<Record<string, unknown>>> {
   const agent = fakeAgent(executor, db) as never;
-  const response = await (agent as { onRequest: (request: Request) => Promise<Response> }).onRequest.call(agent, new Request("https://example.test/trade-history?limit=25"));
+  const response = await (agent as { onRequest: (request: Request) => Promise<Response> }).onRequest.call(agent, new Request(`https://example.test/trade-history?limit=${limit}`));
   expect(response.status).toBe(200);
   return (await response.json() as { trades: Array<Record<string, unknown>> }).trades;
 }
 
 describe("blocked proposal risk gate reason", () => {
+  it("backfills experience journal links during storage migration", () => {
+    const db = new DatabaseSync(":memory:");
+    const executor = sqliteExecutor(db);
+    const oldJournal = experienceLinkedJournal("exp-preexisting-link", "cycle-preexisting-link", [], []);
+    db.exec("CREATE TABLE journals (cycle_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)");
+    executor.sql`INSERT INTO journals (cycle_id, payload, created_at) VALUES (${oldJournal.cycleId}, ${JSON.stringify(oldJournal)}, ${AT})`;
+
+    ensureStorage(executor);
+    const batch = loadJournalsForExperienceIds(executor, ["exp-preexisting-link"]);
+    expect(batch.complete).toBe(true);
+    expect(batch.journals.map((journal) => journal.cycleId)).toEqual(["cycle-preexisting-link"]);
+    db.close();
+  });
+
+  it("fails closed when bounded experience evidence omits linked journals at limit=1", async () => {
+    const { db, executor } = memoryExecutor();
+    const experienceId = "exp-linked-overflow";
+    const firstBlock = managementDecision("dec-overflow-0", "cycle-overflow-0", "INCREASE");
+    const reflected = reflect({
+      decision: firstBlock, outcome: "RISK_BLOCKED", failureCode: "MAX_SINGLE_POSITION_MARGIN", symbol: firstBlock.symbol,
+      marketRegime: "TREND_UP", experienceStatus: "BLOCKED", entryPrice: "198.02", now: new Date(AT),
+    });
+    const linkedExperienceId = reflected.experience.experienceId;
+    const candidates = [firstBlock];
+    for (let index = 1; index < 4; index += 1) candidates.push(managementDecision(`dec-overflow-${index}`, `cycle-overflow-${index}`, "CLOSE"));
+    candidates.push(managementDecision("dec-overflow-4", "cycle-overflow-4", "INCREASE"));
+    for (const [index, candidate] of candidates.entries()) {
+      const result: RiskGateResult = index === 0
+        ? { status: "BLOCK", codes: ["MAX_SINGLE_POSITION_MARGIN"], checkedAt: AT }
+        : index === 4 ? { status: "PASS", codes: [], checkedAt: AT }
+          : { status: "BLOCK", codes: [`OTHER_ACTION_${index}`], checkedAt: AT };
+      saveJournal(executor, experienceLinkedJournal(linkedExperienceId, `cycle-overflow-${index}`, [candidate], [
+        { decision: candidate, riskGateResult: result },
+      ]));
+    }
+    saveExperience(executor, reflected.experience, AT);
+
+    const batch = loadJournalsForExperienceIds(executor, [linkedExperienceId]);
+    expect(batch.journals).toHaveLength(4);
+    expect(batch.complete).toBe(false);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: AT } as never);
+    const [trade] = await tradeHistory(executor, db, 1);
+    expect(trade).toMatchObject({ status: "BLOCKED", action: "INCREASE" });
+    expect(trade).not.toHaveProperty("blockedReasonCodes");
+    expect(trade).not.toHaveProperty("riskGateCheckedAt");
+    db.close();
+  });
+
   it.each(["CLOSE", "REDUCE"] as const)("retrieves a BLOCKED %s decision by exitDecisionId and returns its persisted evaluation", async (action) => {
     const { db, executor } = memoryExecutor();
     const decisionId = `dec-blocked-${action.toLowerCase()}`;
@@ -229,6 +281,85 @@ describe("blocked proposal risk gate reason", () => {
 
     const [trade] = await tradeHistory(executor, db);
     expect(trade).toMatchObject({ status: "BLOCKED" });
+    expect(trade).not.toHaveProperty("blockedReasonCodes");
+    expect(trade).not.toHaveProperty("riskGateCheckedAt");
+    db.close();
+  });
+
+  it("does not claim unique INCREASE attribution after limit=1 truncates linked journals", async () => {
+    const { db, executor } = memoryExecutor();
+    const increaseBlock = managementDecision("dec-limit1-block", "cycle-limit-a", "INCREASE");
+    const unrelatedClose = managementDecision("dec-limit1-close", "cycle-limit-b", "CLOSE");
+    const increasePass = managementDecision("dec-limit1-pass", "cycle-limit-c", "INCREASE");
+    const reflected = reflect({
+      decision: increaseBlock, outcome: "RISK_BLOCKED", failureCode: "MAX_SINGLE_POSITION_MARGIN", symbol: increaseBlock.symbol,
+      marketRegime: "TREND_UP", experienceStatus: "BLOCKED", entryPrice: "198.02", exitPrice: "198.02", now: new Date(AT),
+    });
+    const experienceId = reflected.experience.experienceId;
+    const linkedJournals = [
+      experienceLinkedJournal(experienceId, "cycle-limit-a", [increaseBlock], [
+        { decision: increaseBlock, riskGateResult: { status: "BLOCK", codes: ["MAX_SINGLE_POSITION_MARGIN"], checkedAt: AT } },
+      ]),
+      experienceLinkedJournal(experienceId, "cycle-limit-b", [unrelatedClose], [
+        { decision: unrelatedClose, riskGateResult: { status: "BLOCK", codes: ["OTHER_ACTION"], checkedAt: AT } },
+      ]),
+      experienceLinkedJournal(experienceId, "cycle-limit-c", [increasePass], [
+        { decision: increasePass, riskGateResult: { status: "PASS", codes: [], checkedAt: AT } },
+      ]),
+    ];
+    for (const journal of linkedJournals) saveJournal(executor, journal);
+    saveExperience(executor, reflected.experience, AT);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: AT } as never);
+
+    const [trade] = await tradeHistory(executor, db, 1);
+    expect(trade).toMatchObject({ status: "BLOCKED", action: "INCREASE" });
+    expect(trade).not.toHaveProperty("blockedReasonCodes");
+    expect(trade).not.toHaveProperty("riskGateCheckedAt");
+    db.close();
+  });
+
+  it("fails closed when a direct decision ID is unresolved outside the bounded fallback window", async () => {
+    const db = new DatabaseSync(":memory:");
+    const executor = sqliteExecutor(db);
+    db.exec("CREATE TABLE journals (cycle_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)");
+    const experienceId = "exp-old-direct-link";
+    const target = managementDecision("dec-old-direct-link", "cycle-000", "CLOSE");
+    const linked = experienceLinkedJournal(experienceId, "cycle-000", [target], [
+      { decision: target, riskGateResult: { status: "BLOCK", codes: ["INSUFFICIENT_MARGIN"], checkedAt: AT } },
+    ]);
+    const insert = db.prepare("INSERT INTO journals (cycle_id, payload, created_at) VALUES (?, ?, ?)");
+    insert.run(linked.cycleId, JSON.stringify(linked), "2026-10-01T00:00:00.000Z");
+    for (let index = 1; index <= 25; index += 1) {
+      const recent = experienceLinkedJournal(`exp-other-${index}`, `cycle-${String(index).padStart(3, "0")}`, [], []);
+      insert.run(recent.cycleId, JSON.stringify(recent), AT);
+    }
+    ensureStorage(executor);
+    saveExperience(executor, blockedExperience("", {
+      experienceId, action: "CLOSE", lastAction: "CLOSE", entryDecisionId: "", exitDecisionId: target.decisionId,
+    }), AT);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: AT } as never);
+
+    const [trade] = await tradeHistory(executor, db, 1);
+    expect(trade).toMatchObject({ status: "BLOCKED", action: "CLOSE" });
+    expect(trade).not.toHaveProperty("blockedReasonCodes");
+    expect(trade).not.toHaveProperty("riskGateCheckedAt");
+    db.close();
+  });
+
+  it("rejects direct decision-ID attribution when the persisted action conflicts", async () => {
+    const { db, executor } = memoryExecutor();
+    const conflicting = managementDecision("dec-action-conflict", "cycle-action-conflict", "REDUCE");
+    saveJournal(executor, experienceLinkedJournal("exp-other", "cycle-action-conflict", [conflicting], [
+      { decision: conflicting, riskGateResult: { status: "BLOCK", codes: ["INSUFFICIENT_MARGIN"], checkedAt: AT } },
+    ]));
+    saveExperience(executor, blockedExperience("", {
+      experienceId: "exp-direct-action-conflict", action: "CLOSE", lastAction: "CLOSE",
+      entryDecisionId: "", exitDecisionId: conflicting.decisionId,
+    }), AT);
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue({ positions: [], portfolioEquity: "1000", observedAt: AT } as never);
+
+    const [trade] = await tradeHistory(executor, db, 1);
+    expect(trade).toMatchObject({ status: "BLOCKED", action: "CLOSE" });
     expect(trade).not.toHaveProperty("blockedReasonCodes");
     expect(trade).not.toHaveProperty("riskGateCheckedAt");
     db.close();
