@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
-import { loadAllEvents, loadExperiences, loadJournalsForDecisionIds, loadPerformanceAggregate, loadPositionContext, loadRecentJournals, saveEvent, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
+import { loadAllEvents, loadExecutionQuarantines, loadExecutionQuarantineResolution, loadExperiences, loadJournalsForDecisionIds, loadPerformanceAggregate, loadPositionContext, loadRecentJournals, saveEvent, saveExecutionQuarantine, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
 import { buildPaperLogExport } from "../src/storage/paper-log.js";
 import type { AccountSnapshot, CycleDecisionPlan, DecisionContext, DecisionExecutionRecord, EvidenceBundle, Instrument, PositionContext, PositionManagementState, PositionReasoning, PositionSnapshot, TradeExperience, TradingJournal } from "../src/types.js";
 
@@ -496,6 +496,14 @@ describe("journal observability persistence", () => {
       positionSide: "LONG",
       outcomeStatus: "EXECUTION_UNRESOLVED",
     }, "2026-09-21T00:00:32.000Z");
+    saveExecutionQuarantine(executor, {
+      symbol: record.decision.symbol,
+      decisionId: record.decision.decisionId,
+      cycleId: journal.cycleId,
+      clientOrderId: record.executionResult!.clientOrderId,
+      reason: "POSITION_READBACK_UNAVAILABLE",
+      createdAt: record.executionResult!.submittedAt,
+    });
     const original = loadRecentJournals(executor, 1)[0]!;
     const originalExecution = JSON.stringify(original.executionRecords?.[0]?.executionResult);
     const originalReconciliation = JSON.stringify(original.executionRecords?.[0]?.reconciliationResult);
@@ -530,6 +538,12 @@ describe("journal observability persistence", () => {
     const performanceBeforeSecond = JSON.stringify(loadPerformanceAggregate<PerformanceAggregate>(executor));
     const eventsBeforeSecond = loadAllEvents(executor).filter((event) => event.type === "LATE_EXECUTION_RECONCILED").length;
     const second = await (TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<{ status: string; experienceId: string }> }).reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId);
+    (TraderAgent.prototype as unknown as { seedExecutionQuarantinesFromRecentJournals: () => void }).seedExecutionQuarantinesFromRecentJournals.call(fake);
+    expect(loadExecutionQuarantines(executor)).toEqual([]);
+    const newerQuarantine = { symbol: record.decision.symbol, decisionId: "newer-decision", cycleId: "newer-cycle", clientOrderId: "newer-client", reason: "EXECUTION_UNKNOWN", createdAt: "2026-09-21T00:02:00.000Z" };
+    saveExecutionQuarantine(executor, newerQuarantine);
+    (TraderAgent.prototype as unknown as { seedExecutionQuarantinesFromRecentJournals: () => void }).seedExecutionQuarantinesFromRecentJournals.call(fake);
+    expect(loadExecutionQuarantines(executor)).toEqual([newerQuarantine]);
     const persistedExperiences = loadExperiences(executor, 100).filter((experience) => experience.entryDecisionId === record.decision.decisionId);
     const persistedContext = loadPositionContext(executor, "CRCLUSDT", "LONG");
     const performance = loadPerformanceAggregate<PerformanceAggregate>(executor);
@@ -539,6 +553,8 @@ describe("journal observability persistence", () => {
     expect(first.status).toBe("RECONCILED");
     expect(second.status).toBe("ALREADY_RECONCILED");
     expect(second.experienceId).toBe(first.experienceId);
+    expect(loadExecutionQuarantines(executor)).toEqual([newerQuarantine]);
+    expect(loadExecutionQuarantineResolution(executor, { symbol: record.decision.symbol, decisionId: record.decision.decisionId, cycleId: journal.cycleId, clientOrderId: record.executionResult!.clientOrderId })).toMatchObject({ providerOrderId: "provider-open" });
     expect(persistedExperiences).toHaveLength(1);
     expect(persistedExperiences[0]?.experienceId).toBe(first.experienceId);
     expect(persistedExperiences[0]?.outcomeStatus).toBe("OPEN");

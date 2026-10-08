@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { DatabaseSync } from "node:sqlite";
 vi.mock("agents", () => ({ Agent: class {}, routeAgentRequest: vi.fn() }));
 import server from "../src/server.js";
 import { BitgetClient } from "../src/bitget/client.js";
 import { TraderAgent } from "../src/agent/agent.js";
-import { clampHistoryLimit } from "../src/storage/store.js";
+import { clampHistoryLimit, loadExecutionQuarantines, saveExecutionQuarantine, saveJournal } from "../src/storage/store.js";
+import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
 import { PROVIDER_FINANCIAL_CATEGORIES } from "../src/bitget/provider-sync.js";
-import type { AccountSnapshot, Env, OwnerPolicy } from "../src/types.js";
+import type { AccountSnapshot, Env, OwnerPolicy, TradingJournal } from "../src/types.js";
 
 const policy: OwnerPolicy = {
   paperOnly: true,
@@ -99,6 +101,146 @@ describe("bounded Durable Object read paths", () => {
 
     expect(response.status).toBe(200);
     expect(forwardedPath).toBe("/provider-performance/rebuild");
+  });
+
+  it("routes owner execution-quarantine diagnostics to the Durable Object and preserves its authorization", async () => {
+    let forwardedPath = "";
+    let forwardedAuthorization = "";
+    const namespace = {
+      idFromName: () => "primary",
+      get: () => ({ fetch: async (request: Request) => {
+        forwardedPath = new URL(request.url).pathname;
+        forwardedAuthorization = request.headers.get("authorization") ?? "";
+        return Response.json({ ok: true });
+      } }),
+    };
+    const env = { ...envWithThrowingDo(), TRADER_AGENT: namespace } as unknown as Env;
+    const response = await server.fetch(new Request("https://darwin.test/api/execution-quarantines?symbols=CRCLUSDT,MSTRUSDT", {
+      headers: { authorization: "Bearer owner-token" },
+    }), env);
+
+    expect(response.status).toBe(200);
+    expect(forwardedPath).toBe("/execution-quarantines");
+    expect(forwardedAuthorization).toBe("Bearer owner-token");
+  });
+
+  it("rejects unauthenticated quarantine diagnostics before reading persisted state", async () => {
+    const fake = { env: { OWNER_CONTROL_TOKEN: "configured" }, sql: () => { throw new Error("storage must not be read"); } };
+    const request = new Request("https://darwin.test/execution-quarantines?symbols=CRCLUSDT");
+    const response = await (TraderAgent.prototype as unknown as { executionQuarantineDiagnostics: (request: Request, url: URL) => Promise<Response> }).executionQuarantineDiagnostics.call(fake, request, new URL(request.url));
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "OWNER_AUTH_REQUIRED" });
+  });
+
+  it("rejects oversized raw symbol input before touching persisted state", async () => {
+    const fake = { env: { OWNER_CONTROL_TOKEN: "configured" }, sql: () => { throw new Error("storage must not be read"); } };
+    const request = new Request(`https://darwin.test/execution-quarantines?symbols=${"A".repeat(257)}`, { headers: { authorization: "Bearer configured" } });
+    const response = await (TraderAgent.prototype as unknown as { executionQuarantineDiagnostics: (request: Request, url: URL) => Promise<Response> }).executionQuarantineDiagnostics.call(fake, request, new URL(request.url));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "INVALID_SYMBOLS" });
+  });
+
+  it("rejects too many symbols before storage or provider access", async () => {
+    const fake = { env: { OWNER_CONTROL_TOKEN: "configured" }, sql: () => { throw new Error("storage must not be read"); } };
+    const getDashboardPortfolio = vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio");
+    const symbols = Array.from({ length: 9 }, () => "CRCLUSDT").join(",");
+    const request = new Request(`https://darwin.test/execution-quarantines?symbols=${symbols}`, { headers: { authorization: "Bearer configured" } });
+    const response = await (TraderAgent.prototype as unknown as { executionQuarantineDiagnostics: (request: Request, url: URL) => Promise<Response> }).executionQuarantineDiagnostics.call(fake, request, new URL(request.url));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "INVALID_SYMBOLS" });
+    expect(getDashboardPortfolio).not.toHaveBeenCalled();
+  });
+
+  it("returns owner diagnostics from persisted quarantine state with direct provider matches and no quarantine writes", async () => {
+    const db = new DatabaseSync(":memory:");
+    const executor: SqlExecutor = {
+      sql<T>(strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]): T[] {
+        const query = strings.reduce((result, part, index) => result + part + (index < values.length ? "?" : ""), "");
+        return db.prepare(query).all(...values.map((value) => typeof value === "boolean" ? Number(value) : value)) as T[];
+      },
+    };
+    ensureStorage(executor);
+    const active = { symbol: "CRCLUSDT", decisionId: "decision-crcl", cycleId: "cycle-crcl", clientOrderId: "client-crcl", reason: "POSITION_READBACK_UNAVAILABLE", createdAt: "2026-10-07T00:00:00.000Z" };
+    const journal = {
+      cycleId: active.cycleId,
+      mode: "AUTONOMOUS",
+      startedAt: active.createdAt,
+      completedAt: "2026-10-07T00:01:00.000Z",
+      executionRecords: [{
+        decision: { decisionId: active.decisionId, cycleId: active.cycleId, symbol: active.symbol, action: "OPEN_LONG", positionSide: "LONG" },
+        executionResult: { status: "filled", providerOrderId: "provider-crcl", clientOrderId: active.clientOrderId, providerSide: "buy", tradeSide: "open", executedQuantity: "3", averageFillPrice: "100", submittedAt: active.createdAt, readBackAt: "2026-10-07T00:00:10.000Z" },
+        reconciliationResult: { status: "MISMATCH", codes: ["POSITION_READBACK_UNAVAILABLE"], execution: { status: "filled" } },
+      }],
+    } as unknown as TradingJournal;
+    saveExecutionQuarantine(executor, active);
+    saveJournal(executor, journal);
+    const env = {
+      OWNER_CONTROL_TOKEN: "owner-token", TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true",
+      BITGET_CATEGORY: "USDT-FUTURES", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_API_BASE_URL: "https://api.bitget.com",
+      MAX_SINGLE_POSITION_MARGIN_PCT: "30", MAX_LEVERAGE: "5", MAX_DAILY_DRAWDOWN_PCT: "10", DRAWDOWN_COOLDOWN_MINUTES: "60", SCAN_INTERVAL_MINUTES: "15",
+    };
+    const fake = { env, sql: executor.sql };
+    const before = JSON.stringify(loadExecutionQuarantines(executor));
+    const placePaperOrder = vi.spyOn(BitgetClient.prototype, "placePaperOrder");
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(portfolio);
+    vi.spyOn(BitgetClient.prototype, "getOrderDetailsRead").mockResolvedValue({ orderId: "provider-crcl", clientOid: "client-crcl", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open", qty: "3", cumExecQty: "3", avgPrice: "100", orderStatus: "filled", createdTime: "1789968749335" });
+    const getFillHistoryRead = vi.spyOn(BitgetClient.prototype, "getFillHistoryRead").mockResolvedValue({ list: [
+      { execId: "fill-a", orderId: "provider-crcl", clientOid: "client-crcl", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open", execQty: "1", execPrice: "100", createdTime: "1789968749337" },
+      { execId: "fill-b", orderId: "provider-crcl", clientOid: "client-crcl", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open", execQty: "2", execPrice: "100", createdTime: "1789968749338" },
+    ] });
+    const request = new Request("https://darwin.test/execution-quarantines?symbols=CRCLUSDT", { headers: { authorization: "Bearer owner-token" } });
+    const response = await (TraderAgent.prototype as unknown as { executionQuarantineDiagnostics: (request: Request, url: URL) => Promise<Response> }).executionQuarantineDiagnostics.call(fake, request, new URL(request.url));
+    const body = await response.json() as { diagnostics: Array<{ identity: { clientOrderId: string }; providerPositionReadback: { position: { quantity: string } | null }; providerReadback: { status: string; matches: { aggregateFillQuantity: string | null; aggregateFillQuantityMatchesExecution: boolean | null; invalidMatchingProviderFillRows: number; order: { providerOrderId: boolean | null } }; fills: Array<{ matchesQuarantineIdentity: boolean }> } }> };
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(body.diagnostics[0]).toMatchObject({
+      identity: { clientOrderId: "client-crcl" },
+      providerPositionReadback: { status: "SUCCESS", position: { quantity: "3" } },
+      providerReadback: { status: "ORDER_AND_FILLS_FOUND", matches: { aggregateFillQuantity: "3", aggregateFillQuantityMatchesExecution: true } },
+    });
+    expect(body.diagnostics[0]?.providerReadback.fills).toHaveLength(2);
+    getFillHistoryRead.mockResolvedValue({ list: [
+      { execId: "foreign-fill", orderId: "provider-crcl", clientOid: "other-client", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open", execQty: "3", execPrice: "100", createdTime: "1789968749339" },
+    ] });
+    const mismatchedResponse = await (TraderAgent.prototype as unknown as { executionQuarantineDiagnostics: (request: Request, url: URL) => Promise<Response> }).executionQuarantineDiagnostics.call(fake, request, new URL(request.url));
+    const mismatchedBody = await mismatchedResponse.json() as typeof body;
+    expect(mismatchedBody.diagnostics[0]?.providerReadback.fills[0]?.matchesQuarantineIdentity).toBe(false);
+    expect(mismatchedBody.diagnostics[0]?.providerReadback.matches.aggregateFillQuantity).toBeNull();
+    expect(mismatchedBody.diagnostics[0]?.providerReadback.matches.aggregateFillQuantityMatchesExecution).toBe(false);
+    const exactFills = [
+      { execId: "fill-a", orderId: "provider-crcl", clientOid: "client-crcl", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open", execQty: "1", execPrice: "100", createdTime: "1789968749337" },
+      { execId: "fill-b", orderId: "provider-crcl", clientOid: "client-crcl", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open", execQty: "2", execPrice: "100", createdTime: "1789968749338" },
+    ];
+    getFillHistoryRead.mockResolvedValue({ list: exactFills });
+    const journalWithoutProviderOrderId = {
+      ...journal,
+      executionRecords: journal.executionRecords!.map((record) => {
+        const { providerOrderId: _omittedProviderOrderId, ...executionResult } = record.executionResult!;
+        return { ...record, executionResult };
+      }),
+    };
+    saveJournal(executor, journalWithoutProviderOrderId);
+    const noProviderOrderIdResponse = await (TraderAgent.prototype as unknown as { executionQuarantineDiagnostics: (request: Request, url: URL) => Promise<Response> }).executionQuarantineDiagnostics.call(fake, request, new URL(request.url));
+    const noProviderOrderIdBody = await noProviderOrderIdResponse.json() as typeof body;
+    expect(noProviderOrderIdBody.diagnostics[0]?.providerReadback.matches.order.providerOrderId).toBeNull();
+    expect(noProviderOrderIdBody.diagnostics[0]?.providerReadback.matches.aggregateFillQuantity).toBeNull();
+    expect(noProviderOrderIdBody.diagnostics[0]?.providerReadback.matches.aggregateFillQuantityMatchesExecution).toBe(false);
+    saveJournal(executor, journal);
+    getFillHistoryRead.mockResolvedValue({ list: [
+      { execId: "invalid-price-fill", orderId: "provider-crcl", clientOid: "client-crcl", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open", execQty: "3", execPrice: "not-a-price", createdTime: "1789968749339" },
+    ] });
+    const invalidPriceResponse = await (TraderAgent.prototype as unknown as { executionQuarantineDiagnostics: (request: Request, url: URL) => Promise<Response> }).executionQuarantineDiagnostics.call(fake, request, new URL(request.url));
+    const invalidPriceBody = await invalidPriceResponse.json() as typeof body;
+    expect(invalidPriceBody.diagnostics[0]?.providerReadback.status).toBe("ORDER_AND_FILLS_INCOMPLETE");
+    expect(invalidPriceBody.diagnostics[0]?.providerReadback.matches.invalidMatchingProviderFillRows).toBe(1);
+    expect(invalidPriceBody.diagnostics[0]?.providerReadback.matches.aggregateFillQuantity).toBeNull();
+    expect(invalidPriceBody.diagnostics[0]?.providerReadback.matches.aggregateFillQuantityMatchesExecution).toBe(false);
+    expect(JSON.stringify(loadExecutionQuarantines(executor))).toBe(before);
+    expect(BitgetClient.prototype.getOrderDetailsRead).toHaveBeenCalledTimes(4);
+    expect(BitgetClient.prototype.getFillHistoryRead).toHaveBeenCalledTimes(4);
+    expect(placePaperOrder).not.toHaveBeenCalled();
+    db.close();
   });
 
   it("rejects unauthenticated provider-ledger diagnostics before touching storage", async () => {
