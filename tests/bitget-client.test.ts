@@ -88,6 +88,46 @@ describe("Bitget read diagnostics", () => {
       expect(fetchMock.mock.calls.every(([input, init]) => init?.method === "POST" && !String(input).includes("place-order"))).toBe(true);
     } finally { vi.unstubAllGlobals(); }
   });
+  it("reads all direct fill-history pages within the hard bound", async () => {
+    const client = new BitgetClient(gatewayConfig());
+    const callRead = vi.spyOn(client as unknown as { callRead: (operation: string, params: Record<string, string>) => Promise<{ data: unknown }> }, "callRead")
+      .mockResolvedValueOnce({ data: { list: [{ execId: "fill-1" }], nextCursor: "cursor-2" } })
+      .mockResolvedValueOnce({ data: { list: [{ execId: "fill-2" }], nextCursor: null } });
+
+    const result = await client.getFillHistoryRead("provider-order");
+
+    expect(result).toMatchObject({ list: [{ execId: "fill-1" }, { execId: "fill-2" }], cursor: null, complete: true, pages: 2, rowCount: 2 });
+    expect(callRead).toHaveBeenCalledTimes(2);
+    expect(callRead.mock.calls[0]?.[1]).toMatchObject({ category: "USDT-FUTURES", orderId: "provider-order", limit: "100" });
+    expect(callRead.mock.calls[1]?.[1]).toMatchObject({ cursor: "cursor-2" });
+  });
+
+  it.each([100, 101])("returns complete direct fill histories when provider supplies %i rows", async (rowCount) => {
+    const client = new BitgetClient(gatewayConfig());
+    const firstPage = Array.from({ length: Math.min(rowCount, 100) }, (_, index) => ({ execId: `fill-${index}` }));
+    const callRead = vi.spyOn(client as unknown as { callRead: (operation: string, params: Record<string, string>) => Promise<{ data: unknown }> }, "callRead")
+      .mockResolvedValueOnce({ data: { list: firstPage, nextCursor: rowCount > 100 ? "cursor-2" : null } });
+    if (rowCount > 100) callRead.mockResolvedValueOnce({ data: { list: [{ execId: "fill-100" }], nextCursor: null } });
+
+    const result = await client.getFillHistoryRead("provider-order") as { list: unknown[]; cursor: null; complete: boolean; pages: number; rowCount: number };
+
+    expect(result).toEqual({ list: expect.any(Array), cursor: null, complete: true, pages: rowCount > 100 ? 2 : 1, rowCount });
+    expect(callRead).toHaveBeenCalledTimes(rowCount > 100 ? 2 : 1);
+  });
+
+  it("fails closed when direct fill-history pagination exhausts the 24-page bound", async () => {
+    const client = new BitgetClient(gatewayConfig());
+    let page = 0;
+    const callRead = vi.spyOn(client as unknown as { callRead: (operation: string, params: Record<string, string>) => Promise<{ data: unknown }> }, "callRead")
+      .mockImplementation(async () => {
+        page += 1;
+        return { data: { list: [{ execId: `fill-${page}` }], nextCursor: `cursor-${page}` } };
+      });
+
+    await expect(client.getFillHistoryRead("provider-order")).rejects.toThrow("PROVIDER_FILL_HISTORY_PAGE_BUDGET_EXCEEDED");
+    expect(callRead).toHaveBeenCalledTimes(24);
+  });
+
   it("keeps account and positions live when open-orders readback is temporarily unavailable", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = new URL(String(input)).pathname;

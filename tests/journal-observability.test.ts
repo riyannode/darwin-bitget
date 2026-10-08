@@ -528,7 +528,7 @@ describe("journal observability persistence", () => {
         if (resolution) {
           return (TraderAgent.prototype as unknown as { dryRunExecutionQuarantineRecovery: (cycleId: string, decisionId: string, evidenceThrough: string) => Promise<Record<string, unknown>> }).dryRunExecutionQuarantineRecovery.call(fake, cycleId, decisionId, evidenceThrough);
         }
-        return { status: "DRY_RUN", evidenceHash: "a".repeat(64), orderSearch: { status: "FOUND_EXACT" }, lifecycleEvidence: { orders: [{ providerOrderId: "provider-open", createdAt: record.executionResult!.submittedAt }], fills: [{ fillId: "fill-open", providerOrderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", positionSide: "LONG", tradeSide: "open_long", quantity: "3", execPrice: "100", execPnl: fillRow.execPnl, feeTotal: fillRow.feeTotal, createdAt: new Date(Date.parse(record.executionResult!.submittedAt) + 1).toISOString() }] } };
+        return { status: "DRY_RUN", evidenceHash: "a".repeat(64), recoveryEligible: true, orderSearch: { status: "FOUND_EXACT" }, lifecycleEvidence: { orders: [{ providerOrderId: "provider-open", createdAt: record.executionResult!.submittedAt }], fills: [{ fillId: "fill-open", providerOrderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", positionSide: "LONG", tradeSide: "open_long", quantity: "3", execPrice: "100", execPnl: fillRow.execPnl, feeTotal: fillRow.feeTotal, createdAt: new Date(Date.parse(record.executionResult!.submittedAt) + 1).toISOString() }] } };
       },
       ensureActivePolicy: () => ({ paperOnly: true, maxSinglePositionMarginPct: "30", maxLeverage: "5", maxDailyDrawdownPct: "10", drawdownCooldownMinutes: 60, scanIntervalMinutes: 5, emergencyStop: false }),
       performanceWithEquity: (TraderAgent.prototype as unknown as { performanceWithEquity: (equity: string, observedAt: string) => PerformanceAggregate }).performanceWithEquity,
@@ -550,7 +550,7 @@ describe("journal observability persistence", () => {
         fake.state.paused = false;
         fake.state.runtimeStatus = "RUNNING";
       }
-      return { list: [{ execId: "fill-open", orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "3", execPrice: "100", createdTime: String(Date.parse(record.executionResult!.submittedAt) + 1) }] };
+      return { list: [{ execId: "fill-open", orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "3", execPrice: "100", createdTime: String(Date.parse(record.executionResult!.submittedAt) + 1) }], cursor: null, complete: true, pages: 1, rowCount: 1 };
     });
 
     const evidenceHash = "a".repeat(64);
@@ -628,6 +628,36 @@ describe("journal observability persistence", () => {
     } as unknown as { state: { paused: boolean; runtimeStatus?: "PAUSED" | "RUNNING" } };
     await expect((TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<unknown> }).reconcileLateExecution.call(fake, "cycle-runtime", "decision-open")).rejects.toThrow("AGENT_MUST_BE_PAUSED");
     db.close();
+  });
+
+  it("refuses open and closed recovery when dry-run readiness is false", async () => {
+    const evidenceHash = "a".repeat(64);
+    const transactionSync = vi.fn(<T>(closure: () => T): T => closure());
+    const fake = {
+      state: { paused: true, runtimeStatus: "PAUSED" },
+      ctx: { storage: { transactionSync } },
+      dryRunExecutionQuarantineRecovery: async () => ({
+        status: "DRY_RUN",
+        evidenceHash,
+        recoveryEligible: false,
+        recoveryBlockers: ["CURRENT_PROVIDER_POSITION_CHANGED_REDRY_RUN_REQUIRED"],
+      }),
+    } as unknown as { state: { paused: boolean; runtimeStatus: "PAUSED" | "RUNNING" } };
+    const portfolioRead = vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio");
+    const orderRead = vi.spyOn(BitgetClient.prototype, "getOrderDetailsRead");
+    const fillRead = vi.spyOn(BitgetClient.prototype, "getFillHistoryRead");
+    const agent = TraderAgent.prototype as unknown as {
+      reconcileLateExecution: (cycleId: string, decisionId: string, hash: string, through: string) => Promise<unknown>;
+      recoverQuarantinedClosedExecution: (cycleId: string, decisionId: string, hash: string, through: string) => Promise<unknown>;
+    };
+    const args = ["cycle-recovery", "decision-recovery", evidenceHash, "2026-10-08T00:00:00.000Z"] as const;
+
+    await expect(agent.reconcileLateExecution.call(fake, ...args)).rejects.toThrow("EXECUTION_QUARANTINE_RECOVERY_NOT_ELIGIBLE");
+    await expect(agent.recoverQuarantinedClosedExecution.call(fake, ...args)).rejects.toThrow("EXECUTION_QUARANTINE_RECOVERY_NOT_ELIGIBLE");
+    expect(portfolioRead).not.toHaveBeenCalled();
+    expect(orderRead).not.toHaveBeenCalled();
+    expect(fillRead).not.toHaveBeenCalled();
+    expect(transactionSync).not.toHaveBeenCalled();
   });
 
   it("persists a verified execution before a later portfolio refresh failure", async () => {

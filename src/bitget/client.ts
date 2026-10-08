@@ -2,7 +2,7 @@ import { BitgetRestClient, loadConfig as loadBitgetConfig } from "@bitget-ai/bit
 import type { AccountSnapshot, EvidenceBundle, ExecutionResult, ExecutionRequest, Instrument, MarketSnapshot, RuntimeConfig } from "../types.js";
 import { classifyMarketRegime } from "../trading/market-regime.js";
 import { accountForEvidenceSymbol, parseDashboardPortfolio, parseFillSummary, parseHistoricalBars, parseInstruments, parseOpenOrders, parsePositionHistorySummary, parsePositionSymbols, parseTicker, record } from "./types.js";
-import type { ProviderLedgerReadParams } from "./provider-ledger.js";
+import { providerPage, type ProviderLedgerReadParams } from "./provider-ledger.js";
 import { BitgetGatewayClient, PRIVATE_BITGET_OPERATIONS, type PrivateBitgetOperation } from "./gateway-client.js";
 
 export interface MarketEvidenceFailure {
@@ -219,7 +219,26 @@ export class BitgetClient {
   }
 
   public async getFillHistoryRead(orderId: string): Promise<unknown> {
-    return (await this.callRead<unknown>("getFillHistory", { category: this.category, orderId, limit: "100" })).data;
+    const rows: Record<string, unknown>[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    for (let pageNumber = 0; pageNumber < 24; pageNumber += 1) {
+      const response = await this.callRead<unknown>("getFillHistory", {
+        category: this.category,
+        orderId,
+        limit: "100",
+        ...(cursor ? { cursor } : {}),
+      });
+      const page = providerPage(response.data);
+      if (rows.length + page.rows.length > 2_400) throw new Error("PROVIDER_FILL_HISTORY_ROW_BUDGET_EXCEEDED");
+      rows.push(...page.rows);
+      if (!page.cursor) return { list: rows, cursor: null, complete: true, pages: pageNumber + 1, rowCount: rows.length };
+      if (page.rows.length === 0) throw new Error("PROVIDER_FILL_HISTORY_EMPTY_PAGE_WITH_CURSOR");
+      if (seenCursors.has(page.cursor)) throw new Error("PROVIDER_FILL_HISTORY_CURSOR_REPEATED");
+      seenCursors.add(page.cursor);
+      cursor = page.cursor;
+    }
+    throw new Error("PROVIDER_FILL_HISTORY_PAGE_BUDGET_EXCEEDED");
   }
 
   public async getOrderHistoryRead(params: ProviderLedgerReadParams): Promise<unknown> {

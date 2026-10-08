@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProviderFillEvidence, ProviderOrderReadback } from "../src/trading/late-reconciliation.js";
-import { assessExecutionQuarantineHistory, isExactQuarantineQuantityTransition } from "../src/trading/execution-quarantine-evidence.js";
+import { assessExecutionQuarantineHistory, assessExecutionQuarantineRecoveryReadiness, isCompleteBoundedProviderFillHistory, isExactQuarantineQuantityTransition } from "../src/trading/execution-quarantine-evidence.js";
 
 const identity = {
   symbol: "CRCLUSDT",
@@ -77,5 +77,66 @@ describe("authoritative quarantine history identity", () => {
   it("does not call an exact order recovery-ready when history coverage is incomplete", () => {
     expect(assessExecutionQuarantineHistory({ identity, orders: [order], fills, historyComplete: false }))
       .toMatchObject({ status: "INCOMPLETE", reason: "EXACT_ORDER_FOUND_HISTORY_COVERAGE_INCOMPLETE", order });
+  });
+
+  it("marks complete matching evidence eligible only after lifecycle and current-state preconditions pass", () => {
+    expect(assessExecutionQuarantineRecoveryReadiness({
+      action: "OPEN_LONG", identityExact: true, historyComplete: true, orderFound: true, fillsComplete: true,
+      lifecycleClassification: "MATCHED_OPEN", lifecycleEvidenceComplete: true, actionSpecificRequirementsMet: true,
+      currentPositionRead: "OK", currentPositionPresent: true, currentPositionUnchanged: true,
+    })).toEqual({ recoveryEligible: true, blockers: [] });
+  });
+
+  it("blocks complete evidence when the current lifecycle classification is inconsistent", () => {
+    expect(assessExecutionQuarantineRecoveryReadiness({
+      action: "OPEN_LONG", identityExact: true, historyComplete: true, orderFound: true, fillsComplete: true,
+      lifecycleClassification: "CONTRADICTORY", lifecycleEvidenceComplete: true, actionSpecificRequirementsMet: true,
+      currentPositionRead: "OK", currentPositionPresent: true, currentPositionUnchanged: true,
+    }).blockers).toContain("CURRENT_LIFECYCLE_CLASSIFICATION_CONTRADICTORY");
+  });
+
+  it("blocks partial provider history and exhausted pagination", () => {
+    expect(assessExecutionQuarantineRecoveryReadiness({
+      action: "OPEN_LONG", identityExact: true, historyComplete: false, orderFound: true, fillsComplete: true,
+      lifecycleClassification: "MATCHED_OPEN", lifecycleEvidenceComplete: true, actionSpecificRequirementsMet: true,
+      currentPositionRead: "OK", currentPositionPresent: true, currentPositionUnchanged: true,
+    }).blockers).toContain("PROVIDER_HISTORY_COVERAGE_INCOMPLETE");
+  });
+
+  it("reports missing direct order and fill evidence as separate blockers", () => {
+    const blockers = assessExecutionQuarantineRecoveryReadiness({
+      action: "OPEN_LONG", identityExact: true, historyComplete: true, orderFound: false, fillsComplete: false,
+      lifecycleClassification: "UNRESOLVED", lifecycleEvidenceComplete: true, actionSpecificRequirementsMet: true,
+      currentPositionRead: "OK", currentPositionPresent: true, currentPositionUnchanged: true,
+    }).blockers;
+    expect(blockers).toContain("DIRECT_PROVIDER_ORDER_MISSING");
+    expect(blockers).toContain("PROVIDER_FILL_AGGREGATION_INCOMPLETE");
+  });
+
+  it("blocks when provider position state changed after the evidence observation", () => {
+    expect(assessExecutionQuarantineRecoveryReadiness({
+      action: "OPEN_LONG", identityExact: true, historyComplete: true, orderFound: true, fillsComplete: true,
+      lifecycleClassification: "MATCHED_OPEN", lifecycleEvidenceComplete: true, actionSpecificRequirementsMet: true,
+      currentPositionRead: "OK", currentPositionPresent: true, currentPositionUnchanged: false,
+    }).blockers).toContain("CURRENT_PROVIDER_POSITION_CHANGED_REDRY_RUN_REQUIRED");
+  });
+
+  it("blocks exact identity mismatch", () => {
+    expect(assessExecutionQuarantineRecoveryReadiness({
+      action: "OPEN_LONG", identityExact: false, historyComplete: true, orderFound: true, fillsComplete: true,
+      lifecycleClassification: "MATCHED_OPEN", lifecycleEvidenceComplete: true, actionSpecificRequirementsMet: true,
+      currentPositionRead: "OK", currentPositionPresent: true, currentPositionUnchanged: true,
+    }).blockers).toContain("EXACT_QUARANTINE_IDENTITY_MISMATCH");
+  });
+
+  it("accepts explicit complete fill pagination at exactly 100 rows and beyond", () => {
+    expect(isCompleteBoundedProviderFillHistory({ complete: true, cursor: null, pages: 1, rowCount: 100 }, 100)).toBe(true);
+    expect(isCompleteBoundedProviderFillHistory({ complete: true, cursor: null, pages: 2, rowCount: 101 }, 101)).toBe(true);
+  });
+
+  it("rejects missing or exhausted fill pagination metadata", () => {
+    expect(isCompleteBoundedProviderFillHistory({ list: Array.from({ length: 100 }, () => ({})) }, 100)).toBe(false);
+    expect(isCompleteBoundedProviderFillHistory({ complete: false, cursor: "next-page", pages: 24, rowCount: 2_400 }, 2_400)).toBe(false);
+    expect(isCompleteBoundedProviderFillHistory({ complete: true, cursor: null, pages: 25, rowCount: 2_401 }, 2_401)).toBe(false);
   });
 });

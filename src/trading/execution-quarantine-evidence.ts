@@ -10,6 +10,62 @@ import type { PositionSide } from "../types.js";
 
 const CANCELED_ORDER_HISTORY_RETENTION_MS = 2 * 60 * 60 * 1_000;
 
+export type ExecutionQuarantineRecoveryAction = "OPEN_LONG" | "OPEN_SHORT" | "REDUCE" | "CLOSE";
+
+export interface ExecutionQuarantineRecoveryReadinessInput {
+  action: string;
+  identityExact: boolean;
+  historyComplete: boolean;
+  orderFound: boolean;
+  fillsComplete: boolean;
+  lifecycleClassification: string;
+  lifecycleEvidenceComplete: boolean;
+  actionSpecificRequirementsMet: boolean;
+  currentPositionRead: "OK" | "ERROR";
+  currentPositionPresent: boolean;
+  currentPositionUnchanged: boolean;
+}
+
+export interface ExecutionQuarantineRecoveryReadiness {
+  recoveryEligible: boolean;
+  blockers: string[];
+}
+
+export function assessExecutionQuarantineRecoveryReadiness(
+  input: ExecutionQuarantineRecoveryReadinessInput,
+): ExecutionQuarantineRecoveryReadiness {
+  const blockers: string[] = [];
+  const isOpen = input.action === "OPEN_LONG" || input.action === "OPEN_SHORT";
+  const isClosed = input.action === "REDUCE" || input.action === "CLOSE";
+  if (!isOpen && !isClosed) blockers.push("QUARANTINE_ACTION_NOT_RECOVERABLE");
+  if (!input.identityExact) blockers.push("EXACT_QUARANTINE_IDENTITY_MISMATCH");
+  if (!input.historyComplete) blockers.push("PROVIDER_HISTORY_COVERAGE_INCOMPLETE");
+  if (!input.orderFound) blockers.push("DIRECT_PROVIDER_ORDER_MISSING");
+  if (!input.fillsComplete) blockers.push("PROVIDER_FILL_AGGREGATION_INCOMPLETE");
+  if (!input.lifecycleEvidenceComplete) blockers.push("LOCAL_PROVIDER_LIFECYCLE_EVIDENCE_INCOMPLETE");
+  if (!input.actionSpecificRequirementsMet) blockers.push("ACTION_SPECIFIC_RECOVERY_REQUIREMENTS_NOT_MET");
+  const expectedClassification = isOpen ? "MATCHED_OPEN" : "LOCAL_OPEN_PROVIDER_CLOSED";
+  if (input.lifecycleClassification !== expectedClassification) {
+    blockers.push(`CURRENT_LIFECYCLE_CLASSIFICATION_${input.lifecycleClassification}`);
+  }
+  if (input.currentPositionRead !== "OK") blockers.push("CURRENT_PROVIDER_POSITION_READ_FAILED");
+  if (input.currentPositionRead === "OK" && input.currentPositionPresent !== isOpen) {
+    blockers.push(isOpen ? "CURRENT_PROVIDER_POSITION_NOT_FOUND" : "CLOSED_LIFECYCLE_CURRENT_PROVIDER_POSITION_STILL_OPEN");
+  }
+  if (!input.currentPositionUnchanged) blockers.push("CURRENT_PROVIDER_POSITION_CHANGED_REDRY_RUN_REQUIRED");
+  return { recoveryEligible: blockers.length === 0, blockers };
+}
+
+export function isCompleteBoundedProviderFillHistory(value: unknown, parsedRowCount: number): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const evidence = value as Record<string, unknown>;
+  return evidence.complete === true
+    && evidence.cursor === null
+    && Number.isSafeInteger(evidence.pages) && Number(evidence.pages) >= 1 && Number(evidence.pages) <= 24
+    && Number.isSafeInteger(evidence.rowCount) && Number(evidence.rowCount) === parsedRowCount
+    && parsedRowCount > 0 && parsedRowCount <= 2_400;
+}
+
 export function isExactQuarantineQuantityTransition(before: string, after: string, executedQuantity: string): boolean {
   if (!isPositiveDecimal(before) || !isDecimal(after) || !isPositiveDecimal(executedQuantity)
     || compareDecimal(after, "0") < 0 || compareDecimal(before, after) <= 0) return false;
