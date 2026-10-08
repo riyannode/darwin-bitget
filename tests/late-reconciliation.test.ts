@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DecisionExecutionRecord, PositionContext, PositionReasoning, PositionSnapshot, TradeExperience } from "../src/types.js";
-import { parseProviderFillEvidence, parseProviderOrderEvidence, reconcileLateExecution } from "../src/trading/late-reconciliation.js";
+import { parseProviderFillEvidence, parseProviderFillEvidenceRows, parseProviderOrderEvidence, parseProviderOrderReadback, reconcileLateExecution } from "../src/trading/late-reconciliation.js";
 import { emptyPerformance, recordVerifiedOpen } from "../src/trading/performance.js";
 
 const decision = {
@@ -141,6 +141,51 @@ function input(overrides: Partial<Parameters<typeof reconcileLateExecution>[0]> 
 }
 
 describe("late filled-open reconciliation", () => {
+  it("exposes non-filled order status and all exact-identity provider fills for diagnostics", () => {
+    const readback = parseProviderOrderReadback({
+      orderId: execution.providerOrderId, clientOid: execution.clientOrderId, symbol: "CRCLUSDT", side: "buy",
+      posSide: "long", tradeSide: "open_long", qty: "24.54", cumExecQty: "10", avgPrice: "92.11",
+      orderStatus: "cancelled", createdTime: "1789968749335",
+    });
+    expect(readback?.status).toBe("cancelled");
+    const fills = parseProviderFillEvidenceRows({ list: [
+      { execId: "fill-1", orderId: execution.providerOrderId, clientOid: execution.clientOrderId, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "4", execPrice: "92", createdTime: "1789968749337" },
+      { execId: "fill-2", orderId: execution.providerOrderId, clientOid: execution.clientOrderId, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "6", execPrice: "92.18", createdTime: "1789968749338" },
+      { orderId: execution.providerOrderId, clientOid: execution.clientOrderId, symbol: "CRCLUSDT" },
+      { execId: "other-fill", orderId: execution.providerOrderId, clientOid: "other-client", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "100", execPrice: "1", createdTime: "1789968739339" },
+    ] });
+    expect(fills.records.map((fill) => fill.fillId)).toEqual(["fill-1", "fill-2", "other-fill"]);
+    expect(fills.providerRowCount).toBe(4);
+    expect(fills.invalidProviderRowCount).toBe(1);
+    expect(parseProviderFillEvidence({ list: [
+      { orderId: order?.orderId, clientOid: order?.clientOid, symbol: "CRCLUSDT" },
+      { execId: "later-valid-fill", orderId: order?.orderId, clientOid: order?.clientOid, symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "24.54", execPrice: "92.11", createdTime: "1789968749337" },
+    ] }, order!)).toBeNull();
+  });
+
+  it.each([
+    ["0", "100"],
+    ["-1", "100"],
+    ["1", "0"],
+    ["1", "-1"],
+  ])("rejects nonpositive provider fill quantity %s and price %s", (quantity, price) => {
+    const batch = parseProviderFillEvidenceRows({ list: [{
+      execId: "invalid-positive-decimal",
+      orderId: "provider-order-1",
+      clientOid: "client-order-1",
+      symbol: "CRCLUSDT",
+      side: "buy",
+      posSide: "long",
+      tradeSide: "open_long",
+      execQty: quantity,
+      execPrice: price,
+      createdTime: "1789968749337",
+    }] });
+    expect(batch.records).toEqual([]);
+    expect(batch.providerRowCount).toBe(1);
+    expect(batch.invalidProviderRowCount).toBe(1);
+  });
+
   it("transitions a provider-filled unresolved open into a usable OPEN lifecycle", () => {
     const result = reconcileLateExecution(input());
     expect(result.status).toBe("RECONCILED");

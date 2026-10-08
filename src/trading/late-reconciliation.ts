@@ -89,6 +89,38 @@ export function providerTimestampIso(value: unknown): string | null {
   }
 }
 
+export interface ProviderOrderReadback {
+  orderId: string;
+  clientOid: string;
+  symbol: string;
+  side: "buy" | "sell";
+  positionSide: PositionSide;
+  tradeSide: string;
+  quantity: string;
+  executedQuantity: string;
+  averageFillPrice: string | null;
+  status: string;
+  createdAt: string;
+}
+
+export function parseProviderOrderReadback(value: unknown): ProviderOrderReadback | null {
+  const source = record(value);
+  const orderId = text(source.orderId);
+  const clientOid = text(source.clientOid);
+  const symbol = text(source.symbol);
+  const side = text(source.side).toLowerCase();
+  const positionSide = providerPositionSide(source.posSide);
+  const tradeSide = text(source.tradeSide);
+  const quantity = text(source.qty, text(source.size));
+  const executedQuantity = text(source.cumExecQty, text(source.filledQty));
+  const averageFillPrice = text(source.avgPrice, text(source.priceAvg)) || null;
+  const status = text(source.orderStatus, text(source.status)).toLowerCase();
+  const createdAt = providerTimestampIso(source.createdTime);
+  if (!orderId || !clientOid || !symbol || (side !== "buy" && side !== "sell") || !positionSide || !tradeSide
+    || !quantity || !executedQuantity || !status || !createdAt) return null;
+  return { orderId, clientOid, symbol, side, positionSide, tradeSide, quantity, executedQuantity, averageFillPrice, status, createdAt };
+}
+
 export function parseProviderOrderEvidence(value: unknown): ProviderOrderEvidence | null {
   const source = record(value);
   const orderId = text(source.orderId);
@@ -113,8 +145,27 @@ export function parseProviderFillEvidence(value: unknown, expectedOrder: Provide
     const source = record(candidate);
     return text(source.orderId) === expectedOrder.orderId && text(source.clientOid) === expectedOrder.clientOid;
   });
-  if (!row) return null;
-  const source = record(row);
+  return row ? parseProviderFillRow(row) : null;
+}
+
+export interface ProviderFillEvidenceReadback {
+  records: ProviderFillEvidence[];
+  providerRowCount: number;
+  invalidProviderRowCount: number;
+}
+
+export function parseProviderFillEvidenceRows(value: unknown): ProviderFillEvidenceReadback {
+  const rows = record(value).list;
+  if (!Array.isArray(rows)) return { records: [], providerRowCount: 0, invalidProviderRowCount: 0 };
+  const records = rows.flatMap((row) => {
+    const parsed = parseProviderFillRow(row);
+    return parsed ? [parsed] : [];
+  });
+  return { records, providerRowCount: rows.length, invalidProviderRowCount: rows.length - records.length };
+}
+
+function parseProviderFillRow(value: unknown): ProviderFillEvidence | null {
+  const source = record(value);
   const fillId = text(source.execId, text(source.execLinkId));
   const orderId = text(source.orderId);
   const clientOid = text(source.clientOid);
@@ -125,7 +176,7 @@ export function parseProviderFillEvidence(value: unknown, expectedOrder: Provide
   const quantity = text(source.execQty);
   const price = text(source.execPrice);
   const createdAt = providerTimestampIso(source.createdTime);
-  if (!fillId || !orderId || !clientOid || !symbol || (side !== "buy" && side !== "sell") || !positionSide || !tradeSide || !quantity || !price || !createdAt) return null;
+  if (!fillId || !orderId || !clientOid || !symbol || (side !== "buy" && side !== "sell") || !positionSide || !tradeSide || !isPositiveDecimal(quantity) || !isPositiveDecimal(price) || !createdAt) return null;
   return { fillId, orderId, clientOid, symbol, side, positionSide, tradeSide, quantity, price, createdAt };
 }
 

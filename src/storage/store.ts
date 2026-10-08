@@ -1144,6 +1144,42 @@ export function saveExecutionQuarantine(executor: SqlExecutor, quarantine: Execu
   `;
 }
 
+export interface ExecutionQuarantineResolution {
+  symbol: string;
+  decisionId: string;
+  cycleId: string;
+  clientOrderId: string;
+  providerOrderId: string;
+  resolvedAt: string;
+}
+
+export function loadExecutionQuarantineResolution(
+  executor: SqlExecutor,
+  identity: Pick<ExecutionQuarantine, "symbol" | "decisionId" | "cycleId" | "clientOrderId">,
+): ExecutionQuarantineResolution | null {
+  const rows = executor.sql<ExecutionQuarantineResolution>`
+    SELECT symbol, decision_id AS decisionId, cycle_id AS cycleId, client_order_id AS clientOrderId,
+      provider_order_id AS providerOrderId, resolved_at AS resolvedAt
+    FROM execution_quarantine_resolutions
+    WHERE symbol = ${identity.symbol} AND decision_id = ${identity.decisionId}
+      AND cycle_id = ${identity.cycleId} AND client_order_id = ${identity.clientOrderId}
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
+}
+
+export function recordExecutionQuarantineResolution(
+  executor: SqlExecutor,
+  resolution: ExecutionQuarantineResolution,
+): void {
+  executor.sql`
+    INSERT OR IGNORE INTO execution_quarantine_resolutions (symbol, decision_id, cycle_id, client_order_id, provider_order_id, resolved_at)
+    VALUES (${resolution.symbol}, ${resolution.decisionId}, ${resolution.cycleId}, ${resolution.clientOrderId}, ${resolution.providerOrderId}, ${resolution.resolvedAt})
+  `;
+  const existing = loadExecutionQuarantineResolution(executor, resolution);
+  if (!existing || existing.providerOrderId !== resolution.providerOrderId) throw new Error("EXECUTION_QUARANTINE_RESOLUTION_IDENTITY_CONFLICT");
+}
+
 export function clearExecutionQuarantine(
   executor: SqlExecutor,
   identity: Pick<ExecutionQuarantine, "symbol" | "decisionId" | "cycleId" | "clientOrderId">,

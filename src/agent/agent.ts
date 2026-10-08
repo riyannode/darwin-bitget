@@ -48,6 +48,7 @@ import {
   savePositionContextBootstrap,
   loadDailyDrawdownState,
   loadExecutionQuarantines,
+  loadExecutionQuarantineResolution,
   loadExperiences,
   loadExperienceById,
   loadJournalsForExperienceIds,
@@ -62,6 +63,7 @@ import {
   saveDailyDrawdownState,
   saveExecutionQuarantine,
   clearExecutionQuarantine,
+  recordExecutionQuarantineResolution,
   saveActiveOwnerPolicy,
   hasEvent,
   saveEvent,
@@ -97,7 +99,7 @@ import {
   UNAVAILABLE_ATTRIBUTE,
   type ProviderLiveIdentity,
 } from "./provider-live-lifecycle.js";
-import { isReadbackOnlyExecutionMismatch, parseProviderFillEvidence, parseProviderOrderEvidence, reconcileLateExecution } from "../trading/late-reconciliation.js";
+import { isReadbackOnlyExecutionMismatch, parseProviderFillEvidence, parseProviderFillEvidenceRows, parseProviderOrderEvidence, parseProviderOrderReadback, reconcileLateExecution } from "../trading/late-reconciliation.js";
 import { EvaClient } from "../eva/client.js";
 import { EVA_AGENT_NAME, EVA_CAPABILITIES, EVA_EXECUTION_PROVIDERS, EVA_PROTOCOL_VERSION } from "../eva/types.js";
 import { availableResearchCapabilities } from "../research/capabilities.js";
@@ -105,6 +107,7 @@ import { ResearchExecutor, type ResearchExecutionTelemetryCallback } from "../re
 import { ResearchRouter, validateResearchPlan, type ResearchRouterInput } from "../research/router.js";
 import { buildExecutionCapacityHints } from "../trading/execution-capacity.js";
 import { buildPositionManagementState, positionContextMatchesLifecycle, positionHistoryReconstructionRequired, positionHistoryRequests, reconstructMaximumFavorableReturnPct, resolvePositionManagementLifecycles } from "../trading/position-management.js";
+import { loadExecutionQuarantineDiagnostics } from "../storage/execution-quarantine-diagnostics.js";
 import { providerLedgerDiagnostics, providerLedgerDiagnosticsBatch, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadRecentProviderPositionHistories, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, providerLivePositionLifecycleKey, loadProviderSyncStates, loadProviderDataRevisions, ProviderLifecycleIdentityLookupError, type ProviderLifecycleEvidenceRequest } from "../storage/provider-ledger.js";
 import { calculateNetPnlSinceBaseline, isFinancialRecordCoverageComplete } from "../trading/external-flow.js";
 import { resolveExternalFlowReadModel } from "../trading/external-flow-read-model.js";
@@ -848,8 +851,142 @@ export class TraderAgent extends Agent<Env, AgentState> {
     }
   }
 
+  private async executionQuarantineDiagnostics(request: Request, url: URL): Promise<Response> {
+    const auth = authorizeOwner(request, this.env);
+    if (!auth.authorized) return json({ error: auth.code }, auth.status);
+
+    const rawSymbols = url.searchParams.get("symbols") ?? "";
+    if (rawSymbols.length > 256) return json({ error: "INVALID_SYMBOLS" }, 400);
+    let separatorCount = 0;
+    for (const character of rawSymbols) {
+      if (character === "," && ++separatorCount >= 8) return json({ error: "INVALID_SYMBOLS" }, 400);
+    }
+    const rawSymbolList = rawSymbols.split(",");
+    const symbols = [...new Set(rawSymbolList.map((symbol) => symbol.trim()))];
+    if (symbols.length === 0 || symbols.some((symbol) => !/^[A-Z0-9]{2,16}USDT$/.test(symbol))) {
+      return json({ error: "INVALID_SYMBOLS" }, 400);
+    }
+
+    ensureStorageInitialized(this);
+    const config = loadConfig(this.env, loadActiveOwnerPolicy(this) ?? loadOwnerPolicy(this.env));
+    let diagnostics;
+    try {
+      diagnostics = loadExecutionQuarantineDiagnostics(this, symbols, config.bitgetCategory);
+    } catch (error) {
+      return json({ error: error instanceof Error && error.message === "EXECUTION_QUARANTINE_STATE_INVALID" ? error.message : "EXECUTION_QUARANTINE_DIAGNOSTICS_UNAVAILABLE" }, 503);
+    }
+
+    const client = new BitgetClient(config);
+    let livePortfolio: Awaited<ReturnType<BitgetClient["getDashboardPortfolio"]>> | null = null;
+    let livePortfolioError = "PROVIDER_READ_FAILED";
+    if (diagnostics.length > 0) {
+      try {
+        livePortfolio = await client.getDashboardPortfolio();
+      } catch (error) {
+        livePortfolioError = error instanceof Error && /^[A-Z0-9_-]{1,80}$/.test(error.message) ? error.message : "PROVIDER_READ_FAILED";
+      }
+    }
+    const decimalEqual = (left: string | undefined, right: string | undefined): boolean => {
+      if (!left || !right) return false;
+      try { return compareDecimal(left, right) === 0; } catch { return false; }
+    };
+    const enriched = [];
+    for (const diagnostic of diagnostics) {
+      const providerOrderId = diagnostic.executionResult?.providerOrderId ?? diagnostic.priorResolution?.providerOrderId;
+      const providerPosition = livePortfolio?.positions.find((position) => position.symbol === diagnostic.identity.symbol && (!diagnostic.decision?.positionSide || position.positionSide === diagnostic.decision.positionSide));
+      const providerPositionReadback = livePortfolio
+        ? { status: "SUCCESS", observedAt: livePortfolio.observedAt, position: providerPosition ? { symbol: providerPosition.symbol, positionSide: providerPosition.positionSide, quantity: providerPosition.quantity, entryPrice: providerPosition.entryPrice, markPrice: providerPosition.markPrice, leverage: providerPosition.leverage } : null }
+        : { status: "READ_ERROR", code: livePortfolioError, position: null };
+      try {
+        const rawOrder = await client.getOrderDetailsRead(providerOrderId || undefined, diagnostic.identity.clientOrderId);
+        const order = parseProviderOrderReadback(rawOrder);
+        if (!order) {
+          enriched.push({ ...diagnostic, providerPositionReadback, providerReadback: { source: "DIRECT_PROVIDER_READBACK", status: "ORDER_NOT_FOUND_OR_INCOMPLETE", order: null, fills: [], matches: null } });
+          continue;
+        }
+        const orderMatches = {
+          clientOrderId: order.clientOid === diagnostic.identity.clientOrderId,
+          providerOrderId: providerOrderId ? order.orderId === providerOrderId : null,
+          symbol: order.symbol === diagnostic.identity.symbol,
+          providerSide: diagnostic.executionResult?.providerSide ? order.side === diagnostic.executionResult.providerSide : null,
+          positionSide: diagnostic.decision?.positionSide ? order.positionSide === diagnostic.decision.positionSide : null,
+          tradeSide: diagnostic.executionResult?.tradeSide ? order.tradeSide === diagnostic.executionResult.tradeSide : null,
+          status: diagnostic.executionResult?.status ? order.status === diagnostic.executionResult.status.toLowerCase() : null,
+          executedQuantity: diagnostic.executionResult?.executedQuantity ? decimalEqual(order.executedQuantity, diagnostic.executionResult.executedQuantity) : null,
+          averageFillPrice: diagnostic.executionResult?.averageFillPrice ? decimalEqual(order.averageFillPrice ?? undefined, diagnostic.executionResult.averageFillPrice) : null,
+        };
+        const orderIdentityMatches = [orderMatches.clientOrderId, orderMatches.providerOrderId, orderMatches.symbol, orderMatches.providerSide, orderMatches.positionSide, orderMatches.tradeSide].every((match) => match === true);
+        const orderMatchesExecution = Object.values(orderMatches).every((match) => match === true);
+        const rawFills = await client.getFillHistoryRead(order.orderId);
+        const fillBatch = parseProviderFillEvidenceRows(rawFills);
+        const fills = fillBatch.records;
+        let fillQuantityTotal: string | null = null;
+        try {
+          fillQuantityTotal = fills.reduce((total, fill) => addDecimal(total, fill.quantity), "0");
+        } catch {
+          fillQuantityTotal = null;
+        }
+        const fillMatches = fills.map((fill) => ({
+          fillId: fill.fillId,
+          clientOrderId: fill.clientOid === diagnostic.identity.clientOrderId,
+          providerOrderId: providerOrderId ? fill.orderId === order.orderId && fill.orderId === providerOrderId : null,
+          symbol: fill.symbol === diagnostic.identity.symbol,
+          providerSide: diagnostic.executionResult?.providerSide ? fill.side === diagnostic.executionResult.providerSide : null,
+          positionSide: diagnostic.decision?.positionSide ? fill.positionSide === diagnostic.decision.positionSide : null,
+          tradeSide: diagnostic.executionResult?.tradeSide ? fill.tradeSide === diagnostic.executionResult.tradeSide : null,
+          matchesQuarantineIdentity: orderIdentityMatches
+            && fill.clientOid === diagnostic.identity.clientOrderId
+            && Boolean(providerOrderId && fill.orderId === providerOrderId)
+            && fill.orderId === order.orderId
+            && fill.symbol === diagnostic.identity.symbol
+            && Boolean(diagnostic.executionResult?.providerSide && fill.side === diagnostic.executionResult.providerSide)
+            && Boolean(diagnostic.decision?.positionSide && fill.positionSide === diagnostic.decision.positionSide)
+            && Boolean(diagnostic.executionResult?.tradeSide && fill.tradeSide === diagnostic.executionResult.tradeSide),
+          quantity: fill.quantity,
+          price: fill.price,
+          createdAt: fill.createdAt,
+        }));
+        const allProviderFillRowsParsed = fillBatch.providerRowCount > 0 && fillBatch.invalidProviderRowCount === 0 && fills.length === fillBatch.providerRowCount;
+        const allFillsMatchExactIdentity = allProviderFillRowsParsed && fillMatches.every((fill) => fill.matchesQuarantineIdentity);
+        enriched.push({
+          ...diagnostic,
+          providerPositionReadback,
+          providerReadback: {
+            source: "DIRECT_PROVIDER_READBACK",
+            status: fillBatch.invalidProviderRowCount > 0 ? "ORDER_AND_FILLS_INCOMPLETE" : fills.length > 0 ? "ORDER_AND_FILLS_FOUND" : "ORDER_FOUND_FILL_NOT_FOUND_OR_UNPARSEABLE",
+            order: { orderId: order.orderId, clientOrderId: order.clientOid, symbol: order.symbol, side: order.side, positionSide: order.positionSide, tradeSide: order.tradeSide, quantity: order.quantity, executedQuantity: order.executedQuantity, averageFillPrice: order.averageFillPrice, status: order.status, createdAt: order.createdAt },
+            fills: fillMatches,
+            matches: {
+              order: orderMatches,
+              matchingProviderFillRows: fillBatch.providerRowCount,
+              invalidMatchingProviderFillRows: fillBatch.invalidProviderRowCount,
+              allFillsMatchExactIdentity,
+              fillClientOrderIds: fillBatch.providerRowCount > 0 && fillBatch.invalidProviderRowCount === 0 && fills.every((fill) => fill.clientOid === diagnostic.identity.clientOrderId),
+              fillOrderIds: Boolean(providerOrderId) && fillBatch.providerRowCount > 0 && fillBatch.invalidProviderRowCount === 0 && fills.every((fill) => fill.orderId === order.orderId && fill.orderId === providerOrderId),
+              fillSymbols: fillBatch.providerRowCount > 0 && fillBatch.invalidProviderRowCount === 0 && fills.every((fill) => fill.symbol === diagnostic.identity.symbol),
+              fillSides: fillBatch.providerRowCount > 0 && fillBatch.invalidProviderRowCount === 0 && fills.every((fill) => fill.side === order.side && fill.positionSide === order.positionSide && fill.tradeSide === order.tradeSide),
+              aggregateFillQuantity: allFillsMatchExactIdentity && orderMatchesExecution ? fillQuantityTotal : null,
+              aggregateFillQuantityMatchesExecution: fillBatch.providerRowCount === 0 || !diagnostic.executionResult?.executedQuantity
+                ? null
+                : allFillsMatchExactIdentity && orderMatchesExecution && fillQuantityTotal !== null
+                  ? decimalEqual(fillQuantityTotal, diagnostic.executionResult.executedQuantity)
+                  : false,
+            },
+          },
+        });
+      } catch (error) {
+        const providerErrorCode = error instanceof Error && /^[A-Z0-9_-]{1,80}$/.test(error.message) ? error.message : "PROVIDER_READ_FAILED";
+        enriched.push({ ...diagnostic, providerPositionReadback, providerReadback: { source: "DIRECT_PROVIDER_READBACK", status: "READ_ERROR", code: providerErrorCode, order: null, fills: [], matches: null } });
+      }
+    }
+    return new Response(JSON.stringify({ source: "PERSISTED_RISK_STATE", observedAt: new Date().toISOString(), requestedSymbols: symbols, diagnostics: enriched }), {
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    });
+  }
+
   public override async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/execution-quarantines" && request.method === "GET") return this.executionQuarantineDiagnostics(request, url);
     if (url.pathname === "/snapshot" && request.method === "GET") {
       const config = loadConfig(this.env, this.ensureActivePolicy());
       let livePortfolio: DashboardSnapshot["portfolio"] | undefined;
@@ -1163,6 +1300,19 @@ export class TraderAgent extends Agent<Env, AgentState> {
           if (!execution) continue;
           const clientOrderId = record.executionRequest?.clientOrderId ?? execution.clientOrderId;
           const quarantineIdentity = { symbol: record.decision.symbol, decisionId: record.decision.decisionId, cycleId: journal.cycleId, clientOrderId };
+          const priorResolution = loadExecutionQuarantineResolution(this, quarantineIdentity);
+          if (priorResolution) {
+            if (clearExecutionQuarantine(this, quarantineIdentity, priorResolution.resolvedAt)) {
+              existingSymbols.delete(record.decision.symbol);
+              this.recordEvent("EXECUTION_QUARANTINE_CLEARED", journal.cycleId, {
+                ...quarantineIdentity,
+                code: "PERSISTED_AUTHORITATIVE_RECONCILIATION",
+                providerOrderId: priorResolution.providerOrderId,
+                source: "HISTORICAL_JOURNAL_SEED",
+              });
+            }
+            continue;
+          }
           if (isDefinitivelyRejectedExecution(execution, record.executionRequest, { cycleId: journal.cycleId, decisionId: record.decision.decisionId })) {
             if (clearExecutionQuarantine(this, quarantineIdentity, execution.readBackAt)) {
               existingSymbols.delete(record.decision.symbol);
@@ -1538,6 +1688,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const clientOrderId = record.executionRequest?.clientOrderId ?? record.executionResult.clientOrderId;
     const quarantineIdentity = { symbol: record.decision.symbol, decisionId, cycleId: originalCycleId, clientOrderId };
     if (result.status === "ALREADY_RECONCILED") {
+      recordExecutionQuarantineResolution(this, { ...quarantineIdentity, providerOrderId: order.orderId, resolvedAt });
       if (clearExecutionQuarantine(this, quarantineIdentity, resolvedAt)) this.recordEvent("EXECUTION_QUARANTINE_CLEARED", originalCycleId, { symbol: record.decision.symbol, decisionId, clientOrderId, code: "DETERMINISTIC_PROVIDER_RECONCILIATION" });
       return { status: result.status, experienceId: result.experience.experienceId };
     }
@@ -1547,6 +1698,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     savePerformanceAggregate(this, performance, resolvedAt);
     const audited = loadAllEvents(this, "late_reconciliation", "late_reconciliation_all_events").some((event) => event.type === "LATE_EXECUTION_RECONCILED" && event.metadata?.originalCycleId === originalCycleId && event.metadata?.decisionId === decisionId);
     if (!audited) this.recordEvent("LATE_EXECUTION_RECONCILED", originalCycleId, result.auditMetadata);
+    recordExecutionQuarantineResolution(this, { ...quarantineIdentity, providerOrderId: order.orderId, resolvedAt });
     if (clearExecutionQuarantine(this, quarantineIdentity, resolvedAt)) this.recordEvent("EXECUTION_QUARANTINE_CLEARED", originalCycleId, { symbol: record.decision.symbol, decisionId, clientOrderId, code: "DETERMINISTIC_PROVIDER_RECONCILIATION" });
     return { status: result.status, experienceId: result.experience.experienceId };
   }

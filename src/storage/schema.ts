@@ -264,6 +264,15 @@ export function ensureStorage(executor: SqlExecutor): void {
   executor.sql`CREATE TABLE IF NOT EXISTS journal_decision_lookup (cycle_id TEXT NOT NULL, decision_id TEXT NOT NULL, PRIMARY KEY (cycle_id, decision_id))`;
   executor.sql`CREATE TABLE IF NOT EXISTS journal_experience_lookup (cycle_id TEXT NOT NULL, experience_id TEXT NOT NULL, PRIMARY KEY (cycle_id, experience_id))`;
   executor.sql`CREATE TABLE IF NOT EXISTS risk_state (state_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)`;
+  executor.sql`CREATE TABLE IF NOT EXISTS execution_quarantine_resolutions (
+    symbol TEXT NOT NULL,
+    decision_id TEXT NOT NULL,
+    cycle_id TEXT NOT NULL,
+    client_order_id TEXT NOT NULL,
+    provider_order_id TEXT NOT NULL,
+    resolved_at TEXT NOT NULL,
+    PRIMARY KEY (symbol, decision_id, cycle_id, client_order_id)
+  )`;
   executor.sql`CREATE TABLE IF NOT EXISTS backtests (backtest_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS lessons (lesson_id TEXT PRIMARY KEY, symbol_scope TEXT NOT NULL, market_regime TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS lesson_usage (cycle_id TEXT NOT NULL, lesson_id TEXT NOT NULL, applied INTEGER NOT NULL, outcome TEXT, created_at TEXT NOT NULL, PRIMARY KEY (cycle_id, lesson_id))`;
