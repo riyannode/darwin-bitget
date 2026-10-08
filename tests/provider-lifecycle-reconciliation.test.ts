@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { TradeExperience } from "../src/types.js";
-import { classifyProviderLifecycle, type ProviderLifecycleEvidence } from "../src/trading/provider-lifecycle-reconciliation.js";
+import { classifyProviderLifecycle, reconcileProviderLifecycleFinancials, type ProviderLifecycleEvidence, type ProviderLifecycleFill } from "../src/trading/provider-lifecycle-reconciliation.js";
 
 const experience: TradeExperience = {
   experienceId: "80432b47-8fa1-4f41-af10-63e6ac4c55f6",
@@ -102,6 +102,23 @@ const costBasisFixture = (entryPrice: string, increaseOrigin: ProviderLifecycleE
 };
 
 describe("provider/local lifecycle reconciliation", () => {
+  it("reconciles exact fill PnL and signed fees to closed position-history settlement totals", () => {
+    const history = fixture().history!;
+    const financialFills: ProviderLifecycleFill[] = [
+      { providerOrderId: "provider-entry-order", clientOid: "darwin-entry-oid", symbol: "SAMSUNGUSDT", side: "buy", positionSide: "LONG", tradeSide: "open", quantity: "7.51", execPrice: "198.02", execPnl: null, feeTotal: "-0.89227812", createdAt: history.openingTime, origin: "DARWIN" },
+      { providerOrderId: "provider-close-order", clientOid: "darwin-close-order", symbol: "SAMSUNGUSDT", side: "sell", positionSide: "LONG", tradeSide: "close", quantity: "7.51", execPrice: "202.66", execPnl: "34.8487", feeTotal: "-0.91318734", createdAt: history.closingTime, origin: "DARWIN" },
+    ];
+    expect(reconcileProviderLifecycleFinancials(history, financialFills)).toEqual({
+      valid: true,
+      realizedPnl: "34.8487",
+      openFeeTotal: "-0.89227812",
+      closeFeeTotal: "-0.91318734",
+      netProfit: "33.19485709",
+    });
+    expect(reconcileProviderLifecycleFinancials(history, financialFills.map((fill) => fill.tradeSide === "close" ? { ...fill, feeTotal: "-0.90" } : fill)))
+      .toMatchObject({ valid: false, code: "PROVIDER_CLOSE_FEE_MISMATCH" });
+  });
+
   it("replays current cost basis across reduce then increase instead of averaging all historical opens", () => {
     expect(classifyProviderLifecycle(costBasisFixture("105"))).toMatchObject({ classification: "MATCHED_OPEN" });
   });
@@ -111,6 +128,51 @@ describe("provider/local lifecycle reconciliation", () => {
       classification: "CONTRADICTORY",
       reason: "CURRENT_POSITION_COST_BASIS_MISMATCH",
     });
+  });
+
+  it("rejects a lifecycle that reaches zero quantity before a later increase", () => {
+    const evidence = costBasisFixture("110");
+    evidence.fills = evidence.fills.map((fill) => fill.providerOrderId === "reduce-1" ? { ...fill, quantity: "10" } : fill);
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({
+      classification: "CONTRADICTORY",
+      reason: "LIFECYCLE_CLOSED_BEFORE_SUBSEQUENT_FILL",
+    });
+  });
+
+  it("fails closed when open and close fills share a timestamp and their order is ambiguous", () => {
+    const evidence = costBasisFixture("105");
+    const closeTime = "2026-09-21T17:10:00.000Z";
+    evidence.fills = evidence.fills.map((fill) => fill.providerOrderId === "reduce-1" ? { ...fill, createdAt: closeTime } : fill);
+    evidence.fills = [...evidence.fills, {
+      providerOrderId: "same-time-increase", clientOid: "same-time-increase-oid", symbol: "SAMSUNGUSDT",
+      side: "buy", positionSide: "LONG", tradeSide: "open", quantity: "1", execPrice: "110",
+      createdAt: closeTime, origin: "DARWIN",
+    }];
+    evidence.orders = [...evidence.orders, {
+      providerOrderId: "same-time-increase", clientOid: "same-time-increase-oid", symbol: "SAMSUNGUSDT",
+      side: "buy", positionSide: "LONG", tradeSide: "open", createdAt: closeTime, origin: "DARWIN",
+    }];
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({
+      classification: "UNRESOLVED",
+      reason: "LIFECYCLE_FILL_ORDER_AMBIGUOUS",
+    });
+  });
+
+  it("replays changing quantity and average entry from exact decimal partial fills", () => {
+    const evidence = costBasisFixture("105");
+    evidence.fills = evidence.fills.flatMap((fill) => fill.providerOrderId === "reduce-1"
+      ? [
+        { ...fill, providerOrderId: "reduce-a", clientOid: "reduce-a-oid", quantity: "2.25", createdAt: "2026-09-21T17:09:59.000Z" },
+        { ...fill, providerOrderId: "reduce-b", clientOid: "reduce-b-oid", quantity: "2.75", createdAt: "2026-09-21T17:10:00.000Z" },
+      ]
+      : fill);
+    evidence.orders = evidence.orders.flatMap((order) => order.providerOrderId === "reduce-1"
+      ? [
+        { ...order, providerOrderId: "reduce-a", clientOid: "reduce-a-oid", createdAt: "2026-09-21T17:09:59.000Z" },
+        { ...order, providerOrderId: "reduce-b", clientOid: "reduce-b-oid", createdAt: "2026-09-21T17:10:00.000Z" },
+      ]
+      : order);
+    expect(classifyProviderLifecycle(evidence)).toMatchObject({ classification: "MATCHED_OPEN" });
   });
 
   it("does not classify an externally increased current position as fully DARWIN-owned", () => {

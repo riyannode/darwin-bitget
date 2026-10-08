@@ -1036,9 +1036,20 @@ export function persistProviderLifecycleRepair(
   experience: TradeExperience,
   context: PositionContext,
   event: ActivityEvent,
+  quarantineResolution?: ExecutionQuarantineResolution,
+  quarantineClearedEvent?: ActivityEvent,
 ): boolean {
   return transactionSync(() => {
-    if (hasEvent(executor, event.eventId)) return false;
+    const existingResolution = quarantineResolution ? loadExecutionQuarantineResolution(executor, quarantineResolution) : null;
+    const quarantineActive = quarantineResolution && loadExecutionQuarantines(executor).some((item) => item.symbol === quarantineResolution.symbol
+      && item.decisionId === quarantineResolution.decisionId && item.cycleId === quarantineResolution.cycleId
+      && item.clientOrderId === quarantineResolution.clientOrderId);
+    if (existingResolution && existingResolution.providerOrderId !== quarantineResolution?.providerOrderId) throw new Error("EXECUTION_QUARANTINE_RESOLUTION_IDENTITY_CONFLICT");
+    if (quarantineResolution && !quarantineActive && !existingResolution) throw new Error("EXECUTION_QUARANTINE_NOT_ACTIVE");
+    if (hasEvent(executor, event.eventId)) {
+      if (quarantineResolution && (!existingResolution || quarantineActive)) throw new Error("EXECUTION_QUARANTINE_REPAIR_ATOMIC_STATE_INCONSISTENT");
+      return false;
+    }
     const experienceRows = executor.sql<ExperienceRow>`SELECT payload FROM experiences WHERE experience_id = ${expectedExperience.experienceId}`;
     const currentExperience = experienceRows[0] ? JSON.parse(experienceRows[0].payload) as TradeExperience : null;
     if (experienceRows.length !== 1 || canonicalJson(currentExperience) !== canonicalJson(expectedExperience) || currentExperience?.outcomeStatus !== "OPEN") {
@@ -1051,6 +1062,12 @@ export function persistProviderLifecycleRepair(
     saveExperience(executor, experience, event.createdAt);
     savePositionContext(executor, context);
     saveEvent(executor, event);
+    if (quarantineResolution) {
+      recordExecutionQuarantineResolution(executor, quarantineResolution);
+      if (quarantineActive && !clearExecutionQuarantine(executor, quarantineResolution, quarantineResolution.resolvedAt)) throw new Error("EXECUTION_QUARANTINE_ATOMIC_CLEAR_FAILED");
+      if (!quarantineClearedEvent) throw new Error("EXECUTION_QUARANTINE_CLEAR_AUDIT_EVENT_MISSING");
+      if (!hasEvent(executor, quarantineClearedEvent.eventId)) saveEvent(executor, quarantineClearedEvent);
+    }
     return true;
   });
 }
@@ -1095,6 +1112,48 @@ export function loadEventById(executor: SqlExecutor, eventId: string): ActivityE
   } catch {
     return undefined;
   }
+}
+
+export function loadExecutionQuarantineRecoveryAuditEvents(
+  executor: SqlExecutor,
+  identity: { symbol: string; cycleId: string; decisionId: string; clientOrderId: string },
+): { complete: boolean; reconciled: ActivityEvent[]; cleared: ActivityEvent[] } {
+  const rows = executor.sql<EventRow>`
+    SELECT event_id, event_type, cycle_id, payload, created_at FROM events
+    WHERE cycle_id = ${identity.cycleId}
+      AND event_type IN ('LATE_EXECUTION_RECONCILED', 'EXECUTION_QUARANTINE_CLEARED')
+      AND (
+        (event_type = 'LATE_EXECUTION_RECONCILED'
+          AND json_extract(payload, '$.metadata.originalCycleId') = ${identity.cycleId}
+          AND json_extract(payload, '$.metadata.decisionId') = ${identity.decisionId}
+          AND json_extract(payload, '$.metadata.clientOrderId') = ${identity.clientOrderId})
+        OR (event_type = 'EXECUTION_QUARANTINE_CLEARED'
+          AND json_extract(payload, '$.metadata.symbol') = ${identity.symbol}
+          AND json_extract(payload, '$.metadata.decisionId') = ${identity.decisionId}
+          AND json_extract(payload, '$.metadata.clientOrderId') = ${identity.clientOrderId})
+      )
+    ORDER BY created_at DESC, event_id ASC
+    LIMIT 3
+  `;
+  const events = rows.flatMap((row) => {
+    try {
+      const event = JSON.parse(row.payload) as ActivityEvent;
+      return [{
+        eventId: event.eventId || row.event_id,
+        type: event.type || row.event_type,
+        cycleId: event.cycleId || row.cycle_id,
+        createdAt: event.createdAt || row.created_at,
+        ...(event.metadata ? { metadata: event.metadata } : {}),
+      }];
+    } catch {
+      return [];
+    }
+  });
+  return {
+    complete: rows.length < 3 && events.length === rows.length,
+    reconciled: events.filter((event) => event.type === "LATE_EXECUTION_RECONCILED"),
+    cleared: events.filter((event) => event.type === "EXECUTION_QUARANTINE_CLEARED"),
+  };
 }
 
 export function loadAllEvents(executor: SqlExecutor, path = "/api/export/paper-log", queryName = "paper_log_all_events"): ActivityEvent[] {

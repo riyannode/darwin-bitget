@@ -223,9 +223,9 @@ describe("bounded Durable Object read paths", () => {
     saveJournal(executor, journalWithoutProviderOrderId);
     const noProviderOrderIdResponse = await (TraderAgent.prototype as unknown as { executionQuarantineDiagnostics: (request: Request, url: URL) => Promise<Response> }).executionQuarantineDiagnostics.call(fake, request, new URL(request.url));
     const noProviderOrderIdBody = await noProviderOrderIdResponse.json() as typeof body;
-    expect(noProviderOrderIdBody.diagnostics[0]?.providerReadback.matches.order.providerOrderId).toBeNull();
-    expect(noProviderOrderIdBody.diagnostics[0]?.providerReadback.matches.aggregateFillQuantity).toBeNull();
-    expect(noProviderOrderIdBody.diagnostics[0]?.providerReadback.matches.aggregateFillQuantityMatchesExecution).toBe(false);
+    expect(noProviderOrderIdBody.diagnostics[0]?.providerReadback.matches.order.providerOrderId).toBe(true);
+    expect(noProviderOrderIdBody.diagnostics[0]?.providerReadback.matches.aggregateFillQuantity).toBe("3");
+    expect(noProviderOrderIdBody.diagnostics[0]?.providerReadback.matches.aggregateFillQuantityMatchesExecution).toBe(true);
     saveJournal(executor, journal);
     getFillHistoryRead.mockResolvedValue({ list: [
       { execId: "invalid-price-fill", orderId: "provider-crcl", clientOid: "client-crcl", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open", execQty: "3", execPrice: "not-a-price", createdTime: "1789968749339" },

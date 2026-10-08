@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { ensureStorage, type SqlExecutor } from "../src/storage/schema.js";
 import { loadAllEvents, loadExecutionQuarantines, loadExecutionQuarantineResolution, loadExperiences, loadJournalsForDecisionIds, loadPerformanceAggregate, loadPositionContext, loadRecentJournals, saveEvent, saveExecutionQuarantine, saveExperience, saveJournal, savePositionContext } from "../src/storage/store.js";
+import { normalizeProviderFill, normalizeProviderOrder } from "../src/bitget/provider-ledger.js";
+import { upsertProviderFill, upsertProviderOrder } from "../src/storage/provider-ledger.js";
 import { buildPaperLogExport } from "../src/storage/paper-log.js";
 import type { AccountSnapshot, CycleDecisionPlan, DecisionContext, DecisionExecutionRecord, EvidenceBundle, Instrument, PositionContext, PositionManagementState, PositionReasoning, PositionSnapshot, TradeExperience, TradingJournal } from "../src/types.js";
 
@@ -496,6 +498,13 @@ describe("journal observability persistence", () => {
       positionSide: "LONG",
       outcomeStatus: "EXECUTION_UNRESOLVED",
     }, "2026-09-21T00:00:32.000Z");
+    const observedAt = "2026-09-21T00:01:00.000Z";
+    const orderRow = normalizeProviderOrder({ orderId: "provider-open", clientOid: "client-open", category: "USDT-FUTURES", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "3", cumExecQty: "3", avgPrice: "100", orderStatus: "filled", createdTime: String(Date.parse(record.executionResult!.submittedAt)) }, "DARWIN", observedAt);
+    const fillRow = normalizeProviderFill({ execId: "fill-open", orderId: "provider-open", clientOid: "client-open", category: "USDT-FUTURES", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "3", execPrice: "100", createdTime: String(Date.parse(record.executionResult!.submittedAt) + 1) }, "DARWIN", observedAt);
+    if (!orderRow || !fillRow) throw new Error("provider ledger fixture failed");
+    upsertProviderOrder(executor, orderRow, observedAt);
+    upsertProviderFill(executor, fillRow, observedAt);
+    executor.sql`INSERT INTO idempotency (client_order_id, cycle_id, decision_id, provider_order_id, created_at) VALUES (${"client-open"}, ${journal.cycleId}, ${record.decision.decisionId}, ${"provider-open"}, ${record.executionResult!.submittedAt})`;
     saveExecutionQuarantine(executor, {
       symbol: record.decision.symbol,
       decisionId: record.decision.decisionId,
@@ -511,7 +520,16 @@ describe("journal observability persistence", () => {
     let eventSequence = 0;
     const fake = {
       env: { TRADING_MODE: "PAPER", AGENT_MODE: "AUTONOMOUS", PAPER_ONLY: "true", EVIDENCE_MAX_AGE_SECONDS: "90", BITGET_CATEGORY: "USDT-FUTURES" },
-      state: { paused: true, emergencyStop: false },
+      state: { paused: true, emergencyStop: false, runtimeStatus: "PAUSED" },
+      ctx: { storage: { transactionSync: <T>(closure: () => T): T => { db.exec("BEGIN IMMEDIATE"); try { const result = closure(); db.exec("COMMIT"); return result; } catch (error) { db.exec("ROLLBACK"); throw error; } } } },
+      dryRunExecutionQuarantineRecovery: async (cycleId: string, decisionId: string, evidenceThrough: string) => {
+        const identity = { symbol: record.decision.symbol, decisionId: record.decision.decisionId, cycleId: journal.cycleId, clientOrderId: record.executionResult!.clientOrderId };
+        const resolution = loadExecutionQuarantineResolution(executor, identity);
+        if (resolution) {
+          return (TraderAgent.prototype as unknown as { dryRunExecutionQuarantineRecovery: (cycleId: string, decisionId: string, evidenceThrough: string) => Promise<Record<string, unknown>> }).dryRunExecutionQuarantineRecovery.call(fake, cycleId, decisionId, evidenceThrough);
+        }
+        return { status: "DRY_RUN", evidenceHash: "a".repeat(64), orderSearch: { status: "FOUND_EXACT" }, lifecycleEvidence: { orders: [{ providerOrderId: "provider-open", createdAt: record.executionResult!.submittedAt }], fills: [{ fillId: "fill-open", providerOrderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", positionSide: "LONG", tradeSide: "open_long", quantity: "3", execPrice: "100", execPnl: fillRow.execPnl, feeTotal: fillRow.feeTotal, createdAt: new Date(Date.parse(record.executionResult!.submittedAt) + 1).toISOString() }] } };
+      },
       ensureActivePolicy: () => ({ paperOnly: true, maxSinglePositionMarginPct: "30", maxLeverage: "5", maxDailyDrawdownPct: "10", drawdownCooldownMinutes: 60, scanIntervalMinutes: 5, emergencyStop: false }),
       performanceWithEquity: (TraderAgent.prototype as unknown as { performanceWithEquity: (equity: string, observedAt: string) => PerformanceAggregate }).performanceWithEquity,
       recordEvent(type: string, cycleId: string, metadata?: Record<string, string>) {
@@ -519,13 +537,33 @@ describe("journal observability persistence", () => {
         saveEvent(executor, { eventId: `event-${++eventSequence}`, type, cycleId, createdAt: `2026-09-21T00:01:0${eventSequence}.000Z`, ...(metadata ? { metadata } : {}) });
       },
       sql: executor.sql,
-    } as unknown as { state: { paused: boolean } };
+    } as unknown as { state: { paused: boolean; runtimeStatus?: "PAUSED" | "RUNNING" } };
+    const providerWrite = vi.spyOn(BitgetClient.prototype, "placePaperOrder");
+    let resumeDuringProviderRead = true;
     vi.spyOn(BitgetClient.prototype, "collectSymbolMarketEvidence").mockResolvedValue({ bundles: [bundle()], unavailable: [] });
-    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(bundle().account);
-    vi.spyOn(BitgetClient.prototype, "getOrderDetailsRead").mockResolvedValue({ orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "3", cumExecQty: "3", avgPrice: "100", orderStatus: "filled", createdTime: "1789968749335" });
-    vi.spyOn(BitgetClient.prototype, "getFillHistoryRead").mockResolvedValue({ list: [{ execId: "fill-open", orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "3", execPrice: "100", createdTime: "1789968749337" }] });
+    const livePortfolio = { ...bundle().account, positions: [{ ...position(), openedAt: record.executionResult!.submittedAt }] };
+    vi.spyOn(BitgetClient.prototype, "getDashboardPortfolio").mockResolvedValue(livePortfolio);
+    vi.spyOn(BitgetClient.prototype, "getOrderDetailsRead").mockResolvedValue({ orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", qty: "3", cumExecQty: "3", avgPrice: "100", orderStatus: "filled", createdTime: String(Date.parse(record.executionResult!.submittedAt)) });
+    vi.spyOn(BitgetClient.prototype, "getFillHistoryRead").mockImplementation(async () => {
+      if (resumeDuringProviderRead) {
+        resumeDuringProviderRead = false;
+        fake.state.paused = false;
+        fake.state.runtimeStatus = "RUNNING";
+      }
+      return { list: [{ execId: "fill-open", orderId: "provider-open", clientOid: "client-open", symbol: "CRCLUSDT", side: "buy", posSide: "long", tradeSide: "open_long", execQty: "3", execPrice: "100", createdTime: String(Date.parse(record.executionResult!.submittedAt) + 1) }] };
+    });
 
-    const first = await (TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<{ status: string; experienceId: string }> }).reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId);
+    const evidenceHash = "a".repeat(64);
+    const evidenceThrough = "2026-09-21T00:02:00.000Z";
+    const reconcile = TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string, evidenceHash: string, evidenceThrough: string) => Promise<{ status: string; experienceId: string }> };
+    await expect(reconcile.reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId, evidenceHash, evidenceThrough))
+      .rejects.toThrow("AGENT_MUST_BE_PAUSED");
+    expect(loadExecutionQuarantines(executor)).toHaveLength(1);
+    expect(loadExecutionQuarantineResolution(executor, { symbol: record.decision.symbol, decisionId: record.decision.decisionId, cycleId: journal.cycleId, clientOrderId: record.executionResult!.clientOrderId })).toBeNull();
+    fake.state.paused = true;
+    fake.state.runtimeStatus = "PAUSED";
+
+    const first = await reconcile.reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId, evidenceHash, evidenceThrough);
     const initialContext = loadPositionContext(executor, "CRCLUSDT", "LONG");
     if (!initialContext) throw new Error("missing reconciled context fixture");
     const managementReasoning = (action: "HOLD" | "REDUCE", decisionId: string, createdAt: string): PositionReasoning => ({ action, thesis: action, strategyThesis: action, supportingFactors: [], riskFactors: [], evidenceUsed: [], lessonsUsed: [], confidence: 0.5, cycleId: "management-cycle", decisionId, createdAt });
@@ -536,8 +574,9 @@ describe("journal observability persistence", () => {
     const contextBeforeSecond = JSON.stringify(preservedContext);
     const experienceBeforeSecond = JSON.stringify(loadExperiences(executor, 100).find((experience) => experience.entryDecisionId === record.decision.decisionId));
     const performanceBeforeSecond = JSON.stringify(loadPerformanceAggregate<PerformanceAggregate>(executor));
-    const eventsBeforeSecond = loadAllEvents(executor).filter((event) => event.type === "LATE_EXECUTION_RECONCILED").length;
-    const second = await (TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<{ status: string; experienceId: string }> }).reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId);
+    await expect(reconcile.reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId, "b".repeat(64), evidenceThrough))
+      .rejects.toThrow("EXECUTION_QUARANTINE_EVIDENCE_CHANGED_REDRY_RUN_REQUIRED");
+    const second = await reconcile.reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId, evidenceHash, evidenceThrough);
     (TraderAgent.prototype as unknown as { seedExecutionQuarantinesFromRecentJournals: () => void }).seedExecutionQuarantinesFromRecentJournals.call(fake);
     expect(loadExecutionQuarantines(executor)).toEqual([]);
     const newerQuarantine = { symbol: record.decision.symbol, decisionId: "newer-decision", cycleId: "newer-cycle", clientOrderId: "newer-client", reason: "EXECUTION_UNKNOWN", createdAt: "2026-09-21T00:02:00.000Z" };
@@ -559,7 +598,7 @@ describe("journal observability persistence", () => {
     expect(persistedExperiences[0]?.experienceId).toBe(first.experienceId);
     expect(persistedExperiences[0]?.outcomeStatus).toBe("OPEN");
     expect(persistedExperiences[0]?.entryPrice).toBe("100");
-    expect(persistedExperiences[0]?.entryTime).toBe("2026-09-21T05:32:29.337Z");
+    expect(persistedExperiences[0]?.entryTime).toBe(new Date(Date.parse(record.executionResult!.submittedAt) + 1).toISOString());
     expect(Number.isFinite(Date.parse(persistedExperiences[0]?.entryTime ?? ""))).toBe(true);
     expect(JSON.stringify(persistedContext)).toBe(contextBeforeSecond);
     expect(persistedContext?.managementEvents).toEqual([hold, reduce]);
@@ -569,10 +608,15 @@ describe("journal observability persistence", () => {
     expect(performance?.totalTrades).toBe(0);
     expect(performance?.openTrades).toBe(0);
     expect(JSON.stringify(performance)).toBe(performanceBeforeSecond);
-    expect(events).toEqual(["LATE_EXECUTION_RECONCILED"]);
-    expect(reconciliationEvents).toHaveLength(eventsBeforeSecond);
+    expect(events).toEqual([]);
+    expect(providerWrite).not.toHaveBeenCalled();
+    expect(reconciliationEvents).toHaveLength(1);
+    expect(reconciliationEvents[0]?.metadata?.evidenceHash).toBe(evidenceHash);
     expect(JSON.stringify(persistedJournal.executionRecords?.[0]?.executionResult)).toBe(originalExecution);
     expect(JSON.stringify(persistedJournal.executionRecords?.[0]?.reconciliationResult)).toBe(originalReconciliation);
+    executor.sql`DELETE FROM events WHERE event_id = ${`q-cleared:${evidenceHash}`}`;
+    await expect(reconcile.reconcileLateExecution.call(fake, journal.cycleId, record.decision.decisionId, evidenceHash, evidenceThrough))
+      .rejects.toThrow("EXECUTION_QUARANTINE_RESOLUTION_STATE_INCONSISTENT");
     db.close();
   });
 
@@ -581,7 +625,7 @@ describe("journal observability persistence", () => {
     const fake = {
       state: { paused: false },
       sql: executor.sql,
-    } as unknown as { state: { paused: boolean } };
+    } as unknown as { state: { paused: boolean; runtimeStatus?: "PAUSED" | "RUNNING" } };
     await expect((TraderAgent.prototype as unknown as { reconcileLateExecution: (cycleId: string, decisionId: string) => Promise<unknown> }).reconcileLateExecution.call(fake, "cycle-runtime", "decision-open")).rejects.toThrow("AGENT_MUST_BE_PAUSED");
     db.close();
   });
