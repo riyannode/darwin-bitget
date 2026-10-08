@@ -1209,6 +1209,34 @@ td .table-action {
   font-weight: 600;
 }
 
+/* Risk gate reason shown only for BLOCKED proposals, never inferred. */
+.reason-cell {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.reason-code {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--warning);
+  background: var(--warning-dim);
+  border: 1px solid var(--warning-border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  white-space: nowrap;
+}
+
+.reason-more,
+.reason-empty {
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 /* ---------------------------------------------------------------------------
    FILTER ROW
    --------------------------------------------------------------------------- */

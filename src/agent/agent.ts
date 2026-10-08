@@ -33,6 +33,7 @@ import {
   loadRecentLessons,
   loadOpenExperiences,
   loadJournalsForDecisionIds,
+  loadJournalsForDecisionIdsDetailed,
   loadJournalForExactDecisionCycle,
   loadUsableLessons,
   loadPerformanceAggregate,
@@ -49,6 +50,7 @@ import {
   loadExecutionQuarantines,
   loadExperiences,
   loadExperienceById,
+  loadJournalsForExperienceIds,
   loadActiveOwnerPolicy,
   clampHistoryLimit,
   recordIdempotency,
@@ -69,7 +71,7 @@ import {
   persistProviderLifecycleRepair,
 } from "../storage/store.js";
 import { buildPaperLogExport, parsePaperLogPeriod, paperLogToCsv } from "../storage/paper-log.js";
-import { cyclePlanDecisions, cycleReadModel, normalizeCycleDecisions } from "../storage/journal-normalizer.js";
+import { cyclePlanDecisions, cycleReadModel, normalizeCycleDecisions, blockedRiskGateResult } from "../storage/journal-normalizer.js";
 import { evaluateRiskGate } from "../trading/risk-gate.js";
 import { evaluateDrawdown } from "../trading/drawdown.js";
 import { loadOwnerPolicy, updateOwnerPolicy } from "../trading/policy.js";
@@ -504,6 +506,7 @@ function tradeLogEntries(
   journals: readonly TradingJournal[],
   contexts: ReadonlyMap<string, PositionContext> = new Map(),
   financialFacts: ReadonlyMap<string, ResolvedProviderTradeFact> = new Map(),
+  blockedReasonEvidenceComplete = true,
 ): DashboardSnapshot["trades"] {
   const decisions = journals.flatMap((journal) => cyclePlanDecisions(journal));
   const verifiedOpenIds = verifiedLifecycleFacts(journals).verifiedOpenIds;
@@ -528,6 +531,9 @@ function tradeLogEntries(
     const closedAt = history?.closingTime;
     const persistedReasoning = Boolean(entryReasoning || exitReasoning || managementEvents.length || experience.entryThesis.trim());
     const financialStatus = experience.outcomeStatus === "BLOCKED" ? "BLOCKED" : isProviderClosed ? "CLOSED" : isProviderLive ? "OPEN" : providerExecution ? "EXECUTION_VERIFIED" : "UNRESOLVED";
+    // Surface why a proposal was rejected, read only from the persisted gate evaluation. No
+    // unique authoritative attribution means no reason field at all; never a guess.
+    const blockedGate = financialStatus === "BLOCKED" ? blockedRiskGateResult(experience, journals, blockedReasonEvidenceComplete) : undefined;
     return {
       tradeId: experience.experienceId,
       timestamp: isProviderClosed ? (closedAt ?? openedAt) : isProviderLive ? openedAt : providerExecution?.fills[0]?.filledAt ?? record?.decision.createdAt ?? "UNAVAILABLE",
@@ -548,6 +554,7 @@ function tradeLogEntries(
       realizedPnl: history?.netProfit ?? "UNAVAILABLE",
       status: financialStatus,
       localLifecycleStatus: tradeLifecycleStatus(experience),
+      ...(blockedGate ? { blockedReasonCodes: [...blockedGate.codes], riskGateCheckedAt: blockedGate.checkedAt } : {}),
       thesis: experience.entryThesis,
       orderReference: facts?.providerOrderId ?? providerExecution?.providerOrderId ?? record?.executionResult?.providerOrderId ?? record?.executionResult?.clientOrderId ?? journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
       ...(facts?.providerOrderId ? { providerOrderId: facts.providerOrderId } : {}),
@@ -1796,12 +1803,15 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const reasoningDecisionIds = [...new Set([
       ...historyDecisionIds.values(),
       ...[...openPositionIdentities.values()].map((identity) => identity.decisionId),
-      ...recentExperiences.map((experience) => experience.entryDecisionId),
+      ...recentExperiences.flatMap((experience) => [experience.entryDecisionId, experience.exitDecisionId]),
     ])];
     const targetedExperiences = loadExperiencesForDecisionIds(this, reasoningDecisionIds, Math.min(reasoningDecisionIds.length, 100), "/api/trade-history");
     const experiencesById = new Map([...recentExperiences, ...targetedExperiences].map((experience) => [experience.experienceId, experience]));
     const experiences = [...experiencesById.values()];
-    const journals = loadJournalsForDecisionIds(this, reasoningDecisionIds, Math.min(reasoningDecisionIds.length * 2, 100), "/api/trade-history");
+    const linkedExperienceEvidence = loadJournalsForExperienceIds(this, recentExperiences.map((experience) => experience.experienceId), "/api/trade-history");
+    const decisionEvidence = loadJournalsForDecisionIdsDetailed(this, reasoningDecisionIds, 100, "/api/trade-history");
+    const blockedReasonEvidenceComplete = linkedExperienceEvidence.complete && decisionEvidence.complete;
+    const journals = [...new Map([...linkedExperienceEvidence.journals, ...decisionEvidence.journals].map((journal) => [journal.cycleId, journal])).values()];
     const recentLivePositionKeys = positions
       .filter((position) => position.openedAt && (position.positionSide === "LONG" || position.positionSide === "SHORT"))
       .sort((left, right) => (right.openedAt ?? "").localeCompare(left.openedAt ?? ""))
@@ -1814,7 +1824,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
     ];
     const contexts = loadPositionContextsForKeys(this, contextKeys, Math.min(limit * 4, 400), "/api/trade-history");
     const resolved = resolveProviderTradeFacts(this, experiences, PROVIDER_TRADE_LIFECYCLE_CATEGORY, positions, { histories, historyDecisionIds, openPositionIdentities, positionContexts: contexts, queryPath: "/api/trade-history" });
-    const localTrades = tradeLogEntries(experiences, journals, contexts, resolved.facts).filter((trade) => {
+    const localTrades = tradeLogEntries(experiences, journals, contexts, resolved.facts, blockedReasonEvidenceComplete).filter((trade) => {
       const fact = experiences.find((experience) => experience.experienceId === trade.tradeId);
       const source = fact ? resolved.facts.get(fact.experienceId)?.source : undefined;
       return source !== "PROVIDER_LEDGER" && source !== "PROVIDER_LIVE";

@@ -7,6 +7,7 @@ import type {
   ExecutionResult,
   ExecutionRequest,
   RiskGateResult,
+  TradeExperience,
   TradingJournal,
 } from "../types.js";
 
@@ -79,4 +80,110 @@ export function effectiveReconciliationResult(journal: TradingJournal, decision:
 export function effectiveRiskGateResult(journal: TradingJournal, decision: Decision, record?: DecisionExecutionRecord): RiskGateResult | undefined {
   if (record?.riskGateResult) return record.riskGateResult;
   return journal.decision?.decisionId === decision.decisionId ? journal.riskGateResult : undefined;
+}
+
+/**
+ * Resolves the persisted risk gate evaluation that blocked a proposal, for read-only display.
+ *
+ * Identity is accepted only from the experience's explicit decision ID, or from an exact
+ * experienceId/experienceIds journal link when that ID is absent. A journal-linked fallback must
+ * leave exactly one BLOCK evaluation for the reflected action; symbol and timestamps are never
+ * used to associate a decision with an experience.
+ */
+export function blockedRiskGateResult(
+  experience: Pick<TradeExperience, "experienceId" | "outcomeStatus" | "action" | "lastAction" | "entryDecisionId" | "exitDecisionId">,
+  journals: readonly TradingJournal[],
+  evidenceComplete = true,
+): RiskGateResult | undefined {
+  if (experience.outcomeStatus !== "BLOCKED" || !evidenceComplete) return undefined;
+  const currentAction = experience.lastAction ?? experience.action;
+  const managementAction = currentAction === "CLOSE" || currentAction === "REDUCE";
+  const entryAction = currentAction === "OPEN_LONG" || currentAction === "OPEN_SHORT";
+  const suppliedId = managementAction ? experience.exitDecisionId : entryAction ? experience.entryDecisionId : undefined;
+  const targetDecisionId = typeof suppliedId === "string" && suppliedId.trim().length > 0 ? suppliedId : undefined;
+  const linkedMode = targetDecisionId === undefined;
+  if (linkedMode && (typeof experience.experienceId !== "string" || experience.experienceId.trim().length === 0)) return undefined;
+
+  const relevantJournals = linkedMode
+    ? journals.filter((journal) => journal.experienceId === experience.experienceId
+      || (Array.isArray(journal.experienceIds) && journal.experienceIds.some((linkedId) => linkedId === experience.experienceId)))
+    : journals;
+  if (relevantJournals.length === 0) return undefined;
+
+  const recordsFor = (journal: TradingJournal): DecisionExecutionRecord[] => [
+    ...(journal.executionRecords ?? []),
+    ...(journal.exitExecutions ?? []),
+  ];
+  const candidateDecisionIds = new Set<string>();
+  for (const journal of relevantJournals) {
+    for (const record of recordsFor(journal)) {
+      if (record.riskGateResult && record.decision.action === currentAction
+        && (targetDecisionId ? record.decision.decisionId === targetDecisionId : true)) {
+        candidateDecisionIds.add(record.decision.decisionId);
+      }
+    }
+    if (journal.decision?.decisionId && journal.riskGateResult && journal.decision.action === currentAction
+      && (targetDecisionId ? journal.decision.decisionId === targetDecisionId : true)) {
+      candidateDecisionIds.add(journal.decision.decisionId);
+    }
+  }
+  if (candidateDecisionIds.size === 0) return undefined;
+
+  type EvaluationGroup = {
+    decisionId: string;
+    action: string;
+    evaluations: Map<string, RiskGateResult>;
+  };
+  const groups = new Map<string, EvaluationGroup>();
+  const identitiesByDecision = new Map<string, Set<string>>();
+  let ambiguous = false;
+  const add = (journal: TradingJournal, candidate: Decision, rawResult: unknown): void => {
+    if (!candidateDecisionIds.has(candidate.decisionId) || rawResult === undefined || rawResult === null) return;
+    if (typeof journal.cycleId !== "string" || journal.cycleId.trim().length === 0 || candidate.cycleId !== journal.cycleId) {
+      ambiguous = true;
+      return;
+    }
+    if (typeof rawResult !== "object") { ambiguous = true; return; }
+    const result = rawResult as Partial<RiskGateResult>;
+    if ((result.status !== "BLOCK" && result.status !== "PASS")
+      || !Array.isArray(result.codes)
+      || !result.codes.every((code) => typeof code === "string")
+      || typeof result.checkedAt !== "string"
+      || result.checkedAt.length === 0) {
+      ambiguous = true;
+      return;
+    }
+    const identity = JSON.stringify({
+      journalCycleId: journal.cycleId,
+      decisionCycleId: candidate.cycleId,
+      decisionId: candidate.decisionId,
+      action: candidate.action,
+      symbol: candidate.symbol,
+    });
+    const identitySet = identitiesByDecision.get(candidate.decisionId) ?? new Set<string>();
+    identitySet.add(identity);
+    identitiesByDecision.set(candidate.decisionId, identitySet);
+    const evaluation = JSON.stringify({ status: result.status, codes: result.codes, checkedAt: result.checkedAt });
+    const group = groups.get(identity) ?? { decisionId: candidate.decisionId, action: candidate.action, evaluations: new Map<string, RiskGateResult>() };
+    group.evaluations.set(evaluation, result as RiskGateResult);
+    groups.set(identity, group);
+  };
+
+  for (const journal of relevantJournals) {
+    for (const record of recordsFor(journal)) {
+      if (candidateDecisionIds.has(record.decision.decisionId)) add(journal, record.decision, record.riskGateResult);
+    }
+    if (journal.decision && candidateDecisionIds.has(journal.decision.decisionId)) {
+      add(journal, journal.decision, journal.riskGateResult);
+    }
+  }
+
+  if (ambiguous || [...identitiesByDecision.values()].some((identities) => identities.size !== 1)
+    || [...groups.values()].some((group) => group.evaluations.size !== 1)) return undefined;
+
+  const candidates = [...groups.values()].filter((group) => group.action === currentAction
+    && (linkedMode || group.decisionId === targetDecisionId));
+  if (candidates.length !== 1) return undefined;
+  const only = candidates[0]?.evaluations.values().next().value;
+  return only?.status === "BLOCK" && only.codes.length > 0 ? only : undefined;
 }

@@ -782,6 +782,14 @@ export interface TradeLogEntry {
   status: TradeLifecycleStatus | "UNRESOLVED" | "EXECUTION_VERIFIED";
   unresolvedReason?: string;
   localLifecycleStatus?: TradeLifecycleStatus;
+  /**
+   * Authoritative risk gate codes that rejected a BLOCKED proposal, resolved from the persisted
+   * `RiskGateResult` of the decision that produced this row. Absent whenever no unique persisted
+   * attribution exists; never inferred from other trade fields.
+   */
+  blockedReasonCodes?: string[];
+  /** `checkedAt` of the persisted risk gate evaluation that produced `blockedReasonCodes`. */
+  riskGateCheckedAt?: string;
   intendedMarginAllocated?: string;
   intendedMarginAllocationPct?: string;
   intendedLeverage?: string;
