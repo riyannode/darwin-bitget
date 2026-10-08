@@ -7,6 +7,7 @@ import type {
   ExecutionResult,
   ExecutionRequest,
   RiskGateResult,
+  TradeExperience,
   TradingJournal,
 } from "../types.js";
 
@@ -79,4 +80,42 @@ export function effectiveReconciliationResult(journal: TradingJournal, decision:
 export function effectiveRiskGateResult(journal: TradingJournal, decision: Decision, record?: DecisionExecutionRecord): RiskGateResult | undefined {
   if (record?.riskGateResult) return record.riskGateResult;
   return journal.decision?.decisionId === decision.decisionId ? journal.riskGateResult : undefined;
+}
+
+/**
+ * Resolves the persisted risk gate evaluation that blocked a proposal, for read-only display.
+ *
+ * Attribution is deliberately conservative and never inferred from trade fields:
+ *   - only a gate that actually reported BLOCK contributes codes;
+ *   - a candidate decision must be one the BLOCKED experience is attributed to;
+ *   - if journals disagree about that decision, nothing is returned rather than guessing.
+ *
+ * `experience` may carry an `entryDecisionId` (entry proposals) or an `exitDecisionId` (blocked
+ * management actions); both are matched against the recorded decision identity.
+ */
+export function blockedRiskGateResult(
+  experience: Pick<TradeExperience, "outcomeStatus" | "entryDecisionId" | "exitDecisionId">,
+  journals: readonly TradingJournal[],
+): RiskGateResult | undefined {
+  if (experience.outcomeStatus !== "BLOCKED") return undefined;
+  const decisionIds = [...new Set([experience.entryDecisionId, experience.exitDecisionId].filter((id): id is string => typeof id === "string" && id.length > 0))];
+  if (decisionIds.length === 0) return undefined;
+  const matches = new Map<string, string>();
+  const results = new Map<string, RiskGateResult>();
+  let ambiguous = false;
+  for (const journal of journals) {
+    for (const decision of cyclePlanDecisions(journal)) {
+      if (!decisionIds.includes(decision.decisionId)) continue;
+      const result = effectiveRiskGateResult(journal, decision, executionRecordForDecision(journal, decision.decisionId));
+      if (!result || result.status !== "BLOCK" || result.codes.length === 0) continue;
+      const signature = [...result.codes].join(",");
+      const existing = matches.get(decision.decisionId);
+      if (existing !== undefined && existing !== signature) ambiguous = true;
+      matches.set(decision.decisionId, signature);
+      results.set(decision.decisionId, result);
+    }
+  }
+  if (ambiguous || results.size !== 1) return undefined;
+  const [only] = results.values();
+  return only;
 }

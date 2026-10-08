@@ -69,7 +69,7 @@ import {
   persistProviderLifecycleRepair,
 } from "../storage/store.js";
 import { buildPaperLogExport, parsePaperLogPeriod, paperLogToCsv } from "../storage/paper-log.js";
-import { cyclePlanDecisions, cycleReadModel, normalizeCycleDecisions } from "../storage/journal-normalizer.js";
+import { cyclePlanDecisions, cycleReadModel, normalizeCycleDecisions, blockedRiskGateResult } from "../storage/journal-normalizer.js";
 import { evaluateRiskGate } from "../trading/risk-gate.js";
 import { evaluateDrawdown } from "../trading/drawdown.js";
 import { loadOwnerPolicy, updateOwnerPolicy } from "../trading/policy.js";
@@ -528,6 +528,9 @@ function tradeLogEntries(
     const closedAt = history?.closingTime;
     const persistedReasoning = Boolean(entryReasoning || exitReasoning || managementEvents.length || experience.entryThesis.trim());
     const financialStatus = experience.outcomeStatus === "BLOCKED" ? "BLOCKED" : isProviderClosed ? "CLOSED" : isProviderLive ? "OPEN" : providerExecution ? "EXECUTION_VERIFIED" : "UNRESOLVED";
+    // Surface why a proposal was rejected, read only from the persisted gate evaluation. No
+    // unique authoritative attribution means no reason field at all; never a guess.
+    const blockedGate = financialStatus === "BLOCKED" ? blockedRiskGateResult(experience, journals) : undefined;
     return {
       tradeId: experience.experienceId,
       timestamp: isProviderClosed ? (closedAt ?? openedAt) : isProviderLive ? openedAt : providerExecution?.fills[0]?.filledAt ?? record?.decision.createdAt ?? "UNAVAILABLE",
@@ -548,6 +551,7 @@ function tradeLogEntries(
       realizedPnl: history?.netProfit ?? "UNAVAILABLE",
       status: financialStatus,
       localLifecycleStatus: tradeLifecycleStatus(experience),
+      ...(blockedGate ? { blockedReasonCodes: [...blockedGate.codes], riskGateCheckedAt: blockedGate.checkedAt } : {}),
       thesis: experience.entryThesis,
       orderReference: facts?.providerOrderId ?? providerExecution?.providerOrderId ?? record?.executionResult?.providerOrderId ?? record?.executionResult?.clientOrderId ?? journal?.executionResult?.providerOrderId ?? journal?.executionResult?.clientOrderId ?? "—",
       ...(facts?.providerOrderId ? { providerOrderId: facts.providerOrderId } : {}),

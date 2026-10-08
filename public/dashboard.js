@@ -262,6 +262,27 @@ function renderLearning() {
   learning.lessons.slice(0, 3).forEach((lesson) => { const item = document.createElement("div"); item.className = "lesson"; item.textContent = `${lesson.source} · ${lesson.status} · ${lesson.lesson}`; node.append(item); });
 }
 
+function blockedReasonCodes(trade) {
+  // Only codes persisted with the row are shown. A missing field is "not recorded", never a guess.
+  if (trade.status !== "BLOCKED") return [];
+  return Array.isArray(trade.blockedReasonCodes) ? trade.blockedReasonCodes.filter((code) => typeof code === "string" && code.trim().length > 0) : [];
+}
+
+function blockedReasonCell(trade) {
+  const codes = blockedReasonCodes(trade);
+  if (!codes.length) { const empty = document.createElement("span"); empty.className = "reason-empty"; empty.textContent = trade.status === "BLOCKED" ? "Not recorded" : "—"; return empty; }
+  const primary = codes[0];
+  const cell = document.createElement("span");
+  cell.className = "reason-cell";
+  const code = document.createElement("code");
+  code.className = "reason-code";
+  code.textContent = primary;
+  code.title = codes.join(" · ");
+  cell.append(code);
+  if (codes.length > 1) { const more = document.createElement("small"); more.className = "reason-more"; more.textContent = `+${codes.length - 1} more`; more.title = codes.join(" · "); cell.append(more); }
+  return cell;
+}
+
 function renderRecentTrades() {
   const node = $("recent-trades"); node.replaceChildren(); node.className = snapshot.trades.length ? "recent-trades" : "recent-trades empty";
   if (!snapshot.trades.length) { node.textContent = "No recent trades"; return; }
@@ -280,6 +301,20 @@ function renderLatestTrade() {
   if (!trade) { summary.textContent = "No verified PAPER trade recorded yet."; return; }
   [detail("TIME", when(trade.timestamp)), detail("SYMBOL / SIDE", `${trade.symbol} / ${trade.positionSide ?? "—"}`), detail("ACTION", trade.action), detail("STATUS", trade.status)].forEach((item) => summary.append(item));
   [detail("MARGIN", `${trade.marginAllocationPct}% / ${money(trade.marginAllocated)}`), detail("LEVERAGE", `${trade.leverage}x`), detail("POSITION NOTIONAL", money(trade.positionNotional)), detail("ENTRY", trade.entry), detail("EXIT", trade.exit), detail("REALIZED PNL", money(trade.realizedPnl)), detail("ORDER REFERENCE", trade.orderReference)].forEach((item) => node.append(item));
+  const blockedCodes = blockedReasonCodes(trade);
+  if (trade.status === "BLOCKED") {
+    const heading = document.createElement("section");
+    const title = document.createElement("h3"); title.textContent = "RISK GATE REASON";
+    heading.append(title);
+    if (blockedCodes.length) {
+      heading.append(detail("RISK GATE STATUS", "BLOCK", true));
+      blockedCodes.forEach((code) => { const item = document.createElement("div"); item.className = "wide"; const name = document.createElement("span"); name.className = "label"; name.textContent = "CODE"; const content = document.createElement("span"); content.className = "value"; const chip = document.createElement("code"); chip.className = "reason-code"; chip.textContent = code; content.append(chip); item.append(name, content); heading.append(item); });
+      if (trade.riskGateCheckedAt) heading.append(detail("GATE EVALUATED AT", when(trade.riskGateCheckedAt)));
+    } else {
+      const empty = document.createElement("p"); empty.className = "subtle"; empty.textContent = "No persisted risk gate evaluation is attributable to this proposal."; heading.append(empty);
+    }
+    node.append(heading);
+  }
   node.append(reasoningSection("WHY THIS TRADE WAS OPENED", trade.entryReasoning, "Verified opening exists; structured entry reasoning unavailable."));
   if (trade.exitReasoning) node.append(reasoningSection("WHY THIS TRADE WAS CLOSED", trade.exitReasoning, "Structured close reasoning unavailable."));
   if (trade.managementEvents?.length) {
@@ -299,7 +334,7 @@ function renderActivity() {
 
 function renderTradeTable() {
   const node = $("trade-table"); node.replaceChildren(); const trades = snapshot.trades.filter((trade) => tradeFilter === "ALL" || (tradeFilter === "OPEN" && (trade.status === "OPEN" || trade.status === "PARTIALLY_REDUCED")) || (tradeFilter === "CLOSED" && trade.status === "CLOSED") || (tradeFilter === "WIN" && Number(trade.realizedPnl) > 0) || (tradeFilter === "LOSS" && Number(trade.realizedPnl) < 0));
-  trades.forEach((trade) => { const row = document.createElement("tr"); row.tabIndex = 0; row.addEventListener("click", () => { selectedTradeId = trade.tradeId; renderLatestTrade(); }); [when(trade.timestamp), trade.symbol, trade.action, `${trade.marginAllocationPct}% / ${money(trade.marginAllocated)}`, `${trade.leverage}x`, money(trade.positionNotional), trade.entry, trade.exit, money(trade.realizedPnl), trade.status].forEach((value, index) => { const cell = document.createElement("td"); cell.textContent = text(value); if (index === 2) cell.className = "table-action"; row.append(cell); }); node.append(row); });
+  trades.forEach((trade) => { const row = document.createElement("tr"); row.tabIndex = 0; row.addEventListener("click", () => { selectedTradeId = trade.tradeId; renderLatestTrade(); }); [when(trade.timestamp), trade.symbol, trade.action, `${trade.marginAllocationPct}% / ${money(trade.marginAllocated)}`, `${trade.leverage}x`, money(trade.positionNotional), trade.entry, trade.exit, money(trade.realizedPnl), trade.status].forEach((value, index) => { const cell = document.createElement("td"); cell.textContent = text(value); if (index === 2) cell.className = "table-action"; row.append(cell); }); const reason = document.createElement("td"); reason.append(blockedReasonCell(trade)); row.append(reason); node.append(row); });
 }
 
 function renderLessons() {
