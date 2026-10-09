@@ -532,13 +532,26 @@ export function loadJournalForExactDecisionCycle(executor: SqlExecutor, cycleId:
   }
 }
 
-export function loadAllExperiences(executor: SqlExecutor, path = "/api/export/paper-log", queryName = "paper_log_all_experiences", afterRowId?: number, from?: string, to?: string): TradeExperience[] {
+export function loadAllExperiences(executor: SqlExecutor, path = "/api/export/paper-log", queryName = "paper_log_all_experiences", afterRowId?: number, from?: string, to?: string, collectionEpoch?: PaperLogCollectionEpoch): TradeExperience[] {
   const query = executeMeasuredSql<ExperienceRow>(executor, path, queryName);
   const start = from ?? null;
   const end = to ?? null;
-  const rows = afterRowId !== undefined
-    ? query`SELECT payload FROM experiences WHERE rowid > ${afterRowId} AND (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end}) ORDER BY created_at ASC, experience_id ASC`
-    : query`SELECT payload FROM experiences WHERE (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end}) ORDER BY created_at ASC, experience_id ASC`;
+  const rows = collectionEpoch
+    ? query`SELECT e.payload FROM experiences e
+      WHERE EXISTS (SELECT 1 FROM journals j, json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') id
+        WHERE j.rowid > ${collectionEpoch.highWaterRowIds.journals} AND j.cycle_id IN (
+          SELECT cycle_id FROM journals WHERE rowid > ${collectionEpoch.highWaterRowIds.journals}
+            AND created_at >= ${collectionEpoch.startedAt} AND (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end})
+            AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+        ) AND id.value = e.experience_id)
+        OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${collectionEpoch.highWaterRowIds.events} AND ev.created_at >= ${collectionEpoch.startedAt}
+          AND (${start} IS NULL OR ev.created_at >= ${start}) AND (${end} IS NULL OR ev.created_at <= ${end})
+          AND ev.event_type IN ('LATE_EXECUTION_RECONCILED', 'EXECUTION_QUARANTINE_CLEARED')
+          AND CASE WHEN json_valid(ev.payload) THEN json_extract(ev.payload, '$.metadata.experienceId') = e.experience_id ELSE 0 END)
+      ORDER BY e.created_at ASC, e.experience_id ASC`
+    : afterRowId !== undefined
+      ? query`SELECT payload FROM experiences WHERE rowid > ${afterRowId} AND (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end}) ORDER BY created_at ASC, experience_id ASC`
+      : query`SELECT payload FROM experiences WHERE (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end}) ORDER BY created_at ASC, experience_id ASC`;
   return rows.flatMap((row) => {
     try {
       return [parseExperience(JSON.parse(row.payload))];
@@ -1204,13 +1217,23 @@ export function loadExecutionQuarantineRecoveryAuditEvents(
   };
 }
 
-export function loadAllEvents(executor: SqlExecutor, path = "/api/export/paper-log", queryName = "paper_log_all_events", afterRowId?: number, from?: string, to?: string): ActivityEvent[] {
+export function loadAllEvents(executor: SqlExecutor, path = "/api/export/paper-log", queryName = "paper_log_all_events", afterRowId?: number, from?: string, to?: string, collectionEpoch?: PaperLogCollectionEpoch): ActivityEvent[] {
   const query = executeMeasuredSql<EventRow>(executor, path, queryName);
   const start = from ?? null;
   const end = to ?? null;
-  const rows = afterRowId !== undefined
-    ? query`SELECT event_id, event_type, cycle_id, payload, created_at FROM events WHERE rowid > ${afterRowId} AND (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end}) ORDER BY created_at ASC, event_id ASC`
-    : query`SELECT event_id, event_type, cycle_id, payload, created_at FROM events WHERE (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end}) ORDER BY created_at ASC, event_id ASC`;
+  const rows = collectionEpoch
+    ? query`SELECT e.event_id, e.event_type, e.cycle_id, e.payload, e.created_at FROM events e
+      WHERE e.rowid > ${collectionEpoch.highWaterRowIds.events} AND e.created_at >= ${collectionEpoch.startedAt}
+        AND (${start} IS NULL OR e.created_at >= ${start}) AND (${end} IS NULL OR e.created_at <= ${end})
+        AND e.cycle_id <> 'CONTROL' AND e.event_type NOT LIKE 'PROVIDER_SYNC_%'
+        AND (EXISTS (SELECT 1 FROM journals j WHERE j.rowid > ${collectionEpoch.highWaterRowIds.journals} AND j.cycle_id = e.cycle_id
+          AND j.created_at >= ${collectionEpoch.startedAt} AND (${start} IS NULL OR j.created_at >= ${start}) AND (${end} IS NULL OR j.created_at <= ${end})
+          AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END)
+          OR e.event_type IN ('LATE_EXECUTION_RECONCILED', 'EXECUTION_QUARANTINE_CLEARED'))
+      ORDER BY e.created_at ASC, e.event_id ASC`
+    : afterRowId !== undefined
+      ? query`SELECT event_id, event_type, cycle_id, payload, created_at FROM events WHERE rowid > ${afterRowId} AND (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end}) ORDER BY created_at ASC, event_id ASC`
+      : query`SELECT event_id, event_type, cycle_id, payload, created_at FROM events WHERE (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end}) ORDER BY created_at ASC, event_id ASC`;
   return rows.flatMap((row) => {
     try {
       const event = JSON.parse(row.payload) as ActivityEvent;
@@ -1441,33 +1464,48 @@ export function savePaperLogCollectionEpoch(executor: SqlExecutor, epoch: PaperL
   `;
 }
 
-export function loadPaperLogCollectionExportSize(executor: SqlExecutor, epoch: PaperLogCollectionEpoch): PaperLogCollectionExportSize {
+export function loadPaperLogCollectionExportSize(executor: SqlExecutor, epoch: PaperLogCollectionEpoch, from?: string, to?: string): PaperLogCollectionExportSize {
+  const start = from ?? null;
+  const end = to ?? null;
   const journals = executor.sql<{ row_count: number; payload_bytes: number; invalid_payload_rows: number }>`SELECT
       COUNT(CASE WHEN json_valid(payload) THEN CASE WHEN json_extract(payload, '$.mode') = 'AUTONOMOUS' THEN 1 END END) AS row_count,
-      COALESCE(SUM(CASE WHEN json_valid(payload) THEN CASE WHEN json_extract(payload, '$.mode') = 'AUTONOMOUS' THEN length(CAST(payload AS BLOB)) ELSE 0 END ELSE 0 END), 0) AS payload_bytes,
+      COALESCE(SUM(CASE WHEN json_valid(payload) AND json_extract(payload, '$.mode') = 'AUTONOMOUS' THEN length(CAST(payload AS BLOB)) ELSE 0 END), 0) AS payload_bytes,
       COALESCE(SUM(CASE WHEN json_valid(payload) THEN CASE WHEN json_type(payload, '$.mode') = 'text' THEN 0 ELSE 1 END ELSE 1 END), 0) AS invalid_payload_rows
-    FROM journals WHERE rowid > ${epoch.highWaterRowIds.journals}`;
+    FROM journals WHERE rowid > ${epoch.highWaterRowIds.journals} AND created_at >= ${epoch.startedAt}
+      AND (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end})`;
   const cycles = executor.sql<{ row_count: number; payload_bytes: number; invalid_payload_rows: number }>`SELECT COUNT(*) AS row_count, 0 AS payload_bytes, 0 AS invalid_payload_rows
-    FROM cycles WHERE rowid > ${epoch.highWaterRowIds.cycles}`;
+    FROM cycles WHERE rowid > ${epoch.highWaterRowIds.cycles}
+      AND (${start} IS NULL OR started_at >= ${start}) AND (${end} IS NULL OR started_at <= ${end})`;
   const experiences = executor.sql<{ row_count: number; payload_bytes: number; invalid_payload_rows: number }>`SELECT COUNT(*) AS row_count,
-      COALESCE(SUM(length(CAST(payload AS BLOB))), 0) AS payload_bytes,
-      COALESCE(SUM(CASE WHEN json_valid(payload) THEN 0 ELSE 1 END), 0) AS invalid_payload_rows
-    FROM experiences WHERE rowid > ${epoch.highWaterRowIds.experiences}`;
+      COALESCE(SUM(length(CAST(e.payload AS BLOB))), 0) AS payload_bytes,
+      COALESCE(SUM(CASE WHEN json_valid(e.payload) THEN 0 ELSE 1 END), 0) AS invalid_payload_rows
+    FROM experiences e WHERE EXISTS (
+      SELECT 1 FROM journals j, json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') id
+      WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.created_at >= ${epoch.startedAt}
+        AND (${start} IS NULL OR j.created_at >= ${start}) AND (${end} IS NULL OR j.created_at <= ${end})
+        AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+        AND id.value = e.experience_id)
+      OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${epoch.highWaterRowIds.events} AND ev.created_at >= ${epoch.startedAt}
+        AND (${start} IS NULL OR ev.created_at >= ${start}) AND (${end} IS NULL OR ev.created_at <= ${end})
+        AND ev.event_type IN ('LATE_EXECUTION_RECONCILED', 'EXECUTION_QUARANTINE_CLEARED')
+        AND CASE WHEN json_valid(ev.payload) THEN json_extract(ev.payload, '$.metadata.experienceId') = e.experience_id ELSE 0 END)`;
   const events = executor.sql<{ row_count: number; payload_bytes: number; invalid_payload_rows: number }>`SELECT COUNT(*) AS row_count,
       COALESCE(SUM(length(CAST(e.payload AS BLOB))), 0) AS payload_bytes,
       COALESCE(SUM(CASE WHEN json_valid(e.payload) THEN 0 ELSE 1 END), 0) AS invalid_payload_rows
     FROM events e WHERE e.rowid > ${epoch.highWaterRowIds.events} AND e.created_at >= ${epoch.startedAt}
-      AND (EXISTS (
-        SELECT 1 FROM journals j WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.cycle_id = e.cycle_id
-          AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
-      ) OR e.event_type IN ('LATE_EXECUTION_RECONCILED', 'EXECUTION_QUARANTINE_CLEARED'))`;
+      AND (${start} IS NULL OR e.created_at >= ${start}) AND (${end} IS NULL OR e.created_at <= ${end})
+      AND e.cycle_id <> 'CONTROL' AND e.event_type NOT LIKE 'PROVIDER_SYNC_%'
+      AND (EXISTS (SELECT 1 FROM journals j WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.cycle_id = e.cycle_id
+        AND j.created_at >= ${epoch.startedAt} AND (${start} IS NULL OR j.created_at >= ${start}) AND (${end} IS NULL OR j.created_at <= ${end})
+        AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END)
+        OR e.event_type IN ('LATE_EXECUTION_RECONCILED', 'EXECUTION_QUARANTINE_CLEARED'))`;
   const unpairedCycles = executor.sql<{ count: number }>`SELECT COUNT(*) AS count FROM cycles c
-    WHERE c.rowid > ${epoch.highWaterRowIds.cycles} AND NOT EXISTS (
-      SELECT 1 FROM journals j WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.cycle_id = c.cycle_id
-        AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
-    )`;
+    WHERE c.rowid > ${epoch.highWaterRowIds.cycles} AND (${start} IS NULL OR c.started_at >= ${start}) AND (${end} IS NULL OR c.started_at <= ${end})
+      AND NOT EXISTS (SELECT 1 FROM journals j WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.cycle_id = c.cycle_id
+        AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END)`;
   const unpairedJournals = executor.sql<{ count: number }>`SELECT COUNT(*) AS count FROM journals j
-    WHERE j.rowid > ${epoch.highWaterRowIds.journals}
+    WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.created_at >= ${epoch.startedAt}
+      AND (${start} IS NULL OR j.created_at >= ${start}) AND (${end} IS NULL OR j.created_at <= ${end})
       AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
       AND NOT EXISTS (SELECT 1 FROM cycles c WHERE c.rowid > ${epoch.highWaterRowIds.cycles} AND c.cycle_id = j.cycle_id)`;
   const rows = [journals[0], cycles[0], experiences[0], events[0]];

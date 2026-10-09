@@ -529,7 +529,10 @@ export function buildPaperLogExport(input: {
     .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
 
   const decisions = journals.flatMap(cycleDecisions);
-  const experienceIds = new Set(journals.flatMap((journal) => journal.experienceIds ?? []));
+  const experienceIds = new Set([
+    ...journals.flatMap((journal) => journal.experienceIds ?? []),
+    ...events.flatMap((event) => typeof event.metadata?.experienceId === "string" ? [event.metadata.experienceId] : []),
+  ]);
   const experiences = input.experiences.filter((experience) => experienceIds.has(experience.experienceId)).map(exportExperience);
 
   const decisionCounts: Record<Decision["action"], number> = { HOLD: 0, OPEN_LONG: 0, OPEN_SHORT: 0, INCREASE: 0, REDUCE: 0, CLOSE: 0, REVERSE: 0 };
@@ -683,11 +686,11 @@ function csvValue(value: unknown): string {
 export function paperLogToCsv(exported: PaperLogExport): string {
   const baseHeader = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "scannedUniverseCount", "selectedEntryCandidates", "managedExistingPositions", "totalProposedActions", "financialWritesPerformed", "decisionId", "decisionTimestamp", "actionCategory", "action", "symbol", "positionSide", "marginAllocationPct", "additionalMarginPct", "targetPositionSide", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "providerOperation", "providerCode", "providerMessage", "providerReadbackCode", "providerReadbackMessage", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "physicalWrites", "reflectionIds", "createdLessonIds", "closedEpisodeRealizedPnl", "openEpisodePartialRealizedPnl", "verifiedRealizedPnl", "closedTrades", "wins", "losses", "breakeven", "classifiedClosedTrades", "winRatePct"];
   const isEpochExport = Boolean(exported.export.collectionEpoch);
-  const epochHeader = isEpochExport ? ["metricsScope", "lifetimeMetricsState", "collectionEpochId", "collectionStartedAt", "archiveManifestSha256", "archiveContentSha256", "quarantineContentSha256"] : [];
+  const epochHeader = isEpochExport ? ["metricsScope", "lifetimeMetricsState", "collectionEpochId", "collectionStartedAt", "periodStart", "periodEnd", "archiveManifestSha256", "archiveContentSha256", "quarantineContentSha256"] : [];
   const eventHeader = isEpochExport ? ["recordType", "eventId", "eventType", "eventCycleId", "eventCreatedAt", "eventMetadata"] : [];
   const header = [...baseHeader, ...epochHeader, ...eventHeader];
   const summaryValues = [exported.summary.closedTrades.closedEpisodeRealizedPnl, exported.summary.closedTrades.openEpisodePartialRealizedPnl, exported.summary.closedTrades.verifiedRealizedPnl, exported.summary.closedTrades.total, exported.summary.closedTrades.wins, exported.summary.closedTrades.losses, exported.summary.closedTrades.breakeven, exported.summary.closedTrades.classifiedClosedTrades, exported.summary.closedTrades.winRatePct];
-  const epochValues = exported.export.collectionEpoch ? [exported.export.metricsScope, exported.export.lifetimeMetricsState, exported.export.collectionEpoch.epochId, exported.export.collectionEpoch.startedAt, exported.export.collectionEpoch.archiveManifestSha256, exported.export.collectionEpoch.archiveContentSha256, exported.export.collectionEpoch.quarantineContentSha256] : [];
+  const epochValues = exported.export.collectionEpoch ? [exported.export.metricsScope, exported.export.lifetimeMetricsState, exported.export.collectionEpoch.epochId, exported.export.collectionEpoch.startedAt, exported.export.period.start, exported.export.period.end, exported.export.collectionEpoch.archiveManifestSha256, exported.export.collectionEpoch.archiveContentSha256, exported.export.collectionEpoch.quarantineContentSha256] : [];
   const eventBlankValues = isEpochExport ? ["", "", "", "", "", ""] : [];
   const rows = exported.cycles.flatMap((cycle) => {
     const decisions = exported.decisions.filter((decision) => decision.cycleId === cycle.cycleId);

@@ -1635,16 +1635,16 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (format !== "json" && format !== "csv") return json({ error: "INVALID_EXPORT_FORMAT" }, 400);
       const epoch = loadPaperLogCollectionEpoch(this);
       if (!epoch) return json({ error: "PAPER_LOG_COLLECTION_EPOCH_NOT_INITIALIZED" }, 409);
-      const exportSize = loadPaperLogCollectionExportSize(this, epoch);
-      if (exportSize.invalidPayloadRows > 0) return json({ error: "PAPER_LOG_COLLECTION_HAS_INVALID_PAYLOAD" }, 409);
-      if (exportSize.unpairedCurrentCycleRows > 0 || exportSize.unpairedCurrentJournalRows > 0) return json({ error: "PAPER_LOG_COLLECTION_HAS_UNPAIRED_CYCLES", unpairedCurrentCycleRows: exportSize.unpairedCurrentCycleRows, unpairedCurrentJournalRows: exportSize.unpairedCurrentJournalRows }, 409);
-      if (exportSize.rowCount > MAX_PAPER_LOG_EXPORT_ROWS || exportSize.payloadBytes > MAX_PAPER_LOG_EXPORT_PAYLOAD_BYTES) {
-        return json({ error: "PAPER_LOG_EXPORT_REQUIRES_BOUNDED_ARCHIVE_PAGES", rowCount: exportSize.rowCount, payloadBytes: exportSize.payloadBytes }, 413);
-      }
       const requestedPeriod = parsePaperLogPeriod(url.searchParams.get("from"), url.searchParams.get("to"));
       if (requestedPeriod.end && requestedPeriod.end < epoch.startedAt) return json({ error: "PAPER_LOG_PERIOD_OUTSIDE_COLLECTION_EPOCH" }, 416);
       const start = requestedPeriod.start && requestedPeriod.start > epoch.startedAt ? requestedPeriod.start : epoch.startedAt;
       const period = { start, end: requestedPeriod.end };
+      const exportSize = loadPaperLogCollectionExportSize(this, epoch, period.start ?? undefined, period.end ?? undefined);
+      if (exportSize.invalidPayloadRows > 0) return json({ error: "PAPER_LOG_COLLECTION_HAS_INVALID_PAYLOAD" }, 409);
+      if (exportSize.unpairedCurrentCycleRows > 0 || exportSize.unpairedCurrentJournalRows > 0) return json({ error: "PAPER_LOG_COLLECTION_HAS_UNPAIRED_CYCLES", unpairedCurrentCycleRows: exportSize.unpairedCurrentCycleRows, unpairedCurrentJournalRows: exportSize.unpairedCurrentJournalRows }, 409);
+      if (exportSize.rowCount > MAX_PAPER_LOG_EXPORT_ROWS || exportSize.payloadBytes > MAX_PAPER_LOG_EXPORT_PAYLOAD_BYTES) {
+        return json({ error: "PAPER_LOG_EXPORT_REQUIRES_BOUNDED_PAGES", rowCount: exportSize.rowCount, payloadBytes: exportSize.payloadBytes, hint: "Use from/to to export smaller collection-period windows." }, 413);
+      }
       const journals = loadAllAutonomousJournals(this, period.start ?? undefined, period.end ?? undefined, "/api/export/paper-log", "paper_log_current_epoch_journals", epoch.highWaterRowIds.journals);
       const exported = buildPaperLogExport({
         generatedAt: new Date().toISOString(),
@@ -1655,8 +1655,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
         commit: this.env.GIT_COMMIT_SHA?.trim() || "unknown",
         cycles: loadAllStoredCycles(this, period.start ?? undefined, period.end ?? undefined, "/api/export/paper-log", "paper_log_current_epoch_cycles", epoch.highWaterRowIds.cycles),
         journals,
-        experiences: loadAllExperiences(this, "/api/export/paper-log", "paper_log_current_epoch_experiences", epoch.highWaterRowIds.experiences, period.start ?? undefined, period.end ?? undefined),
-        events: loadAllEvents(this, "/api/export/paper-log", "paper_log_current_epoch_events", epoch.highWaterRowIds.events, period.start ?? undefined, period.end ?? undefined),
+        experiences: loadAllExperiences(this, "/api/export/paper-log", "paper_log_current_epoch_experiences", epoch.highWaterRowIds.experiences, period.start ?? undefined, period.end ?? undefined, epoch),
+        events: loadAllEvents(this, "/api/export/paper-log", "paper_log_current_epoch_events", epoch.highWaterRowIds.events, period.start ?? undefined, period.end ?? undefined, epoch),
         includeUnlinkedEvents: true,
         collectionEpoch: { epochId: epoch.epochId, startedAt: epoch.startedAt, archiveManifestSha256: epoch.archiveManifestSha256, archiveContentSha256: epoch.archiveContentSha256, quarantineContentSha256: epoch.quarantineContentSha256 },
       });
@@ -2617,7 +2617,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       type: "LATE_EXECUTION_RECONCILED",
       cycleId: originalCycleId,
       createdAt: resolvedAt,
-      metadata: { ...result.auditMetadata, originalCycleId, decisionId, clientOrderId, providerOrderId: order.orderId, evidenceHash },
+      metadata: { ...result.auditMetadata, originalCycleId, decisionId, clientOrderId, providerOrderId: order.orderId, evidenceHash, experienceId: result.experience.experienceId },
     };
     const clearedEvent = {
       eventId: clearedEventId,
