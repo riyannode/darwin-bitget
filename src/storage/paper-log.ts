@@ -549,8 +549,10 @@ export function buildPaperLogExport(input: {
     ...events.flatMap((event) => typeof event.metadata?.experienceId === "string" ? [event.metadata.experienceId] : []),
   ]);
   const collectionStartedAt = input.collectionEpoch?.startedAt;
+  // Epoch-scoped storage has already selected experiences through evidence anywhere in the fixed epoch snapshot;
+  // re-filtering against only this page/window's journal links would drop a position closed in a later period.
   const experiences = input.experiences
-    .filter((experience) => experienceIds.has(experience.experienceId))
+    .filter((experience) => Boolean(input.collectionEpoch) || experienceIds.has(experience.experienceId))
     .filter((experience) => experienceBelongsToPeriod(experience, input.period, collectionStartedAt))
     .map(exportExperience);
 

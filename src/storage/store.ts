@@ -550,11 +550,12 @@ export function loadAllExperiences(executor: SqlExecutor, path = "/api/export/pa
       WHERE (EXISTS (SELECT 1 FROM journals j LEFT JOIN json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') id ON true
         WHERE j.rowid > ${collectionEpoch.highWaterRowIds.journals} AND j.cycle_id IN (
           SELECT cycle_id FROM journals WHERE rowid > ${collectionEpoch.highWaterRowIds.journals}
-            AND created_at >= ${collectionEpoch.startedAt} AND (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end})
+            AND created_at >= ${collectionEpoch.startedAt}
+            AND (e.outcome_status IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR ((${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end})))
             AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
         ) AND (id.value = e.experience_id OR CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.experienceId') = e.experience_id ELSE 0 END))
         OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${collectionEpoch.highWaterRowIds.events} AND ev.created_at >= ${collectionEpoch.startedAt}
-          AND (${start} IS NULL OR ev.created_at >= ${start}) AND (${end} IS NULL OR ev.created_at <= ${end})
+          AND (e.outcome_status IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR ((${start} IS NULL OR ev.created_at >= ${start}) AND (${end} IS NULL OR ev.created_at <= ${end})))
           AND ev.event_type IN ('LATE_EXECUTION_RECONCILED', 'EXECUTION_QUARANTINE_CLEARED')
           AND CASE WHEN json_valid(ev.payload) THEN json_extract(ev.payload, '$.metadata.experienceId') = e.experience_id ELSE 0 END))
       AND (NOT json_valid(e.payload) OR julianday(json_extract(e.payload, '$.exitTime')) IS NULL OR e.outcome_status NOT IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR
@@ -1444,12 +1445,12 @@ export function loadPaperLogCollectionExportPage(
             (json_valid(e.payload) AND json_extract(e.payload, '$.exitTime') >= ${epoch.startedAt}
               AND json_extract(e.payload, '$.exitTime') >= ${start} AND (${end} IS NULL OR json_extract(e.payload, '$.exitTime') <= ${end})))
           AND (EXISTS (SELECT 1 FROM journals j LEFT JOIN json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') linked ON true
-            WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.rowid <= ${input.throughRowIds.journals} AND j.created_at >= ${start}
-              AND (${end} IS NULL OR j.created_at <= ${end})
+            WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.rowid <= ${input.throughRowIds.journals} AND j.created_at >= ${epoch.startedAt}
+              AND (e.outcome_status IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR (j.created_at >= ${start} AND (${end} IS NULL OR j.created_at <= ${end})))
               AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
               AND (linked.value = e.experience_id OR CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.experienceId') = e.experience_id ELSE 0 END))
-            OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${epoch.highWaterRowIds.events} AND ev.rowid <= ${input.throughRowIds.events}
-              AND ev.created_at >= ${start} AND (${end} IS NULL OR ev.created_at <= ${end})
+            OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${epoch.highWaterRowIds.events} AND ev.rowid <= ${input.throughRowIds.events} AND ev.created_at >= ${epoch.startedAt}
+              AND (e.outcome_status IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR (ev.created_at >= ${start} AND (${end} IS NULL OR ev.created_at <= ${end})))
               AND ev.event_type IN ('LATE_EXECUTION_RECONCILED','EXECUTION_QUARANTINE_CLEARED')
               AND CASE WHEN json_valid(ev.payload) THEN json_extract(ev.payload, '$.metadata.experienceId') = e.experience_id ELSE 0 END))
           ORDER BY e.rowid ASC LIMIT ${limitSql}`
@@ -1461,12 +1462,12 @@ export function loadPaperLogCollectionExportPage(
             (json_valid(e.payload) AND json_extract(e.payload, '$.exitTime') >= ${epoch.startedAt}
               AND json_extract(e.payload, '$.exitTime') >= ${start} AND (${end} IS NULL OR json_extract(e.payload, '$.exitTime') <= ${end})))
           AND (EXISTS (SELECT 1 FROM journals j LEFT JOIN json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') linked ON true
-            WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.rowid <= ${input.throughRowIds.journals} AND j.created_at >= ${start}
-              AND (${end} IS NULL OR j.created_at <= ${end})
+            WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.rowid <= ${input.throughRowIds.journals} AND j.created_at >= ${epoch.startedAt}
+              AND (e.outcome_status IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR (j.created_at >= ${start} AND (${end} IS NULL OR j.created_at <= ${end})))
               AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
               AND (linked.value = e.experience_id OR CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.experienceId') = e.experience_id ELSE 0 END))
-            OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${epoch.highWaterRowIds.events} AND ev.rowid <= ${input.throughRowIds.events}
-              AND ev.created_at >= ${start} AND (${end} IS NULL OR ev.created_at <= ${end})
+            OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${epoch.highWaterRowIds.events} AND ev.rowid <= ${input.throughRowIds.events} AND ev.created_at >= ${epoch.startedAt}
+              AND (e.outcome_status IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR (ev.created_at >= ${start} AND (${end} IS NULL OR ev.created_at <= ${end})))
               AND ev.event_type IN ('LATE_EXECUTION_RECONCILED','EXECUTION_QUARANTINE_CLEARED')
               AND CASE WHEN json_valid(ev.payload) THEN json_extract(ev.payload, '$.metadata.experienceId') = e.experience_id ELSE 0 END))
           ORDER BY e.rowid ASC LIMIT ${limitSql}`;
@@ -1609,11 +1610,11 @@ export function loadPaperLogCollectionExportSize(executor: SqlExecutor, epoch: P
     FROM experiences e WHERE (EXISTS (
       SELECT 1 FROM journals j LEFT JOIN json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') id ON true
       WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.created_at >= ${epoch.startedAt}
-        AND (${start} IS NULL OR j.created_at >= ${start}) AND (${end} IS NULL OR j.created_at <= ${end})
+        AND (e.outcome_status IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR ((${start} IS NULL OR j.created_at >= ${start}) AND (${end} IS NULL OR j.created_at <= ${end})))
         AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
         AND (id.value = e.experience_id OR CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.experienceId') = e.experience_id ELSE 0 END))
       OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${epoch.highWaterRowIds.events} AND ev.created_at >= ${epoch.startedAt}
-        AND (${start} IS NULL OR ev.created_at >= ${start}) AND (${end} IS NULL OR ev.created_at <= ${end})
+        AND (e.outcome_status IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR ((${start} IS NULL OR ev.created_at >= ${start}) AND (${end} IS NULL OR ev.created_at <= ${end})))
         AND ev.event_type IN ('LATE_EXECUTION_RECONCILED', 'EXECUTION_QUARANTINE_CLEARED')
         AND CASE WHEN json_valid(ev.payload) THEN json_extract(ev.payload, '$.metadata.experienceId') = e.experience_id ELSE 0 END))
       AND (NOT json_valid(e.payload) OR julianday(json_extract(e.payload, '$.exitTime')) IS NULL OR e.outcome_status NOT IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR
