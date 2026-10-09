@@ -530,7 +530,10 @@ export function buildPaperLogExport(input: {
 
   const decisions = journals.flatMap(cycleDecisions);
   const experienceIds = new Set([
-    ...journals.flatMap((journal) => journal.experienceIds ?? []),
+    ...journals.flatMap((journal) => [
+      ...(journal.experienceIds ?? []),
+      ...(journal.experienceId ? [journal.experienceId] : []),
+    ]),
     ...events.flatMap((event) => typeof event.metadata?.experienceId === "string" ? [event.metadata.experienceId] : []),
   ]);
   const experiences = input.experiences.filter((experience) => experienceIds.has(experience.experienceId)).map(exportExperience);

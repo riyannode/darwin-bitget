@@ -538,12 +538,12 @@ export function loadAllExperiences(executor: SqlExecutor, path = "/api/export/pa
   const end = to ?? null;
   const rows = collectionEpoch
     ? query`SELECT e.payload FROM experiences e
-      WHERE EXISTS (SELECT 1 FROM journals j, json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') id
+      WHERE EXISTS (SELECT 1 FROM journals j LEFT JOIN json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') id ON true
         WHERE j.rowid > ${collectionEpoch.highWaterRowIds.journals} AND j.cycle_id IN (
           SELECT cycle_id FROM journals WHERE rowid > ${collectionEpoch.highWaterRowIds.journals}
             AND created_at >= ${collectionEpoch.startedAt} AND (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end})
             AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
-        ) AND id.value = e.experience_id)
+        ) AND (id.value = e.experience_id OR CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.experienceId') = e.experience_id ELSE 0 END))
         OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${collectionEpoch.highWaterRowIds.events} AND ev.created_at >= ${collectionEpoch.startedAt}
           AND (${start} IS NULL OR ev.created_at >= ${start}) AND (${end} IS NULL OR ev.created_at <= ${end})
           AND ev.event_type IN ('LATE_EXECUTION_RECONCILED', 'EXECUTION_QUARANTINE_CLEARED')
@@ -1480,11 +1480,11 @@ export function loadPaperLogCollectionExportSize(executor: SqlExecutor, epoch: P
       COALESCE(SUM(length(CAST(e.payload AS BLOB))), 0) AS payload_bytes,
       COALESCE(SUM(CASE WHEN json_valid(e.payload) THEN 0 ELSE 1 END), 0) AS invalid_payload_rows
     FROM experiences e WHERE EXISTS (
-      SELECT 1 FROM journals j, json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') id
+      SELECT 1 FROM journals j LEFT JOIN json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') id ON true
       WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.created_at >= ${epoch.startedAt}
         AND (${start} IS NULL OR j.created_at >= ${start}) AND (${end} IS NULL OR j.created_at <= ${end})
         AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
-        AND id.value = e.experience_id)
+        AND (id.value = e.experience_id OR CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.experienceId') = e.experience_id ELSE 0 END))
       OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${epoch.highWaterRowIds.events} AND ev.created_at >= ${epoch.startedAt}
         AND (${start} IS NULL OR ev.created_at >= ${start}) AND (${end} IS NULL OR ev.created_at <= ${end})
         AND ev.event_type IN ('LATE_EXECUTION_RECONCILED', 'EXECUTION_QUARANTINE_CLEARED')
