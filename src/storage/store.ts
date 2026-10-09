@@ -111,6 +111,15 @@ export interface PaperLogArchivePage {
   hasMore: boolean;
 }
 
+export const PAPER_LOG_COLLECTION_EXPORT_PAGE_LIMIT = 16;
+export const PAPER_LOG_COLLECTION_EXPORT_PAGE_MAX_BYTES = 2 * 1024 * 1024;
+
+export type PaperLogCollectionExportHighWaterRowIds = Record<PaperLogArchiveTable, number>;
+
+export interface PaperLogCollectionExportPage extends PaperLogArchivePage {
+  payloadBytes: number;
+}
+
 export interface JournalLookupBatch {
   journals: TradingJournal[];
   complete: boolean;
@@ -538,7 +547,7 @@ export function loadAllExperiences(executor: SqlExecutor, path = "/api/export/pa
   const end = to ?? null;
   const rows = collectionEpoch
     ? query`SELECT e.payload FROM experiences e
-      WHERE EXISTS (SELECT 1 FROM journals j LEFT JOIN json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') id ON true
+      WHERE (EXISTS (SELECT 1 FROM journals j LEFT JOIN json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') id ON true
         WHERE j.rowid > ${collectionEpoch.highWaterRowIds.journals} AND j.cycle_id IN (
           SELECT cycle_id FROM journals WHERE rowid > ${collectionEpoch.highWaterRowIds.journals}
             AND created_at >= ${collectionEpoch.startedAt} AND (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end})
@@ -547,7 +556,10 @@ export function loadAllExperiences(executor: SqlExecutor, path = "/api/export/pa
         OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${collectionEpoch.highWaterRowIds.events} AND ev.created_at >= ${collectionEpoch.startedAt}
           AND (${start} IS NULL OR ev.created_at >= ${start}) AND (${end} IS NULL OR ev.created_at <= ${end})
           AND ev.event_type IN ('LATE_EXECUTION_RECONCILED', 'EXECUTION_QUARANTINE_CLEARED')
-          AND CASE WHEN json_valid(ev.payload) THEN json_extract(ev.payload, '$.metadata.experienceId') = e.experience_id ELSE 0 END)
+          AND CASE WHEN json_valid(ev.payload) THEN json_extract(ev.payload, '$.metadata.experienceId') = e.experience_id ELSE 0 END))
+      AND (NOT json_valid(e.payload) OR julianday(json_extract(e.payload, '$.exitTime')) IS NULL OR e.outcome_status NOT IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR
+        (json_valid(e.payload) AND json_extract(e.payload, '$.exitTime') >= ${collectionEpoch.startedAt}
+          AND json_extract(e.payload, '$.exitTime') >= ${start} AND (${end} IS NULL OR json_extract(e.payload, '$.exitTime') <= ${end})))
       ORDER BY e.created_at ASC, e.experience_id ASC`
     : afterRowId !== undefined
       ? query`SELECT payload FROM experiences WHERE rowid > ${afterRowId} AND (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end}) ORDER BY created_at ASC, experience_id ASC`
@@ -1361,6 +1373,121 @@ export function loadPaperLogArchivePage(
   };
 }
 
+export function capturePaperLogCollectionExportHighWaterRowIds(executor: SqlExecutor): PaperLogCollectionExportHighWaterRowIds {
+  const rows = executor.sql<{
+    journals: number; cycles: number; experiences: number; events: number;
+  }>`SELECT
+    (SELECT COALESCE(MAX(rowid), 0) FROM journals) AS journals,
+    (SELECT COALESCE(MAX(rowid), 0) FROM cycles) AS cycles,
+    (SELECT COALESCE(MAX(rowid), 0) FROM experiences) AS experiences,
+    (SELECT COALESCE(MAX(rowid), 0) FROM events) AS events`;
+  const row = rows[0];
+  if (!row || ![row.journals, row.cycles, row.experiences, row.events].every((value) => Number.isSafeInteger(Number(value)) && Number(value) >= 0)) {
+    throw new Error("PAPER_LOG_COLLECTION_EXPORT_HIGH_WATER_UNAVAILABLE");
+  }
+  return { journals: Number(row.journals), cycles: Number(row.cycles), experiences: Number(row.experiences), events: Number(row.events) };
+}
+
+export function loadPaperLogCollectionExportMutationRevision(executor: SqlExecutor): number {
+  let rows: Array<{ revision: number }>;
+  try {
+    rows = executor.sql<{ revision: number }>`SELECT revision FROM paper_log_export_revision WHERE singleton = 1 LIMIT 1`;
+  } catch {
+    throw new Error("PAPER_LOG_COLLECTION_EXPORT_REVISION_UNAVAILABLE");
+  }
+  const revision = rows[0] ? Number(rows[0].revision) : 0;
+  if (!Number.isSafeInteger(revision) || revision < 0) throw new Error("PAPER_LOG_COLLECTION_EXPORT_REVISION_UNAVAILABLE");
+  return revision;
+}
+
+export function loadPaperLogCollectionExportPage(
+  executor: SqlExecutor,
+  epoch: PaperLogCollectionEpoch,
+  input: {
+    table: PaperLogArchiveTable;
+    afterRowId: number;
+    throughRowIds: PaperLogCollectionExportHighWaterRowIds;
+    period: { start: string | null; end: string | null };
+    limit?: number;
+  },
+  path = "/api/export/paper-log/page",
+): PaperLogCollectionExportPage {
+  const highWaterValues = [input.throughRowIds.journals, input.throughRowIds.cycles, input.throughRowIds.experiences, input.throughRowIds.events];
+  const firstRowId = input.table === "experiences" ? 0 : epoch.highWaterRowIds[input.table];
+  if (!Number.isSafeInteger(input.afterRowId) || input.afterRowId < firstRowId
+    || !highWaterValues.every((value) => Number.isSafeInteger(value) && value >= 0)
+    || input.afterRowId > input.throughRowIds[input.table]) throw new Error("INVALID_PAPER_LOG_COLLECTION_EXPORT_CURSOR");
+  const requestedLimit = input.limit ?? PAPER_LOG_COLLECTION_EXPORT_PAGE_LIMIT;
+  const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0
+    ? Math.min(PAPER_LOG_COLLECTION_EXPORT_PAGE_LIMIT, requestedLimit)
+    : PAPER_LOG_COLLECTION_EXPORT_PAGE_LIMIT;
+  const start = input.period.start ?? epoch.startedAt;
+  const end = input.period.end;
+  const query = executeMeasuredSql<{ row_id: number; record_id: string; created_at: string; payload: string; row_metadata: string; payload_bytes: number; invalid_payload: number }>(executor, path, `paper_log_collection_export_page_${input.table}`);
+
+  const pageSql = (sizeOnly: boolean): Array<{ row_id: number; record_id: string; created_at: string; payload: string; row_metadata: string; payload_bytes: number; invalid_payload: number }> => {
+    const limitSql = sizeOnly ? limit + 1 : limit;
+    if (input.table === "journals") return sizeOnly
+      ? query`SELECT rowid AS row_id, cycle_id AS record_id, created_at, '' AS payload, '{}' AS row_metadata, length(CAST(payload AS BLOB)) AS payload_bytes, CASE WHEN json_valid(payload) THEN 0 ELSE 1 END AS invalid_payload FROM journals WHERE rowid > ${input.afterRowId} AND rowid <= ${input.throughRowIds.journals} AND created_at >= ${start} AND (${end} IS NULL OR created_at <= ${end}) AND (NOT json_valid(payload) OR CASE WHEN json_valid(payload) THEN json_extract(payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END) ORDER BY rowid ASC LIMIT ${limitSql}`
+      : query`SELECT rowid AS row_id, cycle_id AS record_id, created_at, payload, json_object() AS row_metadata, length(CAST(payload AS BLOB)) AS payload_bytes, 0 AS invalid_payload FROM journals WHERE rowid > ${input.afterRowId} AND rowid <= ${input.throughRowIds.journals} AND created_at >= ${start} AND (${end} IS NULL OR created_at <= ${end}) AND (NOT json_valid(payload) OR CASE WHEN json_valid(payload) THEN json_extract(payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END) ORDER BY rowid ASC LIMIT ${limitSql}`;
+    if (input.table === "cycles") return sizeOnly
+      ? query`SELECT c.rowid AS row_id, c.cycle_id AS record_id, c.started_at AS created_at, '' AS payload, '{}' AS row_metadata, length(CAST(json_object('cycleId',c.cycle_id,'status',c.status,'startedAt',c.started_at,'completedAt',c.completed_at) AS BLOB)) AS payload_bytes, 0 AS invalid_payload FROM cycles c WHERE c.rowid > ${input.afterRowId} AND c.rowid <= ${input.throughRowIds.cycles} AND c.started_at >= ${start} AND (${end} IS NULL OR c.started_at <= ${end}) AND EXISTS (SELECT 1 FROM journals j WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.rowid <= ${input.throughRowIds.journals} AND j.cycle_id = c.cycle_id AND j.created_at >= ${start} AND (${end} IS NULL OR j.created_at <= ${end}) AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END) ORDER BY c.rowid ASC LIMIT ${limitSql}`
+      : query`SELECT c.rowid AS row_id, c.cycle_id AS record_id, c.started_at AS created_at, json_object('cycleId',c.cycle_id,'status',c.status,'startedAt',c.started_at,'completedAt',c.completed_at) AS payload, json_object() AS row_metadata, length(CAST(json_object('cycleId',c.cycle_id,'status',c.status,'startedAt',c.started_at,'completedAt',c.completed_at) AS BLOB)) AS payload_bytes, 0 AS invalid_payload FROM cycles c WHERE c.rowid > ${input.afterRowId} AND c.rowid <= ${input.throughRowIds.cycles} AND c.started_at >= ${start} AND (${end} IS NULL OR c.started_at <= ${end}) AND EXISTS (SELECT 1 FROM journals j WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.rowid <= ${input.throughRowIds.journals} AND j.cycle_id = c.cycle_id AND j.created_at >= ${start} AND (${end} IS NULL OR j.created_at <= ${end}) AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END) ORDER BY c.rowid ASC LIMIT ${limitSql}`;
+    if (input.table === "events") return sizeOnly
+      ? query`SELECT e.rowid AS row_id, e.event_id AS record_id, e.created_at, '' AS payload, '{}' AS row_metadata, length(CAST(e.payload AS BLOB)) AS payload_bytes, CASE WHEN json_valid(e.payload) THEN 0 ELSE 1 END AS invalid_payload FROM events e WHERE e.rowid > ${input.afterRowId} AND e.rowid <= ${input.throughRowIds.events} AND e.created_at >= ${start} AND (${end} IS NULL OR e.created_at <= ${end}) AND e.cycle_id <> 'CONTROL' AND e.event_type NOT LIKE 'PROVIDER_SYNC_%' AND (EXISTS (SELECT 1 FROM journals j WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.rowid <= ${input.throughRowIds.journals} AND j.cycle_id = e.cycle_id AND j.created_at >= ${start} AND (${end} IS NULL OR j.created_at <= ${end}) AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END) OR e.event_type IN ('LATE_EXECUTION_RECONCILED','EXECUTION_QUARANTINE_CLEARED')) ORDER BY e.rowid ASC LIMIT ${limitSql}`
+      : query`SELECT e.rowid AS row_id, e.event_id AS record_id, e.created_at, e.payload, json_object('eventType', e.event_type, 'cycleId', e.cycle_id) AS row_metadata, length(CAST(e.payload AS BLOB)) AS payload_bytes, 0 AS invalid_payload FROM events e WHERE e.rowid > ${input.afterRowId} AND e.rowid <= ${input.throughRowIds.events} AND e.created_at >= ${start} AND (${end} IS NULL OR e.created_at <= ${end}) AND e.cycle_id <> 'CONTROL' AND e.event_type NOT LIKE 'PROVIDER_SYNC_%' AND (EXISTS (SELECT 1 FROM journals j WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.rowid <= ${input.throughRowIds.journals} AND j.cycle_id = e.cycle_id AND j.created_at >= ${start} AND (${end} IS NULL OR j.created_at <= ${end}) AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END) OR e.event_type IN ('LATE_EXECUTION_RECONCILED','EXECUTION_QUARANTINE_CLEARED')) ORDER BY e.rowid ASC LIMIT ${limitSql}`;
+    return sizeOnly
+      ? query`SELECT e.rowid AS row_id, e.experience_id AS record_id, e.created_at, '' AS payload, '{}' AS row_metadata,
+          length(CAST(e.payload AS BLOB)) AS payload_bytes, CASE WHEN NOT json_valid(e.payload) OR (e.outcome_status IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') AND julianday(json_extract(e.payload, '$.exitTime')) IS NULL) THEN 1 ELSE 0 END AS invalid_payload
+        FROM experiences e WHERE e.rowid > ${input.afterRowId} AND e.rowid <= ${input.throughRowIds.experiences}
+          AND (NOT json_valid(e.payload) OR julianday(json_extract(e.payload, '$.exitTime')) IS NULL OR e.outcome_status NOT IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR
+            (json_valid(e.payload) AND json_extract(e.payload, '$.exitTime') >= ${epoch.startedAt}
+              AND json_extract(e.payload, '$.exitTime') >= ${start} AND (${end} IS NULL OR json_extract(e.payload, '$.exitTime') <= ${end})))
+          AND (EXISTS (SELECT 1 FROM journals j LEFT JOIN json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') linked ON true
+            WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.rowid <= ${input.throughRowIds.journals} AND j.created_at >= ${start}
+              AND (${end} IS NULL OR j.created_at <= ${end})
+              AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+              AND (linked.value = e.experience_id OR CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.experienceId') = e.experience_id ELSE 0 END))
+            OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${epoch.highWaterRowIds.events} AND ev.rowid <= ${input.throughRowIds.events}
+              AND ev.created_at >= ${start} AND (${end} IS NULL OR ev.created_at <= ${end})
+              AND ev.event_type IN ('LATE_EXECUTION_RECONCILED','EXECUTION_QUARANTINE_CLEARED')
+              AND CASE WHEN json_valid(ev.payload) THEN json_extract(ev.payload, '$.metadata.experienceId') = e.experience_id ELSE 0 END))
+          ORDER BY e.rowid ASC LIMIT ${limitSql}`
+      : query`SELECT e.rowid AS row_id, e.experience_id AS record_id, e.created_at, e.payload,
+          json_object('symbol', e.symbol, 'outcomeStatus', e.outcome_status) AS row_metadata,
+          length(CAST(e.payload AS BLOB)) AS payload_bytes, 0 AS invalid_payload
+        FROM experiences e WHERE e.rowid > ${input.afterRowId} AND e.rowid <= ${input.throughRowIds.experiences}
+          AND (NOT json_valid(e.payload) OR julianday(json_extract(e.payload, '$.exitTime')) IS NULL OR e.outcome_status NOT IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR
+            (json_valid(e.payload) AND json_extract(e.payload, '$.exitTime') >= ${epoch.startedAt}
+              AND json_extract(e.payload, '$.exitTime') >= ${start} AND (${end} IS NULL OR json_extract(e.payload, '$.exitTime') <= ${end})))
+          AND (EXISTS (SELECT 1 FROM journals j LEFT JOIN json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') linked ON true
+            WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.rowid <= ${input.throughRowIds.journals} AND j.created_at >= ${start}
+              AND (${end} IS NULL OR j.created_at <= ${end})
+              AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+              AND (linked.value = e.experience_id OR CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.experienceId') = e.experience_id ELSE 0 END))
+            OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${epoch.highWaterRowIds.events} AND ev.rowid <= ${input.throughRowIds.events}
+              AND ev.created_at >= ${start} AND (${end} IS NULL OR ev.created_at <= ${end})
+              AND ev.event_type IN ('LATE_EXECUTION_RECONCILED','EXECUTION_QUARANTINE_CLEARED')
+              AND CASE WHEN json_valid(ev.payload) THEN json_extract(ev.payload, '$.metadata.experienceId') = e.experience_id ELSE 0 END))
+          ORDER BY e.rowid ASC LIMIT ${limitSql}`;
+  };
+  const sizeRows = pageSql(true);
+  const pageSizeRows = sizeRows.slice(0, limit);
+  if (pageSizeRows.some((row) => row.invalid_payload > 0)) throw new Error("PAPER_LOG_COLLECTION_HAS_INVALID_PAYLOAD");
+  if (pageSizeRows.some((row) => row.payload_bytes > PAPER_LOG_ARCHIVE_MAX_ROW_BYTES)) throw new Error("PAPER_LOG_COLLECTION_EXPORT_ROW_EXCEEDS_BYTE_LIMIT");
+  const rows = pageSql(false);
+  const hasMore = sizeRows.length > limit;
+  const pageRows = rows;
+  const payloadBytes = pageRows.reduce((total, row) => total + Number(row.payload_bytes), 0);
+  if (payloadBytes > PAPER_LOG_COLLECTION_EXPORT_PAGE_MAX_BYTES) throw new Error("PAPER_LOG_COLLECTION_EXPORT_PAGE_EXCEEDS_BYTE_LIMIT");
+  return {
+    rows: pageRows.map((row) => ({ rowId: Number(row.row_id), recordId: row.record_id, createdAt: row.created_at, payload: row.payload, rowMetadata: JSON.parse(row.row_metadata) as Record<string, string | null> })),
+    nextCursor: Number(pageRows[pageRows.length - 1]?.row_id ?? input.afterRowId),
+    hasMore,
+    payloadBytes,
+  };
+}
+
 /** Hashes the complete bounded source in fixed 50-row pages without retaining history. */
 export async function computePaperLogArchiveContentSha256(
   executor: SqlExecutor,
@@ -1478,8 +1605,8 @@ export function loadPaperLogCollectionExportSize(executor: SqlExecutor, epoch: P
       AND (${start} IS NULL OR started_at >= ${start}) AND (${end} IS NULL OR started_at <= ${end})`;
   const experiences = executor.sql<{ row_count: number; payload_bytes: number; invalid_payload_rows: number }>`SELECT COUNT(*) AS row_count,
       COALESCE(SUM(length(CAST(e.payload AS BLOB))), 0) AS payload_bytes,
-      COALESCE(SUM(CASE WHEN json_valid(e.payload) THEN 0 ELSE 1 END), 0) AS invalid_payload_rows
-    FROM experiences e WHERE EXISTS (
+      COALESCE(SUM(CASE WHEN NOT json_valid(e.payload) OR (e.outcome_status IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') AND julianday(json_extract(e.payload, '$.exitTime')) IS NULL) THEN 1 ELSE 0 END), 0) AS invalid_payload_rows
+    FROM experiences e WHERE (EXISTS (
       SELECT 1 FROM journals j LEFT JOIN json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{"experienceIds":[]}' END, '$.experienceIds') id ON true
       WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.created_at >= ${epoch.startedAt}
         AND (${start} IS NULL OR j.created_at >= ${start}) AND (${end} IS NULL OR j.created_at <= ${end})
@@ -1488,7 +1615,11 @@ export function loadPaperLogCollectionExportSize(executor: SqlExecutor, epoch: P
       OR EXISTS (SELECT 1 FROM events ev WHERE ev.rowid > ${epoch.highWaterRowIds.events} AND ev.created_at >= ${epoch.startedAt}
         AND (${start} IS NULL OR ev.created_at >= ${start}) AND (${end} IS NULL OR ev.created_at <= ${end})
         AND ev.event_type IN ('LATE_EXECUTION_RECONCILED', 'EXECUTION_QUARANTINE_CLEARED')
-        AND CASE WHEN json_valid(ev.payload) THEN json_extract(ev.payload, '$.metadata.experienceId') = e.experience_id ELSE 0 END)`;
+        AND CASE WHEN json_valid(ev.payload) THEN json_extract(ev.payload, '$.metadata.experienceId') = e.experience_id ELSE 0 END))
+      AND (NOT json_valid(e.payload) OR julianday(json_extract(e.payload, '$.exitTime')) IS NULL OR e.outcome_status NOT IN ('PROFITABLE','LOSING','BREAK_EVEN','CLOSED_UNCLASSIFIED') OR
+        (json_valid(e.payload) AND json_extract(e.payload, '$.exitTime') >= ${epoch.startedAt}
+          AND (${start} IS NULL OR json_extract(e.payload, '$.exitTime') >= ${start})
+          AND (${end} IS NULL OR json_extract(e.payload, '$.exitTime') <= ${end})))`;
   const events = executor.sql<{ row_count: number; payload_bytes: number; invalid_payload_rows: number }>`SELECT COUNT(*) AS row_count,
       COALESCE(SUM(length(CAST(e.payload AS BLOB))), 0) AS payload_bytes,
       COALESCE(SUM(CASE WHEN json_valid(e.payload) THEN 0 ELSE 1 END), 0) AS invalid_payload_rows

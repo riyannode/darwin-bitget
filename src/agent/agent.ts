@@ -25,6 +25,12 @@ import {
   loadExperiencesForDecisionIds,
   loadAllStoredCycles,
   loadPaperLogArchivePage,
+  capturePaperLogCollectionExportHighWaterRowIds,
+  loadPaperLogCollectionExportMutationRevision,
+  loadPaperLogCollectionExportPage,
+  PAPER_LOG_COLLECTION_EXPORT_PAGE_LIMIT,
+  PAPER_LOG_COLLECTION_EXPORT_PAGE_MAX_BYTES,
+  type PaperLogCollectionExportHighWaterRowIds,
   loadPaperLogArchiveSnapshot,
   computePaperLogArchiveContentSha256,
   computeExecutionQuarantineContentSha256,
@@ -83,7 +89,7 @@ import {
   saveLesson,
   persistProviderLifecycleRepair,
 } from "../storage/store.js";
-import { buildPaperLogExport, parsePaperLogPeriod, paperLogToCsv } from "../storage/paper-log.js";
+import { buildPaperLogExport, parsePaperLogPeriod, paperLogCollectionPageToCsv, paperLogToCsv } from "../storage/paper-log.js";
 import { cyclePlanDecisions, cycleReadModel, normalizeCycleDecisions, blockedRiskGateResult } from "../storage/journal-normalizer.js";
 import { evaluateRiskGate } from "../trading/risk-gate.js";
 import { evaluateDrawdown } from "../trading/drawdown.js";
@@ -168,6 +174,44 @@ const SNAPSHOT_EVENT_LIMIT = 25;
 const MAX_PAPER_LOG_EXPORT_ROWS = 500;
 const MAX_PAPER_LOG_EXPORT_PAYLOAD_BYTES = 2 * 1024 * 1024;
 const initializedStorageExecutors = new WeakSet<object>();
+
+type PaperLogCollectionPageCursor = {
+  version: 1;
+  epochId: string;
+  highWaterRowIds: PaperLogCollectionExportHighWaterRowIds;
+  revision: number;
+  period: { start: string; end: string | null };
+  table: PaperLogArchiveTable | null;
+  afterRowId: number;
+};
+
+const PAPER_LOG_ARCHIVE_TABLES = ["journals", "cycles", "experiences", "events"] as const;
+
+function encodePaperLogCollectionPageCursor(cursor: PaperLogCollectionPageCursor): string {
+  return encodeURIComponent(JSON.stringify(cursor));
+}
+
+function decodePaperLogCollectionPageCursor(value: string, epoch: PaperLogCollectionEpoch): PaperLogCollectionPageCursor | null {
+  if (!value || value.length > 4096) return null;
+  try {
+    const parsed: unknown = JSON.parse(decodeURIComponent(value));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+    const cursor = parsed as Partial<PaperLogCollectionPageCursor>;
+    const highWater = cursor.highWaterRowIds;
+    const isCanonicalTimestamp = (candidate: unknown): candidate is string => typeof candidate === "string"
+      && Number.isFinite(Date.parse(candidate)) && new Date(candidate).toISOString() === candidate;
+    if (cursor.version !== 1 || cursor.epochId !== epoch.epochId || !Number.isSafeInteger(cursor.afterRowId) || Number(cursor.afterRowId) < 0
+      || !Number.isSafeInteger(cursor.revision) || Number(cursor.revision) < 0
+      || !cursor.period || !isCanonicalTimestamp(cursor.period.start)
+      || (cursor.period.end !== null && !isCanonicalTimestamp(cursor.period.end))
+      || (cursor.period.end !== null && cursor.period.end < cursor.period.start)
+      || (cursor.table !== null && !PAPER_LOG_ARCHIVE_TABLES.includes(cursor.table as PaperLogArchiveTable))
+      || !highWater || !PAPER_LOG_ARCHIVE_TABLES.every((table) => Number.isSafeInteger(highWater[table]) && highWater[table] >= 0)) return null;
+    return cursor as PaperLogCollectionPageCursor;
+  } catch {
+    return null;
+  }
+}
 
 function ensureStorageInitialized(executor: SqlExecutor): void {
   if (initializedStorageExecutors.has(executor)) return;
@@ -1337,7 +1381,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       return noStore(await this.paperLogArchive(request, url));
     }
     if (request.method === "GET" && url.pathname === "/export/paper-log") {
-      return this.exportPaperLog(url);
+      return noStore(this.exportPaperLog(url));
     }
     if (request.method === "POST" && url.pathname === "/paper-log/archive/epoch") {
       const auth = authorizeOwner(request, this.env);
@@ -1359,7 +1403,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
 
   public override async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/export/paper-log" && request.method === "GET") return TraderAgent.prototype.exportPaperLog.call(this, url);
+    if (url.pathname === "/export/paper-log" && request.method === "GET") return noStore(TraderAgent.prototype.exportPaperLog.call(this, url));
     if (url.pathname === "/execution-quarantines" && request.method === "GET") return this.executionQuarantineDiagnostics(request, url);
     if (url.pathname === "/snapshot" && request.method === "GET") {
       const config = loadConfig(this.env, this.ensureActivePolicy());
@@ -1447,7 +1491,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       return json({ source: "PROVIDER_READ_ONLY_BACKFILL", baselineAt, results, categories: diagnostics.map((entry) => ({ category: entry.category, rowCount: entry.counts.financialRecords, sync: entry.sync, coverage: entry.sync?.financialRecordCoverage ?? null })) });
     }
     if (url.pathname === "/policy" && request.method === "GET") return this.getPolicyRead();
-    if (url.pathname === "/export/paper-log" && request.method === "GET") return TraderAgent.prototype.exportPaperLog.call(this, url);
+    if (url.pathname === "/export/paper-log" && request.method === "GET") return noStore(TraderAgent.prototype.exportPaperLog.call(this, url));
     if ((url.pathname === "/control" || url.pathname === "/policy" || url.pathname === "/eva/connection-test") && request.method === "POST") {
       const auth = authorizeOwner(request, this.env);
       if (!auth.authorized) return json({ error: auth.code }, auth.status);
@@ -1628,6 +1672,103 @@ export class TraderAgent extends Agent<Env, AgentState> {
     return this.state;
   }
 
+  private exportPaperLogCollectionPage(url: URL, format: "json" | "csv", epoch: PaperLogCollectionEpoch): Response {
+    const operation = url.searchParams.get("page");
+    if (operation === "snapshot") {
+      if (url.searchParams.has("cursor")) return json({ error: "INVALID_PAPER_LOG_COLLECTION_EXPORT_CURSOR" }, 400);
+      const requestedPeriod = parsePaperLogPeriod(url.searchParams.get("from"), url.searchParams.get("to"));
+      if (requestedPeriod.end && requestedPeriod.end < epoch.startedAt) return json({ error: "PAPER_LOG_PERIOD_OUTSIDE_COLLECTION_EPOCH" }, 416);
+      const period = {
+        start: requestedPeriod.start && requestedPeriod.start > epoch.startedAt ? requestedPeriod.start : epoch.startedAt,
+        end: requestedPeriod.end,
+      };
+      const highWaterRowIds = capturePaperLogCollectionExportHighWaterRowIds(this);
+      const revision = loadPaperLogCollectionExportMutationRevision(this);
+      const initialCursors = Object.fromEntries(PAPER_LOG_ARCHIVE_TABLES.map((table) => [table, encodePaperLogCollectionPageCursor({
+        version: 1,
+        epochId: epoch.epochId,
+        highWaterRowIds,
+        revision,
+        period,
+        table,
+        afterRowId: table === "experiences" ? 0 : epoch.highWaterRowIds[table],
+      })]));
+      return json({
+        schemaVersion: 1,
+        source: "ACTIVE_COLLECTION_EPOCH",
+        summaryScope: "NOT_INCLUDED_IN_RAW_PAGES",
+        epochId: epoch.epochId,
+        collectionStartedAt: epoch.startedAt,
+        period,
+        highWaterRowIds,
+        revision,
+        pageRowLimit: PAPER_LOG_COLLECTION_EXPORT_PAGE_LIMIT,
+        pagePayloadByteLimit: PAPER_LOG_COLLECTION_EXPORT_PAGE_MAX_BYTES,
+        cursors: initialCursors,
+      });
+    }
+    if (operation !== "next") return json({ error: "INVALID_PAPER_LOG_COLLECTION_EXPORT_PAGE_OPERATION" }, 400);
+    const cursorValue = url.searchParams.get("cursor");
+    const cursor = cursorValue ? decodePaperLogCollectionPageCursor(cursorValue, epoch) : null;
+    if (!cursor || !cursor.table || cursor.period.start < epoch.startedAt) return json({ error: "INVALID_PAPER_LOG_COLLECTION_EXPORT_CURSOR" }, 400);
+    const currentRevision = loadPaperLogCollectionExportMutationRevision(this);
+    if (currentRevision !== cursor.revision) return json({ error: "PAPER_LOG_COLLECTION_EXPORT_SNAPSHOT_STALE", restartWithNewSnapshot: true }, 409);
+    const latestHighWater = capturePaperLogCollectionExportHighWaterRowIds(this);
+    if (PAPER_LOG_ARCHIVE_TABLES.some((table) => cursor.highWaterRowIds[table] > latestHighWater[table])) return json({ error: "INVALID_PAPER_LOG_COLLECTION_EXPORT_CURSOR" }, 400);
+    const limitValue = url.searchParams.get("limit");
+    const limit = limitValue === null ? PAPER_LOG_COLLECTION_EXPORT_PAGE_LIMIT
+      : /^(0|[1-9][0-9]*)$/.test(limitValue) ? Number(limitValue) : Number.NaN;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > PAPER_LOG_COLLECTION_EXPORT_PAGE_LIMIT) return json({ error: "INVALID_PAPER_LOG_COLLECTION_EXPORT_LIMIT" }, 400);
+    try {
+      const page = loadPaperLogCollectionExportPage(this, epoch, {
+        table: cursor.table,
+        afterRowId: cursor.afterRowId,
+        throughRowIds: cursor.highWaterRowIds,
+        period: cursor.period,
+        limit,
+      }, "/api/export/paper-log/page");
+      if (page.hasMore && page.nextCursor <= cursor.afterRowId) return json({ error: "PAPER_LOG_COLLECTION_EXPORT_CURSOR_DID_NOT_ADVANCE" }, 500);
+      const nextCursor = page.hasMore ? encodePaperLogCollectionPageCursor({ ...cursor, afterRowId: page.nextCursor }) : null;
+      const metadata = {
+        schemaVersion: 1 as const,
+        source: "ACTIVE_COLLECTION_EPOCH" as const,
+        summaryScope: "NOT_INCLUDED_IN_RAW_PAGES" as const,
+        epochId: epoch.epochId,
+        startedAt: epoch.startedAt,
+        period: cursor.period,
+        highWaterRowIds: cursor.highWaterRowIds,
+        revision: cursor.revision,
+        nextCursor,
+        hasMore: page.hasMore,
+        rowCount: page.rows.length,
+        payloadBytes: page.payloadBytes,
+      };
+      if (format === "csv") return new Response(paperLogCollectionPageToCsv(cursor.table, page.rows, metadata), {
+        headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename=darwin-paper-log-${epoch.epochId}-${cursor.table}.csv`, "cache-control": "no-store" },
+      });
+      return new Response(JSON.stringify({
+        schemaVersion: 1,
+        source: "ACTIVE_COLLECTION_EPOCH",
+        summaryScope: "NOT_INCLUDED_IN_RAW_PAGES",
+        epochId: epoch.epochId,
+        collectionStartedAt: epoch.startedAt,
+        period: cursor.period,
+        highWaterRowIds: cursor.highWaterRowIds,
+        revision: cursor.revision,
+        table: cursor.table,
+        page: { nextCursor, hasMore: page.hasMore, rowCount: page.rows.length, payloadBytes: page.payloadBytes },
+        rows: page.rows,
+      }), { headers: { "content-type": "application/json; charset=utf-8", "content-disposition": `attachment; filename=darwin-paper-log-${epoch.epochId}-${cursor.table}.json`, "cache-control": "no-store" } });
+    } catch (error) {
+      const code = error instanceof Error ? error.message.split(":", 1)[0] ?? "PAPER_LOG_COLLECTION_EXPORT_PAGE_FAILED" : "PAPER_LOG_COLLECTION_EXPORT_PAGE_FAILED";
+      const status = code === "PAPER_LOG_COLLECTION_HAS_INVALID_PAYLOAD" ? 409
+        : code === "PAPER_LOG_COLLECTION_EXPORT_ROW_EXCEEDS_BYTE_LIMIT" || code === "PAPER_LOG_COLLECTION_EXPORT_PAGE_EXCEEDS_BYTE_LIMIT" ? 413
+          : code === "PAPER_LOG_COLLECTION_EXPORT_REVISION_UNAVAILABLE" || code === "PAPER_LOG_COLLECTION_EXPORT_HIGH_WATER_UNAVAILABLE" ? 503
+            : 400;
+      return json({ error: code }, status);
+    }
+  }
+
   private exportPaperLog(url: URL): Response {
     try {
       if (this.env.TRADING_MODE !== "PAPER" || this.env.PAPER_ONLY !== "true") return json({ error: "PAPER_ONLY" }, 503);
@@ -1635,6 +1776,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (format !== "json" && format !== "csv") return json({ error: "INVALID_EXPORT_FORMAT" }, 400);
       const epoch = loadPaperLogCollectionEpoch(this);
       if (!epoch) return json({ error: "PAPER_LOG_COLLECTION_EPOCH_NOT_INITIALIZED" }, 409);
+      if (url.searchParams.has("page")) return this.exportPaperLogCollectionPage(url, format, epoch);
       const requestedPeriod = parsePaperLogPeriod(url.searchParams.get("from"), url.searchParams.get("to"));
       if (requestedPeriod.end && requestedPeriod.end < epoch.startedAt) return json({ error: "PAPER_LOG_PERIOD_OUTSIDE_COLLECTION_EPOCH" }, 416);
       const start = requestedPeriod.start && requestedPeriod.start > epoch.startedAt ? requestedPeriod.start : epoch.startedAt;
@@ -1643,7 +1785,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (exportSize.invalidPayloadRows > 0) return json({ error: "PAPER_LOG_COLLECTION_HAS_INVALID_PAYLOAD" }, 409);
       if (exportSize.unpairedCurrentCycleRows > 0 || exportSize.unpairedCurrentJournalRows > 0) return json({ error: "PAPER_LOG_COLLECTION_HAS_UNPAIRED_CYCLES", unpairedCurrentCycleRows: exportSize.unpairedCurrentCycleRows, unpairedCurrentJournalRows: exportSize.unpairedCurrentJournalRows }, 409);
       if (exportSize.rowCount > MAX_PAPER_LOG_EXPORT_ROWS || exportSize.payloadBytes > MAX_PAPER_LOG_EXPORT_PAYLOAD_BYTES) {
-        return json({ error: "PAPER_LOG_EXPORT_REQUIRES_BOUNDED_PAGES", rowCount: exportSize.rowCount, payloadBytes: exportSize.payloadBytes, hint: "Use from/to to export smaller collection-period windows." }, 413);
+        return json({ error: "PAPER_LOG_EXPORT_REQUIRES_BOUNDED_PAGES", rowCount: exportSize.rowCount, payloadBytes: exportSize.payloadBytes, hint: "Use page=snapshot for bounded row pages; use from/to only for smaller period summaries." }, 413);
       }
       const journals = loadAllAutonomousJournals(this, period.start ?? undefined, period.end ?? undefined, "/api/export/paper-log", "paper_log_current_epoch_journals", epoch.highWaterRowIds.journals);
       const exported = buildPaperLogExport({
@@ -1663,7 +1805,9 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (format === "csv") return new Response(paperLogToCsv(exported), { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename=darwin-paper-log-${epoch.epochId}.csv`, "cache-control": "no-store" } });
       return new Response(JSON.stringify(exported), { headers: { "content-type": "application/json; charset=utf-8", "content-disposition": `attachment; filename=darwin-paper-log-${epoch.epochId}.json`, "cache-control": "no-store" } });
     } catch (error) {
-      return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "PAPER_LOG_EXPORT_FAILED" : "PAPER_LOG_EXPORT_FAILED" }, 400);
+      const code = error instanceof Error ? error.message.split(":", 1)[0] ?? "PAPER_LOG_EXPORT_FAILED" : "PAPER_LOG_EXPORT_FAILED";
+      const status = code === "PAPER_LOG_COLLECTION_EXPORT_REVISION_UNAVAILABLE" || code === "PAPER_LOG_COLLECTION_EXPORT_HIGH_WATER_UNAVAILABLE" ? 503 : 400;
+      return json({ error: code }, status);
     }
   }
 

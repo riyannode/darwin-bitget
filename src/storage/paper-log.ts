@@ -1,6 +1,6 @@
 import { addDecimal, isDecimal } from "../trading/decimal.js";
 import type { ActivityEvent, Decision, DecisionExecutionRecord, ExecutionRequest, ExecutionResult, ReconciliationResult, TradeExperience, TradingJournal } from "../types.js";
-import type { StoredCycle } from "./store.js";
+import type { PaperLogArchiveRow, PaperLogArchiveTable, StoredCycle } from "./store.js";
 import { cyclePlanDecisions, decisionCategory, effectiveExecutionRequest, effectiveExecutionResult, effectiveReconciliationResult, effectiveRiskGateResult, normalizeCycleDecisions } from "./journal-normalizer.js";
 
 export interface PaperLogPeriod {
@@ -463,6 +463,18 @@ function deriveFailureStage(lastSuccessfulEvent: string | null, executionOutcome
   return stageMap[lastSuccessfulEvent] ?? "unknown";
 }
 
+const CLOSED_EXPERIENCE_OUTCOMES = new Set(["PROFITABLE", "LOSING", "BREAK_EVEN", "CLOSED_UNCLASSIFIED"]);
+
+function experienceBelongsToPeriod(experience: TradeExperience, period: PaperLogPeriod, collectionStartedAt?: string): boolean {
+  if (!CLOSED_EXPERIENCE_OUTCOMES.has(experience.outcomeStatus)) return true;
+  const exitTime = experience.exitTime;
+  if (typeof exitTime !== "string" || !Number.isFinite(Date.parse(exitTime))) return false;
+  if (collectionStartedAt && exitTime < collectionStartedAt) return false;
+  if (period.start && exitTime < period.start) return false;
+  if (period.end && exitTime > period.end) return false;
+  return true;
+}
+
 export function buildPaperLogExport(input: {
   generatedAt: string;
   period: PaperLogPeriod;
@@ -536,7 +548,11 @@ export function buildPaperLogExport(input: {
     ]),
     ...events.flatMap((event) => typeof event.metadata?.experienceId === "string" ? [event.metadata.experienceId] : []),
   ]);
-  const experiences = input.experiences.filter((experience) => experienceIds.has(experience.experienceId)).map(exportExperience);
+  const collectionStartedAt = input.collectionEpoch?.startedAt;
+  const experiences = input.experiences
+    .filter((experience) => experienceIds.has(experience.experienceId))
+    .filter((experience) => experienceBelongsToPeriod(experience, input.period, collectionStartedAt))
+    .map(exportExperience);
 
   const decisionCounts: Record<Decision["action"], number> = { HOLD: 0, OPEN_LONG: 0, OPEN_SHORT: 0, INCREASE: 0, REDUCE: 0, CLOSE: 0, REVERSE: 0 };
   for (const decision of decisions) decisionCounts[decision.action] += 1;
@@ -684,6 +700,30 @@ export function buildPaperLogExport(input: {
 function csvValue(value: unknown): string {
   const text = value === null || value === undefined ? "" : Array.isArray(value) ? value.join(" | ") : typeof value === "object" ? JSON.stringify(value) : String(value);
   return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+export function paperLogCollectionPageToCsv(
+  table: PaperLogArchiveTable,
+  rows: readonly PaperLogArchiveRow[],
+  metadata: {
+    schemaVersion: 1;
+    source: "ACTIVE_COLLECTION_EPOCH";
+    summaryScope: "NOT_INCLUDED_IN_RAW_PAGES";
+    epochId: string;
+    startedAt: string;
+    period: PaperLogPeriod;
+    highWaterRowIds: Record<PaperLogArchiveTable, number>;
+    revision: number;
+    nextCursor: string | null;
+    hasMore: boolean;
+    rowCount: number;
+    payloadBytes: number;
+  },
+): string {
+  const header = ["recordType", "schemaVersion", "source", "summaryScope", "epochId", "collectionStartedAt", "periodStart", "periodEnd", "highWaterRowIds", "revision", "table", "rowId", "recordId", "createdAt", "payload", "rowMetadata", "nextCursor", "hasMore", "rowCount", "payloadBytes"];
+  const pageMetadata = ["PAGE", metadata.schemaVersion, metadata.source, metadata.summaryScope, metadata.epochId, metadata.startedAt, metadata.period.start, metadata.period.end, metadata.highWaterRowIds, metadata.revision, table, "", "", "", "", "", metadata.nextCursor, metadata.hasMore, metadata.rowCount, metadata.payloadBytes];
+  const records = rows.map((row) => ["ROW", metadata.schemaVersion, metadata.source, metadata.summaryScope, metadata.epochId, metadata.startedAt, metadata.period.start, metadata.period.end, metadata.highWaterRowIds, metadata.revision, table, row.rowId, row.recordId, row.createdAt, row.payload, row.rowMetadata, "", "", "", ""]);
+  return [header, pageMetadata, ...records].map((record) => record.map(csvValue).join(",")).join("\r\n") + "\r\n";
 }
 
 export function paperLogToCsv(exported: PaperLogExport): string {
