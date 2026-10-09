@@ -1,0 +1,415 @@
+{
+  "complete": true,
+  "archiveType": "INTERIM_HISTORICAL_ARCHIVE",
+  "source": "PRODUCTION_AUTONOMOUS_PAPER",
+  "deployedSha": "67d20a088aa76a77f8bef8cee7f697f7a97f34df",
+  "utcCollectionBoundary": {
+    "capturedAt": "2026-10-09T10:15:07.489Z",
+    "scope": "ATOMIC_SOURCE_SNAPSHOT",
+    "highWaterRowIds": {
+      "journals": 2677,
+      "cycles": 2719,
+      "experiences": 1173,
+      "events": 35152
+    },
+    "sourceTimeBounds": {
+      "journals": {
+        "start": "2026-09-11T18:43:12.001Z",
+        "end": "2026-10-08T13:39:24.851Z"
+      },
+      "cycles": {
+        "start": "2026-09-11T18:43:12.001Z",
+        "end": "2026-10-08T13:39:24.851Z"
+      },
+      "experiences": {
+        "start": "2026-09-12T00:18:31.000Z",
+        "end": "2026-10-08T13:33:56.440Z"
+      },
+      "events": {
+        "start": "2026-09-11T18:43:12.001Z",
+        "end": "2026-10-08T13:39:56.896Z"
+      }
+    }
+  },
+  "sourceCounts": {
+    "journals": 2677,
+    "cycles": 2677,
+    "experiences": 1173,
+    "events": 31384
+  },
+  "totalSourceRecords": 37911,
+  "publicProjectionCounts": {
+    "journals": 2677,
+    "cycles": 2677,
+    "experiences": 1173,
+    "events": 31384
+  },
+  "totalPublicProjectionRecords": 37911,
+  "sourceContentSha256": "705f2e28c6058d6c15ff8b791a47bbe690ca46242a9e05cbe88203be34a26e18",
+  "quarantineContentSha256": "fb3c977309ec52a30b93a14d01bc30ff2fab4b8d6abe0aa3f916a678b325560d",
+  "quarantineIdentityCount": 10,
+  "quarantineIdentities": [
+    {
+      "symbol": "CRCLUSDT",
+      "cycleId": "db041919-3590-4364-a24f-dbb3d78000de",
+      "decisionId": "ad6a8a15-6c30-4e4d-8d32-afdea124a331",
+      "clientOrderId": "paper-db04191935904364-ad6a8a156",
+      "reason": "POSITION_READBACK_UNAVAILABLE,POSITION_READBACK_MISSING",
+      "createdAt": "2026-09-21T05:32:28.909Z"
+    },
+    {
+      "symbol": "HOODUSDT",
+      "cycleId": "a10bb3bf-e28b-412e-98f1-4d4dec2bd6c0",
+      "decisionId": "3701db80-6691-4088-814c-f384902d467a",
+      "clientOrderId": "paper-a10bb3bfe28b412e-3701db806",
+      "reason": "EXECUTION_UNKNOWN",
+      "createdAt": "2026-09-21T13:49:41.800Z"
+    },
+    {
+      "symbol": "KORUUSDT",
+      "cycleId": "0fd99fcb-cf46-4fe8-b71e-ebb8e64168a1",
+      "decisionId": "8c8d71df-dcc7-4cce-a7eb-b53a533766e7",
+      "clientOrderId": "paper-0fd99fcbcf464fe8-8c8d71dfd",
+      "reason": "EXECUTION_UNKNOWN",
+      "createdAt": "2026-09-21T13:43:39.188Z"
+    },
+    {
+      "symbol": "METAUSDT",
+      "cycleId": "2bf00b37-e6bb-4b59-8f40-2e48b0ec1d9a",
+      "decisionId": "0d59ec5c-3a29-4d61-bb10-2f35ddafd1ba",
+      "clientOrderId": "paper-2bf00b37e6bb4b59-0d59ec5c3",
+      "reason": "EXECUTION_UNKNOWN",
+      "createdAt": "2026-09-21T14:20:24.710Z"
+    },
+    {
+      "symbol": "MSTRUSDT",
+      "cycleId": "1e401d4b-cbb3-4267-bce6-588b6f580c51",
+      "decisionId": "91a3cd88-3aad-4b0e-9805-fbec80269c50",
+      "clientOrderId": "paper-1e401d4bcbb34267-91a3cd883",
+      "reason": "POSITION_READBACK_MISSING,POSITION_READBACK_UNAVAILABLE",
+      "createdAt": "2026-09-21T11:15:38.042Z"
+    },
+    {
+      "symbol": "NVDAUSDT",
+      "cycleId": "03b155b6-d90b-4d79-9114-85b9ff7e3e38",
+      "decisionId": "1400352d-0932-4967-98ce-2ce78c8e0ff6",
+      "clientOrderId": "paper-03b155b6d90b4d79-1400352d0",
+      "reason": "EXECUTION_UNKNOWN",
+      "createdAt": "2026-09-22T00:41:09.746Z"
+    },
+    {
+      "symbol": "SAMSUNGUSDT",
+      "cycleId": "31d4e436-a1f7-4472-b0b1-76f700f8cf3c",
+      "decisionId": "27d2f239-4a51-4d87-9b00-16284167b288",
+      "clientOrderId": "paper-31d4e436a1f74472-27d2f2394",
+      "reason": "POSITION_READBACK_UNAVAILABLE",
+      "createdAt": "2026-09-22T01:43:06.096Z"
+    },
+    {
+      "symbol": "SKHYUSDT",
+      "cycleId": "f077d4d9-724a-4892-baf8-166efb6ed432",
+      "decisionId": "c44b6dee-9c82-4d69-b691-5fc57bae3996",
+      "clientOrderId": "paper-f077d4d9724a4892-c44b6dee9",
+      "reason": "EXECUTION_UNKNOWN",
+      "createdAt": "2026-10-05T00:24:08.361Z"
+    },
+    {
+      "symbol": "SNDKUSDT",
+      "cycleId": "1192e7d9-3917-4fa1-8250-770f30bd00e8",
+      "decisionId": "47f4b6b4-e625-44f9-a44c-9e8d68a30d73",
+      "clientOrderId": "paper-1192e7d939174fa1-47f4b6b4e",
+      "reason": "EXECUTION_UNKNOWN",
+      "createdAt": "2026-09-21T14:14:10.211Z"
+    },
+    {
+      "symbol": "TSLAUSDT",
+      "cycleId": "3411b736-9276-465c-ae3e-4064ae3271f7",
+      "decisionId": "b3ed4bcd-6a7b-447f-8638-a2527b187fa8",
+      "clientOrderId": "paper-3411b7369276465c-b3ed4bcd6",
+      "reason": "EXECUTION_UNKNOWN",
+      "createdAt": "2026-09-21T14:32:10.502Z"
+    }
+  ],
+  "identityVerification": {
+    "uniqueRowIdAndRecordIdByTable": true,
+    "paginationContinuity": true,
+    "countParity": true,
+    "duplicatedRecords": 0,
+    "missingRecords": 0
+  },
+  "verifiedExecutionTotals": 134,
+  "unresolvedExecutionTotals": 30,
+  "providerVerifiedClosedTradeMetrics": {
+    "verificationRule": "unique linked exit decision with executionResult.status=filled and reconciliation.status=MATCHED, plus source realizedPnlVerified=true",
+    "count": 32,
+    "realizedPnl": "229.00895709",
+    "wins": 13,
+    "losses": 19,
+    "breakeven": 0
+  },
+  "publicProjectionPolicy": {
+    "schemaVersion": "darwin-public-archive-record/1",
+    "rawPayloadsPublished": false,
+    "rawPromptsPublished": false,
+    "hiddenChainOfThoughtPublished": false,
+    "accountWideAssetSnapshotsPublished": false,
+    "internalReflectionNarrativesPublished": false,
+    "internalBacktestDetailsPublished": false,
+    "accountAssetEvidencePayloadsPublished": false,
+    "rawProviderErrorMessagesPublished": false,
+    "financialFactsInJournalExecutionAndExperienceProjectionPreserved": true
+  },
+  "projectionOmissions": {
+    "accountAssetSnapshots": 14847,
+    "rawPortfolioSnapshots": 2542,
+    "reflections": 735,
+    "backtests": 215,
+    "providerMessages": 328,
+    "eventFreeTextMetadata": 326,
+    "rawEvidencePayloads": 14847
+  },
+  "archiveSchemaVersion": "darwin-interim-archive/1",
+  "publicRecordSchemaVersion": "darwin-public-archive-record/1",
+  "chunks": [
+    {
+      "path": "paper-log-0001.jsonl.gz",
+      "rowCount": 785,
+      "uncompressedBytes": 41923166,
+      "compressedBytes": 6057360,
+      "uncompressedSha256": "bfd4fc3286da4c7edf5cf9beb73ba0f180524ca3aef3d6938d657d4cb7e49828",
+      "compressedSha256": "1d256e5c0ed05d78f191477dfe2c8e2351e2facc3b0e5cfd816ad66380ed79b9"
+    },
+    {
+      "path": "paper-log-0002.jsonl.gz",
+      "rowCount": 664,
+      "uncompressedBytes": 41917961,
+      "compressedBytes": 6058245,
+      "uncompressedSha256": "b6c575588e846437ae330216957bcc61835441be257b268098e12f9053b2d7cc",
+      "compressedSha256": "4b66e64348e61a1d7bd5ebf27e35d0d916d1250bbfca77dec05edeeb2c310ae3"
+    },
+    {
+      "path": "paper-log-0003.jsonl.gz",
+      "rowCount": 633,
+      "uncompressedBytes": 41886907,
+      "compressedBytes": 6519937,
+      "uncompressedSha256": "9b817c64f0c49554e6a1c79ded93b3a1bf8599abb97942d1dd7106214463b27a",
+      "compressedSha256": "9d3d37aa858842a7f44191f7bf6595719d10d2e5bd7903bf2e57abf88ecda749"
+    },
+    {
+      "path": "paper-log-0004.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 30311235,
+      "compressedBytes": 5268414,
+      "uncompressedSha256": "100ce5a723830fa009fa08ee30af583a3844b07eaf54f17042a81e82e707b45f",
+      "compressedSha256": "6bdcd849783e535378392bfaf0681c5031c74a0ade74ffa1adb04a328c4551ad"
+    },
+    {
+      "path": "paper-log-0005.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1780801,
+      "compressedBytes": 174266,
+      "uncompressedSha256": "fc3e7c995989ea2c53a1e3976a6745283ab74bace8ec70ebf822c04f9ccd0d7f",
+      "compressedSha256": "4468bab191bfed7dae469db83cdf5119631ee34050b0b750e0c549106b6b381d"
+    },
+    {
+      "path": "paper-log-0006.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1284539,
+      "compressedBytes": 128924,
+      "uncompressedSha256": "ae46b4a93a359db4b85ac1166426c938b3f23e7ecd91bc76cba662c06f7d33e9",
+      "compressedSha256": "f9338df4769a0b1342264a7ef909bbe476415daa434b7f3b9f21b9e03858f4f7"
+    },
+    {
+      "path": "paper-log-0007.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1383678,
+      "compressedBytes": 129784,
+      "uncompressedSha256": "db02a4317bc56172e9c9cc45b6184db93d819b0b8007c491401d48bdf420df52",
+      "compressedSha256": "c5e9d5c55d24f91b62e30189ae91db59a2d00fcd5d0a3eba20dd4f7bd2c8130b"
+    },
+    {
+      "path": "paper-log-0008.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1395705,
+      "compressedBytes": 128961,
+      "uncompressedSha256": "76f154f6f3a962bf1329737ec32f7442374b69b406089d95a542c7710b88d4aa",
+      "compressedSha256": "df2872dbfe91a2a1780f4e7c1ffdffdb0d0378982843e1ce65b65d76cee04afb"
+    },
+    {
+      "path": "paper-log-0009.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1389150,
+      "compressedBytes": 127157,
+      "uncompressedSha256": "7b47dac9fd6c5a1d0824a816508d345f4698d65c5000b151b6ada1f31dff44ea",
+      "compressedSha256": "c2efd7780a8b5d22bfcc2abc798ea6c6cec2286f9cd635ab2644c0f64c1474f6"
+    },
+    {
+      "path": "paper-log-0010.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1380398,
+      "compressedBytes": 132532,
+      "uncompressedSha256": "6c974d98d13310fc221f50797b18fa8cd31bf4e3ff89f5f239ce84f95521f580",
+      "compressedSha256": "c2a3a3186170cc8312e93c473752089ddb564d0f8babfaa447ee6212343b314a"
+    },
+    {
+      "path": "paper-log-0011.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1309224,
+      "compressedBytes": 125484,
+      "uncompressedSha256": "64b6855bc4ed5c8f8dd3f96f00967c5c16ae55ae2220eaf82f47071590a91433",
+      "compressedSha256": "2e14e529b5af40071c92bea42c4c2085b9861540b331d32f1bd044d29db1e6a5"
+    },
+    {
+      "path": "paper-log-0012.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1298409,
+      "compressedBytes": 126524,
+      "uncompressedSha256": "1107042133e36078e9a27c05bc8ef7565244b2e76baf942a3611a19b88d87d61",
+      "compressedSha256": "dcdd5832cb05499c721a595a64c86b14d61afb54dc03eb4428b9e2f662c3555e"
+    },
+    {
+      "path": "paper-log-0013.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1308509,
+      "compressedBytes": 125158,
+      "uncompressedSha256": "1b9de8f89e7cbcbb8afe94072cd7fa139574e5956d4485d4e9027bec8fd4f29b",
+      "compressedSha256": "398fe4b49970706c1c54c7552c5df8a72e9f837380a9df9fe91eed467e942988"
+    },
+    {
+      "path": "paper-log-0014.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1362134,
+      "compressedBytes": 118624,
+      "uncompressedSha256": "01ceb70ec56e4a1557f72adc14bda995ebfa79572515266fd39563babda64cbd",
+      "compressedSha256": "90d46fa25a927ddaf31f43488bae4b76602f9810f603fc31027612a58f0fa059"
+    },
+    {
+      "path": "paper-log-0015.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1379689,
+      "compressedBytes": 115804,
+      "uncompressedSha256": "60083962cb70991adfcf9f42ae88823b8d8fe87612b5476bb144f77e226f0a5d",
+      "compressedSha256": "2c3c18cc26a8fbd0eb0e0a61a30bb6b8cd391633f989a811747967ee59deb4f9"
+    },
+    {
+      "path": "paper-log-0016.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1363458,
+      "compressedBytes": 114558,
+      "uncompressedSha256": "b882c300b7c15efe92596b4285afd00ea656a81170a4682515a2a45b8a7d9d3f",
+      "compressedSha256": "982b51325fbb9e4a830c752b3e6575b41ab39d95c9a3a7e84c873d4a21594355"
+    },
+    {
+      "path": "paper-log-0017.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1353373,
+      "compressedBytes": 115968,
+      "uncompressedSha256": "43769a13c7a63a1f9ffdd8cf503710912bae6db02d5c36cc63e67d83a7dcd446",
+      "compressedSha256": "2683e912e7bf885abf24751f1417d2efbd97c9cb8a97ac447cd46742841bc4d1"
+    },
+    {
+      "path": "paper-log-0018.jsonl.gz",
+      "rowCount": 829,
+      "uncompressedBytes": 429838,
+      "compressedBytes": 42358,
+      "uncompressedSha256": "dd129369f560e734bfc9ca0b8fab55740b62fdc27db55d769c62a70a6567a549",
+      "compressedSha256": "bdc66e9e57ddf6af7d837bb663a57d3eb42dd2476c58714aac204abaf2797347"
+    }
+  ],
+  "artifactChecksums": {
+    "summary.json": {
+      "bytes": 10633,
+      "sha256": "2fa54de57825cbdf2e1879f670573b25f52e3ef141843634535657d2099d6536"
+    },
+    "paper-log-summary.csv": {
+      "bytes": 1568,
+      "sha256": "8c5f759bc0be516b4cb6ebecd83fc16df0f0c6e03b08c2ac81db6b386bf25110"
+    },
+    "README.md": {
+      "bytes": 3063,
+      "sha256": "ecf1c879f716f988c760e9c9f0012699d5a6472fb8a2564c1d92675ffa87c2e7"
+    },
+    "paper-log-0001.jsonl.gz": {
+      "bytes": 6057360,
+      "sha256": "1d256e5c0ed05d78f191477dfe2c8e2351e2facc3b0e5cfd816ad66380ed79b9"
+    },
+    "paper-log-0002.jsonl.gz": {
+      "bytes": 6058245,
+      "sha256": "4b66e64348e61a1d7bd5ebf27e35d0d916d1250bbfca77dec05edeeb2c310ae3"
+    },
+    "paper-log-0003.jsonl.gz": {
+      "bytes": 6519937,
+      "sha256": "9d3d37aa858842a7f44191f7bf6595719d10d2e5bd7903bf2e57abf88ecda749"
+    },
+    "paper-log-0004.jsonl.gz": {
+      "bytes": 5268414,
+      "sha256": "6bdcd849783e535378392bfaf0681c5031c74a0ade74ffa1adb04a328c4551ad"
+    },
+    "paper-log-0005.jsonl.gz": {
+      "bytes": 174266,
+      "sha256": "4468bab191bfed7dae469db83cdf5119631ee34050b0b750e0c549106b6b381d"
+    },
+    "paper-log-0006.jsonl.gz": {
+      "bytes": 128924,
+      "sha256": "f9338df4769a0b1342264a7ef909bbe476415daa434b7f3b9f21b9e03858f4f7"
+    },
+    "paper-log-0007.jsonl.gz": {
+      "bytes": 129784,
+      "sha256": "c5e9d5c55d24f91b62e30189ae91db59a2d00fcd5d0a3eba20dd4f7bd2c8130b"
+    },
+    "paper-log-0008.jsonl.gz": {
+      "bytes": 128961,
+      "sha256": "df2872dbfe91a2a1780f4e7c1ffdffdb0d0378982843e1ce65b65d76cee04afb"
+    },
+    "paper-log-0009.jsonl.gz": {
+      "bytes": 127157,
+      "sha256": "c2efd7780a8b5d22bfcc2abc798ea6c6cec2286f9cd635ab2644c0f64c1474f6"
+    },
+    "paper-log-0010.jsonl.gz": {
+      "bytes": 132532,
+      "sha256": "c2a3a3186170cc8312e93c473752089ddb564d0f8babfaa447ee6212343b314a"
+    },
+    "paper-log-0011.jsonl.gz": {
+      "bytes": 125484,
+      "sha256": "2e14e529b5af40071c92bea42c4c2085b9861540b331d32f1bd044d29db1e6a5"
+    },
+    "paper-log-0012.jsonl.gz": {
+      "bytes": 126524,
+      "sha256": "dcdd5832cb05499c721a595a64c86b14d61afb54dc03eb4428b9e2f662c3555e"
+    },
+    "paper-log-0013.jsonl.gz": {
+      "bytes": 125158,
+      "sha256": "398fe4b49970706c1c54c7552c5df8a72e9f837380a9df9fe91eed467e942988"
+    },
+    "paper-log-0014.jsonl.gz": {
+      "bytes": 118624,
+      "sha256": "90d46fa25a927ddaf31f43488bae4b76602f9810f603fc31027612a58f0fa059"
+    },
+    "paper-log-0015.jsonl.gz": {
+      "bytes": 115804,
+      "sha256": "2c3c18cc26a8fbd0eb0e0a61a30bb6b8cd391633f989a811747967ee59deb4f9"
+    },
+    "paper-log-0016.jsonl.gz": {
+      "bytes": 114558,
+      "sha256": "982b51325fbb9e4a830c752b3e6575b41ab39d95c9a3a7e84c873d4a21594355"
+    },
+    "paper-log-0017.jsonl.gz": {
+      "bytes": 115968,
+      "sha256": "2683e912e7bf885abf24751f1417d2efbd97c9cb8a97ac447cd46742841bc4d1"
+    },
+    "paper-log-0018.jsonl.gz": {
+      "bytes": 42358,
+      "sha256": "bdc66e9e57ddf6af7d837bb663a57d3eb42dd2476c58714aac204abaf2797347"
+    }
+  },
+  "completenessChecks": {
+    "allBoundedPagesFetched": true,
+    "sourceSha256Matched": true,
+    "quarantineIdentityStableAcrossPages": true,
+    "invalidPayloadRows": 0,
+    "duplicateIdentities": 0,
+    "projectionCountMatchesSource": true,
+    "chunksDecompressedAndParsed": true,
+    "publicSecretScan": "PASS"
+  }
+}

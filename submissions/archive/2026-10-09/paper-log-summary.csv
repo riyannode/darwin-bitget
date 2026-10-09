@@ -1,0 +1,24 @@
+metric,value,scope
+source,PRODUCTION_AUTONOMOUS_PAPER,snapshot
+archive_type,INTERIM_HISTORICAL_ARCHIVE,publication
+source_journals_count,2677,snapshot-scoped
+source_cycles_count,2677,snapshot-scoped
+source_experiences_count,1173,snapshot-scoped
+source_events_count,31384,snapshot-scoped
+total_source_records,37911,snapshot-scoped
+source_content_sha256,705f2e28c6058d6c15ff8b791a47bbe690ca46242a9e05cbe88203be34a26e18,raw source digest; not a projection hash
+quarantine_content_sha256,fb3c977309ec52a30b93a14d01bc30ff2fab4b8d6abe0aa3f916a678b325560d,raw quarantine-state digest
+deployed_sha,67d20a088aa76a77f8bef8cee7f697f7a97f34df,source runtime
+cycles_completed,2391,archived autonomous cycles
+cycles_failed,286,archived autonomous cycles
+decisions_total,9061,archived autonomous journals
+verified_executions,134,provider-verified journal evidence
+unresolved_executions,30,journal evidence; source reconciliation unchanged
+provider_verified_closed_trade_count,32,unique exit decision with filled execution + MATCHED reconciliation
+provider_verified_closed_trade_realized_pnl,229.00895709,strictly verified closed experiences only
+provider_verified_closed_trade_wins,13,strictly verified linked experiences
+provider_verified_closed_trade_losses,19,strictly verified linked experiences
+provider_verified_closed_trade_breakeven,0,strictly verified linked experiences
+source_experience_rows_not_linked_to_autonomous_journals,1,full experience table included in archive
+projection_records,37911,one public projection per source row
+projection_chunks,18,bounded gzip JSONL

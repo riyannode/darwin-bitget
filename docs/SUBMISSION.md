@@ -16,8 +16,8 @@ Present the paths in this order:
 
 1. [Live Production](https://darwin-bitget.vercel.app/) — actual autonomous
    Bitget Demo PAPER runtime.
-2. **Live PAPER journal/log export** — after the archive-export release, `/api/export/paper-log?format=json` and `/api/export/paper-log?format=csv` contain only the active collection epoch. Historical logs are not reloaded into those period exports.
-3. **Interim historical archive** — `submissions/archive/2026-10-09/` is the intended judge path. The archive is pending owner-authenticated extraction, sensitive-data audit, checksum verification, and GitHub publication; it is not complete or present in this change.
+2. **Live PAPER journal/log export** — `/api/export/paper-log?format=json` and `/api/export/paper-log?format=csv` contain only the active collection epoch; pre-epoch history is published separately in the verified interim archive.
+3. **Interim historical archive** — [`submissions/archive/2026-10-09/`](../submissions/archive/2026-10-09/) is the complete, sanitized source projection for judge review. Verify the manifest, counts, and checksums. It is an interim historical archive, not final competition results.
 4. **Zero-credential Docker Judge Demo** — run `docker compose up --build` for a deterministic, credential-free replay with no provider or model calls.
 5. **GitHub source / architecture / verification docs** — inspect the source and evidence boundaries.
 6. **Frozen final competition export** — not committed until collection is complete.
@@ -112,8 +112,8 @@ Canonical provider account reads are independent of ticker/kline evidence. A sym
 | --- | --- |
 | Source | [github.com/riyannode/darwin-bitget](https://github.com/riyannode/darwin-bitget) |
 | Live production | [darwin-bitget.vercel.app](https://darwin-bitget.vercel.app/) |
-| Live PAPER journal/log export | After the archive-export release: `/api/export/paper-log?format=json` and `/api/export/paper-log?format=csv` export only the active collection epoch; bounded response size returns 413 rather than truncating |
-| Interim historical production archive | Target: `submissions/archive/2026-10-09/` — not yet published; see [`PAPER_LOG_ARCHIVE.md`](PAPER_LOG_ARCHIVE.md). Treat as absent until a complete manifest and exact GitHub readback are verified. |
+| Live PAPER journal/log export | `/api/export/paper-log?format=json` and `/api/export/paper-log?format=csv` export only the active collection epoch; bounded response size returns 413 rather than truncating |
+| Interim historical production archive | [`submissions/archive/2026-10-09/`](../submissions/archive/2026-10-09/) — published, complete, sanitized projection verified against the owner-authenticated source snapshot; interim historical archive, not final results. |
 | Canonical Docker Judge Demo | `docker compose up --build` → `http://localhost:3000/demo` |
 | Architecture | [docs/ARCHITECTURE.md](ARCHITECTURE.md) |
 | Demo guide | [docs/DEMO.md](DEMO.md) |

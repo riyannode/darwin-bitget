@@ -1,0 +1,301 @@
+{
+  "archiveType": "INTERIM_HISTORICAL_ARCHIVE",
+  "source": "PRODUCTION_AUTONOMOUS_PAPER",
+  "deployedSha": "67d20a088aa76a77f8bef8cee7f697f7a97f34df",
+  "observedAtUtc": "2026-10-09T10:15:07.489Z",
+  "collectionBoundary": {
+    "kind": "OWNER_AUTHENTICATED_ATOMIC_SNAPSHOT",
+    "capturedAtUtc": "2026-10-09T10:15:07.489Z",
+    "snapshotWatermarks": {
+      "journals": 2677,
+      "cycles": 2719,
+      "experiences": 1173,
+      "events": 35152
+    },
+    "sourceRowsBoundedThroughSnapshot": true
+  },
+  "sourceCounts": {
+    "journals": 2677,
+    "cycles": 2677,
+    "experiences": 1173,
+    "events": 31384
+  },
+  "highWaterRowIds": {
+    "journals": 2677,
+    "cycles": 2719,
+    "experiences": 1173,
+    "events": 35152
+  },
+  "sourceContentSha256": "705f2e28c6058d6c15ff8b791a47bbe690ca46242a9e05cbe88203be34a26e18",
+  "quarantineContentSha256": "fb3c977309ec52a30b93a14d01bc30ff2fab4b8d6abe0aa3f916a678b325560d",
+  "quarantineIdentityCount": 10,
+  "publishedProjectionRowCounts": {
+    "journals": 2677,
+    "cycles": 2677,
+    "experiences": 1173,
+    "events": 31384
+  },
+  "totalSourceRecords": 37911,
+  "totalPublishedProjectionRecords": 37911,
+  "identityVerification": {
+    "perTableUniqueRecordIds": {
+      "journals": 2677,
+      "cycles": 2677,
+      "experiences": 1173,
+      "events": 31384
+    },
+    "noDuplicateRowIds": true,
+    "monotonicPagination": true,
+    "countParity": true
+  },
+  "sourceTimeBoundsUtc": {
+    "journals": {
+      "start": "2026-09-11T18:43:12.001Z",
+      "end": "2026-10-08T13:39:24.851Z"
+    },
+    "cycles": {
+      "start": "2026-09-11T18:43:12.001Z",
+      "end": "2026-10-08T13:39:24.851Z"
+    },
+    "experiences": {
+      "start": "2026-09-12T00:18:31.000Z",
+      "end": "2026-10-08T13:33:56.440Z"
+    },
+    "events": {
+      "start": "2026-09-11T18:43:12.001Z",
+      "end": "2026-10-08T13:39:56.896Z"
+    }
+  },
+  "datasetScope": "Autonomous PAPER journals and their scoped cycles, complete experience source table, and scoped associated events. The mutable Bitget provider ledger is authoritative but is not represented as an atomic part of this archive.",
+  "privacyProjection": {
+    "schemaVersion": "darwin-public-archive-record/1",
+    "rawPayloadsPublished": false,
+    "rawPromptsPublished": false,
+    "hiddenChainOfThoughtPublished": false,
+    "accountWideAssetSnapshotsPublished": false,
+    "internalReflectionNarrativesPublished": false,
+    "internalBacktestDetailsPublished": false,
+    "accountAssetEvidencePayloadsPublished": false,
+    "rawProviderErrorMessagesPublished": false,
+    "financialFactsInJournalExecutionAndExperienceProjectionPreserved": true
+  },
+  "projectionOmissions": {
+    "accountAssetSnapshots": 14847,
+    "rawPortfolioSnapshots": 2542,
+    "reflections": 735,
+    "backtests": 215,
+    "providerMessages": 328,
+    "eventFreeTextMetadata": 326,
+    "rawEvidencePayloads": 14847
+  },
+  "archiveSchemaVersion": "darwin-interim-archive/1",
+  "modelVersions": [
+    "qwen3.8-max"
+  ],
+  "agentVersions": [
+    "0.1.0",
+    "0.2.0"
+  ],
+  "promptVersionIds": [
+    "darwin-decision-v10",
+    "darwin-decision-v9",
+    "darwin-mandate-v2",
+    "darwin-mandate-v3",
+    "darwin-mandate-v4",
+    "darwin-mandate-v6",
+    "darwin-mandate-v7"
+  ],
+  "metrics": {
+    "paperLogSchemaVersion": "2.2.0",
+    "cycleSummary": {
+      "total": 2677,
+      "completed": 2391,
+      "failed": 286,
+      "completionRatePct": "89.32"
+    },
+    "decisionCounts": {
+      "HOLD": 6552,
+      "OPEN_LONG": 707,
+      "OPEN_SHORT": 218,
+      "INCREASE": 0,
+      "REDUCE": 965,
+      "CLOSE": 619,
+      "REVERSE": 0
+    },
+    "executions": {
+      "verified": 134,
+      "unresolved": 30
+    },
+    "closedExperienceOutcomes": {
+      "total": 39,
+      "profitable": 16,
+      "losing": 23,
+      "breakeven": 0,
+      "sourcePnlVerifiedFlagCount": 39
+    },
+    "providerVerifiedClosedTradeMetrics": {
+      "verificationRule": "unique linked exit decision with executionResult.status=filled and reconciliation.status=MATCHED, plus source realizedPnlVerified=true",
+      "count": 32,
+      "realizedPnl": "229.00895709",
+      "wins": 13,
+      "losses": 19,
+      "breakeven": 0
+    },
+    "verifiedExecutionRows": 134,
+    "archivedExperienceRowsLinkedToAutonomousEvidence": 1172,
+    "sourceExperienceRowsNotLinkedToArchivedAutonomousEvidence": 1
+  },
+  "publicChunks": [
+    {
+      "path": "paper-log-0001.jsonl.gz",
+      "rowCount": 785,
+      "uncompressedBytes": 41923166,
+      "compressedBytes": 6057360,
+      "uncompressedSha256": "bfd4fc3286da4c7edf5cf9beb73ba0f180524ca3aef3d6938d657d4cb7e49828",
+      "compressedSha256": "1d256e5c0ed05d78f191477dfe2c8e2351e2facc3b0e5cfd816ad66380ed79b9"
+    },
+    {
+      "path": "paper-log-0002.jsonl.gz",
+      "rowCount": 664,
+      "uncompressedBytes": 41917961,
+      "compressedBytes": 6058245,
+      "uncompressedSha256": "b6c575588e846437ae330216957bcc61835441be257b268098e12f9053b2d7cc",
+      "compressedSha256": "4b66e64348e61a1d7bd5ebf27e35d0d916d1250bbfca77dec05edeeb2c310ae3"
+    },
+    {
+      "path": "paper-log-0003.jsonl.gz",
+      "rowCount": 633,
+      "uncompressedBytes": 41886907,
+      "compressedBytes": 6519937,
+      "uncompressedSha256": "9b817c64f0c49554e6a1c79ded93b3a1bf8599abb97942d1dd7106214463b27a",
+      "compressedSha256": "9d3d37aa858842a7f44191f7bf6595719d10d2e5bd7903bf2e57abf88ecda749"
+    },
+    {
+      "path": "paper-log-0004.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 30311235,
+      "compressedBytes": 5268414,
+      "uncompressedSha256": "100ce5a723830fa009fa08ee30af583a3844b07eaf54f17042a81e82e707b45f",
+      "compressedSha256": "6bdcd849783e535378392bfaf0681c5031c74a0ade74ffa1adb04a328c4551ad"
+    },
+    {
+      "path": "paper-log-0005.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1780801,
+      "compressedBytes": 174266,
+      "uncompressedSha256": "fc3e7c995989ea2c53a1e3976a6745283ab74bace8ec70ebf822c04f9ccd0d7f",
+      "compressedSha256": "4468bab191bfed7dae469db83cdf5119631ee34050b0b750e0c549106b6b381d"
+    },
+    {
+      "path": "paper-log-0006.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1284539,
+      "compressedBytes": 128924,
+      "uncompressedSha256": "ae46b4a93a359db4b85ac1166426c938b3f23e7ecd91bc76cba662c06f7d33e9",
+      "compressedSha256": "f9338df4769a0b1342264a7ef909bbe476415daa434b7f3b9f21b9e03858f4f7"
+    },
+    {
+      "path": "paper-log-0007.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1383678,
+      "compressedBytes": 129784,
+      "uncompressedSha256": "db02a4317bc56172e9c9cc45b6184db93d819b0b8007c491401d48bdf420df52",
+      "compressedSha256": "c5e9d5c55d24f91b62e30189ae91db59a2d00fcd5d0a3eba20dd4f7bd2c8130b"
+    },
+    {
+      "path": "paper-log-0008.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1395705,
+      "compressedBytes": 128961,
+      "uncompressedSha256": "76f154f6f3a962bf1329737ec32f7442374b69b406089d95a542c7710b88d4aa",
+      "compressedSha256": "df2872dbfe91a2a1780f4e7c1ffdffdb0d0378982843e1ce65b65d76cee04afb"
+    },
+    {
+      "path": "paper-log-0009.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1389150,
+      "compressedBytes": 127157,
+      "uncompressedSha256": "7b47dac9fd6c5a1d0824a816508d345f4698d65c5000b151b6ada1f31dff44ea",
+      "compressedSha256": "c2efd7780a8b5d22bfcc2abc798ea6c6cec2286f9cd635ab2644c0f64c1474f6"
+    },
+    {
+      "path": "paper-log-0010.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1380398,
+      "compressedBytes": 132532,
+      "uncompressedSha256": "6c974d98d13310fc221f50797b18fa8cd31bf4e3ff89f5f239ce84f95521f580",
+      "compressedSha256": "c2a3a3186170cc8312e93c473752089ddb564d0f8babfaa447ee6212343b314a"
+    },
+    {
+      "path": "paper-log-0011.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1309224,
+      "compressedBytes": 125484,
+      "uncompressedSha256": "64b6855bc4ed5c8f8dd3f96f00967c5c16ae55ae2220eaf82f47071590a91433",
+      "compressedSha256": "2e14e529b5af40071c92bea42c4c2085b9861540b331d32f1bd044d29db1e6a5"
+    },
+    {
+      "path": "paper-log-0012.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1298409,
+      "compressedBytes": 126524,
+      "uncompressedSha256": "1107042133e36078e9a27c05bc8ef7565244b2e76baf942a3611a19b88d87d61",
+      "compressedSha256": "dcdd5832cb05499c721a595a64c86b14d61afb54dc03eb4428b9e2f662c3555e"
+    },
+    {
+      "path": "paper-log-0013.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1308509,
+      "compressedBytes": 125158,
+      "uncompressedSha256": "1b9de8f89e7cbcbb8afe94072cd7fa139574e5956d4485d4e9027bec8fd4f29b",
+      "compressedSha256": "398fe4b49970706c1c54c7552c5df8a72e9f837380a9df9fe91eed467e942988"
+    },
+    {
+      "path": "paper-log-0014.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1362134,
+      "compressedBytes": 118624,
+      "uncompressedSha256": "01ceb70ec56e4a1557f72adc14bda995ebfa79572515266fd39563babda64cbd",
+      "compressedSha256": "90d46fa25a927ddaf31f43488bae4b76602f9810f603fc31027612a58f0fa059"
+    },
+    {
+      "path": "paper-log-0015.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1379689,
+      "compressedBytes": 115804,
+      "uncompressedSha256": "60083962cb70991adfcf9f42ae88823b8d8fe87612b5476bb144f77e226f0a5d",
+      "compressedSha256": "2c3c18cc26a8fbd0eb0e0a61a30bb6b8cd391633f989a811747967ee59deb4f9"
+    },
+    {
+      "path": "paper-log-0016.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1363458,
+      "compressedBytes": 114558,
+      "uncompressedSha256": "b882c300b7c15efe92596b4285afd00ea656a81170a4682515a2a45b8a7d9d3f",
+      "compressedSha256": "982b51325fbb9e4a830c752b3e6575b41ab39d95c9a3a7e84c873d4a21594355"
+    },
+    {
+      "path": "paper-log-0017.jsonl.gz",
+      "rowCount": 2500,
+      "uncompressedBytes": 1353373,
+      "compressedBytes": 115968,
+      "uncompressedSha256": "43769a13c7a63a1f9ffdd8cf503710912bae6db02d5c36cc63e67d83a7dcd446",
+      "compressedSha256": "2683e912e7bf885abf24751f1417d2efbd97c9cb8a97ac447cd46742841bc4d1"
+    },
+    {
+      "path": "paper-log-0018.jsonl.gz",
+      "rowCount": 829,
+      "uncompressedBytes": 429838,
+      "compressedBytes": 42358,
+      "uncompressedSha256": "dd129369f560e734bfc9ca0b8fab55740b62fdc27db55d769c62a70a6567a549",
+      "compressedSha256": "bdc66e9e57ddf6af7d837bb663a57d3eb42dd2476c58714aac204abaf2797347"
+    }
+  ],
+  "projectionVerification": {
+    "chunksRoundTripDecompressed": true,
+    "recordsJsonParsed": true,
+    "publicSecretScan": "PASS",
+    "sourceToProjectionCountParity": true,
+    "sourceRowsUnique": true
+  }
+}
