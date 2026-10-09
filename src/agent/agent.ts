@@ -1381,7 +1381,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       return noStore(await this.paperLogArchive(request, url));
     }
     if (request.method === "GET" && url.pathname === "/export/paper-log") {
-      return noStore(this.exportPaperLog(url));
+      return noStore(this.exportPaperLog(url, request));
     }
     if (request.method === "POST" && url.pathname === "/paper-log/archive/epoch") {
       const auth = authorizeOwner(request, this.env);
@@ -1403,7 +1403,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
 
   public override async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/export/paper-log" && request.method === "GET") return noStore(TraderAgent.prototype.exportPaperLog.call(this, url));
+    if (url.pathname === "/export/paper-log" && request.method === "GET") return noStore(TraderAgent.prototype.exportPaperLog.call(this, url, request));
     if (url.pathname === "/execution-quarantines" && request.method === "GET") return this.executionQuarantineDiagnostics(request, url);
     if (url.pathname === "/snapshot" && request.method === "GET") {
       const config = loadConfig(this.env, this.ensureActivePolicy());
@@ -1491,7 +1491,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       return json({ source: "PROVIDER_READ_ONLY_BACKFILL", baselineAt, results, categories: diagnostics.map((entry) => ({ category: entry.category, rowCount: entry.counts.financialRecords, sync: entry.sync, coverage: entry.sync?.financialRecordCoverage ?? null })) });
     }
     if (url.pathname === "/policy" && request.method === "GET") return this.getPolicyRead();
-    if (url.pathname === "/export/paper-log" && request.method === "GET") return noStore(TraderAgent.prototype.exportPaperLog.call(this, url));
+    if (url.pathname === "/export/paper-log" && request.method === "GET") return noStore(TraderAgent.prototype.exportPaperLog.call(this, url, request));
     if ((url.pathname === "/control" || url.pathname === "/policy" || url.pathname === "/eva/connection-test") && request.method === "POST") {
       const auth = authorizeOwner(request, this.env);
       if (!auth.authorized) return json({ error: auth.code }, auth.status);
@@ -1769,7 +1769,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
     }
   }
 
-  private exportPaperLog(url: URL): Response {
+  private exportPaperLog(url: URL, request: Request): Response {
+    if (url.searchParams.has("page")) {
+      const auth = authorizeOwner(request, this.env);
+      if (!auth.authorized) return json({ error: auth.code }, auth.status);
+    }
     try {
       if (this.env.TRADING_MODE !== "PAPER" || this.env.PAPER_ONLY !== "true") return json({ error: "PAPER_ONLY" }, 503);
       const format = url.searchParams.get("format") ?? "json";
