@@ -410,7 +410,29 @@ async function selectPage(page) { currentPage = page; document.querySelectorAll(
 function authHeaders() { return ownerToken ? { "authorization": `Bearer ${ownerToken}` } : {}; }
 async function control(action) { if (action === "EMERGENCY_STOP" && !window.confirm("Enable the deterministic emergency stop?")) return; try { const response = await fetch("/api/control", { method: "POST", headers: { "content-type": "application/json", ...authHeaders() }, body: JSON.stringify({ action }) }); if (!response.ok) throw new Error(`HTTP_${response.status}`); invalidatePageData(); snapshot = { ...snapshot, ...(await response.json()), portfolio: livePortfolio, portfolioFreshness: liveFreshness }; render(); } catch (error) { const banner = $("error"); banner.textContent = error instanceof Error ? error.message : "CONTROL_FAILED"; banner.hidden = false; } }
 async function savePolicy() { const status = $("policy-status"); const values = Object.fromEntries([...document.querySelectorAll("[data-policy-field]")].map((input) => [input.dataset.policyField, input.value])); values.drawdownCooldownMinutes = Number(values.drawdownCooldownMinutes); values.scanIntervalMinutes = Number(values.scanIntervalMinutes); try { const response = await fetch("/api/policy", { method: "POST", headers: { "content-type": "application/json", ...authHeaders() }, body: JSON.stringify(values) }); if (!response.ok) throw new Error(`HTTP_${response.status}`); invalidatePageData(); snapshot = { ...snapshot, ...(await response.json()), portfolio: livePortfolio, portfolioFreshness: liveFreshness }; status.textContent = "POLICY_UPDATED"; render(); } catch (error) { status.textContent = error instanceof Error ? error.message : "POLICY_UPDATE_FAILED"; } }
-function downloadPaperLog(format) { const link = document.createElement("a"); link.href = `/api/export/paper-log?format=${encodeURIComponent(format)}`; link.download = `darwin-paper-log-full.${format}`; document.body.append(link); link.click(); link.remove(); }
+async function downloadPaperLog(format) {
+  const banner = $("error");
+  try {
+    const response = await fetch(`/api/export/paper-log?format=${encodeURIComponent(format)}`, { cache: "no-store" });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      throw new Error(body && typeof body.error === "string" ? body.error : `HTTP_${response.status}`);
+    }
+    const blob = await response.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = blobUrl;
+    link.download = `darwin-paper-log-current-epoch.${format}`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 1_000);
+    banner.hidden = true;
+  } catch (error) {
+    banner.textContent = error instanceof Error ? error.message : "PAPER_LOG_EXPORT_FAILED";
+    banner.hidden = false;
+  }
+}
 
 document.querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => control(button.dataset.action)));
 document.querySelectorAll("[data-page]").forEach((button) => button.addEventListener("click", () => selectPage(button.dataset.page)));

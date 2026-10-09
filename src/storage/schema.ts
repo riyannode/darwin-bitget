@@ -280,6 +280,15 @@ export function ensureStorage(executor: SqlExecutor): void {
   const idempotencyColumns = executor.sql<{ name: string }>`SELECT name FROM pragma_table_info('idempotency')`;
   if (!idempotencyColumns.some((column) => column.name === "provider_order_id")) executor.sql`ALTER TABLE idempotency ADD COLUMN provider_order_id TEXT`;
   executor.sql`CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, cycle_id TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL)`;
+  executor.sql`CREATE TABLE IF NOT EXISTS paper_log_export_revision (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), revision INTEGER NOT NULL)`;
+  executor.sql`CREATE TRIGGER IF NOT EXISTS paper_log_export_journals_update AFTER UPDATE ON journals BEGIN INSERT INTO paper_log_export_revision (singleton, revision) VALUES (1, 1) ON CONFLICT(singleton) DO UPDATE SET revision = revision + 1; END`;
+  executor.sql`CREATE TRIGGER IF NOT EXISTS paper_log_export_journals_delete AFTER DELETE ON journals BEGIN INSERT INTO paper_log_export_revision (singleton, revision) VALUES (1, 1) ON CONFLICT(singleton) DO UPDATE SET revision = revision + 1; END`;
+  executor.sql`CREATE TRIGGER IF NOT EXISTS paper_log_export_cycles_update AFTER UPDATE ON cycles BEGIN INSERT INTO paper_log_export_revision (singleton, revision) VALUES (1, 1) ON CONFLICT(singleton) DO UPDATE SET revision = revision + 1; END`;
+  executor.sql`CREATE TRIGGER IF NOT EXISTS paper_log_export_cycles_delete AFTER DELETE ON cycles BEGIN INSERT INTO paper_log_export_revision (singleton, revision) VALUES (1, 1) ON CONFLICT(singleton) DO UPDATE SET revision = revision + 1; END`;
+  executor.sql`CREATE TRIGGER IF NOT EXISTS paper_log_export_experiences_update AFTER UPDATE ON experiences BEGIN INSERT INTO paper_log_export_revision (singleton, revision) VALUES (1, 1) ON CONFLICT(singleton) DO UPDATE SET revision = revision + 1; END`;
+  executor.sql`CREATE TRIGGER IF NOT EXISTS paper_log_export_experiences_delete AFTER DELETE ON experiences BEGIN INSERT INTO paper_log_export_revision (singleton, revision) VALUES (1, 1) ON CONFLICT(singleton) DO UPDATE SET revision = revision + 1; END`;
+  executor.sql`CREATE TRIGGER IF NOT EXISTS paper_log_export_events_update AFTER UPDATE ON events BEGIN INSERT INTO paper_log_export_revision (singleton, revision) VALUES (1, 1) ON CONFLICT(singleton) DO UPDATE SET revision = revision + 1; END`;
+  executor.sql`CREATE TRIGGER IF NOT EXISTS paper_log_export_events_delete AFTER DELETE ON events BEGIN INSERT INTO paper_log_export_revision (singleton, revision) VALUES (1, 1) ON CONFLICT(singleton) DO UPDATE SET revision = revision + 1; END`;
   executor.sql`CREATE TABLE IF NOT EXISTS position_context (context_key TEXT PRIMARY KEY, symbol TEXT NOT NULL, position_side TEXT NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL)`;
   executor.sql`CREATE TABLE IF NOT EXISTS provider_orders (
     provider_order_id TEXT PRIMARY KEY,

@@ -46,14 +46,16 @@ Only runtime observations after deployment belong here. The live site is a read-
 
 ## Paper log evidence
 
-The dashboard shows bounded recent history. Full autonomous history is exported through:
+After the archive-export release, the default endpoints export only the active collection epoch:
 
 ```text
 GET /api/export/paper-log?format=json
 GET /api/export/paper-log?format=csv
 ```
 
-- The current live PAPER log is read-only and available through the JSON and CSV export endpoints above. It includes autonomous HOLD cycles, exports semantic actions separately, records REVERSE's physical writes under the parent intent, excludes manual harness and Docker records, and preserves sanitized provider diagnostics. Performance aggregate state is separate from the export's bounded historical projection. Final submission exports remain uncommitted until collection ends; validate them for secrets, API keys, authorization headers, passphrases, owner tokens, and raw model chain-of-thought before submission.
+The epoch metadata marks summary metrics as `COLLECTION_PERIOD` and states that the lifetime baseline is unchanged. To prevent isolate exhaustion, an export exceeding 500 current-period rows or 2 MiB of payload returns HTTP 413; it never succeeds with truncated history. Complete historical extraction is available only through the owner-authenticated, paused-only, 50-row page API documented in [PAPER_LOG_ARCHIVE.md](PAPER_LOG_ARCHIVE.md). The intended interim judge archive path is `submissions/archive/2026-10-09/`, but it remains absent until production extraction, safety review, and GitHub readback all pass.
+
+The archive must preserve full source counts and high-water bounds, verify all chunk hashes and unique identities, exclude Docker/manual replay, and reject publication if secret/private reasoning scans fail. Do not populate the reserved final JSON/CSV before the owner confirms final freeze. Historical production evidence is distinct from deterministic Docker replay.
 
 ## Not claimed
 
