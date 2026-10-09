@@ -1,0 +1,78 @@
+# PAPER journal archive and collection epochs
+
+This procedure applies after the archive-export release is explicitly approved and deployed. Do not run it against the current production SHA unless the deployed runtime confirms the route exists. It does not authorize a deployment, scheduler resume, order, recovery, or quarantine change.
+
+## Startup-effects gate
+
+`TraderAgent.fetch()` dispatches the owner-authenticated archive GET, current-epoch export GET, and epoch-start POST directly before the framework lifecycle fetch. These paths therefore do not invoke `onStart()` or its schema/read-model initialization, historical quarantine backfill, policy hydration, or scheduler reconciliation. The archive/export GETs use read-only persisted-state, schedule, and SQL reads and fail closed if state is unavailable. The epoch-start POST performs only its documented additive `risk_state` write after archive-proof verification; it does not run startup migrations/backfills. All other routes retain normal lifecycle startup behavior. Before production extraction, independently verify the deployed route/SHA, persisted PAUSED/idle state, zero trading schedules, and exact quarantine identities; compare the same identities before/after extraction. Never call the archive/export routes through a fallback that invokes lifecycle startup, and stop if request routing does not prove this bypass.
+
+## Owner-authenticated source snapshot
+
+The endpoint is private and requires the existing owner bearer authentication. It also refuses unless the runtime is `PAPER_ONLY`, the agent is persistently `PAUSED`, no cycle is running, and there is no `runScheduledCycle` schedule.
+
+```text
+GET /api/paper-log/archive?op=snapshot
+Authorization: Bearer <local owner token>
+```
+
+`snapshot.contentSha256` covers every scoped source row in stable table/rowid order, including raw payload and row metadata. `snapshot.quarantineContentSha256` is the SHA-256 of the raw persisted quarantine-state payload (or `[]` when unset); the response also lists the sanitized quarantine identities with reason and creation timestamp as provenance. Include both digests and those full sanitized quarantine records in the archive manifest/readback record. Do not mark an archive complete if any table reports invalid payload rows.
+
+The snapshot call executes its state/schedule checks, per-table count/high-water reads, and bounded 50-row-page content-hash scan under `blockConcurrencyWhile`, so a cold export never runs lifecycle startup and concurrent DO requests cannot mutate rows mid-snapshot. Recompute the canonical content digest from every downloaded page. Also preserve and compare `quarantineIdentities` and `quarantineContentSha256` against the final owner-authenticated snapshot before epoch start. Any digest/count/cursor/identity mismatch makes extraction incomplete. Keep the agent paused between requests; the epoch-start endpoint rechecks counts, high-water marks, and the content digest before persisting the boundary, so in-place payload edits during download are rejected.
+
+## Bounded pages
+
+The `contentSha256` algorithm is reproducible offline in Node.js: start with 32 zero bytes; visit tables in `journals`, `cycles`, `experiences`, `events` order; divide each table's rowid-ordered stream into canonical groups of 50 (including an empty group for an empty table); serialize each group as `JSON.stringify([table, pageNumber, rows.map(r => [r.rowId, r.recordId, r.createdAt, r.rowMetadata, r.payload])])`; replace the chain with `SHA256(previousDigestBytes || UTF8(serializedGroup))`. Store this digest in `manifest.json` as `sourceContentSha256`, and send the exact value as `archiveContentSha256` when starting the epoch.
+
+For each source table, request pages with the corresponding `highWaterRowId` from the snapshot:
+
+```text
+GET /api/paper-log/archive?op=page&table=journals&afterRowId=0&throughRowId=<highWaterRowId>&limit=50
+Authorization: Bearer <local owner token>
+```
+
+Repeat using `page.nextCursor` as `afterRowId` until `hasMore=false`. Keep each page in a local temporary directory and assemble offline; never request one giant JSON export. Each page row includes the exact source `payload`, stable `rowId`/`recordId`/`createdAt`, and `rowMetadata` for table columns not duplicated inside the payload (experience symbol/outcome and event type/cycle ID). The API returns at most 50 rows, and fails with HTTP 413 rather than truncating if any row in the next page exceeds 128 KiB. Any non-200 page, repeated/non-advancing cursor, duplicate rowid, parse failure, or mismatch from snapshot counts means the archive is incomplete and must not be published.
+
+`journals` pages contain autonomous records only. `cycles` pages contain only cycles linked to those autonomous journals; `events` pages contain cycle-linked journal events only and exclude `CONTROL` / `PROVIDER_SYNC_*` telemetry; `experiences` pages contain the complete historical experiences table with its source row metadata. Counts and high-water marks describe those exact scoped rows, not the full provider ledger or all database rows. Late reconciliation and quarantine-clear events remain included when linked to an archived autonomous cycle. Preserve stored identifiers and timestamps, and report source scope and included counts separately. Decision counts come from journal records; do not infer the journal total from the previous 5,354-row observation.
+
+## Offline assembly and publication checks
+
+Assemble verified records in deterministic order. If the serialized archive is at most 20 MiB, publish a readable `paper-log.jsonl`; otherwise write gzip-compressed JSON Lines chunks named `paper-log-0001.jsonl.gz`, etc., each below 50 MiB and comfortably under GitHub's per-file limit. Include a `manifest.json`, `summary.json`, `paper-log-summary.csv`, and a `README.md` under:
+
+```text
+submissions/archive/2026-10-09/
+```
+
+The manifest must identify `PRODUCTION / AUTONOMOUS / PAPER`, deployed SHA, UTC collection bounds, exact source and included counts, `sourceContentSha256`, `quarantineContentSha256`, verified/unresolved execution counts, provider-verified closed-trade metrics, per-chunk row counts and SHA-256, total rows, unique cycle/decision identity checks, schema version, and `complete: true` only after all checks pass.
+
+Before publication, inspect the full projection and every decompressed chunk. Do not publish credentials, API keys, bearer headers, passphrases, owner tokens, raw prompts, hidden chain-of-thought, or private provider headers. Preserve the original production records; create a documented public projection and never rewrite source records. If a sensitive field cannot be safely projected without changing a financial fact, stop publication and report the exact field class. Do not commit local raw downloads, temporary pages, secrets, or the reserved `submissions/paper-log-final.json` / `.csv` files.
+
+After pushing the archive, read each exact GitHub artifact back, recompute SHA-256, parse every chunk, verify row counts and identity uniqueness, and compare the manifest's source totals with the snapshot. A successful push response alone is not publication proof.
+
+## Start the new collection epoch
+
+Only after the verified archive has been published and read back from GitHub, POST to the owner-authenticated `/api/paper-log/archive/epoch` endpoint while still paused:
+
+```text
+POST /api/paper-log/archive/epoch
+Authorization: Bearer *** owner token>
+Content-Type: application/json
+```
+
+The JSON body must use the exact values from the verified source snapshot and archive manifest:
+
+```json
+{
+  "action": "START_PAPER_LOG_COLLECTION_EPOCH",
+  "archiveManifestSha256": "<64-character lowercase SHA-256>",
+  "archiveContentSha256": "<snapshot.contentSha256>",
+  "quarantineContentSha256": "<snapshot.quarantineContentSha256>",
+  "archivedCounts": { "journals": 0, "cycles": 0, "experiences": 0, "events": 0 },
+  "highWaterRowIds": { "journals": 0, "cycles": 0, "experiences": 0, "events": 0 }
+}
+```
+
+The numeric values above are placeholders, not production counts. The Worker recomputes the bounded source digest and raw quarantine-state digest and refuses if counts, high-water marks, either SHA-256, payload validity, PAPER mode, paused/idle state, or zero trading schedules do not match. It persists one additive `risk_state` marker; it does not delete or rewrite journals, cycles, events, experiences, idempotency keys, quarantines, position context, provider ledger, lessons, risk state, or financial baselines.
+
+The default JSON/CSV exports then query only rows with rowids above the epoch's persisted high-water marks. They start at zero for cycles/journals, identify metrics as `COLLECTION_PERIOD`, and mark the lifetime performance baseline `UNCHANGED`. The epoch CSV includes a `recordType` discriminator and always emits a `SUMMARY` row (also for zero cycles); late-reconciliation/quarantine-clear events for earlier archived cycles appear as separate `EVENT` rows and remain linked by exact cycle/decision identity. The exporter fails closed with HTTP 413 above 500 total current-period rows or 2 MiB of source payload rather than returning a partial file or risking another isolate reset. Use the same paused owner-authenticated page API for an explicit bounded extraction when that limit is reached.
+
+Late reconciliation for a pre-epoch execution must be stored as new evidence linked to its original cycle/decision and archive reference. Do not mutate the archived record silently. The interim archive does not freeze competition results; the final reserved paths remain absent until the owner separately confirms the final freeze.

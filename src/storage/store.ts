@@ -84,6 +84,33 @@ export interface StoredCycle {
   completedAt: string | null;
 }
 
+export type PaperLogArchiveTable = "journals" | "cycles" | "experiences" | "events";
+
+export interface PaperLogArchiveTableBoundary {
+  rowCount: number;
+  highWaterRowId: number;
+  invalidPayloadRows: number;
+}
+
+export interface PaperLogArchiveSnapshot {
+  schemaVersion: 1;
+  tables: Record<PaperLogArchiveTable, PaperLogArchiveTableBoundary>;
+}
+
+export interface PaperLogArchiveRow {
+  rowId: number;
+  recordId: string;
+  createdAt: string;
+  payload: string;
+  rowMetadata: Record<string, string | null>;
+}
+
+export interface PaperLogArchivePage {
+  rows: PaperLogArchiveRow[];
+  nextCursor: number;
+  hasMore: boolean;
+}
+
 export interface JournalLookupBatch {
   journals: TradingJournal[];
   complete: boolean;
@@ -505,8 +532,13 @@ export function loadJournalForExactDecisionCycle(executor: SqlExecutor, cycleId:
   }
 }
 
-export function loadAllExperiences(executor: SqlExecutor, path = "/api/export/paper-log", queryName = "paper_log_all_experiences"): TradeExperience[] {
-  const rows = executeMeasuredSql<ExperienceRow>(executor, path, queryName)`SELECT payload FROM experiences ORDER BY created_at ASC, experience_id ASC`;
+export function loadAllExperiences(executor: SqlExecutor, path = "/api/export/paper-log", queryName = "paper_log_all_experiences", afterRowId?: number, from?: string, to?: string): TradeExperience[] {
+  const query = executeMeasuredSql<ExperienceRow>(executor, path, queryName);
+  const start = from ?? null;
+  const end = to ?? null;
+  const rows = afterRowId !== undefined
+    ? query`SELECT payload FROM experiences WHERE rowid > ${afterRowId} AND (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end}) ORDER BY created_at ASC, experience_id ASC`
+    : query`SELECT payload FROM experiences WHERE (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end}) ORDER BY created_at ASC, experience_id ASC`;
   return rows.flatMap((row) => {
     try {
       return [parseExperience(JSON.parse(row.payload))];
@@ -962,15 +994,23 @@ export function loadAllAutonomousJournals(
   to?: string,
   path = "/api/export/paper-log",
   queryName = "paper_log_all_journals",
+  afterRowId?: number,
 ): TradingJournal[] {
   const query = executeMeasuredSql<JournalRow>(executor, path, queryName);
-  const rows = from && to
-    ? query`SELECT payload FROM journals WHERE created_at >= ${from} AND created_at <= ${to} ORDER BY created_at ASC, cycle_id ASC`
-    : from
-      ? query`SELECT payload FROM journals WHERE created_at >= ${from} ORDER BY created_at ASC, cycle_id ASC`
-      : to
-        ? query`SELECT payload FROM journals WHERE created_at <= ${to} ORDER BY created_at ASC, cycle_id ASC`
-        : query`SELECT payload FROM journals ORDER BY created_at ASC, cycle_id ASC`;
+  const start = from ?? null;
+  const end = to ?? null;
+  const rows = afterRowId !== undefined
+    ? query`SELECT payload FROM journals WHERE rowid > ${afterRowId}
+        AND (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end})
+        AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+        ORDER BY created_at ASC, cycle_id ASC`
+    : from && to
+      ? query`SELECT payload FROM journals WHERE created_at >= ${from} AND created_at <= ${to} ORDER BY created_at ASC, cycle_id ASC`
+      : from
+        ? query`SELECT payload FROM journals WHERE created_at >= ${from} ORDER BY created_at ASC, cycle_id ASC`
+        : to
+          ? query`SELECT payload FROM journals WHERE created_at <= ${to} ORDER BY created_at ASC, cycle_id ASC`
+          : query`SELECT payload FROM journals ORDER BY created_at ASC, cycle_id ASC`;
   return rows.flatMap((row) => {
     try {
       const journal = JSON.parse(row.payload) as TradingJournal;
@@ -981,15 +1021,23 @@ export function loadAllAutonomousJournals(
   });
 }
 
-export function loadAllStoredCycles(executor: SqlExecutor, from?: string, to?: string, path = "/api/export/paper-log", queryName = "paper_log_all_cycles"): StoredCycle[] {
+export function loadAllStoredCycles(executor: SqlExecutor, from?: string, to?: string, path = "/api/export/paper-log", queryName = "paper_log_all_cycles", afterRowId?: number): StoredCycle[] {
   const query = executeMeasuredSql<{ cycle_id: string; status: string; started_at: string; completed_at: string | null }>(executor, path, queryName);
-  const rows = from && to
-    ? query`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at >= ${from} AND started_at <= ${to} ORDER BY started_at ASC, cycle_id ASC`
-    : from
-      ? query`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at >= ${from} ORDER BY started_at ASC, cycle_id ASC`
-      : to
-        ? query`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at <= ${to} ORDER BY started_at ASC, cycle_id ASC`
-        : query`SELECT cycle_id, status, started_at, completed_at FROM cycles ORDER BY started_at ASC, cycle_id ASC`;
+  const rows = afterRowId !== undefined
+    ? from && to
+      ? query`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE rowid > ${afterRowId} AND started_at >= ${from} AND started_at <= ${to} ORDER BY started_at ASC, cycle_id ASC`
+      : from
+        ? query`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE rowid > ${afterRowId} AND started_at >= ${from} ORDER BY started_at ASC, cycle_id ASC`
+        : to
+          ? query`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE rowid > ${afterRowId} AND started_at <= ${to} ORDER BY started_at ASC, cycle_id ASC`
+          : query`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE rowid > ${afterRowId} ORDER BY started_at ASC, cycle_id ASC`
+    : from && to
+      ? query`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at >= ${from} AND started_at <= ${to} ORDER BY started_at ASC, cycle_id ASC`
+      : from
+        ? query`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at >= ${from} ORDER BY started_at ASC, cycle_id ASC`
+        : to
+          ? query`SELECT cycle_id, status, started_at, completed_at FROM cycles WHERE started_at <= ${to} ORDER BY started_at ASC, cycle_id ASC`
+          : query`SELECT cycle_id, status, started_at, completed_at FROM cycles ORDER BY started_at ASC, cycle_id ASC`;
   return rows.map((row) => ({ cycleId: row.cycle_id, status: row.status, startedAt: row.started_at, completedAt: row.completed_at }));
 }
 
@@ -1156,8 +1204,13 @@ export function loadExecutionQuarantineRecoveryAuditEvents(
   };
 }
 
-export function loadAllEvents(executor: SqlExecutor, path = "/api/export/paper-log", queryName = "paper_log_all_events"): ActivityEvent[] {
-  const rows = executeMeasuredSql<EventRow>(executor, path, queryName)`SELECT event_id, event_type, cycle_id, payload, created_at FROM events ORDER BY created_at ASC, event_id ASC`;
+export function loadAllEvents(executor: SqlExecutor, path = "/api/export/paper-log", queryName = "paper_log_all_events", afterRowId?: number, from?: string, to?: string): ActivityEvent[] {
+  const query = executeMeasuredSql<EventRow>(executor, path, queryName);
+  const start = from ?? null;
+  const end = to ?? null;
+  const rows = afterRowId !== undefined
+    ? query`SELECT event_id, event_type, cycle_id, payload, created_at FROM events WHERE rowid > ${afterRowId} AND (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end}) ORDER BY created_at ASC, event_id ASC`
+    : query`SELECT event_id, event_type, cycle_id, payload, created_at FROM events WHERE (${start} IS NULL OR created_at >= ${start}) AND (${end} IS NULL OR created_at <= ${end}) ORDER BY created_at ASC, event_id ASC`;
   return rows.flatMap((row) => {
     try {
       const event = JSON.parse(row.payload) as ActivityEvent;
@@ -1172,6 +1225,262 @@ export function loadAllEvents(executor: SqlExecutor, path = "/api/export/paper-l
       return [];
     }
   });
+}
+
+const PAPER_LOG_ARCHIVE_PAGE_LIMIT = 50;
+const PAPER_LOG_ARCHIVE_MAX_ROW_BYTES = 128 * 1024;
+
+/** Captures rowid watermarks and exact source counts in one synchronous DO request. */
+export function loadPaperLogArchiveSnapshot(executor: SqlExecutor, path = "/api/paper-log/archive"): PaperLogArchiveSnapshot {
+  const query = executeMeasuredSql<{
+    row_count: number;
+    high_water_row_id: number;
+    invalid_payload_rows: number;
+  }>(executor, path, "paper_log_archive_snapshot");
+  const journalRows = query`SELECT
+    COUNT(CASE WHEN json_valid(payload) THEN CASE WHEN json_extract(payload, '$.mode') = 'AUTONOMOUS' THEN 1 END END) AS row_count,
+    COALESCE(MAX(CASE WHEN json_valid(payload) THEN CASE WHEN json_extract(payload, '$.mode') = 'AUTONOMOUS' THEN rowid END END), 0) AS high_water_row_id,
+    SUM(CASE WHEN json_valid(payload) THEN CASE WHEN json_type(payload, '$.mode') = 'text' THEN 0 ELSE 1 END ELSE 1 END) AS invalid_payload_rows
+    FROM journals`;
+  const cycleRows = query`SELECT COUNT(*) AS row_count, COALESCE(MAX(c.rowid), 0) AS high_water_row_id, 0 AS invalid_payload_rows
+    FROM cycles c WHERE EXISTS (
+      SELECT 1 FROM journals j WHERE j.cycle_id = c.cycle_id
+        AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+    )`;
+  const experienceRows = query`SELECT COUNT(*) AS row_count, COALESCE(MAX(rowid), 0) AS high_water_row_id,
+    SUM(CASE WHEN json_valid(payload) THEN 0 ELSE 1 END) AS invalid_payload_rows FROM experiences`;
+  const eventRows = query`SELECT COUNT(*) AS row_count, COALESCE(MAX(e.rowid), 0) AS high_water_row_id,
+    SUM(CASE WHEN json_valid(e.payload) THEN 0 ELSE 1 END) AS invalid_payload_rows
+    FROM events e WHERE e.cycle_id <> 'CONTROL' AND e.event_type NOT LIKE 'PROVIDER_SYNC_%' AND EXISTS (
+      SELECT 1 FROM journals j WHERE j.cycle_id = e.cycle_id
+        AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+    )`;
+  const boundary = (rows: Array<{ row_count: number; high_water_row_id: number; invalid_payload_rows: number }>): PaperLogArchiveTableBoundary => ({
+    rowCount: Number(rows[0]?.row_count ?? 0),
+    highWaterRowId: Number(rows[0]?.high_water_row_id ?? 0),
+    invalidPayloadRows: Number(rows[0]?.invalid_payload_rows ?? 0),
+  });
+  return {
+    schemaVersion: 1,
+    tables: {
+      journals: boundary(journalRows),
+      cycles: boundary(cycleRows),
+      experiences: boundary(experienceRows),
+      events: boundary(eventRows),
+    },
+  };
+}
+
+/** Returns one bounded page; callers must retain the returned cursor and boundary. */
+export function loadPaperLogArchivePage(
+  executor: SqlExecutor,
+  input: { table: PaperLogArchiveTable; afterRowId: number; throughRowId: number; limit?: number },
+  path = "/api/paper-log/archive",
+  measureReads = true,
+): PaperLogArchivePage {
+  if (!Number.isSafeInteger(input.afterRowId) || input.afterRowId < 0
+    || !Number.isSafeInteger(input.throughRowId) || input.throughRowId < input.afterRowId) {
+    throw new Error("INVALID_PAPER_LOG_ARCHIVE_CURSOR");
+  }
+  const limit = Math.max(1, Math.min(PAPER_LOG_ARCHIVE_PAGE_LIMIT, Math.floor(input.limit ?? PAPER_LOG_ARCHIVE_PAGE_LIMIT)));
+  const rawQuery = executor.sql.bind(executor);
+  const query = measureReads
+    ? executeMeasuredSql<{ row_id: number; record_id: string; created_at: string; payload: string; row_metadata: string }>(executor, path, `paper_log_archive_page_${input.table}`)
+    : rawQuery;
+  if (input.table !== "cycles") {
+    const sizeQuery = measureReads
+      ? executeMeasuredSql<{ row_id: number; payload_bytes: number }>(executor, path, `paper_log_archive_page_size_${input.table}`)
+      : rawQuery;
+    const candidateRows = input.table === "journals"
+      ? sizeQuery`SELECT rowid AS row_id, length(CAST(payload AS BLOB)) AS payload_bytes FROM journals
+        WHERE rowid > ${input.afterRowId} AND rowid <= ${input.throughRowId}
+          AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+        ORDER BY rowid ASC LIMIT ${limit + 1}`
+      : input.table === "experiences"
+        ? sizeQuery`SELECT rowid AS row_id, length(CAST(payload AS BLOB)) AS payload_bytes FROM experiences
+          WHERE rowid > ${input.afterRowId} AND rowid <= ${input.throughRowId} ORDER BY rowid ASC LIMIT ${limit + 1}`
+        : sizeQuery`SELECT e.rowid AS row_id, length(CAST(e.payload AS BLOB)) AS payload_bytes FROM events e
+          WHERE e.rowid > ${input.afterRowId} AND e.rowid <= ${input.throughRowId} AND e.cycle_id <> 'CONTROL' AND e.event_type NOT LIKE 'PROVIDER_SYNC_%'
+            AND EXISTS (SELECT 1 FROM journals j WHERE j.cycle_id = e.cycle_id
+              AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END)
+          ORDER BY e.rowid ASC LIMIT ${limit + 1}`;
+    if (candidateRows.some((row) => row.payload_bytes > PAPER_LOG_ARCHIVE_MAX_ROW_BYTES)) throw new Error("PAPER_LOG_ARCHIVE_ROW_EXCEEDS_BYTE_LIMIT");
+  }
+  let rows;
+  if (input.table === "journals") {
+    rows = query`SELECT rowid AS row_id, cycle_id AS record_id, created_at, payload, json_object() AS row_metadata FROM journals
+      WHERE rowid > ${input.afterRowId} AND rowid <= ${input.throughRowId}
+        AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+      ORDER BY rowid ASC LIMIT ${limit + 1}`;
+  } else if (input.table === "cycles") {
+    rows = query`SELECT c.rowid AS row_id, c.cycle_id AS record_id, c.started_at AS created_at, json_object('cycleId', c.cycle_id, 'status', c.status, 'startedAt', c.started_at, 'completedAt', c.completed_at) AS payload, json_object() AS row_metadata FROM cycles c
+      WHERE c.rowid > ${input.afterRowId} AND c.rowid <= ${input.throughRowId} AND EXISTS (
+        SELECT 1 FROM journals j WHERE j.cycle_id = c.cycle_id
+          AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+      ) ORDER BY c.rowid ASC LIMIT ${limit + 1}`;
+  } else if (input.table === "experiences") {
+    rows = query`SELECT rowid AS row_id, experience_id AS record_id, created_at, payload, json_object('symbol', symbol, 'outcomeStatus', outcome_status) AS row_metadata FROM experiences
+      WHERE rowid > ${input.afterRowId} AND rowid <= ${input.throughRowId}
+      ORDER BY rowid ASC LIMIT ${limit + 1}`;
+  } else {
+    rows = query`SELECT e.rowid AS row_id, e.event_id AS record_id, e.created_at, e.payload, json_object('eventType', e.event_type, 'cycleId', e.cycle_id) AS row_metadata FROM events e
+      WHERE e.rowid > ${input.afterRowId} AND e.rowid <= ${input.throughRowId} AND e.cycle_id <> 'CONTROL' AND e.event_type NOT LIKE 'PROVIDER_SYNC_%' AND EXISTS (
+        SELECT 1 FROM journals j WHERE j.cycle_id = e.cycle_id
+          AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+      ) ORDER BY e.rowid ASC LIMIT ${limit + 1}`;
+  }
+  const hasMore = rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  return {
+    rows: pageRows.map((row) => ({ rowId: row.row_id, recordId: row.record_id, createdAt: row.created_at, payload: row.payload, rowMetadata: JSON.parse(row.row_metadata) as Record<string, string | null> })),
+    nextCursor: pageRows[pageRows.length - 1]?.row_id ?? input.afterRowId,
+    hasMore,
+  };
+}
+
+/** Hashes the complete bounded source in fixed 50-row pages without retaining history. */
+export async function computePaperLogArchiveContentSha256(
+  executor: SqlExecutor,
+  snapshot: PaperLogArchiveSnapshot,
+  path = "/api/paper-log/archive",
+): Promise<string> {
+  const tables: PaperLogArchiveTable[] = ["journals", "cycles", "experiences", "events"];
+  const encoder = new TextEncoder();
+  let chain = new Uint8Array(32);
+  for (const table of tables) {
+    let cursor = 0;
+    let pageNumber = 0;
+    let rowCount = 0;
+    while (true) {
+      const page = loadPaperLogArchivePage(executor, {
+        table,
+        afterRowId: cursor,
+        throughRowId: snapshot.tables[table].highWaterRowId,
+        limit: PAPER_LOG_ARCHIVE_PAGE_LIMIT,
+      }, path, false);
+      const canonicalPage = encoder.encode(JSON.stringify([
+        table,
+        pageNumber,
+        page.rows.map((row) => [row.rowId, row.recordId, row.createdAt, row.rowMetadata, row.payload]),
+      ]));
+      const input = new Uint8Array(chain.byteLength + canonicalPage.byteLength);
+      input.set(chain);
+      input.set(canonicalPage, chain.byteLength);
+      chain = new Uint8Array(await crypto.subtle.digest("SHA-256", input));
+      rowCount += page.rows.length;
+      if (!page.hasMore) break;
+      if (page.nextCursor <= cursor) throw new Error("PAPER_LOG_ARCHIVE_PAGINATION_DID_NOT_ADVANCE");
+      cursor = page.nextCursor;
+      pageNumber += 1;
+    }
+    if (rowCount !== snapshot.tables[table].rowCount) throw new Error("PAPER_LOG_ARCHIVE_SOURCE_COUNT_MISMATCH");
+  }
+  return Array.from(chain, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export async function computeExecutionQuarantineContentSha256(executor: SqlExecutor): Promise<string> {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${EXECUTION_QUARANTINE_STATE_KEY}`;
+  const payload = rows.length === 0 ? "[]" : rows[0]!.payload;
+  loadExecutionQuarantines(executor);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(payload)));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export interface PaperLogCollectionEpoch {
+  schemaVersion: 1;
+  epochId: string;
+  startedAt: string;
+  archiveManifestSha256: string;
+  archiveContentSha256: string;
+  quarantineContentSha256: string;
+  archivedCounts: Record<PaperLogArchiveTable, number>;
+  highWaterRowIds: Record<PaperLogArchiveTable, number>;
+}
+
+export interface PaperLogCollectionExportSize {
+  rowCount: number;
+  payloadBytes: number;
+  invalidPayloadRows: number;
+  unpairedCurrentCycleRows: number;
+  unpairedCurrentJournalRows: number;
+}
+
+const PAPER_LOG_COLLECTION_EPOCH_KEY = "paper_log_collection_epoch_v1";
+
+export function loadPaperLogCollectionEpoch(executor: SqlExecutor): PaperLogCollectionEpoch | null {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${PAPER_LOG_COLLECTION_EPOCH_KEY}`;
+  if (!rows[0]) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rows[0].payload);
+  } catch {
+    throw new Error("PAPER_LOG_COLLECTION_EPOCH_INVALID");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("PAPER_LOG_COLLECTION_EPOCH_INVALID");
+  const value = parsed as Record<string, unknown>;
+  const tables: PaperLogArchiveTable[] = ["journals", "cycles", "experiences", "events"];
+  const recordOfNonNegativeIntegers = (candidate: unknown): candidate is Record<PaperLogArchiveTable, number> =>
+    typeof candidate === "object" && candidate !== null && !Array.isArray(candidate)
+    && tables.every((table) => Number.isSafeInteger((candidate as Record<string, unknown>)[table]) && Number((candidate as Record<string, unknown>)[table]) >= 0);
+  if (value.schemaVersion !== 1 || typeof value.epochId !== "string" || !value.epochId
+    || typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt))
+    || typeof value.archiveManifestSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.archiveManifestSha256)
+    || typeof value.archiveContentSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.archiveContentSha256)
+    || typeof value.quarantineContentSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.quarantineContentSha256)
+    || !recordOfNonNegativeIntegers(value.archivedCounts) || !recordOfNonNegativeIntegers(value.highWaterRowIds)) {
+    throw new Error("PAPER_LOG_COLLECTION_EPOCH_INVALID");
+  }
+  return value as unknown as PaperLogCollectionEpoch;
+}
+
+export function savePaperLogCollectionEpoch(executor: SqlExecutor, epoch: PaperLogCollectionEpoch, updatedAt: string): void {
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${PAPER_LOG_COLLECTION_EPOCH_KEY}, ${JSON.stringify(epoch)}, ${updatedAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+}
+
+export function loadPaperLogCollectionExportSize(executor: SqlExecutor, epoch: PaperLogCollectionEpoch): PaperLogCollectionExportSize {
+  const journals = executor.sql<{ row_count: number; payload_bytes: number; invalid_payload_rows: number }>`SELECT
+      COUNT(CASE WHEN json_valid(payload) THEN CASE WHEN json_extract(payload, '$.mode') = 'AUTONOMOUS' THEN 1 END END) AS row_count,
+      COALESCE(SUM(CASE WHEN json_valid(payload) THEN CASE WHEN json_extract(payload, '$.mode') = 'AUTONOMOUS' THEN length(CAST(payload AS BLOB)) ELSE 0 END ELSE 0 END), 0) AS payload_bytes,
+      COALESCE(SUM(CASE WHEN json_valid(payload) THEN CASE WHEN json_type(payload, '$.mode') = 'text' THEN 0 ELSE 1 END ELSE 1 END), 0) AS invalid_payload_rows
+    FROM journals WHERE rowid > ${epoch.highWaterRowIds.journals}`;
+  const cycles = executor.sql<{ row_count: number; payload_bytes: number; invalid_payload_rows: number }>`SELECT COUNT(*) AS row_count, 0 AS payload_bytes, 0 AS invalid_payload_rows
+    FROM cycles WHERE rowid > ${epoch.highWaterRowIds.cycles}`;
+  const experiences = executor.sql<{ row_count: number; payload_bytes: number; invalid_payload_rows: number }>`SELECT COUNT(*) AS row_count,
+      COALESCE(SUM(length(CAST(payload AS BLOB))), 0) AS payload_bytes,
+      COALESCE(SUM(CASE WHEN json_valid(payload) THEN 0 ELSE 1 END), 0) AS invalid_payload_rows
+    FROM experiences WHERE rowid > ${epoch.highWaterRowIds.experiences}`;
+  const events = executor.sql<{ row_count: number; payload_bytes: number; invalid_payload_rows: number }>`SELECT COUNT(*) AS row_count,
+      COALESCE(SUM(length(CAST(e.payload AS BLOB))), 0) AS payload_bytes,
+      COALESCE(SUM(CASE WHEN json_valid(e.payload) THEN 0 ELSE 1 END), 0) AS invalid_payload_rows
+    FROM events e WHERE e.rowid > ${epoch.highWaterRowIds.events} AND e.created_at >= ${epoch.startedAt}
+      AND (EXISTS (
+        SELECT 1 FROM journals j WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.cycle_id = e.cycle_id
+          AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+      ) OR e.event_type IN ('LATE_EXECUTION_RECONCILED', 'EXECUTION_QUARANTINE_CLEARED'))`;
+  const unpairedCycles = executor.sql<{ count: number }>`SELECT COUNT(*) AS count FROM cycles c
+    WHERE c.rowid > ${epoch.highWaterRowIds.cycles} AND NOT EXISTS (
+      SELECT 1 FROM journals j WHERE j.rowid > ${epoch.highWaterRowIds.journals} AND j.cycle_id = c.cycle_id
+        AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+    )`;
+  const unpairedJournals = executor.sql<{ count: number }>`SELECT COUNT(*) AS count FROM journals j
+    WHERE j.rowid > ${epoch.highWaterRowIds.journals}
+      AND CASE WHEN json_valid(j.payload) THEN json_extract(j.payload, '$.mode') = 'AUTONOMOUS' ELSE 0 END
+      AND NOT EXISTS (SELECT 1 FROM cycles c WHERE c.rowid > ${epoch.highWaterRowIds.cycles} AND c.cycle_id = j.cycle_id)`;
+  const rows = [journals[0], cycles[0], experiences[0], events[0]];
+  const totals = rows.reduce((size, row) => ({
+    rowCount: size.rowCount + Number(row?.row_count ?? 0),
+    payloadBytes: size.payloadBytes + Number(row?.payload_bytes ?? 0),
+    invalidPayloadRows: size.invalidPayloadRows + Number(row?.invalid_payload_rows ?? 0),
+  }), { rowCount: 0, payloadBytes: 0, invalidPayloadRows: 0 });
+  return {
+    ...totals,
+    unpairedCurrentCycleRows: Number(unpairedCycles[0]?.count ?? 0),
+    unpairedCurrentJournalRows: Number(unpairedJournals[0]?.count ?? 0),
+  };
 }
 
 const EXECUTION_QUARANTINE_STATE_KEY = "unresolved_execution_quarantine";

@@ -8,7 +8,7 @@ Bitget market/account evidence → Qwen decisions → deterministic risk gate �
 
 - **Live Production:** [darwin-bitget.vercel.app](https://darwin-bitget.vercel.app/) — current autonomous PAPER runtime and provider state.
 - **Judge Demo:** [Docker replay guide](docs/DEMO.md) — deterministic recorded replay; no live orders or external calls.
-- **Paper Log Export:** production read-only [`JSON`](https://darwin-bitget.vercel.app/api/export/paper-log?format=json) / [`CSV`](https://darwin-bitget.vercel.app/api/export/paper-log?format=csv).
+- **Paper Log Export:** after the archive-export release, JSON/CSV expose the active collection epoch only; complete historical archives are owner-authenticated, paginated, and published separately after validation.
 - **Submission docs:** [Judge submission](docs/SUBMISSION.md) · [Verification](docs/VERIFICATION.md) · [Deployment](docs/DEPLOYMENT.md).
 - **Architecture:** [authority boundaries and runtime](docs/ARCHITECTURE.md).
 

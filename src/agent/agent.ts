@@ -24,6 +24,16 @@ import {
   loadAllExperiences,
   loadExperiencesForDecisionIds,
   loadAllStoredCycles,
+  loadPaperLogArchivePage,
+  loadPaperLogArchiveSnapshot,
+  computePaperLogArchiveContentSha256,
+  computeExecutionQuarantineContentSha256,
+  loadPaperLogCollectionEpoch,
+  loadPaperLogCollectionExportSize,
+  savePaperLogCollectionEpoch,
+  type PaperLogArchiveSnapshot,
+  type PaperLogArchiveTable,
+  type PaperLogCollectionEpoch,
   loadRecentStoredCycles,
   loadRecentJournals,
   loadJournalBackfillPage,
@@ -155,6 +165,8 @@ const STALE_CYCLE_TIMEOUT_MS = 120_000;
 const USER_STORAGE_VERSION = 6;
 const LATEST_VALID_PLAN_MIGRATION_VERSION = 5;
 const SNAPSHOT_EVENT_LIMIT = 25;
+const MAX_PAPER_LOG_EXPORT_ROWS = 500;
+const MAX_PAPER_LOG_EXPORT_PAYLOAD_BYTES = 2 * 1024 * 1024;
 const initializedStorageExecutors = new WeakSet<object>();
 
 function ensureStorageInitialized(executor: SqlExecutor): void {
@@ -670,6 +682,43 @@ function json(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 }
 
+function noStore(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("cache-control", "no-store");
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+async function readBoundedJsonRequest(request: Request, maxBytes: number): Promise<{ value: unknown } | { error: "INVALID_JSON_REQUEST" | "JSON_REQUEST_TOO_LARGE" }> {
+  const declaredLength = request.headers.get("content-length");
+  if (declaredLength !== null && (!/^(0|[1-9][0-9]*)$/.test(declaredLength) || Number(declaredLength) > maxBytes)) return { error: "JSON_REQUEST_TOO_LARGE" };
+  const reader = request.clone().body?.getReader();
+  if (!reader) return { error: "INVALID_JSON_REQUEST" };
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      byteLength += chunk.value.byteLength;
+      if (byteLength > maxBytes) {
+        await reader.cancel();
+        return { error: "JSON_REQUEST_TOO_LARGE" };
+      }
+      chunks.push(chunk.value);
+    }
+  } catch {
+    return { error: "INVALID_JSON_REQUEST" };
+  }
+  const bytes = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  try {
+    return { value: JSON.parse(new TextDecoder().decode(bytes)) as unknown };
+  } catch {
+    return { error: "INVALID_JSON_REQUEST" };
+  }
+}
+
 function cycleReadModelWithStatus(journal: TradingJournal, storedCycles: readonly { cycleId: string; status: string; startedAt: string; completedAt: string | null }[], events: readonly { type: string; cycleId: string; metadata?: Record<string, string> }[]): NormalizedCycleDecisions & { startedAt: string; completedAt: string | null } {
   const stored = storedCycles.find((cycle) => cycle.cycleId === journal.cycleId);
   const status = stored?.status === "RUNNING" || stored?.status === "COMPLETED" || stored?.status === "FAILED"
@@ -901,6 +950,214 @@ export class TraderAgent extends Agent<Env, AgentState> {
     }
   }
 
+  private async paperLogArchive(request: Request, url: URL): Promise<Response> {
+    const auth = authorizeOwner(request, this.env);
+    if (!auth.authorized) return json({ error: auth.code }, auth.status);
+    if (this.env.TRADING_MODE !== "PAPER" || this.env.PAPER_ONLY !== "true") return json({ error: "PAPER_ONLY" }, 503);
+    const readRuntimeState = (): { paused: boolean; runtimeStatus: string; cycleStartedAt: string | null } => {
+      const rows = this.sql<{ state: string }>`SELECT state FROM cf_agents_state WHERE id = 'cf_state_row_id' LIMIT 1`;
+      const state: unknown = rows[0] ? JSON.parse(rows[0].state) : null;
+      if (typeof state !== "object" || state === null || typeof (state as Record<string, unknown>).paused !== "boolean"
+        || typeof (state as Record<string, unknown>).runtimeStatus !== "string") throw new Error("AGENT_STATE_UNAVAILABLE");
+      return {
+        paused: (state as Record<string, unknown>).paused as boolean,
+        runtimeStatus: (state as Record<string, unknown>).runtimeStatus as string,
+        cycleStartedAt: typeof (state as Record<string, unknown>).cycleStartedAt === "string" ? (state as Record<string, unknown>).cycleStartedAt as string : null,
+      };
+    };
+    let runtimeState: ReturnType<typeof readRuntimeState>;
+    try {
+      runtimeState = readRuntimeState();
+    } catch {
+      return json({ error: "PAPER_LOG_ARCHIVE_STATE_UNAVAILABLE" }, 503);
+    }
+    if (!runtimeState.paused || runtimeState.runtimeStatus !== "PAUSED" || runtimeState.cycleStartedAt) {
+      return json({ error: "PAPER_LOG_ARCHIVE_REQUIRES_PAUSED_IDLE_AGENT" }, 409);
+    }
+    let hasTradingSchedule: boolean;
+    try {
+      hasTradingSchedule = (await this.listSchedules()).some((entry) => entry.callback === "runScheduledCycle");
+    } catch {
+      return json({ error: "PAPER_LOG_ARCHIVE_SCHEDULER_READ_FAILED" }, 503);
+    }
+    if (hasTradingSchedule) return json({ error: "PAPER_LOG_ARCHIVE_REQUIRES_ZERO_TRADING_SCHEDULES" }, 409);
+    try {
+      runtimeState = readRuntimeState();
+    } catch {
+      return json({ error: "PAPER_LOG_ARCHIVE_STATE_UNAVAILABLE" }, 503);
+    }
+    if (!runtimeState.paused || runtimeState.runtimeStatus !== "PAUSED" || runtimeState.cycleStartedAt) return json({ error: "PAPER_LOG_ARCHIVE_REQUIRES_PAUSED_IDLE_AGENT" }, 409);
+    const operation = url.searchParams.get("op");
+    if (operation === "snapshot") {
+      let snapshot: PaperLogArchiveSnapshot;
+      let archiveContentSha256: string;
+      let quarantineContentSha256: string;
+      let lockedState: ReturnType<typeof readRuntimeState>;
+      let quarantineIdentities: Array<{ symbol: string; cycleId: string; decisionId: string; clientOrderId: string }>;
+      try {
+        const captured = await this.ctx.blockConcurrencyWhile(async () => {
+          try {
+            const state = readRuntimeState();
+            if (!state.paused || state.runtimeStatus !== "PAUSED" || state.cycleStartedAt) return { ok: false as const, code: "PAPER_LOG_ARCHIVE_REQUIRES_PAUSED_IDLE_AGENT" };
+            if ((await this.listSchedules()).some((entry) => entry.callback === "runScheduledCycle")) return { ok: false as const, code: "PAPER_LOG_ARCHIVE_REQUIRES_ZERO_TRADING_SCHEDULES" };
+            const stableState = readRuntimeState();
+            if (!stableState.paused || stableState.runtimeStatus !== "PAUSED" || stableState.cycleStartedAt) return { ok: false as const, code: "PAPER_LOG_ARCHIVE_REQUIRES_PAUSED_IDLE_AGENT" };
+            const stableSnapshot = loadPaperLogArchiveSnapshot(this, "/api/paper-log/archive");
+            const contentSha256 = await computePaperLogArchiveContentSha256(this, stableSnapshot, "/api/paper-log/archive");
+            const quarantineContentSha256 = await computeExecutionQuarantineContentSha256(this);
+            const quarantineIdentities = loadExecutionQuarantines(this).map(({ symbol, cycleId, decisionId, clientOrderId, reason, createdAt }) => ({ symbol, cycleId, decisionId, clientOrderId, reason, createdAt }))
+              .sort((left, right) => `${left.symbol}\u0000${left.cycleId}\u0000${left.decisionId}\u0000${left.clientOrderId}`.localeCompare(`${right.symbol}\u0000${right.cycleId}\u0000${right.decisionId}\u0000${right.clientOrderId}`));
+            return { ok: true as const, snapshot: stableSnapshot, contentSha256, quarantineContentSha256, state: stableState, quarantineIdentities };
+          } catch {
+            return { ok: false as const, code: "PAPER_LOG_ARCHIVE_SNAPSHOT_FAILED" };
+          }
+        });
+        if (!captured.ok) return json({ error: captured.code }, captured.code === "PAPER_LOG_ARCHIVE_SNAPSHOT_FAILED" ? 503 : 409);
+        snapshot = captured.snapshot;
+        archiveContentSha256 = captured.contentSha256;
+        quarantineContentSha256 = captured.quarantineContentSha256;
+        lockedState = captured.state;
+        quarantineIdentities = captured.quarantineIdentities;
+      } catch {
+        return json({ error: "PAPER_LOG_ARCHIVE_SNAPSHOT_FAILED" }, 503);
+      }
+      let collectionEpoch: PaperLogCollectionEpoch | null;
+      try {
+        collectionEpoch = loadPaperLogCollectionEpoch(this);
+      } catch {
+        return json({ error: "PAPER_LOG_COLLECTION_EPOCH_INVALID" }, 503);
+      }
+      return json({
+        source: "PRODUCTION_AUTONOMOUS_PAPER",
+        observedAt: new Date().toISOString(),
+        deployedSha: this.env.GIT_COMMIT_SHA?.trim() || "unknown",
+        paused: lockedState.paused,
+        tradingScheduleCount: 0,
+        quarantineIdentities,
+        snapshot: { ...snapshot, contentSha256: archiveContentSha256, quarantineContentSha256 },
+        collectionEpoch,
+      });
+    }
+    if (operation !== "page") return json({ error: "INVALID_PAPER_LOG_ARCHIVE_OPERATION" }, 400);
+    const tableValue = url.searchParams.get("table");
+    if (tableValue !== "journals" && tableValue !== "cycles" && tableValue !== "experiences" && tableValue !== "events") return json({ error: "INVALID_PAPER_LOG_ARCHIVE_TABLE" }, 400);
+    const parseInteger = (value: string | null): number | null => value !== null && /^(0|[1-9][0-9]*)$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : null;
+    const afterRowId = parseInteger(url.searchParams.get("afterRowId"));
+    const throughRowId = parseInteger(url.searchParams.get("throughRowId"));
+    const limit = parseInteger(url.searchParams.get("limit"));
+    if (afterRowId === null || throughRowId === null || throughRowId < afterRowId || limit === null || limit < 1 || limit > 50) {
+      return json({ error: "INVALID_PAPER_LOG_ARCHIVE_CURSOR" }, 400);
+    }
+    try {
+      return json({
+        source: "PRODUCTION_AUTONOMOUS_PAPER",
+        table: tableValue satisfies PaperLogArchiveTable,
+        quarantineIdentities: loadExecutionQuarantines(this).map(({ symbol, cycleId, decisionId, clientOrderId, reason, createdAt }) => ({ symbol, cycleId, decisionId, clientOrderId, reason, createdAt }))
+          .sort((left, right) => `${left.symbol}\u0000${left.cycleId}\u0000${left.decisionId}\u0000${left.clientOrderId}`.localeCompare(`${right.symbol}\u0000${right.cycleId}\u0000${right.decisionId}\u0000${right.clientOrderId}`)),
+        page: loadPaperLogArchivePage(this, { table: tableValue, afterRowId, throughRowId, limit }, "/api/paper-log/archive"),
+      });
+    } catch (error) {
+      const code = error instanceof Error ? error.message.split(":", 1)[0] ?? "PAPER_LOG_ARCHIVE_PAGE_FAILED" : "PAPER_LOG_ARCHIVE_PAGE_FAILED";
+      return json({ error: code }, code === "PAPER_LOG_ARCHIVE_ROW_EXCEEDS_BYTE_LIMIT" ? 413 : 400);
+    }
+  }
+
+  private async startPaperLogCollectionEpoch(request: Request, body: { action: "START_PAPER_LOG_COLLECTION_EPOCH"; archiveManifestSha256: string; archiveContentSha256: string; quarantineContentSha256: string; archivedCounts: Record<PaperLogArchiveTable, number>; highWaterRowIds: Record<PaperLogArchiveTable, number> }): Promise<Response> {
+    const auth = authorizeOwner(request, this.env);
+    if (!auth.authorized) return json({ error: auth.code }, auth.status);
+    if (this.env.TRADING_MODE !== "PAPER" || this.env.PAPER_ONLY !== "true") return json({ error: "PAPER_ONLY" }, 503);
+    const readRuntimeState = (): { paused: boolean; runtimeStatus: string; cycleStartedAt: string | null } => {
+      const rows = this.sql<{ state: string }>`SELECT state FROM cf_agents_state WHERE id = 'cf_state_row_id' LIMIT 1`;
+      const state: unknown = rows[0] ? JSON.parse(rows[0].state) : null;
+      if (typeof state !== "object" || state === null || typeof (state as Record<string, unknown>).paused !== "boolean"
+        || typeof (state as Record<string, unknown>).runtimeStatus !== "string") throw new Error("AGENT_STATE_UNAVAILABLE");
+      return {
+        paused: (state as Record<string, unknown>).paused as boolean,
+        runtimeStatus: (state as Record<string, unknown>).runtimeStatus as string,
+        cycleStartedAt: typeof (state as Record<string, unknown>).cycleStartedAt === "string" ? (state as Record<string, unknown>).cycleStartedAt as string : null,
+      };
+    };
+    try {
+      const beforeScheduleRead = readRuntimeState();
+      if (!beforeScheduleRead.paused || beforeScheduleRead.runtimeStatus !== "PAUSED" || beforeScheduleRead.cycleStartedAt) return json({ error: "PAPER_LOG_COLLECTION_EPOCH_REQUIRES_PAPER_PAUSED_IDLE_AGENT" }, 409);
+    } catch {
+      return json({ error: "PAPER_LOG_COLLECTION_EPOCH_STATE_UNAVAILABLE" }, 503);
+    }
+    let hasTradingSchedule: boolean;
+    try {
+      hasTradingSchedule = (await this.listSchedules()).some((entry) => entry.callback === "runScheduledCycle");
+    } catch {
+      return json({ error: "PAPER_LOG_COLLECTION_EPOCH_SCHEDULER_READ_FAILED" }, 503);
+    }
+    if (hasTradingSchedule) return json({ error: "PAPER_LOG_COLLECTION_EPOCH_REQUIRES_ZERO_TRADING_SCHEDULES" }, 409);
+    try {
+      const afterScheduleRead = readRuntimeState();
+      if (!afterScheduleRead.paused || afterScheduleRead.runtimeStatus !== "PAUSED" || afterScheduleRead.cycleStartedAt) return json({ error: "PAPER_LOG_COLLECTION_EPOCH_REQUIRES_PAPER_PAUSED_IDLE_AGENT" }, 409);
+    } catch {
+      return json({ error: "PAPER_LOG_COLLECTION_EPOCH_STATE_UNAVAILABLE" }, 503);
+    }
+    let existingEpoch: PaperLogCollectionEpoch | null;
+    try {
+      existingEpoch = loadPaperLogCollectionEpoch(this);
+    } catch {
+      return json({ error: "PAPER_LOG_COLLECTION_EPOCH_INVALID" }, 503);
+    }
+    if (existingEpoch?.archiveManifestSha256 === body.archiveManifestSha256) {
+      const proofMatches = existingEpoch.archiveContentSha256 === body.archiveContentSha256 && existingEpoch.quarantineContentSha256 === body.quarantineContentSha256 && (["journals", "cycles", "experiences", "events"] as const).every((table) =>
+        existingEpoch.archivedCounts[table] === body.archivedCounts[table] && existingEpoch.highWaterRowIds[table] === body.highWaterRowIds[table]);
+      if (!proofMatches) return json({ error: "PAPER_LOG_ARCHIVE_MANIFEST_PROOF_CONFLICT" }, 409);
+      return json({ collectionEpoch: existingEpoch, idempotentReplay: true });
+    }
+    if (existingEpoch) return json({ error: "PAPER_LOG_COLLECTION_EPOCH_ALREADY_STARTED" }, 409);
+    const startedAt = new Date().toISOString();
+    try {
+      return await this.ctx.blockConcurrencyWhile(async () => {
+        try {
+          const lockedState = readRuntimeState();
+          if (!lockedState.paused || lockedState.runtimeStatus !== "PAUSED" || lockedState.cycleStartedAt) return json({ error: "PAPER_LOG_COLLECTION_EPOCH_REQUIRES_PAPER_PAUSED_IDLE_AGENT" }, 409);
+          if ((await this.listSchedules()).some((entry) => entry.callback === "runScheduledCycle")) return json({ error: "PAPER_LOG_COLLECTION_EPOCH_REQUIRES_ZERO_TRADING_SCHEDULES" }, 409);
+          const finalState = readRuntimeState();
+          if (!finalState.paused || finalState.runtimeStatus !== "PAUSED" || finalState.cycleStartedAt) return json({ error: "PAPER_LOG_COLLECTION_EPOCH_REQUIRES_PAPER_PAUSED_IDLE_AGENT" }, 409);
+          const activeEpoch = loadPaperLogCollectionEpoch(this);
+          if (activeEpoch) {
+            const sameProof = activeEpoch.archiveManifestSha256 === body.archiveManifestSha256
+              && activeEpoch.archiveContentSha256 === body.archiveContentSha256
+              && activeEpoch.quarantineContentSha256 === body.quarantineContentSha256
+              && (["journals", "cycles", "experiences", "events"] as const).every((table) =>
+                activeEpoch.archivedCounts[table] === body.archivedCounts[table] && activeEpoch.highWaterRowIds[table] === body.highWaterRowIds[table]);
+            return sameProof ? json({ collectionEpoch: activeEpoch, idempotentReplay: true }) : json({ error: "PAPER_LOG_COLLECTION_EPOCH_ALREADY_STARTED" }, 409);
+          }
+          const snapshot = loadPaperLogArchiveSnapshot(this, "/api/paper-log/archive/epoch");
+          if (Object.values(snapshot.tables).some((boundary) => boundary.invalidPayloadRows > 0)) return json({ error: "PAPER_LOG_ARCHIVE_SOURCE_INVALID" }, 409);
+          const currentCounts = Object.fromEntries(Object.entries(snapshot.tables).map(([table, boundary]) => [table, boundary.rowCount])) as Record<PaperLogArchiveTable, number>;
+          const currentHighWater = Object.fromEntries(Object.entries(snapshot.tables).map(([table, boundary]) => [table, boundary.highWaterRowId])) as Record<PaperLogArchiveTable, number>;
+          const matches = (left: Record<string, number>, right: Record<string, number>): boolean => Object.keys(currentCounts).every((table) => left[table] === right[table]);
+          if (!matches(body.archivedCounts, currentCounts) || !matches(body.highWaterRowIds, currentHighWater)) return json({ error: "PAPER_LOG_ARCHIVE_BOUNDARY_CHANGED" }, 409);
+          const sourceContentSha256 = await computePaperLogArchiveContentSha256(this, snapshot, "/api/paper-log/archive/epoch");
+          if (sourceContentSha256 !== body.archiveContentSha256) return json({ error: "PAPER_LOG_ARCHIVE_CONTENT_CHANGED" }, 409);
+          const quarantineContentSha256 = await computeExecutionQuarantineContentSha256(this);
+          if (quarantineContentSha256 !== body.quarantineContentSha256) return json({ error: "PAPER_LOG_ARCHIVE_QUARANTINE_STATE_CHANGED" }, 409);
+          const epoch: PaperLogCollectionEpoch = {
+            schemaVersion: 1,
+            epochId: crypto.randomUUID(),
+            startedAt,
+            archiveManifestSha256: body.archiveManifestSha256,
+            archiveContentSha256: sourceContentSha256,
+            quarantineContentSha256,
+            archivedCounts: currentCounts,
+            highWaterRowIds: currentHighWater,
+          };
+          savePaperLogCollectionEpoch(this, epoch, startedAt);
+          return json({ collectionEpoch: epoch, currentPeriod: { cycleCount: 0, journalCount: 0 }, lifetimePerformanceBaselineChanged: false });
+        } catch {
+          return json({ error: "PAPER_LOG_COLLECTION_EPOCH_STATE_UNAVAILABLE" }, 503);
+        }
+      });
+    } catch {
+      return json({ error: "PAPER_LOG_COLLECTION_EPOCH_STATE_UNAVAILABLE" }, 503);
+    }
+  }
+
   private async executionQuarantineDiagnostics(request: Request, url: URL): Promise<Response> {
     const auth = authorizeOwner(request, this.env);
     if (!auth.authorized) return json({ error: auth.code }, auth.status);
@@ -1074,8 +1331,35 @@ export class TraderAgent extends Agent<Env, AgentState> {
     });
   }
 
+  public override async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/paper-log/archive") {
+      return noStore(await this.paperLogArchive(request, url));
+    }
+    if (request.method === "GET" && url.pathname === "/export/paper-log") {
+      return this.exportPaperLog(url);
+    }
+    if (request.method === "POST" && url.pathname === "/paper-log/archive/epoch") {
+      const auth = authorizeOwner(request, this.env);
+      if (!auth.authorized) return noStore(json({ error: auth.code }, auth.status));
+      const parsed = await readBoundedJsonRequest(request, 4096);
+      if ("error" in parsed) return noStore(json({ error: parsed.error }, parsed.error === "JSON_REQUEST_TOO_LARGE" ? 413 : 400));
+      if (!isControlBody(parsed.value) || parsed.value.action !== "START_PAPER_LOG_COLLECTION_EPOCH") return noStore(json({ error: "INVALID_PAPER_LOG_EPOCH_REQUEST" }, 400));
+      return noStore(await this.startPaperLogCollectionEpoch(request, parsed.value));
+    }
+    if (request.method === "POST" && url.pathname === "/control") {
+      const auth = authorizeOwner(request, this.env);
+      if (!auth.authorized) return json({ error: auth.code }, auth.status);
+      const parsed = await readBoundedJsonRequest(request, 4096);
+      if ("error" in parsed) return json({ error: parsed.error }, parsed.error === "JSON_REQUEST_TOO_LARGE" ? 413 : 400);
+      if (typeof parsed.value === "object" && parsed.value !== null && "action" in parsed.value && parsed.value.action === "START_PAPER_LOG_COLLECTION_EPOCH") return json({ error: "USE_PAPER_LOG_ARCHIVE_EPOCH_ENDPOINT" }, 409);
+    }
+    return super.fetch(request);
+  }
+
   public override async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/export/paper-log" && request.method === "GET") return TraderAgent.prototype.exportPaperLog.call(this, url);
     if (url.pathname === "/execution-quarantines" && request.method === "GET") return this.executionQuarantineDiagnostics(request, url);
     if (url.pathname === "/snapshot" && request.method === "GET") {
       const config = loadConfig(this.env, this.ensureActivePolicy());
@@ -1163,7 +1447,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       return json({ source: "PROVIDER_READ_ONLY_BACKFILL", baselineAt, results, categories: diagnostics.map((entry) => ({ category: entry.category, rowCount: entry.counts.financialRecords, sync: entry.sync, coverage: entry.sync?.financialRecordCoverage ?? null })) });
     }
     if (url.pathname === "/policy" && request.method === "GET") return this.getPolicyRead();
-    if (url.pathname === "/export/paper-log" && request.method === "GET") return this.exportPaperLog(url);
+    if (url.pathname === "/export/paper-log" && request.method === "GET") return TraderAgent.prototype.exportPaperLog.call(this, url);
     if ((url.pathname === "/control" || url.pathname === "/policy" || url.pathname === "/eva/connection-test") && request.method === "POST") {
       const auth = authorizeOwner(request, this.env);
       if (!auth.authorized) return json({ error: auth.code }, auth.status);
@@ -1177,6 +1461,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       }
       if (body.action === "PAUSE") await this.setPaused(true);
       if (body.action === "EMERGENCY_STOP") await this.setEmergencyStop(true);
+      if (body.action === "START_PAPER_LOG_COLLECTION_EPOCH") return json({ error: "USE_PAPER_LOG_ARCHIVE_EPOCH_ENDPOINT" }, 409);
       if (body.action === "DRY_RUN_EXECUTION_QUARANTINE_RECOVERY") {
         try {
           return json(await this.dryRunExecutionQuarantineRecovery(body.cycleId, body.decisionId, body.evidenceThrough));
@@ -1348,22 +1633,35 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (this.env.TRADING_MODE !== "PAPER" || this.env.PAPER_ONLY !== "true") return json({ error: "PAPER_ONLY" }, 503);
       const format = url.searchParams.get("format") ?? "json";
       if (format !== "json" && format !== "csv") return json({ error: "INVALID_EXPORT_FORMAT" }, 400);
-      const period = parsePaperLogPeriod(url.searchParams.get("from"), url.searchParams.get("to"));
-      const journals = loadAllAutonomousJournals(this, period.start ?? undefined, period.end ?? undefined);
+      const epoch = loadPaperLogCollectionEpoch(this);
+      if (!epoch) return json({ error: "PAPER_LOG_COLLECTION_EPOCH_NOT_INITIALIZED" }, 409);
+      const exportSize = loadPaperLogCollectionExportSize(this, epoch);
+      if (exportSize.invalidPayloadRows > 0) return json({ error: "PAPER_LOG_COLLECTION_HAS_INVALID_PAYLOAD" }, 409);
+      if (exportSize.unpairedCurrentCycleRows > 0 || exportSize.unpairedCurrentJournalRows > 0) return json({ error: "PAPER_LOG_COLLECTION_HAS_UNPAIRED_CYCLES", unpairedCurrentCycleRows: exportSize.unpairedCurrentCycleRows, unpairedCurrentJournalRows: exportSize.unpairedCurrentJournalRows }, 409);
+      if (exportSize.rowCount > MAX_PAPER_LOG_EXPORT_ROWS || exportSize.payloadBytes > MAX_PAPER_LOG_EXPORT_PAYLOAD_BYTES) {
+        return json({ error: "PAPER_LOG_EXPORT_REQUIRES_BOUNDED_ARCHIVE_PAGES", rowCount: exportSize.rowCount, payloadBytes: exportSize.payloadBytes }, 413);
+      }
+      const requestedPeriod = parsePaperLogPeriod(url.searchParams.get("from"), url.searchParams.get("to"));
+      if (requestedPeriod.end && requestedPeriod.end < epoch.startedAt) return json({ error: "PAPER_LOG_PERIOD_OUTSIDE_COLLECTION_EPOCH" }, 416);
+      const start = requestedPeriod.start && requestedPeriod.start > epoch.startedAt ? requestedPeriod.start : epoch.startedAt;
+      const period = { start, end: requestedPeriod.end };
+      const journals = loadAllAutonomousJournals(this, period.start ?? undefined, period.end ?? undefined, "/api/export/paper-log", "paper_log_current_epoch_journals", epoch.highWaterRowIds.journals);
       const exported = buildPaperLogExport({
         generatedAt: new Date().toISOString(),
         period,
         environment: this.env.ENVIRONMENT?.trim() || "unknown",
-        model: this.state.model || this.env.QWEN_MODEL?.trim() || "unknown",
+        model: this.env.QWEN_MODEL?.trim() || "unknown",
         version: this.env.APP_VERSION?.trim() || "unknown",
         commit: this.env.GIT_COMMIT_SHA?.trim() || "unknown",
-        cycles: loadAllStoredCycles(this, period.start ?? undefined, period.end ?? undefined),
+        cycles: loadAllStoredCycles(this, period.start ?? undefined, period.end ?? undefined, "/api/export/paper-log", "paper_log_current_epoch_cycles", epoch.highWaterRowIds.cycles),
         journals,
-        experiences: loadAllExperiences(this),
-        events: loadAllEvents(this),
+        experiences: loadAllExperiences(this, "/api/export/paper-log", "paper_log_current_epoch_experiences", epoch.highWaterRowIds.experiences, period.start ?? undefined, period.end ?? undefined),
+        events: loadAllEvents(this, "/api/export/paper-log", "paper_log_current_epoch_events", epoch.highWaterRowIds.events, period.start ?? undefined, period.end ?? undefined),
+        includeUnlinkedEvents: true,
+        collectionEpoch: { epochId: epoch.epochId, startedAt: epoch.startedAt, archiveManifestSha256: epoch.archiveManifestSha256, archiveContentSha256: epoch.archiveContentSha256, quarantineContentSha256: epoch.quarantineContentSha256 },
       });
-      if (format === "csv") return new Response(paperLogToCsv(exported), { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": "attachment; filename=darwin-paper-log-full.csv", "cache-control": "no-store" } });
-      return new Response(JSON.stringify(exported, null, 2), { headers: { "content-type": "application/json; charset=utf-8", "content-disposition": "attachment; filename=darwin-paper-log-full.json", "cache-control": "no-store" } });
+      if (format === "csv") return new Response(paperLogToCsv(exported), { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename=darwin-paper-log-${epoch.epochId}.csv`, "cache-control": "no-store" } });
+      return new Response(JSON.stringify(exported), { headers: { "content-type": "application/json; charset=utf-8", "content-disposition": `attachment; filename=darwin-paper-log-${epoch.epochId}.json`, "cache-control": "no-store" } });
     } catch (error) {
       return json({ error: error instanceof Error ? error.message.split(":", 1)[0] ?? "PAPER_LOG_EXPORT_FAILED" : "PAPER_LOG_EXPORT_FAILED" }, 400);
     }
@@ -3929,9 +4227,16 @@ function providerReadFailureCode(error: unknown): string {
   return "PROVIDER_READ_FAILED";
 }
 
-function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "DRY_RUN_EXECUTION_QUARANTINE_RECOVERY"; cycleId: string; decisionId: string; evidenceThrough?: string } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "RECOVER_QUARANTINED_CLOSED_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "REPAIR_PROVIDER_CLOSED_LIFECYCLE"; experienceId: string; providerPositionHistoryId: string; dryRun?: boolean } {
+function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "START_PAPER_LOG_COLLECTION_EPOCH"; archiveManifestSha256: string; archiveContentSha256: string; quarantineContentSha256: string; archivedCounts: Record<PaperLogArchiveTable, number>; highWaterRowIds: Record<PaperLogArchiveTable, number> } | { action: "DRY_RUN_EXECUTION_QUARANTINE_RECOVERY"; cycleId: string; decisionId: string; evidenceThrough?: string } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "RECOVER_QUARANTINED_CLOSED_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "REPAIR_PROVIDER_CLOSED_LIFECYCLE"; experienceId: string; providerPositionHistoryId: string; dryRun?: boolean } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const body = value as { action?: unknown; cycleId?: unknown; decisionId?: unknown; experienceId?: unknown; providerPositionHistoryId?: unknown; dryRun?: unknown; evidenceHash?: unknown; evidenceThrough?: unknown };
+  const body = value as { action?: unknown; cycleId?: unknown; decisionId?: unknown; experienceId?: unknown; providerPositionHistoryId?: unknown; dryRun?: unknown; evidenceHash?: unknown; evidenceThrough?: unknown; archiveManifestSha256?: unknown; archiveContentSha256?: unknown; quarantineContentSha256?: unknown; archivedCounts?: unknown; highWaterRowIds?: unknown };
+  const archiveTables: PaperLogArchiveTable[] = ["journals", "cycles", "experiences", "events"];
+  const validCountMap = (candidate: unknown): candidate is Record<PaperLogArchiveTable, number> => typeof candidate === "object" && candidate !== null && !Array.isArray(candidate)
+    && archiveTables.every((table) => Number.isSafeInteger((candidate as Record<string, unknown>)[table]) && Number((candidate as Record<string, unknown>)[table]) >= 0);
+  if (body.action === "START_PAPER_LOG_COLLECTION_EPOCH") return typeof body.archiveManifestSha256 === "string" && /^[a-f0-9]{64}$/.test(body.archiveManifestSha256)
+    && typeof body.archiveContentSha256 === "string" && /^[a-f0-9]{64}$/.test(body.archiveContentSha256)
+    && typeof body.quarantineContentSha256 === "string" && /^[a-f0-9]{64}$/.test(body.quarantineContentSha256)
+    && validCountMap(body.archivedCounts) && validCountMap(body.highWaterRowIds);
   if (body.action === "REPAIR_PROVIDER_CLOSED_LIFECYCLE") return typeof body.experienceId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.experienceId) && typeof body.providerPositionHistoryId === "string" && /^[A-Za-z0-9:_-]{1,128}$/.test(body.providerPositionHistoryId) && (body.dryRun === undefined || typeof body.dryRun === "boolean");
   const validDecisionIdentity = typeof body.cycleId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.cycleId)
     && typeof body.decisionId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.decisionId);

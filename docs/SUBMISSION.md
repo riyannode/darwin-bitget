@@ -16,15 +16,11 @@ Present the paths in this order:
 
 1. [Live Production](https://darwin-bitget.vercel.app/) — actual autonomous
    Bitget Demo PAPER runtime.
-2. **Live PAPER journal/log export** — current autonomous evidence is available
-   read-only from `/api/export/paper-log?format=json` and
-   `/api/export/paper-log?format=csv`.
-3. **Zero-credential Docker Judge Demo** — run `docker compose up --build` for
-   a deterministic, credential-free replay with no provider or model calls.
-4. **GitHub source / architecture / verification docs** — inspect the source and
-   evidence boundaries.
-5. **Frozen final competition export** — not committed until collection is
-   complete.
+2. **Live PAPER journal/log export** — after the archive-export release, `/api/export/paper-log?format=json` and `/api/export/paper-log?format=csv` contain only the active collection epoch. Historical logs are not reloaded into those period exports.
+3. **Interim historical archive** — `submissions/archive/2026-10-09/` is the intended judge path. The archive is pending owner-authenticated extraction, sensitive-data audit, checksum verification, and GitHub publication; it is not complete or present in this change.
+4. **Zero-credential Docker Judge Demo** — run `docker compose up --build` for a deterministic, credential-free replay with no provider or model calls.
+5. **GitHub source / architecture / verification docs** — inspect the source and evidence boundaries.
+6. **Frozen final competition export** — not committed until collection is complete.
 
 These contexts must not be conflated: the live site is production runtime,
 the Docker app is recorded replay, and a fork is the developer's own
@@ -116,7 +112,8 @@ Canonical provider account reads are independent of ticker/kline evidence. A sym
 | --- | --- |
 | Source | [github.com/riyannode/darwin-bitget](https://github.com/riyannode/darwin-bitget) |
 | Live production | [darwin-bitget.vercel.app](https://darwin-bitget.vercel.app/) |
-| Live PAPER journal/log export | Read-only production endpoints: `/api/export/paper-log?format=json` and `/api/export/paper-log?format=csv` |
+| Live PAPER journal/log export | After the archive-export release: `/api/export/paper-log?format=json` and `/api/export/paper-log?format=csv` export only the active collection epoch; bounded response size returns 413 rather than truncating |
+| Interim historical production archive | Target: `submissions/archive/2026-10-09/` — not yet published; see [`PAPER_LOG_ARCHIVE.md`](PAPER_LOG_ARCHIVE.md). Treat as absent until a complete manifest and exact GitHub readback are verified. |
 | Canonical Docker Judge Demo | `docker compose up --build` → `http://localhost:3000/demo` |
 | Architecture | [docs/ARCHITECTURE.md](ARCHITECTURE.md) |
 | Demo guide | [docs/DEMO.md](DEMO.md) |
@@ -135,7 +132,11 @@ The Docker Judge Demo is not a live Bitget session. It exists to make the archit
 
 ## Live current metrics
 
-The live site and production exports represent current autonomous PAPER evidence and may change as collection continues. Read current provider portfolio from `/api/live/portfolio`; read runtime state from `/api/snapshot`. Do not treat a live PnL value as permanent architecture truth or as frozen final results.
+The live site and production exports represent current autonomous PAPER evidence and may change as collection continues. Read current provider portfolio from `/api/live/portfolio`; read runtime state from `/api/snapshot`. Do not treat a live PnL value as permanent architecture truth or as frozen final results. After an epoch is initialized, export summary metrics are explicitly `COLLECTION_PERIOD`; the existing lifetime performance/account-equity state is not reset or reinterpreted.
+
+## Interim historical archive
+
+The intended judge artifact directory is `submissions/archive/2026-10-09/`. It remains absent until an owner-authenticated production extraction is performed, the full snapshot counts and high-water marks are verified, the public artifact is audited for secrets/private reasoning, and checksums are read back from GitHub. The production archive route is described in [docs/PAPER_LOG_ARCHIVE.md](PAPER_LOG_ARCHIVE.md); it is deliberately not exposed as a public raw-journal endpoint. This interim archive is not the reserved final competition export and does not authorize freezing final metrics.
 
 ## Frozen final submission metrics
 
@@ -145,8 +146,8 @@ Not yet frozen. Freeze only after the owner confirms the collection period has e
 
 Until collection is confirmed complete, leave `submissions/paper-log-final.json` and `submissions/paper-log-final.csv` absent and uncommitted. After confirmation:
 
-1. Download the JSON and CSV from the live production endpoints: `/api/export/paper-log?format=json` and `/api/export/paper-log?format=csv`.
-2. Validate JSON parsing and CSV headers/rows; reconcile the export summary and trade count.
+1. Download the current epoch JSON and CSV, then reconcile them with every previously verified interim production archive. Use the owner-authenticated bounded archive pages for final historical readback; do not treat the current-epoch endpoint as a complete lifetime export.
+2. Validate JSON parsing, CSV columns/rows, source and included counts, late-reconciliation references, and provider-verified closed trades across the combined collection.
 3. Inspect every exported field for credentials/secrets, API keys, authorization headers, passphrases, owner tokens, and raw model chain-of-thought. Reject rather than redact-and-publish any unsafe export.
 4. Confirm the records are autonomous production evidence only. Exclude Docker replay and manual harness records.
 5. Calculate final metrics from provider-verified closed trades only; do not count open positions, unresolved writes, or unverified PnL.
@@ -165,7 +166,7 @@ Verified facts and the live read-only smoke status are listed in [docs/VERIFICAT
 ## Final submission checklist
 
 - [ ] Confirm the collection period has ended.
-- [ ] Export the complete final competition log from Durable Object history.
+- [ ] Export and reconcile the complete final competition log from all verified production collection epochs using bounded owner-authenticated reads.
 - [ ] Validate closed verified trades only for final metrics.
 - [ ] Recheck production SHA, `snapshot.commit`, and a successful `/api/live/portfolio` read with HTTP success, `source=PROVIDER_LIVE`, valid `observedAt`, and provider portfolio/readback available.
 - [ ] Keep credentials out of repository and submission artifacts.

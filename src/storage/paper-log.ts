@@ -19,6 +19,9 @@ export interface PaperLogExport {
     version: string;
     commit: string | null;
     commitStatus: "AVAILABLE" | "UNAVAILABLE";
+    metricsScope?: "COLLECTION_PERIOD";
+    lifetimeMetricsState?: "UNCHANGED";
+    collectionEpoch?: { epochId: string; startedAt: string; archiveManifestSha256: string; archiveContentSha256: string; quarantineContentSha256: string };
   };
   summary: PaperLogSummary;
   recentWindow: PaperLogRecentWindow;
@@ -235,7 +238,7 @@ export interface PaperLogExperience {
   lessonsUsed: string[];
 }
 
-export const PAPER_LOG_SCHEMA_VERSION = "2.1.0";
+export const PAPER_LOG_SCHEMA_VERSION = "2.2.0";
 const RECENT_WINDOW_SIZE = 25;
 
 export function parsePaperLogPeriod(from: string | null, to: string | null): PaperLogPeriod {
@@ -471,11 +474,15 @@ export function buildPaperLogExport(input: {
   journals: readonly TradingJournal[];
   experiences: readonly TradeExperience[];
   events: readonly ActivityEvent[];
+  includeUnlinkedEvents?: boolean;
+  collectionEpoch?: { epochId: string; startedAt: string; archiveManifestSha256: string; archiveContentSha256: string; quarantineContentSha256: string };
 }): PaperLogExport {
   const journals = input.journals.filter((journal) => journal.mode === "AUTONOMOUS");
   const journalByCycle = new Map(journals.map((journal) => [journal.cycleId, journal]));
   const cycleIds = new Set(journals.map((journal) => journal.cycleId));
-  const events = input.events.filter((event) => cycleIds.has(event.cycleId));
+  const historicalCorrectionEventTypes = new Set(["LATE_EXECUTION_RECONCILED", "EXECUTION_QUARANTINE_CLEARED"]);
+  const events = input.events.filter((event) => cycleIds.has(event.cycleId)
+    || (input.includeUnlinkedEvents && historicalCorrectionEventTypes.has(event.type)));
 
   const cycles = input.cycles
     .filter((cycle) => cycleIds.has(cycle.cycleId))
@@ -585,7 +592,7 @@ export function buildPaperLogExport(input: {
       realizedPnl: decision.realizedPnl,
     }));
 
-  const failureEvents = events.filter((event) => event.type === "CYCLE_FAILED");
+  const failureEvents = events.filter((event) => cycleIds.has(event.cycleId) && event.type === "CYCLE_FAILED");
   const byCode: Record<string, number> = {};
   const byStage: Record<string, number> = {};
   for (const event of failureEvents) {
@@ -611,6 +618,11 @@ export function buildPaperLogExport(input: {
       version: input.version,
       commit: commitValue && commitValue !== "unknown" && commitValue !== "local" ? commitValue : null,
       commitStatus,
+      ...(input.collectionEpoch ? {
+        metricsScope: "COLLECTION_PERIOD" as const,
+        lifetimeMetricsState: "UNCHANGED" as const,
+        collectionEpoch: input.collectionEpoch,
+      } : {}),
     },
     summary: {
       cycles: {
@@ -669,13 +681,34 @@ function csvValue(value: unknown): string {
 }
 
 export function paperLogToCsv(exported: PaperLogExport): string {
-  const header = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "scannedUniverseCount", "selectedEntryCandidates", "managedExistingPositions", "totalProposedActions", "financialWritesPerformed", "decisionId", "decisionTimestamp", "actionCategory", "action", "symbol", "positionSide", "marginAllocationPct", "additionalMarginPct", "targetPositionSide", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "providerOperation", "providerCode", "providerMessage", "providerReadbackCode", "providerReadbackMessage", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "physicalWrites", "reflectionIds", "createdLessonIds", "closedEpisodeRealizedPnl", "openEpisodePartialRealizedPnl", "verifiedRealizedPnl", "closedTrades", "wins", "losses", "breakeven", "classifiedClosedTrades", "winRatePct"];
+  const baseHeader = ["cycleId", "cycleStatus", "cycleStartedAt", "cycleCompletedAt", "eventTypes", "scannedUniverseCount", "selectedEntryCandidates", "managedExistingPositions", "totalProposedActions", "financialWritesPerformed", "decisionId", "decisionTimestamp", "actionCategory", "action", "symbol", "positionSide", "marginAllocationPct", "additionalMarginPct", "targetPositionSide", "leverage", "reductionPct", "confidence", "strategyThesis", "supportingFactors", "riskFactors", "evidenceUsed", "lessonsUsed", "riskGateStatus", "riskGateCodes", "tradeSide", "positionNotional", "clientOrderId", "providerOrderId", "executionStatus", "requestedQuantity", "executedQuantity", "providerOperation", "providerCode", "providerMessage", "providerReadbackCode", "providerReadbackMessage", "reconciliationStatus", "reconciliationCodes", "providerVerified", "realizedPnl", "physicalWrites", "reflectionIds", "createdLessonIds", "closedEpisodeRealizedPnl", "openEpisodePartialRealizedPnl", "verifiedRealizedPnl", "closedTrades", "wins", "losses", "breakeven", "classifiedClosedTrades", "winRatePct"];
+  const isEpochExport = Boolean(exported.export.collectionEpoch);
+  const epochHeader = isEpochExport ? ["metricsScope", "lifetimeMetricsState", "collectionEpochId", "collectionStartedAt", "archiveManifestSha256", "archiveContentSha256", "quarantineContentSha256"] : [];
+  const eventHeader = isEpochExport ? ["recordType", "eventId", "eventType", "eventCycleId", "eventCreatedAt", "eventMetadata"] : [];
+  const header = [...baseHeader, ...epochHeader, ...eventHeader];
   const summaryValues = [exported.summary.closedTrades.closedEpisodeRealizedPnl, exported.summary.closedTrades.openEpisodePartialRealizedPnl, exported.summary.closedTrades.verifiedRealizedPnl, exported.summary.closedTrades.total, exported.summary.closedTrades.wins, exported.summary.closedTrades.losses, exported.summary.closedTrades.breakeven, exported.summary.closedTrades.classifiedClosedTrades, exported.summary.closedTrades.winRatePct];
+  const epochValues = exported.export.collectionEpoch ? [exported.export.metricsScope, exported.export.lifetimeMetricsState, exported.export.collectionEpoch.epochId, exported.export.collectionEpoch.startedAt, exported.export.collectionEpoch.archiveManifestSha256, exported.export.collectionEpoch.archiveContentSha256, exported.export.collectionEpoch.quarantineContentSha256] : [];
+  const eventBlankValues = isEpochExport ? ["", "", "", "", "", ""] : [];
   const rows = exported.cycles.flatMap((cycle) => {
     const decisions = exported.decisions.filter((decision) => decision.cycleId === cycle.cycleId);
     const cycleValues = [cycle.cycleId, cycle.status, cycle.startedAt, cycle.completedAt, cycle.eventTypes, cycle.planning.scannedUniverseCount, cycle.planning.selectedEntryCandidates, cycle.planning.managedExistingPositions, cycle.planning.totalProposedActions, cycle.execution.financialWritesPerformed];
-    if (!decisions.length) return [[...cycleValues, ...Array(header.length - cycleValues.length - summaryValues.length).fill(""), ...summaryValues]];
-    return decisions.map((decision) => [...cycleValues, decision.decisionId, decision.timestamp, decision.actionCategory, decision.action, decision.symbol, decision.positionSide, decision.marginAllocationPct, decision.additionalMarginPct, decision.targetPositionSide, decision.leverage, decision.reductionPct, decision.confidence, decision.strategyThesis, decision.supportingFactors, decision.riskFactors, decision.evidenceUsed, decision.lessonsUsed, decision.riskGate?.status, decision.riskGate?.codes, decision.executionRequest?.tradeSide, decision.executionRequest?.positionNotional, decision.executionRequest?.clientOrderId, decision.executionResult?.providerOrderId, decision.executionResult?.status, decision.executionResult?.requestedQuantity, decision.executionResult?.executedQuantity, decision.executionResult?.providerOperation, decision.executionResult?.providerCode, decision.executionResult?.providerMessage, decision.executionResult?.providerReadbackCode, decision.executionResult?.providerReadbackMessage, decision.reconciliation?.status, decision.reconciliation?.codes, decision.providerVerified, decision.realizedPnl, decision.physicalWrites, decision.reflectionIds, decision.createdLessonIds, ...summaryValues]);
+    if (!decisions.length) {
+      const filler = Array(header.length - cycleValues.length - summaryValues.length - epochValues.length - eventBlankValues.length).fill("");
+      return [[...cycleValues, ...filler, ...summaryValues, ...epochValues, ...(isEpochExport ? ["CYCLE", ...eventBlankValues.slice(1)] : [])]];
+    }
+    return decisions.map((decision) => [...cycleValues, decision.decisionId, decision.timestamp, decision.actionCategory, decision.action, decision.symbol, decision.positionSide, decision.marginAllocationPct, decision.additionalMarginPct, decision.targetPositionSide, decision.leverage, decision.reductionPct, decision.confidence, decision.strategyThesis, decision.supportingFactors, decision.riskFactors, decision.evidenceUsed, decision.lessonsUsed, decision.riskGate?.status, decision.riskGate?.codes, decision.executionRequest?.tradeSide, decision.executionRequest?.positionNotional, decision.executionRequest?.clientOrderId, decision.executionResult?.providerOrderId, decision.executionResult?.status, decision.executionResult?.requestedQuantity, decision.executionResult?.executedQuantity, decision.executionResult?.providerOperation, decision.executionResult?.providerCode, decision.executionResult?.providerMessage, decision.executionResult?.providerReadbackCode, decision.executionResult?.providerReadbackMessage, decision.reconciliation?.status, decision.reconciliation?.codes, decision.providerVerified, decision.realizedPnl, decision.physicalWrites, decision.reflectionIds, decision.createdLessonIds, ...summaryValues, ...epochValues, ...(isEpochExport ? ["DECISION", ...eventBlankValues.slice(1)] : [])]);
   });
+  if (isEpochExport) {
+    const cycleIds = new Set(exported.cycles.map((cycle) => cycle.cycleId));
+    const orphanEvents = exported.events.filter((event) => !cycleIds.has(event.cycleId));
+    const detailColumnCount = baseHeader.length - summaryValues.length;
+    for (const event of orphanEvents) {
+      const detailValues = Array(detailColumnCount).fill("");
+      detailValues[0] = event.cycleId;
+      detailValues[4] = [event.type];
+      rows.push([...detailValues, ...summaryValues, ...epochValues, "EVENT", event.eventId, event.type, event.cycleId, event.createdAt, event.metadata]);
+    }
+    rows.push([...Array(detailColumnCount).fill(""), ...summaryValues, ...epochValues, "SUMMARY", "", "", "", "", ""]);
+  }
   return [header, ...rows].map((row) => row.map(csvValue).join(",")).join("\r\n") + "\r\n";
 }
