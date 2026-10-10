@@ -57,7 +57,10 @@ A quarantine is admitted only when all of the following hold. Anything else is r
 | Not requested twice | `DUPLICATE_REQUEST` |
 | `createdAt` parses | `CREATED_AT_UNPARSEABLE` |
 | Older than the provider's recoverable history window (2h) | `STILL_RECOVERABLE_WITHIN_WINDOW` |
+| The source journal exists for that cycle and decision | `JOURNAL_SOURCE_MISSING` |
 | The source journal's decision symbol matches | `JOURNAL_SYMBOL_CONFLICT` |
+
+The journal requirement is fail-closed. A quarantine must be backed by the journal entry that produced it, and that journal's decision symbol must be the quarantined symbol. A missing journal, an absent decision within the journal, or a journal read that fails is rejected as `JOURNAL_SOURCE_MISSING` rather than being treated as "no conflict". Without that, a quarantine whose origin cannot be proven would be freed on the strength of the quarantine row alone.
 
 The window check is what keeps a **new** ambiguous order protected: bounded history search can still resolve anything created inside that window, so it stays quarantined and fail-closed. Only a quarantine the provider has genuinely stopped reporting — the exact condition that made it permanent — is eligible.
 

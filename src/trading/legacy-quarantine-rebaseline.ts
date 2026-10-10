@@ -60,6 +60,7 @@ export type ApprovedLegacyRejectionReason =
   | "STILL_RECOVERABLE_WITHIN_WINDOW"
   | "CREATED_AT_UNPARSEABLE"
   | "DUPLICATE_REQUEST"
+  | "JOURNAL_SOURCE_MISSING"
   | "JOURNAL_SYMBOL_CONFLICT";
 
 export interface ApprovedLegacyRejection {
@@ -257,8 +258,28 @@ export function selectOwnerApprovedLegacyQuarantines(input: {
       rejected.push({ identity, reason: "STILL_RECOVERABLE_WITHIN_WINDOW" });
       continue;
     }
-    const journalSymbol = input.journalSymbolFor?.(identity);
-    if (journalSymbol !== undefined && journalSymbol !== null && journalSymbol !== identity.symbol) {
+    // The quarantine must be backed by its source journal, and that journal's decision symbol
+    // must be the quarantined symbol. A missing journal, or a resolver that cannot report one,
+    // means the quarantine's origin cannot be proven, so it is rejected fail-closed: without this
+    // an unresolvable journal would silently pass and free the quarantine.
+    if (!input.journalSymbolFor) {
+      rejected.push({ identity, reason: "JOURNAL_SOURCE_MISSING" });
+      continue;
+    }
+    // Wrap the resolver: a storage or journal read that throws must fail closed with an explicit
+    // reason rather than escaping as an unhandled error.
+    let journalSymbol: string | null | undefined;
+    try {
+      journalSymbol = input.journalSymbolFor(identity);
+    } catch {
+      rejected.push({ identity, reason: "JOURNAL_SOURCE_MISSING" });
+      continue;
+    }
+    if (journalSymbol === undefined || journalSymbol === null || journalSymbol.trim() === "") {
+      rejected.push({ identity, reason: "JOURNAL_SOURCE_MISSING" });
+      continue;
+    }
+    if (journalSymbol !== identity.symbol) {
       rejected.push({ identity, reason: "JOURNAL_SYMBOL_CONFLICT" });
       continue;
     }
