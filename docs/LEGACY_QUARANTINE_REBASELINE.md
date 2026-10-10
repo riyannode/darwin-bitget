@@ -17,28 +17,72 @@ Owner-approved, PAPER-only procedure that closes a legacy execution quarantine w
 1. `TRADING_MODE=PAPER` and `PAPER_ONLY=true`.
 2. Agent is persistently `PAUSED`, `runtimeStatus=PAUSED`, no running cycle.
 3. Two independent provider reads of account + positions + open orders both succeed.
-4. The two reads agree on the open-position fingerprint, open-order count, portfolio equity, and available margin.
-5. No pending/open provider order exists for any currently quarantined symbol.
-6. At least one legacy quarantine is currently active.
+4. The two reads agree on the open-position set (symbol **and** side), on every position quantity exactly, and on open-order count. Equity, available margin, and available balance are compared against a `0.1%` mark-price drift band rather than exact equality — see below.
+5. No pending/open provider order exists for any approved symbol.
+6. At least one requested identity is both active and provably legacy.
 
 Any failure returns `409` with explicit blocker codes and writes only a `LEGACY_QUARANTINE_REBASELINE_REJECTED` event.
 
 ## Owner invocation
+
+The owner names **exact identities**. The request is never interpreted as "everything currently quarantined"; an absent or empty `quarantines` array is rejected.
 
 ```text
 POST /api/control
 Authorization: Bearer <owner token>
 Content-Type: application/json
 
-{"action":"REBASELINE_LEGACY_EXECUTION_QUARANTINE"}
+{
+  "action": "REBASELINE_LEGACY_EXECUTION_QUARANTINE",
+  "quarantines": [
+    {
+      "symbol": "SPCXUSDT",
+      "cycleId": "2026-10-01T00-00-00-000Z",
+      "decisionId": "d3f1a2b4",
+      "clientOrderId": "paper-20261001-d3f1a2b4"
+    }
+  ]
+}
 ```
 
-The body accepts no other field. A successful response carries `status=REBASELINED`, the persisted `baseline`, the `archived` entries, `providerPositionSymbols`, `eligibleAgainSymbols`, and `riskLimitsUnchanged: true`.
+A successful response carries `status=REBASELINED`, the persisted `baseline`, the `archived` entries, `providerPositionSymbols`, `eligibleAgainSymbols`, `remainingActiveQuarantineSymbols`, `rejected`, and `riskLimitsUnchanged: true`.
+
+## Only legacy identities are eligible
+
+A quarantine is admitted only when all of the following hold. Anything else is reported in `rejected` with an explicit reason and nothing is freed implicitly.
+
+| Check | Rejection reason |
+|---|---|
+| The exact identity is currently active | `IDENTITY_NOT_ACTIVE` |
+| Not requested twice | `DUPLICATE_REQUEST` |
+| `createdAt` parses | `CREATED_AT_UNPARSEABLE` |
+| Older than the provider's recoverable history window (2h) | `STILL_RECOVERABLE_WITHIN_WINDOW` |
+| The source journal's decision symbol matches | `JOURNAL_SYMBOL_CONFLICT` |
+
+The window check is what keeps a **new** ambiguous order protected: bounded history search can still resolve anything created inside that window, so it stays quarantined and fail-closed. Only a quarantine the provider has genuinely stopped reporting — the exact condition that made it permanent — is eligible.
+
+Quarantines the owner did not name are left completely untouched and keep blocking their own symbol. They appear in `remainingActiveQuarantineSymbols`.
+
+## Snapshot comparison: exact where it matters, tolerant where it does not
+
+Quantity and side are compared **exactly**, because only a fill changes them: if a position's quantity or side differs between the two reads, the account moved during the rebaseline and the operation aborts. Numeric formatting differences (`400` vs `400.0`) are normalized before comparison.
+
+Equity, available margin, and available balance are compared against a `0.1%` band instead of exact equality. Those values move with mark price between two consecutive reads on any live market, so exact equality would reject a completely stable account. The band is far wider than a rounding tick and far narrower than a real exposure change, which moves equity by the traded notional. Open-order count must match exactly.
+
+## Commit-time revalidation
+
+The two provider reads are asynchronous, so agent and quarantine state can change while they run. Immediately before the atomic commit, inside the same transaction, the operation re-verifies:
+
+- the agent is still `PAUSED` / `PAUSED` / idle (otherwise `AGENT_STATE_CHANGED`)
+- the exact set of approved identities is still active — compared as sorted exact `symbol/cycleId/decisionId/clientOrderId` keys, **not** by array length (otherwise `LEGACY_QUARANTINE_STATE_CHANGED`)
+
+A length-only check would accept a *different* quarantine set of the same size. Any mismatch aborts with nothing written.
 
 ## Post-rebaseline behavior
 
 - A symbol with a live provider position (for example `SPCXUSDT`) returns to normal position management. `HOLD`, `CLOSE`, and `REDUCE` remain available; exposure-increasing actions still pass through every risk gate.
-- A quarantined symbol with no position and no pending order (for example `CRCLUSDT`, `KORUUSDT`) becomes eligible again as an entry candidate.
+- An approved symbol with no position and no pending order (for example `CRCLUSDT`, `KORUUSDT`) becomes eligible again as an entry candidate.
+- Any other quarantine stays active and keeps its symbol blocked.
 - Startup journal seeding cannot re-activate an archived quarantine: `isLegacyExecutionQuarantineBaselined` matches the exact symbol/cycle/decision/clientOrderId identity against the archive before any re-seed, so the journal that produced the quarantine cannot resurrect it.
 
 ## Pre-submit versus ambiguous post-submit failures

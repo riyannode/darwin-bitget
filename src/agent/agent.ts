@@ -104,7 +104,7 @@ import { executeCyclePlan } from "../trading/execution-planner.js";
 import { reconcileExecution, isDefinitivelyRejectedExecution } from "../trading/reconcile.js";
 import { readBoundedProviderHistory } from "../bitget/provider-history-read.js";
 import { assessExecutionQuarantineHistory, assessExecutionQuarantineRecoveryReadiness, isCompleteBoundedProviderFillHistory, isExactQuarantineQuantityTransition } from "../trading/execution-quarantine-evidence.js";
-import { assessLegacyQuarantineRebaseline, legacyRebaselineManagedSymbols } from "../trading/legacy-quarantine-rebaseline.js";
+import { assessLegacyQuarantineRebaseline, legacyQuarantineIdentityKey, legacyRebaselineManagedSymbols, selectOwnerApprovedLegacyQuarantines, type LegacyQuarantineIdentity } from "../trading/legacy-quarantine-rebaseline.js";
 import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal, subtractDecimal } from "../trading/decimal.js";
 import { buildPerformanceAccounting, classifiedWinRate, emptyPerformance, isPerformanceAggregate, migratePerformanceEquityObservations, PERFORMANCE_READ_MODEL_VERSION, POSITION_CONTEXT_READ_MODEL_VERSION, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate, type PerformanceObservation } from "../trading/performance.js";
 import { bootstrapPositionContexts, decisionReasoning, entryReasoning, upsertPositionContext } from "./position-context.js";
@@ -1518,7 +1518,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (body.action === "EMERGENCY_STOP") await this.setEmergencyStop(true);
       if (body.action === "START_PAPER_LOG_COLLECTION_EPOCH") return json({ error: "USE_PAPER_LOG_ARCHIVE_EPOCH_ENDPOINT" }, 409);
       if (body.action === "REBASELINE_LEGACY_EXECUTION_QUARANTINE") {
-        const result = await this.rebaselineLegacyExecutionQuarantine();
+        const result = await this.rebaselineLegacyExecutionQuarantine(body.quarantines);
         return json(result, result.status === "REBASELINED" ? 200 : 409);
       }
       if (body.action === "DRY_RUN_EXECUTION_QUARANTINE_RECOVERY") {
@@ -2288,16 +2288,40 @@ export class TraderAgent extends Agent<Env, AgentState> {
  * archived entry keeps its original identity, reason, execution status and reconciliation
  * codes verbatim, so nothing is falsely marked FILLED, REJECTED or RECONCILED. The current
  * provider positions become the operational baseline instead.
+ *
+ * Only the exact legacy identities the owner named are archived. Any other active quarantine,
+ * including a recent ambiguous write, is left untouched and keeps blocking its own symbol.
  */
-public async rebaselineLegacyExecutionQuarantine(): Promise<Record<string, unknown>> {
+public async rebaselineLegacyExecutionQuarantine(requestedIdentities: readonly LegacyQuarantineIdentity[]): Promise<Record<string, unknown>> {
     if (!this.state.paused || this.state.runtimeStatus !== "PAUSED" || this.state.cycleStartedAt || this.state.lastStatus === "RUNNING") {
       return { status: "REJECTED", blockers: ["EXECUTION_IN_PROGRESS"], rebaselined: [] };
     }
     ensureStorageInitialized(this);
     const config = loadConfig(this.env, this.ensureActivePolicy());
     const activeQuarantines = loadExecutionQuarantines(this);
-    const activeSymbols = [...new Set(activeQuarantines.map((entry) => entry.symbol))].sort();
-    if (activeSymbols.length === 0) return { status: "REJECTED", blockers: ["NO_ACTIVE_LEGACY_QUARANTINE"], rebaselined: [] };
+    if (activeQuarantines.length === 0) return { status: "REJECTED", blockers: ["NO_APPROVED_LEGACY_QUARANTINE"], rebaselined: [] };
+
+    // The owner approves exact identities, never "everything currently quarantined". Each one is
+    // re-checked against live persisted state, and only provably legacy ones are admitted.
+    const selection = selectOwnerApprovedLegacyQuarantines({
+      requested: requestedIdentities,
+      activeQuarantines,
+      nowMs: Date.now(),
+      journalSymbolFor: (identity) => {
+        const journal = loadJournalForExactDecisionCycle(this, identity.cycleId, identity.decisionId);
+        return journal ? normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === identity.decisionId)?.decision.symbol ?? null : null;
+      },
+    });
+    const approvedQuarantines = selection.selected;
+    const approvedSymbols = [...new Set(approvedQuarantines.map((entry) => entry.symbol))].sort();
+    if (approvedQuarantines.length === 0) {
+      this.recordEventBestEffort("LEGACY_QUARANTINE_REBASELINE_REJECTED", "CONTROL", {
+        code: "NO_APPROVED_LEGACY_QUARANTINE",
+        requested: String(requestedIdentities.length),
+        source: "OWNER_APPROVED_LEGACY_REBASELINE",
+      });
+      return { status: "REJECTED", blockers: ["NO_APPROVED_LEGACY_QUARANTINE"], activeQuarantineCount: activeQuarantines.length, rejected: selection.rejected };
+    }
 
     const client = new BitgetClient(config);
     const readSnapshot = async (): Promise<{ account: Awaited<ReturnType<BitgetClient["getDashboardPortfolio"]>>; observedAt: string } | null> => {
@@ -2323,16 +2347,16 @@ public async rebaselineLegacyExecutionQuarantine(): Promise<Record<string, unkno
       paperOnly: this.env.TRADING_MODE === "PAPER" && this.env.PAPER_ONLY === "true",
       firstSnapshot: first,
       secondSnapshot: second,
-      activeQuarantineSymbols: activeSymbols,
+      approvedQuarantineSymbols: approvedSymbols,
       positions: first?.account.positions ?? [],
     });
     if (!assessment.eligible) {
       this.recordEventBestEffort("LEGACY_QUARANTINE_REBASELINE_REJECTED", "CONTROL", {
         code: assessment.blockers.join(","),
-        symbols: activeSymbols.join(","),
+        symbols: approvedSymbols.join(","),
         source: "OWNER_APPROVED_LEGACY_REBASELINE",
       });
-      return { status: "REJECTED", blockers: assessment.blockers, activeQuarantineSymbols: activeSymbols, positionDiscrepancies };
+      return { status: "REJECTED", blockers: assessment.blockers, approvedQuarantineSymbols: approvedSymbols, rejected: selection.rejected, positionDiscrepancies };
     }
 
     const rebaselineId = `legacy-rebaseline-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
@@ -2346,11 +2370,12 @@ public async rebaselineLegacyExecutionQuarantine(): Promise<Record<string, unkno
       snapshotEvidence: assessment.snapshotEvidence,
       positions: assessment.baselinePositions,
       positionFingerprint: assessment.positionFingerprint,
-      activeQuarantineSymbols: activeSymbols,
-      quarantinedIdentities: activeQuarantines.map((entry) => ({ symbol: entry.symbol, cycleId: entry.cycleId, decisionId: entry.decisionId, clientOrderId: entry.clientOrderId, reason: entry.reason, createdAt: entry.createdAt })),
+      approvedQuarantineSymbols: approvedSymbols,
+      approvedQuarantineIdentities: approvedQuarantines.map((entry) => ({ symbol: entry.symbol, cycleId: entry.cycleId, decisionId: entry.decisionId, clientOrderId: entry.clientOrderId, reason: entry.reason, createdAt: entry.createdAt })),
+      rejectedIdentities: selection.rejected,
     };
     const evidenceSha256 = await canonicalEvidenceSha256(evidence);
-    const archiveEntries = activeQuarantines.map((entry) => {
+    const archiveEntries = approvedQuarantines.map((entry) => {
       const journal = loadJournalForExactDecisionCycle(this, entry.cycleId, entry.decisionId);
       const record = journal ? normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === entry.decisionId) : undefined;
       return {
@@ -2383,12 +2408,33 @@ public async rebaselineLegacyExecutionQuarantine(): Promise<Record<string, unkno
       evidenceSha256,
     };
     const eventId = `legacy-rebaseline:${rebaselineId}`;
-    const persisted = this.ctx.storage.transactionSync(() => {
-      if (loadExecutionQuarantines(this).length !== activeQuarantines.length) throw new Error("LEGACY_QUARANTINE_STATE_CHANGED");
+    const expectedIdentities = approvedQuarantines.map((entry) => legacyQuarantineIdentityKey(entry)).sort();
+    let concurrencyConflict: string | null = null;
+    let persisted = false;
+    try {
+      persisted = this.ctx.storage.transactionSync(() => {
+      // The two provider reads above are asynchronous, so agent state and quarantine state may
+      // have moved on. Re-verify the pause condition and the exact approved identities inside
+      // the transaction: a length check alone would accept a different quarantine set.
+      if (!this.state.paused || this.state.runtimeStatus !== "PAUSED" || this.state.cycleStartedAt || this.state.lastStatus === "RUNNING") {
+        concurrencyConflict = "AGENT_STATE_CHANGED";
+        return false;
+      }
+      const current = loadExecutionQuarantines(this);
+      const currentKeys = current.filter((entry) => expectedIdentities.includes(legacyQuarantineIdentityKey(entry))).map((entry) => legacyQuarantineIdentityKey(entry)).sort();
+      if (currentKeys.length !== expectedIdentities.length || currentKeys.some((key, index) => key !== expectedIdentities[index])) {
+        concurrencyConflict = "LEGACY_QUARANTINE_STATE_CHANGED";
+        return false;
+      }
       saveLegacyExecutionQuarantineBaseline(this, baseline);
       appendLegacyExecutionQuarantineArchive(this, archiveEntries);
-      for (const entry of activeQuarantines) {
-        if (!clearExecutionQuarantine(this, entry, rebaselineAt)) throw new Error("LEGACY_QUARANTINE_CLEAR_FAILED");
+      for (const entry of approvedQuarantines) {
+        // Throw rather than return: this runs after the baseline and archive writes, so only a
+        // rollback leaves the rebaseline atomic.
+        if (!clearExecutionQuarantine(this, entry, rebaselineAt)) {
+          concurrencyConflict = "LEGACY_QUARANTINE_CLEAR_FAILED";
+          throw new Error("LEGACY_QUARANTINE_CLEAR_FAILED");
+        }
       }
       if (!hasEvent(this, eventId)) {
         saveEvent(this, {
@@ -2399,8 +2445,10 @@ public async rebaselineLegacyExecutionQuarantine(): Promise<Record<string, unkno
           metadata: {
             rebaselineId,
             evidenceSha256,
-            symbols: activeSymbols.join(","),
+            symbols: approvedSymbols.join(","),
             archivedCount: String(archiveEntries.length),
+            archivedIdentities: JSON.stringify(expectedIdentities),
+            rejectedIdentities: JSON.stringify(selection.rejected),
             baselinePositions: JSON.stringify(assessment.baselinePositions),
             snapshotEvidence: JSON.stringify(assessment.snapshotEvidence),
             openOrderCount: String(assessment.openOrderCount),
@@ -2411,10 +2459,23 @@ public async rebaselineLegacyExecutionQuarantine(): Promise<Record<string, unkno
         });
       }
       return true;
-    });
-    if (!persisted) return { status: "REJECTED", blockers: ["LEGACY_QUARANTINE_STATE_CHANGED"] };
+      });
+    } catch {
+      // The transaction rolled back, so nothing was written. Report the conflict rather than
+      // surfacing a raw error to the owner.
+      this.recordEventBestEffort("LEGACY_QUARANTINE_REBASELINE_REJECTED", "CONTROL", {
+        code: concurrencyConflict ?? "LEGACY_QUARANTINE_COMMIT_FAILED",
+        symbols: approvedSymbols.join(","),
+        source: "OWNER_APPROVED_LEGACY_REBASELINE",
+      });
+      return { status: "REJECTED", blockers: [concurrencyConflict ?? "LEGACY_QUARANTINE_COMMIT_FAILED"], approvedQuarantineSymbols: approvedSymbols, rejected: selection.rejected };
+    }
+    if (!persisted) {
+      return { status: "REJECTED", blockers: [concurrencyConflict ?? "LEGACY_QUARANTINE_STATE_CHANGED"], approvedQuarantineSymbols: approvedSymbols, rejected: selection.rejected };
+    }
 
-    const managed = legacyRebaselineManagedSymbols(assessment.baselinePositions, activeSymbols);
+    const remainingQuarantineSymbols = [...new Set(loadExecutionQuarantines(this).map((entry) => entry.symbol))].sort();
+    const managed = legacyRebaselineManagedSymbols(assessment.baselinePositions, approvedSymbols);
     return {
       status: "REBASELINED",
       rebaselineId,
@@ -2424,6 +2485,9 @@ public async rebaselineLegacyExecutionQuarantine(): Promise<Record<string, unkno
       archived: archiveEntries,
       providerPositionSymbols: managed.providerPositionSymbols,
       eligibleAgainSymbols: managed.eligibleAgainSymbols,
+      // Quarantines the owner did not approve stay active and keep blocking their own symbol.
+      remainingActiveQuarantineSymbols: remainingQuarantineSymbols,
+      rejected: selection.rejected,
       riskLimitsUnchanged: true,
     };
   }
@@ -4560,9 +4624,9 @@ function providerReadFailureCode(error: unknown): string {
   return "PROVIDER_READ_FAILED";
 }
 
-function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "REBASELINE_LEGACY_EXECUTION_QUARANTINE" } | { action: "START_PAPER_LOG_COLLECTION_EPOCH"; archiveManifestSha256: string; archiveContentSha256: string; quarantineContentSha256: string; archivedCounts: Record<PaperLogArchiveTable, number>; highWaterRowIds: Record<PaperLogArchiveTable, number> } | { action: "DRY_RUN_EXECUTION_QUARANTINE_RECOVERY"; cycleId: string; decisionId: string; evidenceThrough?: string } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "RECOVER_QUARANTINED_CLOSED_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "REPAIR_PROVIDER_CLOSED_LIFECYCLE"; experienceId: string; providerPositionHistoryId: string; dryRun?: boolean } {
+function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "REBASELINE_LEGACY_EXECUTION_QUARANTINE"; quarantines: LegacyQuarantineIdentity[] } | { action: "START_PAPER_LOG_COLLECTION_EPOCH"; archiveManifestSha256: string; archiveContentSha256: string; quarantineContentSha256: string; archivedCounts: Record<PaperLogArchiveTable, number>; highWaterRowIds: Record<PaperLogArchiveTable, number> } | { action: "DRY_RUN_EXECUTION_QUARANTINE_RECOVERY"; cycleId: string; decisionId: string; evidenceThrough?: string } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "RECOVER_QUARANTINED_CLOSED_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "REPAIR_PROVIDER_CLOSED_LIFECYCLE"; experienceId: string; providerPositionHistoryId: string; dryRun?: boolean } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const body = value as { action?: unknown; cycleId?: unknown; decisionId?: unknown; experienceId?: unknown; providerPositionHistoryId?: unknown; dryRun?: unknown; evidenceHash?: unknown; evidenceThrough?: unknown; archiveManifestSha256?: unknown; archiveContentSha256?: unknown; quarantineContentSha256?: unknown; archivedCounts?: unknown; highWaterRowIds?: unknown };
+  const body = value as { action?: unknown; cycleId?: unknown; decisionId?: unknown; experienceId?: unknown; providerPositionHistoryId?: unknown; dryRun?: unknown; evidenceHash?: unknown; evidenceThrough?: unknown; archiveManifestSha256?: unknown; archiveContentSha256?: unknown; quarantineContentSha256?: unknown; archivedCounts?: unknown; highWaterRowIds?: unknown; quarantines?: unknown };
   const archiveTables: PaperLogArchiveTable[] = ["journals", "cycles", "experiences", "events"];
   const validCountMap = (candidate: unknown): candidate is Record<PaperLogArchiveTable, number> => typeof candidate === "object" && candidate !== null && !Array.isArray(candidate)
     && archiveTables.every((table) => Number.isSafeInteger((candidate as Record<string, unknown>)[table]) && Number((candidate as Record<string, unknown>)[table]) >= 0);
@@ -4570,7 +4634,20 @@ function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "
     && typeof body.archiveContentSha256 === "string" && /^[a-f0-9]{64}$/.test(body.archiveContentSha256)
     && typeof body.quarantineContentSha256 === "string" && /^[a-f0-9]{64}$/.test(body.quarantineContentSha256)
     && validCountMap(body.archivedCounts) && validCountMap(body.highWaterRowIds);
-  if (body.action === "REBASELINE_LEGACY_EXECUTION_QUARANTINE") return Object.keys(body).length === 1;
+  if (body.action === "REBASELINE_LEGACY_EXECUTION_QUARANTINE") {
+    // The owner must name exact identities. An empty or absent list must never be interpreted as
+    // "archive everything currently quarantined".
+    if (!Array.isArray(body.quarantines) || body.quarantines.length === 0 || body.quarantines.length > 20) return false;
+    return Object.keys(body).every((key) => key === "action" || key === "quarantines")
+      && body.quarantines.every((entry) => {
+        if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return false;
+        const candidate = entry as Record<string, unknown>;
+        return typeof candidate.symbol === "string" && /^[A-Z0-9]{2,16}USDT$/.test(candidate.symbol)
+          && typeof candidate.cycleId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(candidate.cycleId)
+          && typeof candidate.decisionId === "string" && /^[A-Za-z0-9:-]{1,128}$/.test(candidate.decisionId)
+          && typeof candidate.clientOrderId === "string" && /^[A-Za-z0-9-]{1,64}$/.test(candidate.clientOrderId);
+      });
+  }
   if (body.action === "REPAIR_PROVIDER_CLOSED_LIFECYCLE") return typeof body.experienceId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.experienceId) && typeof body.providerPositionHistoryId === "string" && /^[A-Za-z0-9:_-]{1,128}$/.test(body.providerPositionHistoryId) && (body.dryRun === undefined || typeof body.dryRun === "boolean");
   const validDecisionIdentity = typeof body.cycleId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.cycleId)
     && typeof body.decisionId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.decisionId);
