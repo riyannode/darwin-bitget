@@ -119,6 +119,14 @@ export function normalizeBitgetOrderStatus(value: unknown): ExecutionResult["sta
   return "unknown";
 }
 
+/** Bounded confirmation of an ambiguous post-submit write. Fixed: never unbounded, never a resubmit. */
+export const BOUNDED_SUBMISSION_CONFIRMATION_ATTEMPTS = 3;
+const BOUNDED_SUBMISSION_CONFIRMATION_DELAY_MS = 1_500;
+
+function isPreSubmitOperation(operation: string): boolean {
+  return operation === "getAccountInfo" || operation === "setLeverage";
+}
+
 export function extractProviderError(error: unknown): ProviderErrorDetails {
   const record = isRecord(error) ? error : null;
   const details = isRecord(record?.details) ? record.details : null;
@@ -137,10 +145,15 @@ export function buildUnresolvedExecution(
   submittedAt: string,
   writeError: unknown,
   readbackError?: unknown,
+  submitState: ExecutionResult["submitState"] = "AMBIGUOUS",
 ): ExecutionResult {
   const writeDetails = extractProviderError(writeError);
   const readbackDetails = extractProviderError(readbackError);
   const definitivelyRejected = writeDetails.classification === "PROVIDER_REJECTED" && readbackDetails.classification === "PROVIDER_NOT_FOUND";
+  // A proven pre-submit failure cannot have created an order. It is a provider rejection of
+  // the request, not an unknown execution, so it must never become a symbol quarantine.
+  // A post-submit failure stays ambiguous and fail-closed.
+  const notSubmitted = submitState === "NOT_SUBMITTED";
   return {
     provider: "bitget",
     clientOrderId: request.clientOrderId,
@@ -154,7 +167,8 @@ export function buildUnresolvedExecution(
     positionNotional: request.positionNotional,
     requestedQuantity: request.quantity,
     executedQuantity: "0",
-    status: definitivelyRejected ? "rejected" : "unknown",
+    status: definitivelyRejected || notSubmitted ? "rejected" : "unknown",
+    submitState,
     submittedAt,
     readBackAt: new Date().toISOString(),
     ...(writeDetails.classification ? { providerFailureClass: writeDetails.classification } : {}),
@@ -390,10 +404,38 @@ export class BitgetClient {
         submittedAt,
       });
     } catch (error) {
-      const result = await this.readUnknownOrder(request, submittedAt, error);
+      const result = await this.readUnknownOrder(request, submittedAt, error, isPreSubmitOperation(operation));
       const redact = (message: string | undefined) => message === undefined ? undefined : sanitizeProviderMessage(message);
       return { ...result, providerOperation: operation, ...(result.providerMessage ? { providerMessage: redact(result.providerMessage)! } : {}), ...(result.providerReadbackMessage ? { providerReadbackMessage: redact(result.providerReadbackMessage)! } : {}) };
     }
+  }
+
+  /**
+   * Bounded post-submit confirmation of an ambiguous write.
+   *
+   * A transient provider failure must not turn into a permanent symbol quarantine, so the
+   * order (and, through `readOrder`, its fills and position-history financials) is re-read a
+   * bounded number of times before the caller decides the outcome. The bound is fixed: an
+   * unconfirmed read returns `null` and the caller keeps the execution ambiguous. This never
+   * re-sends the order.
+   */
+  public async confirmAmbiguousSubmission(request: ExecutionRequest, submittedAt: string): Promise<ExecutionResult | null> {
+    for (let attempt = 0; attempt < BOUNDED_SUBMISSION_CONFIRMATION_ATTEMPTS; attempt += 1) {
+      if (attempt > 0) await new Promise<void>((resolve) => setTimeout(resolve, BOUNDED_SUBMISSION_CONFIRMATION_DELAY_MS));
+      try {
+        const result = await this.callOperation<unknown>("getOrderDetails", { clientOid: request.clientOrderId });
+        const response = record(result.data);
+        if (!this.text(response.orderId) && !this.text(response.clientOid)) continue;
+        return await this.readOrder(request, {
+          providerOrderId: this.text(response.orderId),
+          clientOrderId: this.text(response.clientOid, request.clientOrderId),
+          submittedAt,
+        });
+      } catch {
+        // Transient or not-found: bounded retry decides, never a resubmit.
+      }
+    }
+    return null;
   }
 
   private async callMarketRead<T>(operation: string, params: Record<string, string>): Promise<{ data: T }> {
@@ -425,7 +467,7 @@ export class BitgetClient {
     return this.client.callOperation<T>(operation, params);
   }
 
-  private async readUnknownOrder(request: ExecutionRequest, submittedAt: string, error: unknown): Promise<ExecutionResult> {
+  private async readUnknownOrder(request: ExecutionRequest, submittedAt: string, error: unknown, notSubmitted = false): Promise<ExecutionResult> {
     try {
       const result = await this.callOperation<unknown>("getOrderDetails", { clientOid: request.clientOrderId });
       const response = record(result.data);
@@ -435,7 +477,9 @@ export class BitgetClient {
         submittedAt,
       });
     } catch (readbackError) {
-      return buildUnresolvedExecution(request, submittedAt, error, readbackError);
+      // A proven pre-submit failure never reaches the order book, so its readback is a
+      // formality: the outcome is a proven rejection, never an unknown execution.
+      return buildUnresolvedExecution(request, submittedAt, error, notSubmitted ? new BitgetReadError("getOrderDetails", request.symbol, new Error("PRE_SUBMIT_FAILURE_NO_ORDER")) : readbackError, notSubmitted ? "NOT_SUBMITTED" : "AMBIGUOUS");
     }
   }
 

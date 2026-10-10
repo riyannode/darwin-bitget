@@ -1873,6 +1873,147 @@ export function clearExecutionQuarantine(
   return true;
 }
 
+/**
+ * Legacy execution quarantines are archived, never resolved.
+ *
+ * `execution_quarantine_resolutions` means a provider-authoritative reconciliation of one
+ * order (filled/rejected). A legacy quarantine that has exhausted bounded order-history
+ * search has no such proof, so it must never be written there. It is archived instead,
+ * with the original identity and the pre-existing execution status preserved verbatim,
+ * and the rebaseline is what becomes operational state.
+ */
+const LEGACY_QUARANTINE_BASELINE_KEY = "legacy_execution_quarantine_baseline_v1";
+const LEGACY_QUARANTINE_ARCHIVE_KEY = "legacy_execution_quarantine_archive_v1";
+
+export interface LegacyRebaselinePositionBaseline {
+  symbol: string;
+  positionSide: PositionSide;
+  quantity: string;
+  entryPrice: string;
+  notional: string;
+  marginAllocated: string;
+  leverage: string;
+  markPrice?: string;
+}
+
+export interface LegacyExecutionQuarantineBaseline {
+  rebaselineId: string;
+  rebaselineAt: string;
+  category: string;
+  status: "LEGACY_BASELINED";
+  portfolioEquity: string;
+  availableMargin: string;
+  openOrderCount: number;
+  snapshotEvidence: Array<{ observedAt: string; positionCount: number; openOrderCount: number }>;
+  positions: LegacyRebaselinePositionBaseline[];
+  positionFingerprint: string[];
+  evidenceSha256: string;
+}
+
+export interface LegacyExecutionQuarantineArchiveEntry {
+  status: "LEGACY_BASELINED";
+  symbol: string;
+  cycleId: string;
+  decisionId: string;
+  clientOrderId: string;
+  reason: string;
+  createdAt: string;
+  originalExecutionStatus: string;
+  originalReconciliationCodes: string;
+  rebaselineId: string;
+  rebaselineAt: string;
+  evidenceSha256: string;
+}
+
+function isIdentityFields(value: Record<string, unknown>): boolean {
+  return typeof value.symbol === "string" && typeof value.cycleId === "string"
+    && typeof value.decisionId === "string" && typeof value.clientOrderId === "string";
+}
+
+export async function canonicalEvidenceSha256(value: unknown): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalJson(value)));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export function loadLegacyExecutionQuarantineBaseline(executor: SqlExecutor): LegacyExecutionQuarantineBaseline | null {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${LEGACY_QUARANTINE_BASELINE_KEY}`;
+  if (!rows[0]) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rows[0].payload);
+  } catch {
+    throw new Error("LEGACY_QUARANTINE_BASELINE_STATE_INVALID");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("LEGACY_QUARANTINE_BASELINE_STATE_INVALID");
+  const value = parsed as Record<string, unknown>;
+  const positions = Array.isArray(value.positions) ? value.positions : null;
+  if (value.status !== "LEGACY_BASELINED" || typeof value.rebaselineId !== "string" || typeof value.rebaselineAt !== "string"
+    || typeof value.category !== "string" || typeof value.portfolioEquity !== "string" || typeof value.availableMargin !== "string"
+    || !Number.isSafeInteger(value.openOrderCount) || Number(value.openOrderCount) < 0 || !positions
+    || !Array.isArray(value.snapshotEvidence) || !Array.isArray(value.positionFingerprint)
+    || positions.some((position) => {
+      const candidate = position as Partial<LegacyRebaselinePositionBaseline>;
+      return typeof position !== "object" || position === null
+        || typeof candidate.symbol !== "string"
+        || (candidate.positionSide !== "LONG" && candidate.positionSide !== "SHORT");
+    })) {
+    throw new Error("LEGACY_QUARANTINE_BASELINE_STATE_INVALID");
+  }
+  return parsed as LegacyExecutionQuarantineBaseline;
+}
+
+export function saveLegacyExecutionQuarantineBaseline(executor: SqlExecutor, baseline: LegacyExecutionQuarantineBaseline): void {
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${LEGACY_QUARANTINE_BASELINE_KEY}, ${JSON.stringify(baseline)}, ${baseline.rebaselineAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+}
+
+export function loadLegacyExecutionQuarantineArchive(executor: SqlExecutor): LegacyExecutionQuarantineArchiveEntry[] {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${LEGACY_QUARANTINE_ARCHIVE_KEY}`;
+  if (!rows[0]) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rows[0].payload);
+  } catch {
+    throw new Error("LEGACY_QUARANTINE_ARCHIVE_STATE_INVALID");
+  }
+  if (!Array.isArray(parsed) || parsed.some((entry) => typeof entry !== "object" || entry === null
+    || (entry as Record<string, unknown>).status !== "LEGACY_BASELINED"
+    || typeof (entry as Record<string, unknown>).reason !== "string" || typeof (entry as Record<string, unknown>).createdAt !== "string"
+    || typeof (entry as Record<string, unknown>).rebaselineId !== "string" || typeof (entry as Record<string, unknown>).evidenceSha256 !== "string"
+    || !isIdentityFields(entry as Record<string, unknown>))) {
+    throw new Error("LEGACY_QUARANTINE_ARCHIVE_STATE_INVALID");
+  }
+  return parsed as LegacyExecutionQuarantineArchiveEntry[];
+}
+
+export function appendLegacyExecutionQuarantineArchive(executor: SqlExecutor, entries: readonly LegacyExecutionQuarantineArchiveEntry[]): void {
+  if (entries.length === 0) return;
+  const existing = loadLegacyExecutionQuarantineArchive(executor);
+  const next = [...existing, ...entries];
+  const rebaselineAt = entries[entries.length - 1]!.rebaselineAt;
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${LEGACY_QUARANTINE_ARCHIVE_KEY}, ${JSON.stringify(next)}, ${rebaselineAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+}
+
+/**
+ * A rebaselined legacy quarantine is permanently archived, so startup journal seeding must
+ * never re-create it from the very journal that produced it.
+ */
+export function isLegacyExecutionQuarantineBaselined(
+  executor: SqlExecutor,
+  identity: Pick<ExecutionQuarantine, "symbol" | "cycleId" | "decisionId" | "clientOrderId">,
+): boolean {
+  return loadLegacyExecutionQuarantineArchive(executor).some((entry) => entry.symbol === identity.symbol
+    && entry.cycleId === identity.cycleId && entry.decisionId === identity.decisionId
+    && entry.clientOrderId === identity.clientOrderId);
+}
+
 export function recordProviderOrderReference(executor: SqlExecutor, clientOrderId: string, providerOrderId: string): void {
   executor.sql`
     UPDATE idempotency

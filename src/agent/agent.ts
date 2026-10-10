@@ -2,7 +2,7 @@ import { Agent } from "agents";
 import { ZodError } from "zod";
 import type { ActivityEvent, BacktestReplay, CycleDecisionPlan, CycleDiscovery, DashboardSnapshot, Decision, DecisionExecutionRecord, Env, EvidenceBundle, LatestValidCyclePlan, Lesson, NormalizedCycleDecisions, OwnerPolicy, PositionContext, PositionManagementState, PositionSnapshot, PositionSide, ProviderExecutionFact, ReflectionResult, ResearchCycleSummary, ResearchEvidence, ResearchPlan, RuntimeConfig, TradeExperience, TradeLifecycleStatus, TradingJournal } from "../types.js";
 import { loadConfig } from "../config.js";
-import { BitgetClient, type MarketEvidenceFailure } from "../bitget/client.js";
+import { BitgetClient, BitgetReadError, BOUNDED_SUBMISSION_CONFIRMATION_ATTEMPTS, type MarketEvidenceFailure } from "../bitget/client.js";
 import { createProviderOriginReadSummary, emitProviderOriginReadSummary, syncProviderLedger, PROVIDER_FINANCIAL_CATEGORIES, PROVIDER_TRADE_LIFECYCLE_CATEGORY } from "../bitget/provider-sync.js";
 import { MANDATE_VERSION, PROMPT_VERSIONS, TRADING_MANDATE } from "./mandate.js";
 import { assertOpenPositionCountWithinPlanLimit, buildEvidenceSymbols, calculateActionCapacity, countOpenPositionLifecycles, decide, filterNewEntryMarketCandidates, rankMarketCandidates, selectDeterministicEntryCandidates } from "./decision.js";
@@ -66,6 +66,11 @@ import {
   loadExecutionQuarantines,
   loadExecutionQuarantineResolution,
   loadExecutionQuarantineRecoveryAuditEvents,
+  loadLegacyExecutionQuarantineArchive,
+  saveLegacyExecutionQuarantineBaseline,
+  appendLegacyExecutionQuarantineArchive,
+  canonicalEvidenceSha256,
+  isLegacyExecutionQuarantineBaselined,
   loadExperiences,
   loadExperienceById,
   loadJournalsForExperienceIds,
@@ -99,6 +104,7 @@ import { executeCyclePlan } from "../trading/execution-planner.js";
 import { reconcileExecution, isDefinitivelyRejectedExecution } from "../trading/reconcile.js";
 import { readBoundedProviderHistory } from "../bitget/provider-history-read.js";
 import { assessExecutionQuarantineHistory, assessExecutionQuarantineRecoveryReadiness, isCompleteBoundedProviderFillHistory, isExactQuarantineQuantityTransition } from "../trading/execution-quarantine-evidence.js";
+import { assessLegacyQuarantineRebaseline, legacyRebaselineManagedSymbols } from "../trading/legacy-quarantine-rebaseline.js";
 import { addDecimal, compareDecimal, isDecimal, isPositiveDecimal, subtractDecimal } from "../trading/decimal.js";
 import { buildPerformanceAccounting, classifiedWinRate, emptyPerformance, isPerformanceAggregate, migratePerformanceEquityObservations, PERFORMANCE_READ_MODEL_VERSION, POSITION_CONTEXT_READ_MODEL_VERSION, updateEquity, verifiedLifecycleFacts, type PerformanceAggregate, type PerformanceObservation } from "../trading/performance.js";
 import { bootstrapPositionContexts, decisionReasoning, entryReasoning, upsertPositionContext } from "./position-context.js";
@@ -168,6 +174,11 @@ interface AgentState {
 }
 
 const STALE_CYCLE_TIMEOUT_MS = 120_000;
+/**
+ * Bounded local state read for the legacy rebaseline assessment. The rebaseline classifies no
+ * order, so it needs only the current open lifecycles, never a full history scan.
+ */
+const MAX_LEGACY_REBASELINE_EXPERIENCES = 100;
 const USER_STORAGE_VERSION = 6;
 const LATEST_VALID_PLAN_MIGRATION_VERSION = 5;
 const SNAPSHOT_EVENT_LIMIT = 25;
@@ -1506,6 +1517,10 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (body.action === "PAUSE") await this.setPaused(true);
       if (body.action === "EMERGENCY_STOP") await this.setEmergencyStop(true);
       if (body.action === "START_PAPER_LOG_COLLECTION_EPOCH") return json({ error: "USE_PAPER_LOG_ARCHIVE_EPOCH_ENDPOINT" }, 409);
+      if (body.action === "REBASELINE_LEGACY_EXECUTION_QUARANTINE") {
+        const result = await this.rebaselineLegacyExecutionQuarantine();
+        return json(result, result.status === "REBASELINED" ? 200 : 409);
+      }
       if (body.action === "DRY_RUN_EXECUTION_QUARANTINE_RECOVERY") {
         try {
           return json(await this.dryRunExecutionQuarantineRecovery(body.cycleId, body.decisionId, body.evidenceThrough));
@@ -1875,10 +1890,13 @@ export class TraderAgent extends Agent<Env, AgentState> {
             continue;
           }
           if (execution.status !== "unknown" && record.reconciliationResult?.status === "MATCHED") continue;
+          if (isLegacyExecutionQuarantineBaselined(this, quarantineIdentity)) continue;
           if (existingSymbols.has(record.decision.symbol)) continue;
           const reason = execution.status === "unknown"
             ? "EXECUTION_UNKNOWN"
             : record.reconciliationResult?.codes.join(",") || "EXECUTION_NOT_RECONCILED";
+          // A proven pre-submit failure never created an order, so it must not become a quarantine.
+          if (isDefinitivelyRejectedExecution(execution, record.executionRequest, { cycleId: journal.cycleId, decisionId: record.decision.decisionId })) continue;
           saveExecutionQuarantine(this, {
             symbol: record.decision.symbol,
             decisionId: record.decision.decisionId,
@@ -2259,6 +2277,155 @@ export class TraderAgent extends Agent<Env, AgentState> {
       return { status: "ALREADY_RECONCILED", experienceId, providerPositionHistoryId };
     }
     return { status: "RECONCILED", experienceId, providerPositionHistoryId };
+  }
+
+  /**
+ * Owner-approved rebaseline of legacy execution quarantines.
+ *
+ * This is the terminal resolution for a quarantine whose bounded order-history search no
+ * longer terminates. It requires a PAUSED idle agent and two independent, agreeing provider
+ * reads of positions, open orders and the account. It never classifies the old order: the
+ * archived entry keeps its original identity, reason, execution status and reconciliation
+ * codes verbatim, so nothing is falsely marked FILLED, REJECTED or RECONCILED. The current
+ * provider positions become the operational baseline instead.
+ */
+public async rebaselineLegacyExecutionQuarantine(): Promise<Record<string, unknown>> {
+    if (!this.state.paused || this.state.runtimeStatus !== "PAUSED" || this.state.cycleStartedAt || this.state.lastStatus === "RUNNING") {
+      return { status: "REJECTED", blockers: ["EXECUTION_IN_PROGRESS"], rebaselined: [] };
+    }
+    ensureStorageInitialized(this);
+    const config = loadConfig(this.env, this.ensureActivePolicy());
+    const activeQuarantines = loadExecutionQuarantines(this);
+    const activeSymbols = [...new Set(activeQuarantines.map((entry) => entry.symbol))].sort();
+    if (activeSymbols.length === 0) return { status: "REJECTED", blockers: ["NO_ACTIVE_LEGACY_QUARANTINE"], rebaselined: [] };
+
+    const client = new BitgetClient(config);
+    const readSnapshot = async (): Promise<{ account: Awaited<ReturnType<BitgetClient["getDashboardPortfolio"]>>; observedAt: string } | null> => {
+      try {
+        const account = await client.getDashboardPortfolio();
+        return { account, observedAt: account.observedAt };
+      } catch {
+        return null;
+      }
+    };
+    const first = await readSnapshot();
+    const second = first ? await readSnapshot() : null;
+
+    const positionDiscrepancies = this.recordPositionDiscrepancies(
+      loadOpenExperiences(this, MAX_LEGACY_REBASELINE_EXPERIENCES, "/api/control", "legacy_rebaseline_open_experiences"),
+      first?.account.positions ?? [],
+      "CONTROL",
+    );
+    const assessment = assessLegacyQuarantineRebaseline({
+      paused: this.state.paused,
+      runtimeStatus: this.state.runtimeStatus,
+      cycleStartedAt: this.state.cycleStartedAt,
+      paperOnly: this.env.TRADING_MODE === "PAPER" && this.env.PAPER_ONLY === "true",
+      firstSnapshot: first,
+      secondSnapshot: second,
+      activeQuarantineSymbols: activeSymbols,
+      positions: first?.account.positions ?? [],
+    });
+    if (!assessment.eligible) {
+      this.recordEventBestEffort("LEGACY_QUARANTINE_REBASELINE_REJECTED", "CONTROL", {
+        code: assessment.blockers.join(","),
+        symbols: activeSymbols.join(","),
+        source: "OWNER_APPROVED_LEGACY_REBASELINE",
+      });
+      return { status: "REJECTED", blockers: assessment.blockers, activeQuarantineSymbols: activeSymbols, positionDiscrepancies };
+    }
+
+    const rebaselineId = `legacy-rebaseline-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
+    const rebaselineAt = new Date().toISOString();
+    const evidence = {
+      rebaselineId,
+      category: config.bitgetCategory,
+      portfolioEquity: assessment.portfolioEquity,
+      availableMargin: assessment.availableMargin,
+      openOrderCount: assessment.openOrderCount,
+      snapshotEvidence: assessment.snapshotEvidence,
+      positions: assessment.baselinePositions,
+      positionFingerprint: assessment.positionFingerprint,
+      activeQuarantineSymbols: activeSymbols,
+      quarantinedIdentities: activeQuarantines.map((entry) => ({ symbol: entry.symbol, cycleId: entry.cycleId, decisionId: entry.decisionId, clientOrderId: entry.clientOrderId, reason: entry.reason, createdAt: entry.createdAt })),
+    };
+    const evidenceSha256 = await canonicalEvidenceSha256(evidence);
+    const archiveEntries = activeQuarantines.map((entry) => {
+      const journal = loadJournalForExactDecisionCycle(this, entry.cycleId, entry.decisionId);
+      const record = journal ? normalizeCycleDecisions(journal).records.find((candidate) => candidate.decision.decisionId === entry.decisionId) : undefined;
+      return {
+        status: "LEGACY_BASELINED" as const,
+        symbol: entry.symbol,
+        cycleId: entry.cycleId,
+        decisionId: entry.decisionId,
+        clientOrderId: entry.clientOrderId,
+        reason: entry.reason,
+        createdAt: entry.createdAt,
+        // Original facts preserved verbatim: the order is never reclassified by this rebaseline.
+        originalExecutionStatus: record?.executionResult?.status ?? "UNAVAILABLE",
+        originalReconciliationCodes: record?.reconciliationResult?.codes.join(",") ?? "UNAVAILABLE",
+        rebaselineId,
+        rebaselineAt,
+        evidenceSha256,
+      };
+    });
+    const baseline = {
+      rebaselineId,
+      rebaselineAt,
+      category: config.bitgetCategory,
+      status: "LEGACY_BASELINED" as const,
+      portfolioEquity: assessment.portfolioEquity,
+      availableMargin: assessment.availableMargin,
+      openOrderCount: assessment.openOrderCount,
+      snapshotEvidence: assessment.snapshotEvidence,
+      positions: assessment.baselinePositions,
+      positionFingerprint: assessment.positionFingerprint,
+      evidenceSha256,
+    };
+    const eventId = `legacy-rebaseline:${rebaselineId}`;
+    const persisted = this.ctx.storage.transactionSync(() => {
+      if (loadExecutionQuarantines(this).length !== activeQuarantines.length) throw new Error("LEGACY_QUARANTINE_STATE_CHANGED");
+      saveLegacyExecutionQuarantineBaseline(this, baseline);
+      appendLegacyExecutionQuarantineArchive(this, archiveEntries);
+      for (const entry of activeQuarantines) {
+        if (!clearExecutionQuarantine(this, entry, rebaselineAt)) throw new Error("LEGACY_QUARANTINE_CLEAR_FAILED");
+      }
+      if (!hasEvent(this, eventId)) {
+        saveEvent(this, {
+          eventId,
+          type: "LEGACY_EXECUTION_QUARANTINE_BASELINED",
+          cycleId: "CONTROL",
+          createdAt: rebaselineAt,
+          metadata: {
+            rebaselineId,
+            evidenceSha256,
+            symbols: activeSymbols.join(","),
+            archivedCount: String(archiveEntries.length),
+            baselinePositions: JSON.stringify(assessment.baselinePositions),
+            snapshotEvidence: JSON.stringify(assessment.snapshotEvidence),
+            openOrderCount: String(assessment.openOrderCount),
+            source: "OWNER_APPROVED_LEGACY_REBASELINE",
+            // Explicit statement that no legacy order was reclassified.
+            orderClassification: "UNCHANGED_ARCHIVED_NOT_RECONCILED",
+          },
+        });
+      }
+      return true;
+    });
+    if (!persisted) return { status: "REJECTED", blockers: ["LEGACY_QUARANTINE_STATE_CHANGED"] };
+
+    const managed = legacyRebaselineManagedSymbols(assessment.baselinePositions, activeSymbols);
+    return {
+      status: "REBASELINED",
+      rebaselineId,
+      rebaselineAt,
+      evidenceSha256,
+      baseline,
+      archived: archiveEntries,
+      providerPositionSymbols: managed.providerPositionSymbols,
+      eligibleAgainSymbols: managed.eligibleAgainSymbols,
+      riskLimitsUnchanged: true,
+    };
   }
 
   public async dryRunExecutionQuarantineRecovery(originalCycleId: string, decisionId: string, throughInput?: string): Promise<Record<string, unknown>> {
@@ -3549,8 +3716,27 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const executionRequest = buildExecutionRequest(decision, bundle, cycleId);
     if (!recordIdempotency(this, executionRequest.clientOrderId, cycleId, decision.decisionId, startedAt)) throw new Error("DUPLICATE_ORDER");
     this.recordEvent("PAPER_ORDER_SUBMITTED", cycleId, { symbol: decision.symbol, action: decision.action, decisionType });
-    const executionResult = await executePaperOrder(client, executionRequest);
-    if (executionResult.providerOrderId) recordProviderOrderReference(this, executionRequest.clientOrderId, executionResult.providerOrderId);
+    const rawExecutionResult = await executePaperOrder(client, executionRequest);
+    if (rawExecutionResult.providerOrderId) recordProviderOrderReference(this, executionRequest.clientOrderId, rawExecutionResult.providerOrderId);
+    // A post-submit failure is only ambiguous after bounded confirmation. Re-reading the order,
+    // its fills and the position once more prevents a transient provider failure from becoming a
+    // permanent symbol quarantine. A proven pre-submit failure is never retried and never resubmitted.
+    let executionResult = rawExecutionResult;
+    if (rawExecutionResult.status === "unknown" && rawExecutionResult.submitState !== "NOT_SUBMITTED") {
+      const confirmed = await client.confirmAmbiguousSubmission(executionRequest, rawExecutionResult.submittedAt);
+      if (confirmed) {
+        executionResult = confirmed;
+        if (confirmed.providerOrderId) recordProviderOrderReference(this, executionRequest.clientOrderId, confirmed.providerOrderId);
+        this.recordEvent("EXECUTION_POST_SUBMIT_CONFIRMED", cycleId, {
+          symbol: decision.symbol,
+          decisionType,
+          status: confirmed.status,
+          attempts: String(BOUNDED_SUBMISSION_CONFIRMATION_ATTEMPTS),
+        });
+      } else {
+        this.recordEvent("EXECUTION_POST_SUBMIT_UNCONFIRMED", cycleId, { symbol: decision.symbol, decisionType, attempts: String(BOUNDED_SUBMISSION_CONFIRMATION_ATTEMPTS) });
+      }
+    }
     this.setState({ ...this.state, runtimeStatus: "RECONCILING", currentStage: "RECONCILING" });
     let positionAfter: PositionSnapshot | undefined;
     let readbackFailure = false;
@@ -4374,7 +4560,7 @@ function providerReadFailureCode(error: unknown): string {
   return "PROVIDER_READ_FAILED";
 }
 
-function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "START_PAPER_LOG_COLLECTION_EPOCH"; archiveManifestSha256: string; archiveContentSha256: string; quarantineContentSha256: string; archivedCounts: Record<PaperLogArchiveTable, number>; highWaterRowIds: Record<PaperLogArchiveTable, number> } | { action: "DRY_RUN_EXECUTION_QUARANTINE_RECOVERY"; cycleId: string; decisionId: string; evidenceThrough?: string } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "RECOVER_QUARANTINED_CLOSED_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "REPAIR_PROVIDER_CLOSED_LIFECYCLE"; experienceId: string; providerPositionHistoryId: string; dryRun?: boolean } {
+function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "RESUME" | "EMERGENCY_STOP" } | { action: "REBASELINE_LEGACY_EXECUTION_QUARANTINE" } | { action: "START_PAPER_LOG_COLLECTION_EPOCH"; archiveManifestSha256: string; archiveContentSha256: string; quarantineContentSha256: string; archivedCounts: Record<PaperLogArchiveTable, number>; highWaterRowIds: Record<PaperLogArchiveTable, number> } | { action: "DRY_RUN_EXECUTION_QUARANTINE_RECOVERY"; cycleId: string; decisionId: string; evidenceThrough?: string } | { action: "RECONCILE_LATE_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "RECOVER_QUARANTINED_CLOSED_EXECUTION"; cycleId: string; decisionId: string; evidenceHash: string; evidenceThrough: string } | { action: "REPAIR_PROVIDER_CLOSED_LIFECYCLE"; experienceId: string; providerPositionHistoryId: string; dryRun?: boolean } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const body = value as { action?: unknown; cycleId?: unknown; decisionId?: unknown; experienceId?: unknown; providerPositionHistoryId?: unknown; dryRun?: unknown; evidenceHash?: unknown; evidenceThrough?: unknown; archiveManifestSha256?: unknown; archiveContentSha256?: unknown; quarantineContentSha256?: unknown; archivedCounts?: unknown; highWaterRowIds?: unknown };
   const archiveTables: PaperLogArchiveTable[] = ["journals", "cycles", "experiences", "events"];
@@ -4384,6 +4570,7 @@ function isControlBody(value: unknown): value is { action: "START" | "PAUSE" | "
     && typeof body.archiveContentSha256 === "string" && /^[a-f0-9]{64}$/.test(body.archiveContentSha256)
     && typeof body.quarantineContentSha256 === "string" && /^[a-f0-9]{64}$/.test(body.quarantineContentSha256)
     && validCountMap(body.archivedCounts) && validCountMap(body.highWaterRowIds);
+  if (body.action === "REBASELINE_LEGACY_EXECUTION_QUARANTINE") return Object.keys(body).length === 1;
   if (body.action === "REPAIR_PROVIDER_CLOSED_LIFECYCLE") return typeof body.experienceId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.experienceId) && typeof body.providerPositionHistoryId === "string" && /^[A-Za-z0-9:_-]{1,128}$/.test(body.providerPositionHistoryId) && (body.dryRun === undefined || typeof body.dryRun === "boolean");
   const validDecisionIdentity = typeof body.cycleId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.cycleId)
     && typeof body.decisionId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(body.decisionId);
