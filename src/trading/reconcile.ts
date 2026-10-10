@@ -10,6 +10,10 @@ export function isDefinitivelyRejectedExecution(
   if (request.cycleId !== expectedIdentity.cycleId || request.decisionId !== expectedIdentity.decisionId
     || execution.clientOrderId !== request.clientOrderId || execution.symbol !== request.symbol || execution.action !== request.action
     || execution.positionSide !== request.positionSide || execution.providerSide !== request.providerSide || execution.tradeSide !== request.tradeSide) return false;
+  // A proven pre-submit failure is definitive on its own: no order was sent, so none can be
+  // open, pending or filled. This is the only path that lets a transient provider failure
+  // avoid a permanent quarantine without weakening the fail-closed post-submit rule.
+  if (execution.submitState === "NOT_SUBMITTED") return true;
   return Boolean(execution.providerOrderId)
     || (execution.providerFailureClass === "PROVIDER_REJECTED" && execution.providerReadbackFailureClass === "PROVIDER_NOT_FOUND");
 }
