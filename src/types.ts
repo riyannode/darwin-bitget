@@ -506,6 +506,15 @@ export interface ExecutionResult {
   providerReadbackCode?: string;
   providerOperation?: string;
   providerReadbackMessage?: string;
+  /**
+   * Whether the provider write actually reached the provider.
+   *
+   * `NOT_SUBMITTED` is a proven pre-submit failure: nothing was sent, so no order can be
+   * open, pending, or filled and the symbol must not be quarantined. `AMBIGUOUS` is a
+   * post-submit failure whose outcome is unknown and therefore stays fail-closed. Absent
+   * (legacy journals) is treated as ambiguous.
+   */
+  submitState?: "NOT_SUBMITTED" | "AMBIGUOUS";
   averageFillPrice?: string;
   fees?: string;
   funding?: string;

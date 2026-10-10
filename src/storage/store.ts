@@ -1873,6 +1873,77 @@ export function clearExecutionQuarantine(
   return true;
 }
 
+/**
+ * Legacy execution quarantines are archived, never resolved.
+ *
+ * `execution_quarantine_resolutions` means a provider-authoritative reconciliation of one
+ * order (filled/rejected). A legacy quarantine that has exhausted bounded order-history search
+ * has no such proof, so it must never be written there. It is archived instead, with the
+ * original identity, reason and creation time preserved verbatim.
+ *
+ * The archive is the only marker needed: the current provider position is the operational state,
+ * so no second baseline record is persisted.
+ */
+const LEGACY_QUARANTINE_ARCHIVE_KEY = "legacy_execution_quarantine_archive_v1";
+
+export interface LegacyExecutionQuarantineArchiveEntry {
+  status: "LEGACY_RELEASED";
+  symbol: string;
+  cycleId: string;
+  decisionId: string;
+  clientOrderId: string;
+  reason: string;
+  createdAt: string;
+  releasedAt: string;
+  releaseId: string;
+}
+
+export function loadLegacyExecutionQuarantineArchive(executor: SqlExecutor): LegacyExecutionQuarantineArchiveEntry[] {
+  const rows = executor.sql<RiskStateRow>`SELECT payload FROM risk_state WHERE state_key = ${LEGACY_QUARANTINE_ARCHIVE_KEY}`;
+  if (!rows[0]) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rows[0].payload);
+  } catch {
+    throw new Error("LEGACY_QUARANTINE_ARCHIVE_STATE_INVALID");
+  }
+  if (!Array.isArray(parsed) || parsed.some((entry) => {
+    const candidate = entry as Partial<LegacyExecutionQuarantineArchiveEntry> | null;
+    return typeof candidate !== "object" || candidate === null
+      || candidate.status !== "LEGACY_RELEASED"
+      || typeof candidate.symbol !== "string" || typeof candidate.cycleId !== "string"
+      || typeof candidate.decisionId !== "string" || typeof candidate.clientOrderId !== "string"
+      || typeof candidate.reason !== "string" || typeof candidate.createdAt !== "string"
+      || typeof candidate.releasedAt !== "string" || typeof candidate.releaseId !== "string";
+  })) {
+    throw new Error("LEGACY_QUARANTINE_ARCHIVE_STATE_INVALID");
+  }
+  return parsed as LegacyExecutionQuarantineArchiveEntry[];
+}
+
+export function appendLegacyExecutionQuarantineArchive(executor: SqlExecutor, entries: readonly LegacyExecutionQuarantineArchiveEntry[]): void {
+  if (entries.length === 0) return;
+  const next = [...loadLegacyExecutionQuarantineArchive(executor), ...entries];
+  const releasedAt = entries[entries.length - 1]!.releasedAt;
+  executor.sql`
+    INSERT INTO risk_state (state_key, payload, updated_at)
+    VALUES (${LEGACY_QUARANTINE_ARCHIVE_KEY}, ${JSON.stringify(next)}, ${releasedAt})
+    ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `;
+}
+
+/**
+ * A released legacy quarantine is permanently archived, so startup journal seeding must never
+ * re-create it from the very journal that produced it.
+ */
+export function isLegacyExecutionQuarantineReleased(
+  executor: SqlExecutor,
+  identity: Pick<ExecutionQuarantine, "symbol" | "cycleId" | "decisionId" | "clientOrderId">,
+): boolean {
+  return loadLegacyExecutionQuarantineArchive(executor).some((entry) => entry.symbol === identity.symbol
+    && entry.cycleId === identity.cycleId && entry.decisionId === identity.decisionId
+    && entry.clientOrderId === identity.clientOrderId);
+}
 export function recordProviderOrderReference(executor: SqlExecutor, clientOrderId: string, providerOrderId: string): void {
   executor.sql`
     UPDATE idempotency
