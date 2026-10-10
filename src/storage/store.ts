@@ -166,6 +166,12 @@ const PERFORMANCE_STATE_KEY = "performance_aggregate";
 const POSITION_CONTEXT_BOOTSTRAP_KEY = "position_context_bootstrap";
 const LATEST_VALID_CYCLE_PLAN_STATE_KEY = "latest_valid_cycle_plan";
 const MAX_TARGETED_DECISION_ID_LENGTH = 256;
+/**
+ * Bounded scan for read-time lesson deduplication. Legacy duplicates of one
+ * failure class cluster together by `updated_at`, so a recent window resolves
+ * them without reading the whole table.
+ */
+const MAX_DEDUPE_SCAN_ROWS = 500;
 
 export function clampHistoryLimit(limit: number, fallback = 25): number {
   if (!Number.isInteger(limit) || limit < 1) return fallback;
@@ -238,14 +244,39 @@ function collapseDuplicateFailureLessons(lessons: readonly Lesson[]): Lesson[] {
 }
 
 export function loadUsableLessons(executor: SqlExecutor): Lesson[] {
-  const rows = executor.sql<LessonRow>`SELECT payload FROM lessons WHERE status IN ('ACTIVE', 'CANDIDATE', 'WEAKENED') ORDER BY updated_at DESC LIMIT 100`;
-  return collapseDuplicateFailureLessons(rows.flatMap((row) => {
+  return usableLessonRootCauses(collapseDuplicateFailureLessons(readLessonRows(executor)));
+}
+
+/**
+ * Drop lessons whose root cause is retired or contradicted.
+ *
+ * The status filter cannot express this on its own: a legacy duplicate pair
+ * holding the same root cause can carry RETIRED on one row and CANDIDATE on
+ * another, and filtering rows by status first would let the CANDIDATE copy
+ * readmit a root cause that had already been retired. Because duplicates are
+ * collapsed before this runs, every root cause appears once with its strongest
+ * status, so excluding the excluded statuses here is both correct and complete.
+ */
+function usableLessonRootCauses(lessons: readonly Lesson[]): Lesson[] {
+  const retired = new Set(lessons.flatMap((lesson) => {
+    const key = lessonRootCauseKey(lesson);
+    return key !== null && (lesson.status === "RETIRED" || lesson.status === "CONTRADICTED") ? [key] : [];
+  }));
+  return lessons.filter((lesson) => {
+    const key = lessonRootCauseKey(lesson);
+    return key === null || !retired.has(key);
+  });
+}
+
+function readLessonRows(executor: SqlExecutor): Lesson[] {
+  const rows = executor.sql<LessonRow>`SELECT payload FROM lessons ORDER BY updated_at DESC LIMIT ${MAX_DEDUPE_SCAN_ROWS}`;
+  return rows.flatMap((row) => {
     try {
       return [parseLesson(JSON.parse(row.payload))];
     } catch {
       return [];
     }
-  }));
+  });
 }
 
 export function loadRecentLessons(executor: SqlExecutor, limit = 10): Lesson[] {
