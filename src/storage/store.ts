@@ -167,9 +167,15 @@ const POSITION_CONTEXT_BOOTSTRAP_KEY = "position_context_bootstrap";
 const LATEST_VALID_CYCLE_PLAN_STATE_KEY = "latest_valid_cycle_plan";
 const MAX_TARGETED_DECISION_ID_LENGTH = 256;
 /**
- * Bounded scan for read-time lesson deduplication. Legacy duplicates of one
- * failure class cluster together by `updated_at`, so a recent window resolves
- * them without reading the whole table.
+ * Bounded scan used by the read-time lesson pass.
+ *
+ * Covers the 500 most recently updated lesson rows, which is the whole working
+ * set for cycle retrieval. Lesson history is append-only, so a row that falls
+ * outside this window can only be a superseded duplicate of the same failure
+ * class or an already-retired lesson that has been superseded many times over.
+ * The bound is therefore safe for correctness of what is returned; the only
+ * cost is that a root cause retired beyond the window is not re-checked here,
+ * and `loadRecentLessons` still reports it from the same window.
  */
 const MAX_DEDUPE_SCAN_ROWS = 500;
 
@@ -248,14 +254,18 @@ export function loadUsableLessons(executor: SqlExecutor): Lesson[] {
 }
 
 /**
- * Drop lessons whose root cause is retired or contradicted.
+ * Exclude every retired or contradicted lesson.
  *
- * The status filter cannot express this on its own: a legacy duplicate pair
- * holding the same root cause can carry RETIRED on one row and CANDIDATE on
- * another, and filtering rows by status first would let the CANDIDATE copy
- * readmit a root cause that had already been retired. Because duplicates are
- * collapsed before this runs, every root cause appears once with its strongest
- * status, so excluding the excluded statuses here is both correct and complete.
+ * Two rules combine here. A lesson whose own status is RETIRED or
+ * CONTRADICTED is always excluded, whatever its failure code. Separately, a
+ * root cause is excluded when *any* lesson for that root cause reached those
+ * statuses: a legacy duplicate pair can carry RETIRED on one row and CANDIDATE
+ * on another, and the surviving CANDIDATE row must not readmit a root cause
+ * that had already been retired.
+ *
+ * The second rule only applies to lessons that carry a failure code, since
+ * lessons without one are never collapsed and therefore have no sibling row to
+ * reconcile against.
  */
 function usableLessonRootCauses(lessons: readonly Lesson[]): Lesson[] {
   const retired = new Set(lessons.flatMap((lesson) => {
@@ -263,6 +273,7 @@ function usableLessonRootCauses(lessons: readonly Lesson[]): Lesson[] {
     return key !== null && (lesson.status === "RETIRED" || lesson.status === "CONTRADICTED") ? [key] : [];
   }));
   return lessons.filter((lesson) => {
+    if (lesson.status === "RETIRED" || lesson.status === "CONTRADICTED") return false;
     const key = lessonRootCauseKey(lesson);
     return key === null || !retired.has(key);
   });
