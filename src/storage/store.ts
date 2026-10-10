@@ -1,6 +1,6 @@
 import type { ActivityEvent, BacktestReplay, CycleDecisionPlan, LatestValidCyclePlan, Lesson, LessonEvaluation, OwnerPolicy, PositionContext, PositionSide, TradeExperience, TradingJournal } from "../types.js";
 import { parseExperience } from "../learning/experiences.js";
-import { parseLesson } from "../learning/lessons.js";
+import { lessonDedupeId, parseLesson, strongerLessonStatus } from "../learning/lessons.js";
 import { parseDailyDrawdownState, type DailyDrawdownState } from "../trading/drawdown.js";
 import { parseOwnerPolicy } from "../trading/policy.js";
 import { normalizeCycleDecisions, cyclePlanDecisions, journalHasPersistedPlan } from "./journal-normalizer.js";
@@ -216,12 +216,50 @@ export function loadRecentLessons(executor: SqlExecutor, limit = 10): Lesson[] {
   });
 }
 
-export function saveLesson(executor: SqlExecutor, lesson: Lesson): void {
+/**
+ * Persist one lesson per recurring root cause.
+ *
+ * A lesson ID is derived from the root cause (source, symbol scope, market
+ * regime, trigger, failure code, action) instead of the per-reflection random
+ * ID, so the same failure seen again refreshes the existing row rather than
+ * adding a duplicate. The original createdAt, the strongest lifecycle status,
+ * and every accumulated counter are preserved. Returns the persisted lesson,
+ * whose ID is what callers must reference.
+ */
+export function saveLesson(executor: SqlExecutor, lesson: Lesson): Lesson {
+  const dedupeId = lessonDedupeId(lesson);
+  const rows = executor.sql<LessonRow>`SELECT payload FROM lessons WHERE lesson_id = ${dedupeId} LIMIT 1`;
+  const row = rows[0];
+  if (!row) {
+    const created: Lesson = { ...lesson, lessonId: dedupeId };
+    executor.sql`
+      INSERT INTO lessons (lesson_id, symbol_scope, market_regime, status, payload, created_at, updated_at)
+      VALUES (${dedupeId}, ${created.symbolScope}, ${created.marketRegime}, ${created.status}, ${JSON.stringify(created)}, ${created.createdAt}, ${created.updatedAt})
+      ON CONFLICT(lesson_id) DO UPDATE SET payload = excluded.payload, status = excluded.status, symbol_scope = excluded.symbol_scope, market_regime = excluded.market_regime, updated_at = excluded.updated_at
+    `;
+    return created;
+  }
+  let current: Lesson;
+  try {
+    current = parseLesson(JSON.parse(row.payload));
+  } catch {
+    current = { ...lesson, lessonId: dedupeId };
+  }
+  const merged: Lesson = {
+    ...lesson,
+    lessonId: dedupeId,
+    createdAt: current.createdAt,
+    timesRetrieved: Math.max(current.timesRetrieved, lesson.timesRetrieved),
+    timesApplied: Math.max(current.timesApplied, lesson.timesApplied),
+    successfulApplications: Math.max(current.successfulApplications, lesson.successfulApplications),
+    failedApplications: Math.max(current.failedApplications, lesson.failedApplications),
+    status: strongerLessonStatus(current.status, lesson.status),
+  };
   executor.sql`
-    INSERT INTO lessons (lesson_id, symbol_scope, market_regime, status, payload, created_at, updated_at)
-    VALUES (${lesson.lessonId}, ${lesson.symbolScope}, ${lesson.marketRegime}, ${lesson.status}, ${JSON.stringify(lesson)}, ${lesson.createdAt}, ${lesson.updatedAt})
-    ON CONFLICT(lesson_id) DO UPDATE SET payload = excluded.payload, status = excluded.status, updated_at = excluded.updated_at
+    UPDATE lessons SET payload = ${JSON.stringify(merged)}, status = ${merged.status}, symbol_scope = ${merged.symbolScope}, market_regime = ${merged.marketRegime}, updated_at = ${merged.updatedAt}
+    WHERE lesson_id = ${dedupeId}
   `;
+  return merged;
 }
 
 export function recordLessonRetrieval(executor: SqlExecutor, lessonIds: readonly string[], cycleId: string, createdAt: string): void {

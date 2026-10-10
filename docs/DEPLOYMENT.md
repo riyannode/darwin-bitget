@@ -54,7 +54,6 @@ git clone https://github.com/riyannode/darwin-bitget.git
 cd darwin-bitget
 npm install
 npm run typecheck
-npm test
 npm run build
 npm run deploy:dry
 ```

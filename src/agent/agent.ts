@@ -3390,9 +3390,8 @@ export class TraderAgent extends Agent<Env, AgentState> {
         if (execution.finalPortfolio) journal.portfolio = execution.finalPortfolio;
         this.persistPerformanceEquity(execution.finalPortfolio?.portfolioEquity ?? account.portfolioEquity, execution.finalPortfolio?.observedAt ?? account.observedAt);
         this.setState({ ...this.state, runtimeStatus: "REFLECTING", currentStage: "REFLECTING" });
-        const backtestLesson = backtest ? createBacktestLesson(backtest) : undefined;
+        const backtestLesson = backtest ? saveLesson(this, createBacktestLesson(backtest)) : undefined;
         journal.createdLessons = [...journal.createdLessons, ...(backtestLesson ? [backtestLesson.lessonId] : [])];
-        if (backtestLesson) saveLesson(this, backtestLesson);
         if (backtestLesson) this.recordEvent("LESSON_CREATED", cycleId, { source: "BACKTEST_REPLAY" });
         journal.completedAt = new Date().toISOString();
         journal.durationMs = Math.max(0, new Date(journal.completedAt).getTime() - new Date(startedAt).getTime());
@@ -3677,11 +3676,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const failure = record.riskGateResult.codes.length ? record.riskGateResult.codes.join(",") : "EXECUTION_FAILURE";
       const failureResult = reflect({ decision, outcome: record.riskGateResult.status === "BLOCK" ? "RISK_BLOCKED" : "EXECUTION_FAILURE", failureCode: failure, symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", experienceStatus: record.riskGateResult.status === "BLOCK" ? "BLOCKED" : "EXECUTION_FAILURE", entryPrice: bundle.market.lastPrice, exitPrice: bundle.market.lastPrice, evidenceAtEntry: bundle.evidence.map((evidence) => evidence.type), evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: decision.lessonsUsed, marginAllocated: record.executionRequest?.marginAllocated ?? "0", positionNotional: record.executionRequest?.positionNotional ?? "0" });
       saveExperience(this, failureResult.experience, startedAt);
-      saveLesson(this, failureResult.lesson);
+      const persistedFailureLesson = saveLesson(this, failureResult.lesson);
       journal.experienceId = failureResult.experience.experienceId;
       journal.experienceIds = [...(journal.experienceIds ?? []), failureResult.experience.experienceId];
       journal.reflection = failureResult.reflection;
-      journal.createdLessons = [...journal.createdLessons, failureResult.lesson.lessonId];
+      journal.createdLessons = [...journal.createdLessons, persistedFailureLesson.lessonId];
       this.recordEvent("REFLECTION_COMPLETED", cycleId, { symbol: decision.symbol, action: decision.action });
       return {};
     }
@@ -3853,14 +3852,14 @@ export class TraderAgent extends Agent<Env, AgentState> {
         const updated = { ...result.experience, ...remaining };
         saveExperience(this, updated, startedAt);
         if (index >= 0) experiences[index] = updated;
-        saveLesson(this, result.lesson);
+        const persistedLesson = saveLesson(this, result.lesson);
         recordLessonApplication(this, cycleId, result.reflection.lessonEvaluations.filter((evaluation) => result.experience.lessonsUsed.includes(evaluation.lessonId)), new Date().toISOString());
         this.recordEvent("REFLECTION_COMPLETED", cycleId, { symbol: decision.symbol, action: decision.action });
         this.recordEvent("LESSON_CREATED", cycleId, { source: result.lesson.source, symbol: decision.symbol });
-        journal.createdLessons = [...journal.createdLessons, result.lesson.lessonId];
+        journal.createdLessons = [...journal.createdLessons, persistedLesson.lessonId];
         journal.exitReflections = [...(journal.exitReflections ?? []), result.reflection];
         journal.reflection = result.reflection;
-        return { reflection: result.reflection, lesson: result.lesson };
+        return { reflection: result.reflection, lesson: persistedLesson };
       } catch (error) {
         this.recordEvent("REFLECTION_FAILED", cycleId, { code: error instanceof Error ? error.message.split(":", 1)[0] ?? "REFLECTION_FAILED" : "REFLECTION_FAILED", symbol: decision.symbol });
       }
@@ -3882,14 +3881,14 @@ export class TraderAgent extends Agent<Env, AgentState> {
           const updated = { ...result.experience, ...remaining };
           saveExperience(this, updated, startedAt);
           if (index >= 0) experiences[index] = updated;
-          saveLesson(this, result.lesson);
+          const persistedPartialLesson = saveLesson(this, result.lesson);
           recordLessonApplication(this, cycleId, result.reflection.lessonEvaluations.filter((evaluation) => result.experience.lessonsUsed.includes(evaluation.lessonId)), new Date().toISOString());
           this.recordEvent("REFLECTION_COMPLETED", cycleId, { symbol: decision.symbol, action: decision.action });
           this.recordEvent("LESSON_CREATED", cycleId, { source: result.lesson.source, symbol: decision.symbol });
-          journal.createdLessons = [...journal.createdLessons, result.lesson.lessonId];
+          journal.createdLessons = [...journal.createdLessons, persistedPartialLesson.lessonId];
           journal.exitReflections = [...(journal.exitReflections ?? []), result.reflection];
           journal.reflection = result.reflection;
-          return { reflection: result.reflection, lesson: result.lesson };
+          return { reflection: result.reflection, lesson: persistedPartialLesson };
         } catch (error) {
           this.recordEvent("REFLECTION_FAILED", cycleId, { ...failureDiagnostic(error), symbol: decision.symbol });
         }
@@ -3900,11 +3899,11 @@ export class TraderAgent extends Agent<Env, AgentState> {
       const failure = record.riskGateResult.codes.length ? record.riskGateResult.codes.join(",") : "EXECUTION_FAILURE";
       const failureResult = reflect({ decision, outcome: record.riskGateResult.status === "BLOCK" ? "RISK_BLOCKED" : "EXECUTION_FAILURE", failureCode: failure, symbol: decision.symbol, marketRegime: bundle.marketRegime ?? "UNKNOWN", experienceStatus: record.riskGateResult.status === "BLOCK" ? "BLOCKED" : "EXECUTION_FAILURE", entryPrice: bundle.market.lastPrice, exitPrice: bundle.market.lastPrice, evidenceAtEntry: bundle.evidence.map((evidence) => evidence.type), evidenceAtExit: bundle.evidence.map((evidence) => evidence.type), lessonsUsed: decision.lessonsUsed, marginAllocated: record.executionRequest?.marginAllocated ?? "0", positionNotional: record.executionRequest?.positionNotional ?? "0" });
       saveExperience(this, failureResult.experience, startedAt);
-      saveLesson(this, failureResult.lesson);
+      const persistedFailureLesson = saveLesson(this, failureResult.lesson);
       journal.experienceId = failureResult.experience.experienceId;
       journal.experienceIds = [...(journal.experienceIds ?? []), failureResult.experience.experienceId];
       journal.reflection = failureResult.reflection;
-      journal.createdLessons = [...journal.createdLessons, failureResult.lesson.lessonId];
+      journal.createdLessons = [...journal.createdLessons, persistedFailureLesson.lessonId];
       this.recordEvent("REFLECTION_COMPLETED", cycleId, { symbol: decision.symbol, action: decision.action });
     }
     return {};
