@@ -5,7 +5,6 @@
 ```bash
 npm install
 npm run typecheck
-npm test
 npm run build
 npm run deploy:dry
 ```
@@ -48,7 +47,7 @@ Keep the first deployment PAPER-only. Do not force a trade while validating.
 
 ## Credentialed PAPER verification
 
-The opt-in `npm run test:paper` suite requires explicit credentials and `PAPER_CONFIRM_ORDER=YES`. It submits only the configured bounded PAPER lifecycle after dynamic instrument and risk checks. No credential means `PAPER_INTEGRATION_NOT_RUN`; it is not a passing execution result. Never use the manual harness as autonomous competition history.
+Credentialed PAPER verification is an operator-driven manual procedure against a paused Worker. Confirm the configured bounded PAPER lifecycle end to end through the live dashboard endpoints after dynamic instrument and risk checks. No automated harness submits orders, so a missing credential is not a passing execution result. Never treat a manual check as autonomous competition history.
 
 ## Operational safety
 

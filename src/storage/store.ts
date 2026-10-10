@@ -1,6 +1,6 @@
 import type { ActivityEvent, BacktestReplay, CycleDecisionPlan, LatestValidCyclePlan, Lesson, LessonEvaluation, OwnerPolicy, PositionContext, PositionSide, TradeExperience, TradingJournal } from "../types.js";
 import { parseExperience } from "../learning/experiences.js";
-import { parseLesson } from "../learning/lessons.js";
+import { lessonDedupeId, lessonRootCauseKey, parseLesson, strongerLessonStatus } from "../learning/lessons.js";
 import { parseDailyDrawdownState, type DailyDrawdownState } from "../trading/drawdown.js";
 import { parseOwnerPolicy } from "../trading/policy.js";
 import { normalizeCycleDecisions, cyclePlanDecisions, journalHasPersistedPlan } from "./journal-normalizer.js";
@@ -166,6 +166,18 @@ const PERFORMANCE_STATE_KEY = "performance_aggregate";
 const POSITION_CONTEXT_BOOTSTRAP_KEY = "position_context_bootstrap";
 const LATEST_VALID_CYCLE_PLAN_STATE_KEY = "latest_valid_cycle_plan";
 const MAX_TARGETED_DECISION_ID_LENGTH = 256;
+/**
+ * Bounded scan used by the read-time lesson pass.
+ *
+ * Covers the 500 most recently updated lesson rows, which is the whole working
+ * set for cycle retrieval. Lesson history is append-only, so a row that falls
+ * outside this window can only be a superseded duplicate of the same failure
+ * class or an already-retired lesson that has been superseded many times over.
+ * The bound is therefore safe for correctness of what is returned; the only
+ * cost is that a root cause retired beyond the window is not re-checked here,
+ * and `loadRecentLessons` still reports it from the same window.
+ */
+const MAX_DEDUPE_SCAN_ROWS = 500;
 
 export function clampHistoryLimit(limit: number, fallback = 25): number {
   if (!Number.isInteger(limit) || limit < 1) return fallback;
@@ -194,8 +206,81 @@ export function saveJournal(executor: SqlExecutor, journal: TradingJournal): voi
   `;
 }
 
+/**
+ * Collapse historical duplicates of one failure class into a single lesson.
+ *
+ * Rows written before failure-class deduplication can contain several lessons
+ * sharing one root cause. They are folded for display only: every row stays in
+ * the table with its own ID, so old journal references and `lesson_usage`
+ * history keep resolving. For each root cause the most recently updated lesson
+ * survives and absorbs the strongest status and the highest evidence counters
+ * of every superseded copy, so no accumulated history is lost. Lessons without
+ * a failure code are never folded.
+ */
+function collapseDuplicateFailureLessons(lessons: readonly Lesson[]): Lesson[] {
+  const survivors = new Map<string, Lesson>();
+  for (const lesson of lessons) {
+    const key = lessonRootCauseKey(lesson);
+    if (key === null) continue;
+    const incumbent = survivors.get(key);
+    if (!incumbent) {
+      survivors.set(key, lesson);
+      continue;
+    }
+    const winner = incumbent.updatedAt >= lesson.updatedAt ? incumbent : lesson;
+    const loser = winner === incumbent ? lesson : incumbent;
+    survivors.set(key, {
+      ...winner,
+      timesRetrieved: Math.max(winner.timesRetrieved, loser.timesRetrieved),
+      timesApplied: Math.max(winner.timesApplied, loser.timesApplied),
+      successfulApplications: Math.max(winner.successfulApplications, loser.successfulApplications),
+      failedApplications: Math.max(winner.failedApplications, loser.failedApplications),
+      status: strongerLessonStatus(winner.status, loser.status),
+    });
+  }
+  if (survivors.size === 0) return [...lessons];
+  const emitted = new Set<string>();
+  return lessons.flatMap((lesson) => {
+    const key = lessonRootCauseKey(lesson);
+    if (key === null) return [lesson];
+    if (emitted.has(key)) return [];
+    emitted.add(key);
+    return [survivors.get(key) ?? lesson];
+  });
+}
+
 export function loadUsableLessons(executor: SqlExecutor): Lesson[] {
-  const rows = executor.sql<LessonRow>`SELECT payload FROM lessons WHERE status IN ('ACTIVE', 'CANDIDATE', 'WEAKENED') ORDER BY updated_at DESC LIMIT 100`;
+  return usableLessonRootCauses(collapseDuplicateFailureLessons(readLessonRows(executor)));
+}
+
+/**
+ * Exclude every retired or contradicted lesson.
+ *
+ * Two rules combine here. A lesson whose own status is RETIRED or
+ * CONTRADICTED is always excluded, whatever its failure code. Separately, a
+ * root cause is excluded when *any* lesson for that root cause reached those
+ * statuses: a legacy duplicate pair can carry RETIRED on one row and CANDIDATE
+ * on another, and the surviving CANDIDATE row must not readmit a root cause
+ * that had already been retired.
+ *
+ * The second rule only applies to lessons that carry a failure code, since
+ * lessons without one are never collapsed and therefore have no sibling row to
+ * reconcile against.
+ */
+function usableLessonRootCauses(lessons: readonly Lesson[]): Lesson[] {
+  const retired = new Set(lessons.flatMap((lesson) => {
+    const key = lessonRootCauseKey(lesson);
+    return key !== null && (lesson.status === "RETIRED" || lesson.status === "CONTRADICTED") ? [key] : [];
+  }));
+  return lessons.filter((lesson) => {
+    if (lesson.status === "RETIRED" || lesson.status === "CONTRADICTED") return false;
+    const key = lessonRootCauseKey(lesson);
+    return key === null || !retired.has(key);
+  });
+}
+
+function readLessonRows(executor: SqlExecutor): Lesson[] {
+  const rows = executor.sql<LessonRow>`SELECT payload FROM lessons ORDER BY updated_at DESC LIMIT ${MAX_DEDUPE_SCAN_ROWS}`;
   return rows.flatMap((row) => {
     try {
       return [parseLesson(JSON.parse(row.payload))];
@@ -207,21 +292,73 @@ export function loadUsableLessons(executor: SqlExecutor): Lesson[] {
 
 export function loadRecentLessons(executor: SqlExecutor, limit = 10): Lesson[] {
   const rows = executor.sql<LessonRow>`SELECT payload FROM lessons ORDER BY updated_at DESC LIMIT ${limit}`;
-  return rows.flatMap((row) => {
+  return collapseDuplicateFailureLessons(rows.flatMap((row) => {
     try {
       return [parseLesson(JSON.parse(row.payload))];
     } catch {
       return [];
     }
-  });
+  }));
 }
 
-export function saveLesson(executor: SqlExecutor, lesson: Lesson): void {
+/**
+ * Persist one lesson row per recurring *failure class*.
+ *
+ * Only lessons carrying a failure code get a derived, stable ID, because the
+ * failure code is the root cause. Lessons without one (`SELF_OUTCOME`,
+ * `BACKTEST_REPLAY`) record distinct trading episodes and keep their own IDs,
+ * so different outcomes are never merged.
+ *
+ * On a failure-class refresh the original `createdAt`, the strongest lifecycle
+ * status, and every accumulated counter are preserved, so a RETIRED lesson is
+ * not resurrected by a later recurrence. The refreshed lesson text comes from
+ * the newest occurrence. Nothing is deleted here; historical duplicates are
+ * handled at read time.
+ *
+ * Returns the persisted lesson, whose ID is what callers must reference.
+ */
+export function saveLesson(executor: SqlExecutor, lesson: Lesson): Lesson {
+  const dedupeId = lessonDedupeId(lesson);
+  if (dedupeId === undefined) {
+    executor.sql`
+      INSERT INTO lessons (lesson_id, symbol_scope, market_regime, status, payload, created_at, updated_at)
+      VALUES (${lesson.lessonId}, ${lesson.symbolScope}, ${lesson.marketRegime}, ${lesson.status}, ${JSON.stringify(lesson)}, ${lesson.createdAt}, ${lesson.updatedAt})
+      ON CONFLICT(lesson_id) DO UPDATE SET payload = excluded.payload, status = excluded.status, symbol_scope = excluded.symbol_scope, market_regime = excluded.market_regime, updated_at = excluded.updated_at
+    `;
+    return lesson;
+  }
+  const rows = executor.sql<LessonRow>`SELECT payload FROM lessons WHERE lesson_id = ${dedupeId} LIMIT 1`;
+  const row = rows[0];
+  if (!row) {
+    const created: Lesson = { ...lesson, lessonId: dedupeId };
+    executor.sql`
+      INSERT INTO lessons (lesson_id, symbol_scope, market_regime, status, payload, created_at, updated_at)
+      VALUES (${dedupeId}, ${created.symbolScope}, ${created.marketRegime}, ${created.status}, ${JSON.stringify(created)}, ${created.createdAt}, ${created.updatedAt})
+      ON CONFLICT(lesson_id) DO UPDATE SET payload = excluded.payload, status = excluded.status, symbol_scope = excluded.symbol_scope, market_regime = excluded.market_regime, updated_at = excluded.updated_at
+    `;
+    return created;
+  }
+  let current: Lesson;
+  try {
+    current = parseLesson(JSON.parse(row.payload));
+  } catch {
+    current = { ...lesson, lessonId: dedupeId };
+  }
+  const merged: Lesson = {
+    ...lesson,
+    lessonId: dedupeId,
+    createdAt: current.createdAt,
+    timesRetrieved: Math.max(current.timesRetrieved, lesson.timesRetrieved),
+    timesApplied: Math.max(current.timesApplied, lesson.timesApplied),
+    successfulApplications: Math.max(current.successfulApplications, lesson.successfulApplications),
+    failedApplications: Math.max(current.failedApplications, lesson.failedApplications),
+    status: strongerLessonStatus(current.status, lesson.status),
+  };
   executor.sql`
-    INSERT INTO lessons (lesson_id, symbol_scope, market_regime, status, payload, created_at, updated_at)
-    VALUES (${lesson.lessonId}, ${lesson.symbolScope}, ${lesson.marketRegime}, ${lesson.status}, ${JSON.stringify(lesson)}, ${lesson.createdAt}, ${lesson.updatedAt})
-    ON CONFLICT(lesson_id) DO UPDATE SET payload = excluded.payload, status = excluded.status, updated_at = excluded.updated_at
+    UPDATE lessons SET payload = ${JSON.stringify(merged)}, status = ${merged.status}, symbol_scope = ${merged.symbolScope}, market_regime = ${merged.marketRegime}, updated_at = ${merged.updatedAt}
+    WHERE lesson_id = ${dedupeId}
   `;
+  return merged;
 }
 
 export function recordLessonRetrieval(executor: SqlExecutor, lessonIds: readonly string[], cycleId: string, createdAt: string): void {

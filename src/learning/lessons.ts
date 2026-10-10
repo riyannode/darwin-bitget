@@ -26,3 +26,66 @@ const lessonSchema = z.object({
 export function parseLesson(value: unknown): Lesson {
   return lessonSchema.parse(value);
 }
+
+/** Monotonic lesson lifecycle rank; a refresh never downgrades accumulated evidence. */
+const LESSON_STATUS_RANK: Readonly<Record<Lesson["status"], number>> = {
+  CANDIDATE: 0,
+  ACTIVE: 1,
+  WEAKENED: 2,
+  CONTRADICTED: 3,
+  RETIRED: 4,
+};
+
+/** Pick the lifecycle status that reflects the strongest evidence recorded so far. */
+export function strongerLessonStatus(current: Lesson["status"], incoming: Lesson["status"]): Lesson["status"] {
+  return LESSON_STATUS_RANK[incoming] > LESSON_STATUS_RANK[current] ? incoming : current;
+}
+
+function stableHash(parts: readonly string[]): string {
+  const input = parts.join(" ");
+  let first = 0x811c9dc5;
+  let second = 0x9dc5811c;
+  for (let index = 0; index < input.length; index += 1) {
+    const code = input.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193) >>> 0;
+    second = Math.imul(second ^ code, 0x85ebca6b) >>> 0;
+  }
+  return `${first.toString(16).padStart(8, "0")}${second.toString(16).padStart(8, "0")}`;
+}
+
+export type LessonRootCause = Pick<Lesson, "source" | "symbolScope" | "marketRegime" | "trigger" | "failureCode" | "actionTaken">;
+
+/**
+ * Root-cause identity for lessons that describe a *failure class*.
+ *
+ * Deduplication is limited to lessons carrying a failure code, because that
+ * code is the root cause itself: the same failure for the same symbol, regime,
+ * and action is genuinely one lesson recurring, not two different lessons.
+ */
+export function lessonRootCauseKey(lesson: LessonRootCause): string | null {
+  if (!lesson.failureCode) return null;
+  return stableHash([lesson.source, lesson.symbolScope, lesson.marketRegime, lesson.trigger, lesson.failureCode, lesson.actionTaken]);
+}
+
+/**
+ * True when two lessons describe the exact same failure class and may be
+ * represented by one row.
+ *
+ * `SELF_OUTCOME` and `BACKTEST_REPLAY` lessons carry no failure code: each one
+ * records a distinct trading episode or replay, so two of them that share a
+ * symbol and regime are still different lessons and are never merged.
+ */
+export function isSameLessonRootCause(left: LessonRootCause, right: LessonRootCause): boolean {
+  const leftKey = lessonRootCauseKey(left);
+  const rightKey = lessonRootCauseKey(right);
+  return leftKey !== null && leftKey === rightKey;
+}
+
+/**
+ * Persistence identity for a failure-class lesson, or undefined when the lesson
+ * must stay unique.
+ */
+export function lessonDedupeId(lesson: LessonRootCause): string | undefined {
+  const key = lessonRootCauseKey(lesson);
+  return key === null ? undefined : `lesson-dedupe:${key}`;
+}
