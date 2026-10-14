@@ -9,7 +9,7 @@ import { loadProviderPositionHistoriesPage } from "../storage/provider-ledger.js
 export const PROVIDER_PERFORMANCE_MATERIALIZATION_VERSION = 1;
 export const PROVIDER_PERFORMANCE_MIGRATION_PAGE_SIZE = 20;
 export const PROVIDER_PERFORMANCE_CHANGE_BATCH_SIZE = 20;
-const PROVIDER_PERFORMANCE_CHANGE_WINDOW_CAP = 20;
+const PROVIDER_PERFORMANCE_CHANGE_PAGE_SIZE = 20;
 const PROVIDER_PERFORMANCE_STATE_KEY = "provider_lifecycle_performance_materialized_v1";
 const PROVIDER_PERFORMANCE_TIME_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
 const PROVIDER_PERFORMANCE_HISTORY_TOLERANCE_MS = 5 * 60 * 1000;
@@ -28,6 +28,11 @@ export interface ProviderPerformanceMaterializationState {
   realizedPnlAccumulator: string;
   totals: ProviderPerformanceTotals;
   errorCode?: string;
+  pendingChangeId?: number;
+  pendingCoordinateIndex?: number;
+  pendingWindow?: "OPEN" | "CLOSED";
+  pendingHistoryTimeCursor?: string | null;
+  pendingHistoryKeyCursor?: string | null;
 }
 
 export interface ProviderPerformanceLifecycleRow {
@@ -84,8 +89,20 @@ export function loadProviderPerformanceMaterializationState(executor: SqlExecuto
   if (!rows[0]) return null;
   try {
     const value = JSON.parse(rows[0].payload) as ProviderPerformanceMaterializationState;
+    const hasPendingChange = value.pendingChangeId !== undefined;
+    const hasPendingCursor = value.pendingCoordinateIndex !== undefined || value.pendingWindow !== undefined
+      || value.pendingHistoryTimeCursor !== undefined || value.pendingHistoryKeyCursor !== undefined;
     if (value.version !== PROVIDER_PERFORMANCE_MATERIALIZATION_VERSION || !value.generation || !Number.isInteger(value.queueCursor)
-      || !["SCAN", "DRAIN", "READY", "RECONCILIATION_REQUIRED"].includes(value.phase) || !value.totals) return null;
+      || !["SCAN", "DRAIN", "READY", "RECONCILIATION_REQUIRED"].includes(value.phase) || !value.totals
+      || (value.pendingChangeId !== undefined && (!Number.isInteger(value.pendingChangeId) || value.pendingChangeId <= value.queueCursor))
+      || (value.pendingCoordinateIndex !== undefined && (!Number.isInteger(value.pendingCoordinateIndex) || value.pendingCoordinateIndex < 0))
+      || (value.pendingWindow !== undefined && value.pendingWindow !== "OPEN" && value.pendingWindow !== "CLOSED")
+      || (value.pendingHistoryTimeCursor !== undefined && value.pendingHistoryTimeCursor !== null && typeof value.pendingHistoryTimeCursor !== "string")
+      || (value.pendingHistoryKeyCursor !== undefined && value.pendingHistoryKeyCursor !== null && typeof value.pendingHistoryKeyCursor !== "string")
+      || hasPendingChange !== hasPendingCursor
+      || (hasPendingChange && (value.pendingCoordinateIndex === undefined || value.pendingWindow === undefined
+        || !Object.hasOwn(value, "pendingHistoryTimeCursor") || !Object.hasOwn(value, "pendingHistoryKeyCursor")))
+      || (!hasPendingChange && hasPendingCursor)) return null;
     return value;
   } catch {
     return null;
@@ -117,10 +134,10 @@ export function startProviderPerformanceMigration(
 ): ProviderPerformanceMaterializationState {
   return transactionSync(() => {
     const current = loadProviderPerformanceMaterializationState(executor);
-    if (current?.phase === "RECONCILIATION_REQUIRED") {
-      throw new ProviderPerformanceMaterializationError(current.errorCode ?? "PROVIDER_PERFORMANCE_RECONCILIATION_REQUIRED");
-    }
-    if (current) return current;
+    if (current && current.phase !== "RECONCILIATION_REQUIRED") return current;
+    // A reconciliation failure invalidates the current generation. Rebuild into a
+    // fresh generation from provider history, using the queue watermark to catch
+    // changes that arrive while the bounded scan is in progress.
     const watermark = executor.sql<{ change_id: number }>`SELECT COALESCE(MAX(change_id), 0) AS change_id FROM provider_performance_change_queue`[0]?.change_id ?? 0;
     const state: ProviderPerformanceMaterializationState = {
       version: PROVIDER_PERFORMANCE_MATERIALIZATION_VERSION,
@@ -262,9 +279,13 @@ function loadChanges(executor: SqlExecutor, after: number, path: string): Provid
   `;
 }
 
-function positionHistoryKeysForEvent(executor: SqlExecutor, event: ProviderPerformanceChange, category: string, path: string): string[] {
-  if (event.source === "history") return event.category === category && event.historyKey ? [event.historyKey] : [];
-  const coordinates: Array<{ symbol: string; eventTime: string }> = [];
+interface PositionHistoryCoordinate {
+  symbol: string;
+  eventTime: string;
+}
+
+function positionHistoryCoordinatesForEvent(executor: SqlExecutor, event: ProviderPerformanceChange, category: string, path: string): PositionHistoryCoordinate[] {
+  const coordinates: PositionHistoryCoordinate[] = [];
   if (event.source === "order" || event.source === "fill") {
     if (event.category === category && event.symbol && event.eventTime) coordinates.push({ symbol: event.symbol, eventTime: event.eventTime });
   } else {
@@ -283,31 +304,56 @@ function positionHistoryKeysForEvent(executor: SqlExecutor, event: ProviderPerfo
       if (row.category === category) coordinates.push({ symbol: row.symbol, eventTime: row.created_time });
     }
   }
+  return coordinates;
+}
 
-  const keys = new Set<string>();
-  for (const coordinate of coordinates) {
-    const timestamp = Date.parse(coordinate.eventTime);
-    if (!Number.isFinite(timestamp)) throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_CHANGE_WINDOW_INVALID");
-    const from = new Date(timestamp - PROVIDER_PERFORMANCE_HISTORY_TOLERANCE_MS).toISOString();
-    const to = new Date(timestamp + PROVIDER_PERFORMANCE_HISTORY_TOLERANCE_MS).toISOString();
-    const openRows = executeMeasuredSql<{ provider_position_history_key: string }>(executor, path, "lifecycle_performance_open_window")`
-      SELECT provider_position_history_key FROM provider_position_history
-      WHERE category = ${category} AND symbol = ${coordinate.symbol} AND opening_time >= ${from} AND opening_time <= ${to}
-      ORDER BY opening_time, provider_position_history_key LIMIT ${PROVIDER_PERFORMANCE_CHANGE_WINDOW_CAP + 1}
+interface PositionHistoryPage {
+  keys: string[];
+  hasMore: boolean;
+  nextTimeCursor: string | null;
+  nextKeyCursor: string | null;
+}
+
+function loadPositionHistoryPage(
+  executor: SqlExecutor,
+  coordinate: PositionHistoryCoordinate,
+  category: string,
+  window: "OPEN" | "CLOSED",
+  timeCursor: string | null,
+  keyCursor: string | null,
+  limit: number,
+  path: string,
+): PositionHistoryPage {
+  const timestamp = Date.parse(coordinate.eventTime);
+  if (!Number.isFinite(timestamp)) throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_CHANGE_WINDOW_INVALID");
+
+  const rows = window === "OPEN"
+    ? executeMeasuredSql<{ provider_position_history_key: string; opening_time: string }>(executor, path, "lifecycle_performance_open_window")`
+      SELECT provider_position_history_key, opening_time FROM provider_position_history
+      WHERE category = ${category} AND symbol = ${coordinate.symbol}
+        AND opening_time >= ${new Date(timestamp - PROVIDER_PERFORMANCE_HISTORY_TOLERANCE_MS).toISOString()}
+        AND opening_time <= ${new Date(timestamp + PROVIDER_PERFORMANCE_HISTORY_TOLERANCE_MS).toISOString()}
+        AND (${timeCursor} IS NULL OR opening_time > ${timeCursor}
+          OR (opening_time = ${timeCursor} AND provider_position_history_key > ${keyCursor}))
+      ORDER BY opening_time, provider_position_history_key LIMIT ${limit + 1}
+    `
+    : executeMeasuredSql<{ provider_position_history_key: string; closing_time: string }>(executor, path, "lifecycle_performance_close_window")`
+      SELECT provider_position_history_key, closing_time FROM provider_position_history
+      WHERE category = ${category} AND symbol = ${coordinate.symbol}
+        AND closing_time >= ${coordinate.eventTime}
+        AND closing_time <= ${new Date(timestamp + PROVIDER_PERFORMANCE_TIME_WINDOW_MS).toISOString()}
+        AND (${timeCursor} IS NULL OR closing_time > ${timeCursor}
+          OR (closing_time = ${timeCursor} AND provider_position_history_key > ${keyCursor}))
+      ORDER BY closing_time, provider_position_history_key LIMIT ${limit + 1}
     `;
-    const end = new Date(timestamp + PROVIDER_PERFORMANCE_TIME_WINDOW_MS).toISOString();
-    const closedRows = executeMeasuredSql<{ provider_position_history_key: string }>(executor, path, "lifecycle_performance_close_window")`
-      SELECT provider_position_history_key FROM provider_position_history
-      WHERE category = ${category} AND symbol = ${coordinate.symbol} AND closing_time >= ${coordinate.eventTime} AND closing_time <= ${end}
-      ORDER BY closing_time, provider_position_history_key LIMIT ${PROVIDER_PERFORMANCE_CHANGE_WINDOW_CAP + 1}
-    `;
-    if (openRows.length > PROVIDER_PERFORMANCE_CHANGE_WINDOW_CAP || closedRows.length > PROVIDER_PERFORMANCE_CHANGE_WINDOW_CAP) {
-      throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_CHANGE_WINDOW_CAP_EXCEEDED");
-    }
-    for (const row of [...openRows, ...closedRows]) keys.add(row.provider_position_history_key);
-    if (keys.size > PROVIDER_PERFORMANCE_CHANGE_WINDOW_CAP) throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_CHANGE_WINDOW_CAP_EXCEEDED");
-  }
-  return [...keys];
+  const page = rows.slice(0, limit);
+  const last = page[page.length - 1];
+  return {
+    keys: page.map((row) => row.provider_position_history_key),
+    hasMore: rows.length > limit,
+    nextTimeCursor: last ? (window === "OPEN" ? (last as { opening_time: string }).opening_time : (last as { closing_time: string }).closing_time) : timeCursor,
+    nextKeyCursor: last?.provider_position_history_key ?? keyCursor,
+  };
 }
 
 function drainChangeBatch(
@@ -318,30 +364,140 @@ function drainChangeBatch(
   resolveRows: ResolveRows,
 ): { state: ProviderPerformanceMaterializationState; hasMore: boolean; processedChanges: boolean } {
   const changes = loadChanges(executor, state.queueCursor, path);
-  if (changes.length === 0) return { state, hasMore: false, processedChanges: false };
-  const batch = changes.slice(0, PROVIDER_PERFORMANCE_CHANGE_BATCH_SIZE);
-  const historyKeys = new Set<string>();
-  for (const event of batch) for (const key of positionHistoryKeysForEvent(executor, event, category, path)) historyKeys.add(key);
-  if (historyKeys.size > PROVIDER_PERFORMANCE_CHANGE_WINDOW_CAP) throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_CHANGE_WINDOW_CAP_EXCEEDED");
-  const orderedKeys = [...historyKeys];
-  const currentRows = loadProviderPerformanceRowsByKeys(executor, orderedKeys, path);
-  const histories = currentRows.filter((row) => row.category === category);
-  const resolved = resolveRows(histories, path);
-  let next = state;
-  for (const key of orderedKeys) {
-    const row = currentRows.find((candidate) => candidate.historyKey === key);
-    const lifecycle = row?.category === category ? resolved.get(key) ?? null : null;
-    next = applyHistoryLifecycle(executor, next, key, row?.category ?? category, lifecycle);
+  if (changes.length === 0) {
+    if (state.pendingChangeId !== undefined) throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_CHANGE_QUEUE_GAP");
+    return { state, hasMore: false, processedChanges: false };
   }
-  const processed = batch.map((change) => change.changeId);
-  executor.sql`DELETE FROM provider_performance_change_queue WHERE change_id IN (SELECT value FROM json_each(${JSON.stringify(processed)}))`;
-  next = { ...next, queueCursor: processed[processed.length - 1]! };
-  return { state: next, hasMore: changes.length > batch.length, processedChanges: true };
+  if (state.pendingChangeId !== undefined && changes[0]?.changeId !== state.pendingChangeId) {
+    throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_CHANGE_QUEUE_GAP");
+  }
+  const batch = changes.slice(0, PROVIDER_PERFORMANCE_CHANGE_BATCH_SIZE);
+  let next = state;
+  let remainingHistoryRows = PROVIDER_PERFORMANCE_CHANGE_PAGE_SIZE;
+  let processedQueueChanges = 0;
+  let processedChanges = false;
+  let hasMore = false;
+
+  const applyHistoryKeys = (keys: readonly string[]): void => {
+    if (keys.length === 0) return;
+    const currentRows = loadProviderPerformanceRowsByKeys(executor, keys, path);
+    const histories = currentRows.filter((row) => row.category === category);
+    const resolved = resolveRows(histories, path);
+    for (const key of keys) {
+      const row = currentRows.find((candidate) => candidate.historyKey === key);
+      const lifecycle = row?.category === category ? resolved.get(key) ?? null : null;
+      next = applyHistoryLifecycle(executor, next, key, row?.category ?? category, lifecycle);
+    }
+    remainingHistoryRows -= keys.length;
+  };
+
+  const clearPendingChange = (current: ProviderPerformanceMaterializationState): ProviderPerformanceMaterializationState => {
+    const {
+      pendingChangeId: _pendingChangeId,
+      pendingCoordinateIndex: _pendingCoordinateIndex,
+      pendingWindow: _pendingWindow,
+      pendingHistoryTimeCursor: _pendingHistoryTimeCursor,
+      pendingHistoryKeyCursor: _pendingHistoryKeyCursor,
+      ...withoutPending
+    } = current;
+    return withoutPending;
+  };
+
+  for (const event of batch) {
+    const resuming = next.pendingChangeId === event.changeId;
+    if (next.pendingChangeId !== undefined && !resuming) throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_CHANGE_QUEUE_GAP");
+
+    if (event.source === "history") {
+      if (resuming) throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_CHANGE_QUEUE_GAP");
+      const key = event.category === category ? event.historyKey : null;
+      if (key) {
+        if (remainingHistoryRows === 0) {
+          hasMore = true;
+          break;
+        }
+        applyHistoryKeys([key]);
+      }
+    } else {
+      const coordinates = positionHistoryCoordinatesForEvent(executor, event, category, path);
+      let coordinateIndex = resuming ? next.pendingCoordinateIndex ?? 0 : 0;
+      let window: "OPEN" | "CLOSED" = resuming ? next.pendingWindow ?? "OPEN" : "OPEN";
+      let timeCursor = resuming ? next.pendingHistoryTimeCursor ?? null : null;
+      let keyCursor = resuming ? next.pendingHistoryKeyCursor ?? null : null;
+      if (coordinateIndex > coordinates.length || (resuming && coordinateIndex >= coordinates.length)) {
+        throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_CHANGE_QUEUE_GAP");
+      }
+
+      let partial = false;
+      while (coordinateIndex < coordinates.length) {
+        if (remainingHistoryRows === 0) {
+          next = {
+            ...next,
+            pendingChangeId: event.changeId,
+            pendingCoordinateIndex: coordinateIndex,
+            pendingWindow: window,
+            pendingHistoryTimeCursor: timeCursor,
+            pendingHistoryKeyCursor: keyCursor,
+          };
+          partial = true;
+          break;
+        }
+        const page = loadPositionHistoryPage(
+          executor,
+          coordinates[coordinateIndex]!,
+          category,
+          window,
+          timeCursor,
+          keyCursor,
+          remainingHistoryRows,
+          path,
+        );
+        applyHistoryKeys(page.keys);
+        if (page.hasMore) {
+          next = {
+            ...next,
+            pendingChangeId: event.changeId,
+            pendingCoordinateIndex: coordinateIndex,
+            pendingWindow: window,
+            pendingHistoryTimeCursor: page.nextTimeCursor,
+            pendingHistoryKeyCursor: page.nextKeyCursor,
+          };
+          partial = true;
+          break;
+        }
+        if (window === "OPEN") {
+          window = "CLOSED";
+          timeCursor = null;
+          keyCursor = null;
+        } else {
+          coordinateIndex += 1;
+          window = "OPEN";
+          timeCursor = null;
+          keyCursor = null;
+        }
+      }
+      if (partial) {
+        hasMore = true;
+        break;
+      }
+    }
+
+    executor.sql`DELETE FROM provider_performance_change_queue WHERE change_id = ${event.changeId}`;
+    next = clearPendingChange({ ...next, queueCursor: event.changeId });
+    processedQueueChanges += 1;
+    processedChanges = true;
+    if (remainingHistoryRows === 0 && processedQueueChanges < batch.length) {
+      hasMore = true;
+      break;
+    }
+  }
+  if (processedQueueChanges < batch.length || changes.length > batch.length) hasMore = true;
+  return { state: next, hasMore, processedChanges };
 }
 
 function loadProviderPerformanceRowsByKeys(executor: SqlExecutor, historyKeys: readonly string[], path: string): ProviderPerformanceLifecycleRow[] {
   if (historyKeys.length === 0) return [];
-  const requested = [...new Set(historyKeys)].slice(0, PROVIDER_PERFORMANCE_CHANGE_WINDOW_CAP);
+  const requested = [...new Set(historyKeys)];
+  if (requested.length > PROVIDER_PERFORMANCE_CHANGE_PAGE_SIZE) throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_HISTORY_KEY_CAP_EXCEEDED");
   const loaded = executeMeasuredSql<{
     provider_position_history_key: string; category: string; provider_position_history_id: string | null; symbol: string; position_side: string;
     open_total_pos: string | null; close_total_pos: string | null; avg_entry_price: string | null; avg_exit_price: string | null;
