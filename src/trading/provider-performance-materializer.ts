@@ -46,6 +46,61 @@ export interface ProviderPerformanceRevisions {
   identityRevision: number;
 }
 
+export type ProviderPerformanceDailyPnlInput = Pick<ProviderPerformanceTotals, "closedEpisodeRealizedPnl" | "verifiedRealizedPnl" | "dailyPnl"> & {
+  unresolvedClosedLifecycles: number | null;
+};
+
+export interface ProviderPerformanceDailyPnlReadModel {
+  status: "VERIFIED" | "UNAVAILABLE";
+  dailyPnl: ProviderPerformanceTotals["dailyPnl"];
+}
+
+export function providerPerformanceDailyPnl(totals: ProviderPerformanceDailyPnlInput): ProviderPerformanceDailyPnlReadModel {
+  if (totals.unresolvedClosedLifecycles !== 0 || totals.closedEpisodeRealizedPnl === "UNAVAILABLE" || totals.verifiedRealizedPnl === "UNAVAILABLE") {
+    return { status: "UNAVAILABLE", dailyPnl: {} };
+  }
+  return { status: "VERIFIED", dailyPnl: totals.dailyPnl };
+}
+
+export type ProviderPerformanceOutcomeMetrics =
+  | { status: "VERIFIED"; wins: number; losses: number; breakeven: number; classifiedClosedTrades: number }
+  | { status: "UNAVAILABLE"; wins: null; losses: null; breakeven: null; classifiedClosedTrades: null };
+
+export function providerPerformanceOutcomeMetrics(
+  totals: (Pick<ProviderPerformanceTotals, "closedTrades" | "wins" | "losses" | "breakeven" | "closedEpisodeRealizedPnl" | "verifiedRealizedPnl"> & { unresolvedClosedLifecycles: number | null }) | null,
+): ProviderPerformanceOutcomeMetrics {
+  if (!totals || totals.unresolvedClosedLifecycles !== 0
+    || totals.closedEpisodeRealizedPnl === "UNAVAILABLE" || totals.verifiedRealizedPnl === "UNAVAILABLE"
+    || totals.wins + totals.losses + totals.breakeven !== totals.closedTrades) {
+    return { status: "UNAVAILABLE", wins: null, losses: null, breakeven: null, classifiedClosedTrades: null };
+  }
+  return {
+    status: "VERIFIED",
+    wins: totals.wins,
+    losses: totals.losses,
+    breakeven: totals.breakeven,
+    classifiedClosedTrades: totals.wins + totals.losses + totals.breakeven,
+  };
+}
+
+export type ProviderPerformanceMaterializationStatus = "READY" | "SYNCING" | "RECONCILIATION_REQUIRED";
+
+export function providerPerformanceMaterializationStatus(
+  state: ProviderPerformanceMaterializationState | null,
+  currentRevisions: ProviderPerformanceRevisions | null,
+  latestChangeId: number | null,
+): ProviderPerformanceMaterializationStatus {
+  if (state?.phase === "RECONCILIATION_REQUIRED") return "RECONCILIATION_REQUIRED";
+  if (!state || state.phase !== "READY" || !currentRevisions || latestChangeId === null
+    || !Number.isSafeInteger(currentRevisions.lifecycleRevision) || !Number.isSafeInteger(currentRevisions.identityRevision)
+    || !Number.isSafeInteger(latestChangeId)) return "SYNCING";
+  return state.lifecycleRevision === currentRevisions.lifecycleRevision
+    && state.identityRevision === currentRevisions.identityRevision
+    && latestChangeId <= state.queueCursor
+    ? "READY"
+    : "SYNCING";
+}
+
 export interface ProviderPerformanceChange {
   changeId: number;
   source: "history" | "order" | "fill" | "identity";
@@ -84,6 +139,21 @@ function emptyTotals(): ProviderPerformanceTotals {
   };
 }
 
+function isProviderPerformanceTotals(value: unknown): value is ProviderPerformanceTotals {
+  if (!value || typeof value !== "object") return false;
+  const totals = value as Partial<ProviderPerformanceTotals>;
+  const count = (candidate: unknown): candidate is number => Number.isSafeInteger(candidate) && Number(candidate) >= 0;
+  const pnl = (candidate: unknown): candidate is string => typeof candidate === "string" && (candidate === "UNAVAILABLE" || isDecimal(candidate));
+  if (totals.source !== "PROVIDER_LEDGER" || !count(totals.closedTrades) || !count(totals.openTrades) || !count(totals.totalTrades)
+    || !count(totals.wins) || !count(totals.losses) || !count(totals.breakeven) || !count(totals.unresolvedClosedLifecycles)
+    || totals.totalTrades !== totals.closedTrades + totals.openTrades
+    || totals.wins + totals.losses + totals.breakeven + totals.unresolvedClosedLifecycles !== totals.closedTrades
+    || !pnl(totals.closedEpisodeRealizedPnl) || !pnl(totals.verifiedRealizedPnl)
+    || !totals.dailyPnl || typeof totals.dailyPnl !== "object" || Array.isArray(totals.dailyPnl)) return false;
+  return Object.entries(totals.dailyPnl).every(([day, entry]) => /^\d{4}-\d{2}-\d{2}$/.test(day)
+    && Boolean(entry) && pnl(entry.pnl) && count(entry.trades));
+}
+
 export function loadProviderPerformanceMaterializationState(executor: SqlExecutor): ProviderPerformanceMaterializationState | null {
   const rows = executor.sql<{ payload: string }>`SELECT payload FROM risk_state WHERE state_key = ${PROVIDER_PERFORMANCE_STATE_KEY} LIMIT 1`;
   if (!rows[0]) return null;
@@ -93,7 +163,7 @@ export function loadProviderPerformanceMaterializationState(executor: SqlExecuto
     const hasPendingCursor = value.pendingCoordinateIndex !== undefined || value.pendingWindow !== undefined
       || value.pendingHistoryTimeCursor !== undefined || value.pendingHistoryKeyCursor !== undefined;
     if (value.version !== PROVIDER_PERFORMANCE_MATERIALIZATION_VERSION || !value.generation || !Number.isInteger(value.queueCursor)
-      || !["SCAN", "DRAIN", "READY", "RECONCILIATION_REQUIRED"].includes(value.phase) || !value.totals
+      || !["SCAN", "DRAIN", "READY", "RECONCILIATION_REQUIRED"].includes(value.phase) || !isProviderPerformanceTotals(value.totals)
       || (value.pendingChangeId !== undefined && (!Number.isInteger(value.pendingChangeId) || value.pendingChangeId <= value.queueCursor))
       || (value.pendingCoordinateIndex !== undefined && (!Number.isInteger(value.pendingCoordinateIndex) || value.pendingCoordinateIndex < 0))
       || (value.pendingWindow !== undefined && value.pendingWindow !== "OPEN" && value.pendingWindow !== "CLOSED")
@@ -567,6 +637,32 @@ function finishOrCheckPending(
   return ready;
 }
 
+export function runProviderPerformanceMaterializationBatch(
+  executor: SqlExecutor,
+  transactionSync: TransactionSync,
+  category: string,
+  updatedAt: string,
+  readRevisions: ReadRevisions,
+  resolveRows: ResolveRows,
+): ProviderPerformanceMaterializationState {
+  const state = loadProviderPerformanceMaterializationState(executor);
+  if (state?.phase === "RECONCILIATION_REQUIRED") return state;
+  const path = "/scheduled/provider-performance/materializer";
+  if (state?.phase !== "READY") {
+    return runProviderPerformanceMigrationBatch(executor, transactionSync, category, updatedAt, readRevisions, resolveRows, path);
+  }
+
+  try {
+    resolveProviderPerformanceMaterializedTotals(executor, transactionSync, category, updatedAt, readRevisions, resolveRows, path);
+  } catch (error) {
+    if (!(error instanceof ProviderPerformanceMaterializationError) || error.code !== "PROVIDER_PERFORMANCE_SYNC_PENDING") throw error;
+  }
+
+  const advanced = loadProviderPerformanceMaterializationState(executor);
+  if (!advanced) throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_MATERIALIZATION_STATE_UNAVAILABLE");
+  return advanced;
+}
+
 export function resolveProviderPerformanceMaterializedTotals(
   executor: SqlExecutor,
   transactionSync: TransactionSync,
@@ -574,6 +670,7 @@ export function resolveProviderPerformanceMaterializedTotals(
   updatedAt: string,
   readRevisions: ReadRevisions,
   resolveRows: ResolveRows,
+  path = "/api/snapshot",
 ): ProviderPerformanceTotals {
   const state = loadProviderPerformanceMaterializationState(executor);
   if (!state) throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_MIGRATION_REQUIRED");
@@ -581,7 +678,7 @@ export function resolveProviderPerformanceMaterializedTotals(
   if (state.phase === "RECONCILIATION_REQUIRED") throw new ProviderPerformanceMaterializationError(state.errorCode ?? "PROVIDER_PERFORMANCE_RECONCILIATION_REQUIRED");
   try {
     const result = transactionSync(() => {
-      const batch = drainChangeBatch(executor, state, category, "/api/snapshot", resolveRows);
+      const batch = drainChangeBatch(executor, state, category, path, resolveRows);
       const ready = finishOrCheckPending(executor, batch.state, updatedAt, readRevisions, batch.hasMore, batch.processedChanges);
       return { totals: ready.totals, pending: batch.hasMore };
     });
@@ -602,6 +699,7 @@ export function runProviderPerformanceMigrationBatch(
   updatedAt: string,
   readRevisions: ReadRevisions,
   resolveRows: ResolveRows,
+  path = "/api/provider-performance/rebuild",
 ): ProviderPerformanceMaterializationState {
   const state = startProviderPerformanceMigration(executor, transactionSync, updatedAt);
   if (state.phase === "READY") return state;
@@ -611,9 +709,9 @@ export function runProviderPerformanceMigrationBatch(
       const current = loadProviderPerformanceMaterializationState(executor);
       if (!current || current.generation !== state.generation) throw new ProviderPerformanceMaterializationError("PROVIDER_PERFORMANCE_MIGRATION_STATE_CHANGED");
       if (current.phase === "SCAN") {
-        const page: ProviderPositionHistoryPage = loadProviderPositionHistoriesPage(executor, category, current.cursor, PROVIDER_PERFORMANCE_MIGRATION_PAGE_SIZE, "/api/provider-performance/rebuild");
+        const page: ProviderPositionHistoryPage = loadProviderPositionHistoriesPage(executor, category, current.cursor, PROVIDER_PERFORMANCE_MIGRATION_PAGE_SIZE, path);
         const rows = page.histories.map((history, index) => ({ historyKey: page.historyKeys[index]!, category, history }));
-        const resolved = resolveRows(rows, "/api/provider-performance/rebuild");
+        const resolved = resolveRows(rows, path);
         let next = current;
         for (const row of rows) next = applyHistoryLifecycle(executor, next, row.historyKey, row.category, resolved.get(row.historyKey) ?? null);
         const scanning: ProviderPerformanceMaterializationState = {
@@ -626,7 +724,7 @@ export function runProviderPerformanceMigrationBatch(
         return scanning;
       }
 
-      const batch = drainChangeBatch(executor, current, category, "/api/provider-performance/rebuild", resolveRows);
+      const batch = drainChangeBatch(executor, current, category, path, resolveRows);
       const complete = finishOrCheckPending(executor, batch.state, updatedAt, readRevisions, batch.hasMore, batch.processedChanges);
       return complete;
     });

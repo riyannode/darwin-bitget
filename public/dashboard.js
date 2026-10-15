@@ -12,8 +12,8 @@ let snapshot = {
   agent: { status: "UNAVAILABLE", runtimeMode: "AUTONOMOUS", currentStage: "STATE_READ_FAILED", lastScan: null, nextScan: null, model: "—", paperMode: true },
   portfolio: null,
   portfolioFreshness: { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" },
-  performance: { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, openTrades: null, closedTrades: null, wins: null, losses: null, breakeven: null, dailyPnl: {} },
-  performanceAccounting: { baselineEquity: null, baselineObservedAt: null, currentEquity: null, currentEquityObservedAt: null, netExternalInflows: "UNAVAILABLE", netPnlSinceBaseline: "UNAVAILABLE", closedEpisodeRealizedPnl: "UNAVAILABLE", openEpisodePartialRealizedPnl: "UNAVAILABLE", verifiedRealizedPnl: "UNAVAILABLE", unrealizedPnl: "UNAVAILABLE", wins: 0, losses: 0, breakeven: 0, classifiedClosedTrades: 0, winRatePct: "UNAVAILABLE", peakEquity: null, peakEquityObservedAt: null, currentDrawdownPct: "UNAVAILABLE", maxDrawdownPct: "UNAVAILABLE", source: "UNAVAILABLE", externalFlowStatus: "UNVERIFIED_ZERO_FLOW_INVARIANT", baselineSource: "UNAVAILABLE", initializationReason: "UNAVAILABLE", competitionStartVerified: false, unrealizedPnlSource: "UNAVAILABLE" },
+  performance: { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, openTrades: null, closedTrades: null, wins: null, losses: null, breakeven: null, dailyPnl: {}, dailyPnlStatus: "UNAVAILABLE", materialization: { status: "UNAVAILABLE", phase: "UNKNOWN", lastVerifiedAt: null } },
+  performanceAccounting: { baselineEquity: null, baselineObservedAt: null, currentEquity: null, currentEquityObservedAt: null, netExternalInflows: "UNAVAILABLE", netPnlSinceBaseline: "UNAVAILABLE", closedEpisodeRealizedPnl: "UNAVAILABLE", openEpisodePartialRealizedPnl: "UNAVAILABLE", verifiedRealizedPnl: "UNAVAILABLE", unrealizedPnl: "UNAVAILABLE", wins: null, losses: null, breakeven: null, classifiedClosedTrades: null, winRatePct: "UNAVAILABLE", peakEquity: null, peakEquityObservedAt: null, currentDrawdownPct: "UNAVAILABLE", maxDrawdownPct: "UNAVAILABLE", source: "UNAVAILABLE", externalFlowStatus: "UNVERIFIED", baselineSource: "UNAVAILABLE", initializationReason: "UNAVAILABLE", competitionStartVerified: false, unrealizedPnlSource: "UNAVAILABLE" },
   trades: [],
   latestDecision: null,
   decisions: [],
@@ -75,31 +75,46 @@ function renderAgent() {
 function renderPerformance() {
   const performance = snapshot.performance;
   const accounting = snapshot.performanceAccounting ?? {};
-  const values = [["NET PNL", money(accounting.netPnlSinceBaseline ?? performance.totalPnl)], ["WIN RATE", accounting.winRatePct && accounting.winRatePct !== "UNAVAILABLE" ? `${accounting.winRatePct}%` : "—"], ["CURRENT / PEAK DRAWDOWN", percent(accounting.currentDrawdownPct)], ["CLOSED TRADES", accounting.classifiedClosedTrades ?? performance.closedTrades ?? "—"], ["OPEN POSITIONS", (judgeDemo ? snapshot.portfolio : livePortfolio)?.positions?.length ?? 0]];
+  const portfolio = judgeDemo ? snapshot.portfolio : livePortfolio;
+  const materialization = performance.materialization ?? { status: "UNAVAILABLE", phase: "UNKNOWN", lastVerifiedAt: null };
+  const statusLabels = { READY: "READY", STALE: "STALE · SYNCING", SYNCING: "SYNCING", RECONCILIATION_REQUIRED: "RECONCILIATION REQUIRED", UNAVAILABLE: "UNAVAILABLE" };
+  const unresolvedClosedLifecycles = Number.isSafeInteger(performance.unresolvedClosedLifecycles) ? performance.unresolvedClosedLifecycles : null;
+  const outcomeCoverage = accounting.classifiedClosedTrades !== null && accounting.classifiedClosedTrades !== undefined
+    ? "ALL CLOSED OUTCOMES VERIFIED"
+    : unresolvedClosedLifecycles !== null && unresolvedClosedLifecycles > 0
+      ? `${unresolvedClosedLifecycles} UNRESOLVED CLOSED · WIN RATE UNAVAILABLE`
+      : "CLOSED OUTCOME COVERAGE UNAVAILABLE";
+  const values = [["NET PNL", money(accounting.netPnlSinceBaseline ?? performance.totalPnl)], ["WIN RATE", accounting.winRatePct && accounting.winRatePct !== "UNAVAILABLE" ? `${accounting.winRatePct}%` : "—"], ["CURRENT / PEAK DRAWDOWN", percent(accounting.currentDrawdownPct)], ["CLOSED LIFECYCLES", performance.closedTrades ?? "UNAVAILABLE"], ["OPEN POSITIONS", portfolio?.positions?.length ?? "UNAVAILABLE"]];
   const node = $("performance"); node.replaceChildren();
   values.forEach(([label, value]) => { const card = document.createElement("div"); card.className = "summary-card"; const title = document.createElement("small"); title.textContent = label; const content = document.createElement("strong"); content.textContent = text(value); card.append(title, content); node.append(card); });
-  const source = accounting.source === "PROVIDER_LIVE" ? "PROVIDER_LIVE" : accounting.source === "PERSISTED_LEDGER" ? "PERSISTED" : "UNAVAILABLE";
-  const audit = document.createElement("small"); audit.className = "subtle"; audit.textContent = `${source} · Updated ${when(accounting.currentEquityObservedAt)}`; node.append(audit);
+  const source = accounting.source === "PROVIDER_LIVE" ? "PROVIDER_LIVE" : accounting.source === "PERSISTED_LEDGER" ? "PERSISTED_LEDGER" : "UNAVAILABLE";
+  const audit = document.createElement("small"); audit.className = "subtle"; audit.textContent = `${statusLabels[materialization.status] ?? "UNAVAILABLE"} · Phase ${materialization.phase ?? "UNKNOWN"} · Last verified ${when(materialization.lastVerifiedAt)} · ${source} · ${outcomeCoverage}${materialization.errorCode ? ` · ${materialization.errorCode}` : ""}${materialization.livePerformanceErrorCode ? ` · Open lifecycle unavailable: ${materialization.livePerformanceErrorCode}` : ""}`; node.append(audit);
   const details = document.createElement("details"); details.className = "accounting-details";
   const summary = document.createElement("summary"); summary.textContent = "Accounting details ▸"; details.append(summary);
   const grid = document.createElement("div"); grid.className = "detail-grid";
   const baselineSource = accounting.baselineSource === "PROVIDER_LIVE" ? "Bitget PAPER" : accounting.baselineSource === "UNAVAILABLE" ? "Unavailable" : "First recorded snapshot";
-  [["BASELINE EQUITY", money(accounting.baselineEquity)], ["BASELINE OBSERVED AT", when(accounting.baselineObservedAt)], ["BASELINE SOURCE", baselineSource], ["COMPETITION START VERIFIED", accounting.competitionStartVerified === true ? "Yes" : "No"], ["EXTERNAL FLOWS VERIFIED", accounting.externalFlowStatus === "VERIFIED" ? "Yes" : "No"], ["CLOSED TRADE REALIZED PNL", signedMoney(accounting.closedEpisodeRealizedPnl)], ["OPEN PARTIAL REALIZED PNL", signedMoney(accounting.openEpisodePartialRealizedPnl)], ["TOTAL VERIFIED REALIZED PNL", signedMoney(accounting.verifiedRealizedPnl)], ["PEAK EQUITY", money(accounting.peakEquity)], ["CURRENT DRAWDOWN", percent(accounting.currentDrawdownPct)], ["MAX DRAWDOWN", percent(accounting.maxDrawdownPct)]].forEach(([label, value]) => grid.append(detail(label, value)));
+  [["PERFORMANCE MATERIALIZATION", statusLabels[materialization.status] ?? "UNAVAILABLE"], ["PERFORMANCE MATERIALIZER PHASE", materialization.phase ?? "UNKNOWN"], ["PERFORMANCE LAST VERIFIED AT", when(materialization.lastVerifiedAt)], ["OUTCOME METRIC COVERAGE", outcomeCoverage], ["UNRESOLVED CLOSED LIFECYCLES", unresolvedClosedLifecycles ?? "UNAVAILABLE"], ["PERFORMANCE SYNC ERROR", materialization.errorCode ?? "—"], ["OPEN LIFECYCLE ERROR", materialization.livePerformanceErrorCode ?? "—"], ["MATERIALIZER SCHEDULER", snapshot.scheduler?.providerPerformanceMaterializerSchedulerHealthy === true ? "HEALTHY" : "UNHEALTHY"], ["BASELINE EQUITY", money(accounting.baselineEquity)], ["BASELINE OBSERVED AT", when(accounting.baselineObservedAt)], ["BASELINE SOURCE", baselineSource], ["COMPETITION START VERIFIED", accounting.competitionStartVerified === true ? "Yes" : "No"], ["EXTERNAL FLOWS VERIFIED", accounting.externalFlowStatus === "VERIFIED" ? "Yes" : "No"], ["EXTERNAL FLOW READ ERROR", snapshot.accountPerformance?.externalFlowErrorCode ?? "—"], ["CLOSED TRADE REALIZED PNL", signedMoney(accounting.closedEpisodeRealizedPnl)], ["OPEN PARTIAL REALIZED PNL", signedMoney(accounting.openEpisodePartialRealizedPnl)], ["TOTAL VERIFIED REALIZED PNL", signedMoney(accounting.verifiedRealizedPnl)], ["PEAK EQUITY", money(accounting.peakEquity)], ["CURRENT DRAWDOWN", percent(accounting.currentDrawdownPct)], ["MAX DRAWDOWN", percent(accounting.maxDrawdownPct)]].forEach(([label, value]) => grid.append(detail(label, value)));
   details.append(grid); node.append(details);
 }
 
 function renderCalendar() {
   const node = $("calendar"); node.replaceChildren();
+  const dailyPnlStatus = snapshot.performance.dailyPnlStatus === "VERIFIED" ? "VERIFIED" : "UNAVAILABLE";
+  const coverage = $("calendar-coverage");
+  coverage.textContent = dailyPnlStatus === "VERIFIED"
+    ? `Daily realized PnL verified · last verified ${when(snapshot.performance.materialization?.lastVerifiedAt)}`
+    : "Daily realized PnL unavailable · closed-lifecycle accounting is incomplete.";
+  coverage.style.color = dailyPnlStatus === "VERIFIED" && snapshot.performance.materialization?.status === "READY" ? "var(--accent)" : "var(--warning)";
   ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].forEach((label) => { const item = document.createElement("span"); item.className = "day-label"; item.textContent = label; node.append(item); });
   const now = new Date(); const year = now.getUTCFullYear(); const month = now.getUTCMonth(); const first = new Date(Date.UTC(year, month, 1)); const days = new Date(Date.UTC(year, month + 1, 0)).getUTCDate(); const offset = (first.getUTCDay() + 6) % 7; $("calendar-month").textContent = now.toLocaleString([], { month: "short", year: "numeric", timeZone: "UTC" });
-  for (let index = 0; index < 42; index += 1) { const day = index - offset + 1; const item = document.createElement("span"); if (day > 0 && day <= days) { const key = `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`; const value = snapshot.performance.dailyPnl[key]; item.textContent = value ? `${day}\n${value.pnl >= 0 ? "+" : ""}${value.pnl}\n${value.trades} trade${value.trades === 1 ? "" : "s"}` : String(day); item.style.whiteSpace = "pre-line"; if (value?.pnl > 0) item.className = "profit"; if (value?.pnl < 0) item.className = "loss"; if (value?.pnl === "0" || value?.pnl === 0) item.className = "zero"; } node.append(item); }
+  for (let index = 0; index < 42; index += 1) { const day = index - offset + 1; const item = document.createElement("span"); if (day > 0 && day <= days) { const key = `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`; const value = dailyPnlStatus === "VERIFIED" ? snapshot.performance.dailyPnl[key] : null; item.textContent = value ? `${day}\n${value.pnl >= 0 ? "+" : ""}${value.pnl}\n${value.trades} trade${value.trades === 1 ? "" : "s"}` : String(day); item.style.whiteSpace = "pre-line"; if (value?.pnl > 0) item.className = "profit"; if (value?.pnl < 0) item.className = "loss"; if (value?.pnl === "0" || value?.pnl === 0) item.className = "zero"; } node.append(item); }
 }
 
 function renderPortfolio() {
   const portfolio = judgeDemo ? snapshot.portfolio : livePortfolio;
-  const freshness = judgeDemo ? { source: "RECORDED_PROVIDER_REPLAY", observedAt: snapshot.portfolioFreshness.observedAt, stale: true } : liveFreshness; const freshnessNode = $("portfolio-freshness"); freshnessNode.textContent = freshness ? `${freshness.source === "PROVIDER_LIVE" ? "Source: Bitget PAPER" : freshness.source === "RECORDED_PROVIDER_REPLAY" ? "Source: Recorded PAPER replay" : "Source: unavailable"} · Updated: ${when(freshness.observedAt)}` : "—"; freshnessNode.style.color = freshness?.stale ? "var(--warning)" : "var(--accent)";
+  const freshness = judgeDemo ? { source: "RECORDED_PROVIDER_REPLAY", observedAt: snapshot.portfolioFreshness.observedAt, stale: true } : liveFreshness; const freshnessNode = $("portfolio-freshness"); freshnessNode.textContent = freshness ? `${freshness.source === "PROVIDER_LIVE" ? "Source: Bitget PAPER" : freshness.source === "RECORDED_PROVIDER_REPLAY" ? "Source: Recorded PAPER replay" : "Source: unavailable"} · Updated: ${when(freshness.observedAt)}${freshness.errorCode ? ` · ${freshness.errorCode}` : ""}` : "—"; freshnessNode.style.color = freshness?.stale ? "var(--warning)" : "var(--accent)";
   const node = $("portfolio"); node.replaceChildren();
-  const fields = [["ACCOUNT EQUITY", money(portfolio?.portfolioEquity)], ["AVAILABLE MARGIN", money(portfolio?.availableMargin)], ["INITIAL MARGIN", money(portfolio?.initialMargin)], ["UNREALIZED PNL", signedMoney(portfolio?.unrealizedPnl)], ["REALIZED PNL", signedMoney(portfolio?.positionRealizedPnl)], ["OPEN POSITIONS", portfolio?.positions?.length ?? 0]];
+  const fields = [["ACCOUNT EQUITY", money(portfolio?.portfolioEquity)], ["AVAILABLE MARGIN", money(portfolio?.availableMargin)], ["INITIAL MARGIN", money(portfolio?.initialMargin)], ["UNREALIZED PNL", signedMoney(portfolio?.unrealizedPnl)], ["REALIZED PNL", signedMoney(portfolio?.positionRealizedPnl)], ["OPEN POSITIONS", portfolio?.positions?.length ?? "UNAVAILABLE"]];
   const optional = [["ACCOUNT MARGIN USED", portfolio?.accountMarginUsed], ["TOTAL POSITION MARGIN", portfolio?.positionMargin], ["FUNDING", portfolio?.funding], ["FEES", portfolio?.fees], ["CASH DIVIDEND", portfolio?.cashDividend]].filter(([, value]) => value !== undefined && value !== null && value !== "" && value !== "UNAVAILABLE");
   [...fields, ...optional].forEach(([label, value]) => { const item = document.createElement("div"); const title = document.createElement("span"); title.className = "label"; title.textContent = label; const content = document.createElement("strong"); content.textContent = text(value); if (label.includes("PNL") || label === "FUNDING" || label === "FEES" || label === "CASH DIVIDEND") content.className = pnlClass(value); item.append(title, content); node.append(item); });
 }
@@ -108,13 +123,14 @@ function renderOpenPositions() {
   const node = $("open-positions");
   const freshness = judgeDemo ? { source: "RECORDED_PROVIDER_REPLAY", observedAt: snapshot.portfolioFreshness.observedAt, stale: true } : liveFreshness;
   const freshnessNode = $("open-position-freshness");
-  freshnessNode.textContent = judgeDemo ? "Source: Recorded PAPER replay · Not live provider state" : freshness ? `${freshness.source === "PROVIDER_LIVE" ? "Source: Bitget PAPER" : "Source: unavailable"} · Updated: ${when(freshness.observedAt)}` : "—";
+  freshnessNode.textContent = judgeDemo ? "Source: Recorded PAPER replay · Not live provider state" : freshness ? `${freshness.source === "PROVIDER_LIVE" ? "Source: Bitget PAPER" : "Source: unavailable"} · Updated: ${when(freshness.observedAt)}${freshness.errorCode ? ` · ${freshness.errorCode}` : ""}` : "—";
   freshnessNode.style.color = freshness?.stale || freshness?.source !== "PROVIDER_LIVE" ? "var(--warning)" : "var(--accent)";
   const openKeys = new Set([...node.querySelectorAll("details[data-stable-key]")].filter((item) => item.open).map((item) => item.dataset.stableKey));
-  const positions = (judgeDemo ? snapshot.portfolio : livePortfolio)?.positions ?? [];
+  const portfolio = judgeDemo ? snapshot.portfolio : livePortfolio;
+  const positions = portfolio?.positions ?? [];
   node.replaceChildren();
   node.className = positions.length ? "position-cards" : "position-cards empty";
-  if (!positions.length) { node.textContent = "No open provider positions."; return; }
+  if (!positions.length) { node.textContent = portfolio ? "No open provider positions." : `Open positions unavailable${freshness?.errorCode ? ` · ${freshness.errorCode}` : ""}.`; return; }
   positions.forEach((position) => {
     const key = `${position.symbol}:${position.positionSide}`;
     const card = document.createElement("details");
@@ -371,7 +387,7 @@ async function refreshSnapshot() {
     livePortfolio = data.portfolio ?? null;
     liveFreshness = data.portfolioFreshness ?? { source: "UNAVAILABLE", observedAt: new Date().toISOString(), stale: true, errorCode: "LIVE_PORTFOLIO_REQUIRED" };
     snapshot = { ...snapshot, ...data, ...retained, portfolio: data.portfolio, portfolioFreshness: data.portfolioFreshness };
-    if (!liveFreshness.stale) $("error").hidden = true;
+    $("error").hidden = true;
     render();
   } catch (error) {
     snapshot.agent = { ...snapshot.agent, status: "UNAVAILABLE", currentStage: "STATE_READ_FAILED" };
