@@ -251,9 +251,12 @@ function verifiedProviderPerformanceFromAggregate(value: unknown): ProviderPerfo
   const unresolvedPresent = value.providerUnresolvedClosedLifecycles !== undefined;
   if (unresolvedPresent && !count(value.providerUnresolvedClosedLifecycles)) return null;
   const unresolvedClosedLifecycles = unresolvedPresent ? value.providerUnresolvedClosedLifecycles as number : null;
+  const closedLifecycleCoverageVerified = unresolvedClosedLifecycles === 0;
+  const closedEpisodeRealizedPnl = closedLifecycleCoverageVerified ? value.closedEpisodeRealizedPnl : "UNAVAILABLE";
+  const verifiedRealizedPnl = closedLifecycleCoverageVerified ? value.verifiedRealizedPnl : "UNAVAILABLE";
   const dailyPnlReadModel = providerPerformanceDailyPnl({
-    closedEpisodeRealizedPnl: value.closedEpisodeRealizedPnl,
-    verifiedRealizedPnl: value.verifiedRealizedPnl,
+    closedEpisodeRealizedPnl,
+    verifiedRealizedPnl,
     unresolvedClosedLifecycles,
     dailyPnl,
   });
@@ -266,8 +269,8 @@ function verifiedProviderPerformanceFromAggregate(value: unknown): ProviderPerfo
     wins: value.wins,
     losses: value.losses,
     breakeven: value.breakeven,
-    closedEpisodeRealizedPnl: value.closedEpisodeRealizedPnl,
-    verifiedRealizedPnl: value.verifiedRealizedPnl,
+    closedEpisodeRealizedPnl,
+    verifiedRealizedPnl,
     unresolvedClosedLifecycles,
     dailyPnl: dailyPnlReadModel.dailyPnl,
     dailyPnlStatus: dailyPnlReadModel.status,
