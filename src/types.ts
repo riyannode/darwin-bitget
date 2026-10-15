@@ -650,9 +650,17 @@ export interface DashboardSnapshot {
     latestEquity: string | null;
     performanceBaselineAt: string | null;
     dailyPnl: Record<string, { pnl: string; trades: number; dailyReturnPct?: string }>;
+    dailyPnlStatus: "VERIFIED" | "UNAVAILABLE";
     financialSource?: "PROVIDER_LEDGER";
     scope?: "DARWIN_ATTRIBUTED";
-    unresolvedClosedLifecycles?: number;
+    unresolvedClosedLifecycles?: number | null;
+    materialization: {
+      status: "READY" | "STALE" | "SYNCING" | "RECONCILIATION_REQUIRED" | "UNAVAILABLE";
+      phase: "SCAN" | "DRAIN" | "CATCH_UP" | "READY" | "RECONCILIATION_REQUIRED" | "UNKNOWN";
+      lastVerifiedAt: string | null;
+      errorCode?: string;
+      livePerformanceErrorCode?: string;
+    };
   };
   accountPerformance: {
     equitySource: "PROVIDER_LIVE" | "UNAVAILABLE";
@@ -660,6 +668,7 @@ export interface DashboardSnapshot {
     externalFlowStatus: "VERIFIED" | "UNVERIFIED";
     netExternalInflows: string;
     netPnlSinceBaseline: string;
+    externalFlowErrorCode?: string;
     financialRecordCoverage: "COMPLETE" | "PARTIAL" | "UNAVAILABLE";
     financialRecordCategories: Array<{ category: string; status: "SUCCESS" | "PARTIAL" | "NOT_SYNCED"; lastSuccessfulSyncAt: string | null; coveredFrom: string | null; coveredThrough: string | null; lastError: string | null }> ;
   };
@@ -712,6 +721,7 @@ export interface DashboardSnapshot {
     schedulerHealthy: boolean;
     tradingSchedulerHealthy: boolean;
     providerSyncSchedulerHealthy: boolean;
+    providerPerformanceMaterializerSchedulerHealthy: boolean;
     schedulerErrorCode?: string;
   };
   learning: {
@@ -743,10 +753,10 @@ export interface PerformanceAccountingReadModel {
   verifiedRealizedPnl: string;
   unrealizedPnl: string;
   unrealizedPnlSource: "ACCOUNT" | "POSITIONS" | "UNAVAILABLE";
-  wins: number;
-  losses: number;
-  breakeven: number;
-  classifiedClosedTrades: number;
+  wins: number | null;
+  losses: number | null;
+  breakeven: number | null;
+  classifiedClosedTrades: number | null;
   winRatePct: string;
   peakEquity: string | null;
   peakEquityObservedAt: string | null;

@@ -36,6 +36,10 @@ export interface PerformanceAggregate {
   financialSource?: "PROVIDER_LEDGER";
   providerOpenTradeCountKnown?: boolean;
   providerDailyPnl?: Record<string, { pnl: string; trades: number }>;
+  providerPerformanceVerifiedAt?: string | null;
+  providerLifecycleRevision?: number;
+  providerIdentityRevision?: number;
+  providerUnresolvedClosedLifecycles?: number | null;
   netExternalInflows?: string;
   externalFlowStatus?: "VERIFIED" | typeof EXTERNAL_FLOW_UNVERIFIED;
   baselineSource?: string;

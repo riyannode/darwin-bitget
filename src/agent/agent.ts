@@ -8,7 +8,7 @@ import { MANDATE_VERSION, PROMPT_VERSIONS, TRADING_MANDATE } from "./mandate.js"
 import { assertOpenPositionCountWithinPlanLimit, buildEvidenceSymbols, calculateActionCapacity, countOpenPositionLifecycles, decide, filterNewEntryMarketCandidates, rankMarketCandidates, selectDeterministicEntryCandidates } from "./decision.js";
 import { runTimedCyclePhase } from "./cycle-phase-timing.js";
 import { QwenJsonError } from "./qwen.js";
-import { reconcileTradingSchedule, reconcileProviderLedgerSchedule, PROVIDER_LEDGER_INTERVAL_SECONDS, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES, type SchedulerReconciliationResult } from "./scheduler.js";
+import { reconcileTradingSchedule, reconcileProviderLedgerSchedule, reconcileProviderPerformanceMaterializationSchedule, PROVIDER_LEDGER_INTERVAL_SECONDS, PROVIDER_PERFORMANCE_MATERIALIZATION_INTERVAL_SECONDS, MAX_PROVIDER_PERFORMANCE_MATERIALIZATION_BATCHES_PER_WAKE, temporaryScanIntervalActive, TEMPORARY_SCAN_INTERVAL_DURATION_MS, TEMPORARY_SCAN_INTERVAL_MINUTES, type SchedulerReconciliationResult } from "./scheduler.js";
 import { authorizeOwner } from "./owner-auth.js";
 import { retrieveLessons } from "../learning/lesson-retrieval.js";
 import { reflect, reflectWithQwen } from "../learning/reflection.js";
@@ -132,12 +132,12 @@ import { buildPositionManagementState, positionContextMatchesLifecycle, position
 import { loadExecutionQuarantineDiagnostics } from "../storage/execution-quarantine-diagnostics.js";
 import { normalizeProviderFill, normalizeProviderOrder, normalizeProviderPositionHistory, providerPage, type ProviderOrigin } from "../bitget/provider-ledger.js";
 import { resolveProviderOrigin, providerLedgerDiagnostics, providerLedgerDiagnosticsBatch, loadProviderLifecycleEvidence, loadProviderLifecycleEvidenceBatch, loadProviderPositionHistories, loadRecentProviderPositionHistories, loadProviderPositionHistoryDecisionIds, loadProviderLiveOpeningOrderIdentities, loadProviderExitExecutionFacts, providerLivePositionLifecycleKey, loadProviderSyncStates, loadProviderDataRevisions, ProviderLifecycleIdentityLookupError, type ProviderLifecycleEvidenceRequest } from "../storage/provider-ledger.js";
-import { calculateNetPnlSinceBaseline, isFinancialRecordCoverageComplete } from "../trading/external-flow.js";
+import { calculateNetPnlSinceBaseline, calculateVerifiedExternalFlows, isFinancialRecordCoverageComplete } from "../trading/external-flow.js";
 import { resolveExternalFlowReadModel } from "../trading/external-flow-read-model.js";
 import { classifyProviderLifecycle, reconcileProviderLifecycleFinancials, reconstructProviderLifecycleTransitions, summarizeProviderLifecycleFillQuantities, type ProviderLifecycleClassification, type ProviderLifecycleHistory, type ProviderLifecycleEvidence, type ProviderLifecycleFill, type ProviderLifecycleCandidateOrder, type ProviderLifecycleCandidateFill } from "../trading/provider-lifecycle-reconciliation.js";
 import { type ProviderPerformanceLifecycle, type ProviderPerformanceTotals } from "../trading/provider-performance.js";
 import { resolveProviderLifecycleSide } from "../trading/provider-lifecycle-side.js";
-import { ProviderPerformanceMaterializationError, loadProviderPerformanceMaterializationState, providerPerformanceMigrationProgress, resolveProviderPerformanceMaterializedTotals, runProviderPerformanceMigrationBatch, type ProviderPerformanceLifecycleRow, type ProviderPerformanceRevisions } from "../trading/provider-performance-materializer.js";
+import { ProviderPerformanceMaterializationError, loadProviderPerformanceMaterializationState, providerPerformanceMaterializationStatus, providerPerformanceDailyPnl, providerPerformanceOutcomeMetrics, providerPerformanceMigrationProgress, resolveProviderPerformanceMaterializedTotals, runProviderPerformanceMaterializationBatch, runProviderPerformanceMigrationBatch, type ProviderPerformanceLifecycleRow, type ProviderPerformanceMaterializationState, type ProviderPerformanceRevisions } from "../trading/provider-performance-materializer.js";
 import { boundedDiagnosticText, safeDiagnosticMessage } from "../shared/failure-diagnostics.js";
 
 type DarwinLifecycleRepairPreparation =
@@ -226,6 +226,61 @@ function readProviderPerformanceRevisions(executor: SqlExecutor): ProviderPerfor
   const revisions = loadProviderDataRevisions(executor, [PROVIDER_TRADE_LIFECYCLE_CATEGORY]).get(PROVIDER_TRADE_LIFECYCLE_CATEGORY);
   if (!revisions) throw new Error("PROVIDER_DATA_REVISION_UNAVAILABLE");
   return { lifecycleRevision: revisions.lifecycleRevision, identityRevision: revisions.identityRevision };
+}
+
+type ProviderPerformanceSnapshotMetrics = Pick<ProviderPerformanceTotals, "closedTrades" | "wins" | "losses" | "breakeven" | "closedEpisodeRealizedPnl" | "verifiedRealizedPnl" | "dailyPnl"> & {
+  unresolvedClosedLifecycles: number | null;
+  dailyPnlStatus: "VERIFIED" | "UNAVAILABLE";
+  lastVerifiedAt: string | null;
+};
+
+function verifiedProviderPerformanceFromAggregate(value: unknown): ProviderPerformanceSnapshotMetrics | null {
+  if (!isPerformanceAggregate(value) || value.financialSource !== "PROVIDER_LEDGER") return null;
+  const count = (candidate: unknown): candidate is number => Number.isSafeInteger(candidate) && Number(candidate) >= 0;
+  const pnl = (candidate: unknown): candidate is string => typeof candidate === "string" && (candidate === "UNAVAILABLE" || isDecimal(candidate));
+  if (!count(value.closedTrades) || !count(value.wins) || !count(value.losses) || !count(value.breakeven)
+    || !pnl(value.closedEpisodeRealizedPnl) || !pnl(value.verifiedRealizedPnl)
+    || !value.providerDailyPnl || typeof value.providerDailyPnl !== "object" || Array.isArray(value.providerDailyPnl)) return null;
+  const revisionSignaturePresent = value.providerLifecycleRevision !== undefined || value.providerIdentityRevision !== undefined;
+  if (revisionSignaturePresent && (!count(value.providerLifecycleRevision) || !count(value.providerIdentityRevision))) return null;
+  const dailyPnl: ProviderPerformanceSnapshotMetrics["dailyPnl"] = {};
+  for (const [day, metric] of Object.entries(value.providerDailyPnl)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !metric || !pnl(metric.pnl) || !count(metric.trades)) return null;
+    dailyPnl[day] = { pnl: metric.pnl, trades: metric.trades };
+  }
+  const unresolvedPresent = value.providerUnresolvedClosedLifecycles !== undefined;
+  if (unresolvedPresent && !count(value.providerUnresolvedClosedLifecycles)) return null;
+  const unresolvedClosedLifecycles = unresolvedPresent ? value.providerUnresolvedClosedLifecycles as number : null;
+  const closedLifecycleCoverageVerified = unresolvedClosedLifecycles === 0;
+  const closedEpisodeRealizedPnl = closedLifecycleCoverageVerified ? value.closedEpisodeRealizedPnl : "UNAVAILABLE";
+  const verifiedRealizedPnl = closedLifecycleCoverageVerified ? value.verifiedRealizedPnl : "UNAVAILABLE";
+  const dailyPnlReadModel = providerPerformanceDailyPnl({
+    closedEpisodeRealizedPnl,
+    verifiedRealizedPnl,
+    unresolvedClosedLifecycles,
+    dailyPnl,
+  });
+  const lastVerifiedAt = typeof value.providerPerformanceVerifiedAt === "string" && Number.isFinite(Date.parse(value.providerPerformanceVerifiedAt))
+    ? value.providerPerformanceVerifiedAt
+    : null;
+  if (revisionSignaturePresent && !lastVerifiedAt) return null;
+  return {
+    closedTrades: value.closedTrades,
+    wins: value.wins,
+    losses: value.losses,
+    breakeven: value.breakeven,
+    closedEpisodeRealizedPnl,
+    verifiedRealizedPnl,
+    unresolvedClosedLifecycles,
+    dailyPnl: dailyPnlReadModel.dailyPnl,
+    dailyPnlStatus: dailyPnlReadModel.status,
+    lastVerifiedAt,
+  };
+}
+
+function canonicalRuntimeErrorCode(error: unknown, fallback: string): string {
+  const candidate = error instanceof Error ? error.message.split(":", 1)[0]?.trim() ?? "" : "";
+  return /^[A-Z][A-Z0-9_]{1,79}$/.test(candidate) ? candidate : fallback;
 }
 
 function resolveProviderPerformanceRows(
@@ -319,6 +374,7 @@ function schedulerMetrics(events: readonly { type: string; metadata?: Record<str
     schedulerHealthy: false,
     tradingSchedulerHealthy: false,
     providerSyncSchedulerHealthy: false,
+    providerPerformanceMaterializerSchedulerHealthy: false,
   };
 }
 
@@ -722,7 +778,7 @@ function executionEvidence(journal: TradingJournal | null): DashboardSnapshot["e
 }
 
 function unavailablePerformance(): DashboardSnapshot["performance"] {
-  return { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, openTrades: null, closedTrades: null, wins: null, losses: null, breakeven: null, closedEpisodeRealizedPnl: "UNAVAILABLE", openEpisodePartialRealizedPnl: "UNAVAILABLE", verifiedRealizedPnl: "UNAVAILABLE", competitionBaselineEquity: null, latestEquity: null, performanceBaselineAt: null, dailyPnl: {} };
+  return { totalPnl: "UNAVAILABLE", winRate: "UNAVAILABLE", dailyDrawdown: "UNAVAILABLE", totalTrades: null, openTrades: null, closedTrades: null, wins: null, losses: null, breakeven: null, closedEpisodeRealizedPnl: "UNAVAILABLE", openEpisodePartialRealizedPnl: "UNAVAILABLE", verifiedRealizedPnl: "UNAVAILABLE", competitionBaselineEquity: null, latestEquity: null, performanceBaselineAt: null, dailyPnl: {}, dailyPnlStatus: "UNAVAILABLE", materialization: { status: "UNAVAILABLE", phase: "UNKNOWN", lastVerifiedAt: null } };
 }
 
 function json(value: unknown, status = 200): Response {
@@ -994,6 +1050,12 @@ export class TraderAgent extends Agent<Env, AgentState> {
       if (!healthy) this.recordEventBestEffort("PROVIDER_SYNC_SCHEDULE_UNHEALTHY", "CONTROL", { intervalSeconds: String(PROVIDER_LEDGER_INTERVAL_SECONDS) });
     } catch {
       this.recordEventBestEffort("PROVIDER_SYNC_SCHEDULE_UNHEALTHY", "CONTROL", { intervalSeconds: String(PROVIDER_LEDGER_INTERVAL_SECONDS), code: "SCHEDULE_RECONCILIATION_FAILED" });
+    }
+    try {
+      const healthy = await reconcileProviderPerformanceMaterializationSchedule(this);
+      if (!healthy) this.recordEventBestEffort("PROVIDER_PERFORMANCE_MATERIALIZATION_SCHEDULE_UNHEALTHY", "CONTROL", { code: "SCHEDULE_READBACK_MISMATCH" });
+    } catch {
+      this.recordEventBestEffort("PROVIDER_PERFORMANCE_MATERIALIZATION_SCHEDULE_UNHEALTHY", "CONTROL", { code: "SCHEDULE_RECONCILIATION_FAILED" });
     }
   }
 
@@ -1416,12 +1478,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       } catch {
         livePortfolio = undefined;
       }
-      try {
-        return json(await this.getDashboardSnapshot(livePortfolio, config));
-      } catch (error) {
-        if (error instanceof ProviderPerformanceMaterializationError) return json({ error: error.code }, 503);
-        throw error;
-      }
+      return json(await this.getDashboardSnapshot(livePortfolio, config));
     }
     if (url.pathname === "/position-context" && request.method === "GET") return this.getPositionContext(url);
     if (url.pathname === "/agent-journal" && request.method === "GET") return this.getAgentJournal(url);
@@ -1606,6 +1663,39 @@ export class TraderAgent extends Agent<Env, AgentState> {
       this.recordEventBestEffort("PROVIDER_SYNC_FAILED", "CONTROL", failureDiagnostic(error));
     } finally {
       emitProviderOriginReadSummary(originReadSummary);
+    }
+  }
+
+  public async runScheduledProviderPerformanceMaterialization(): Promise<void> {
+    ensureStorageInitialized(this);
+    const readRevisions = (): ProviderPerformanceRevisions => readProviderPerformanceRevisions(this);
+    const resolveRows = (rows: readonly ProviderPerformanceLifecycleRow[], path: string): ReadonlyMap<string, ProviderPerformanceLifecycle | null> => resolveProviderPerformanceRows(this, rows, path);
+
+    for (let batchIndex = 0; batchIndex < MAX_PROVIDER_PERFORMANCE_MATERIALIZATION_BATCHES_PER_WAKE; batchIndex += 1) {
+      const previous = loadProviderPerformanceMaterializationState(this);
+      if (previous?.phase === "RECONCILIATION_REQUIRED") return;
+      try {
+        const next = runProviderPerformanceMaterializationBatch(
+          this,
+          (closure) => this.ctx.storage.transactionSync(closure),
+          PROVIDER_TRADE_LIFECYCLE_CATEGORY,
+          new Date().toISOString(),
+          readRevisions,
+          resolveRows,
+        );
+        if (next.phase === "RECONCILIATION_REQUIRED") return;
+        if (JSON.stringify(previous) === JSON.stringify(next)) return;
+      } catch (error) {
+        if (!(error instanceof ProviderPerformanceMaterializationError)) throw error;
+        if (error.code !== "PROVIDER_PERFORMANCE_SYNC_PENDING") {
+          const state = loadProviderPerformanceMaterializationState(this);
+          this.recordEventBestEffort("PROVIDER_PERFORMANCE_MATERIALIZATION_FAILED", "CONTROL", {
+            code: error.code,
+            phase: state?.phase ?? "UNKNOWN",
+          });
+          return;
+        }
+      }
     }
   }
 
@@ -2967,7 +3057,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       ? { cycleId: this.state.lastCycleId, status: "RUNNING" as const, startedAt: this.state.cycleStartedAt, completedAt: null, hasPersistedPlan: false, hasValidPlan: false }
       : latestCycle?.status ? { cycleId: latestCycle.cycleId, status: latestCycle.status, startedAt: latestCycle.startedAt, completedAt: latestCycle.completedAt, hasPersistedPlan: latestCycle.hasPersistedPlan === true, hasValidPlan: latestCycle.hasValidPlan === true, ...(latestCycle.failureCode ? { failureCode: latestCycle.failureCode } : {}), ...(latestCycle.failurePath ? { failurePath: latestCycle.failurePath } : {}), ...(latestCycle.failureIssue ? { failureIssue: latestCycle.failureIssue } : {}) } : null;
     const drawdown = loadDailyDrawdownState(this);
-    const drawdownPct = drawdown ? calculateDrawdownPct(drawdown.baselineEquity, drawdown.lastEquity) : "0";
+    const drawdownPct = drawdown ? calculateDrawdownPct(drawdown.baselineEquity, drawdown.lastEquity) : "UNAVAILABLE";
     const configuredIntervalMinutes = temporaryScanIntervalActive(this.state.temporaryScanIntervalExpiresAt, this.state.temporaryScanIntervalCompleted) ? TEMPORARY_SCAN_INTERVAL_MINUTES : config.ownerPolicy.scanIntervalMinutes;
     const scheduler = await this.getSchedulerDiagnostics(configuredIntervalMinutes);
     const persistedPerformance = loadPerformanceAggregate<PerformanceAggregate>(this);
@@ -2977,32 +3067,66 @@ export class TraderAgent extends Agent<Env, AgentState> {
     const baselineAt = accountingBase.baselineObservedAt;
     const syncStates = loadProviderSyncStates(this, PROVIDER_FINANCIAL_CATEGORIES);
     const dataRevisions = loadProviderDataRevisions(this, PROVIDER_FINANCIAL_CATEGORIES);
-    const lifecycleRevisions = dataRevisions.get(PROVIDER_TRADE_LIFECYCLE_CATEGORY);
-    if (!lifecycleRevisions) throw new Error("PROVIDER_DATA_REVISION_UNAVAILABLE");
-    const closedProviderPerformance = resolveProviderPerformanceMaterializedTotals(
-      this,
-      (closure) => this.ctx.storage.transactionSync(closure),
-      PROVIDER_TRADE_LIFECYCLE_CATEGORY,
-      livePortfolio?.observedAt ?? new Date().toISOString(),
-      () => ({ lifecycleRevision: lifecycleRevisions.lifecycleRevision, identityRevision: lifecycleRevisions.identityRevision }),
-      (rows, path) => resolveProviderPerformanceRows(this, rows, path),
-    );
-    const openPositionIdentities = livePortfolio
-      ? loadProviderLiveOpeningOrderIdentities(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, livePortfolio.positions, "/api/snapshot")
-      : new Map<string, { providerOrderId: string; decisionId: string }>();
-    const liveProviderPerformance = livePortfolio
-      ? resolveProviderTradeFacts(this, [], PROVIDER_TRADE_LIFECYCLE_CATEGORY, livePortfolio.positions, {
-        histories: [],
-        historyDecisionIds: new Map<string, string>(),
-        openPositionIdentities,
-      })
-      : null;
-    const openTrades = liveProviderPerformance?.lifecycles.filter((lifecycle) => lifecycle.origin === "DARWIN" && lifecycle.status === "OPEN").length ?? 0;
-    const providerPerformance: ProviderPerformanceTotals = {
-      ...closedProviderPerformance,
-      openTrades,
-      totalTrades: closedProviderPerformance.closedTrades + openTrades,
+    const lifecycleRevisions = dataRevisions.get(PROVIDER_TRADE_LIFECYCLE_CATEGORY) ?? null;
+    let materializerState: ProviderPerformanceMaterializationState | null = null;
+    let materializerStatus: "READY" | "SYNCING" | "RECONCILIATION_REQUIRED" | "UNAVAILABLE" = "UNAVAILABLE";
+    let materializerErrorCode: string | undefined;
+    try {
+      materializerState = loadProviderPerformanceMaterializationState(this);
+      if (!lifecycleRevisions) throw new Error("PROVIDER_DATA_REVISION_UNAVAILABLE");
+      const latestChangeRows = this.sql<{ change_id: number }>`SELECT COALESCE(MAX(change_id), 0) AS change_id FROM provider_performance_change_queue`;
+      const latestChangeId = Number(latestChangeRows[0]?.change_id);
+      if (!Number.isSafeInteger(latestChangeId)) throw new Error("PROVIDER_PERFORMANCE_CHANGE_WATERMARK_UNAVAILABLE");
+      materializerStatus = providerPerformanceMaterializationStatus(materializerState, lifecycleRevisions, latestChangeId);
+    } catch (error) {
+      materializerErrorCode = canonicalRuntimeErrorCode(error, "PROVIDER_PERFORMANCE_STATUS_READ_FAILED");
+    }
+    const cachedProviderPerformance = verifiedProviderPerformanceFromAggregate(persistedPerformance);
+    const performanceVerifiedAt = new Date().toISOString();
+    const lifecycleDailyPnl = materializerState ? providerPerformanceDailyPnl(materializerState.totals) : null;
+    const lifecyclePerformance: ProviderPerformanceSnapshotMetrics | null = materializerStatus === "READY" && materializerState
+      ? {
+        closedTrades: materializerState.totals.closedTrades,
+        wins: materializerState.totals.wins,
+        losses: materializerState.totals.losses,
+        breakeven: materializerState.totals.breakeven,
+        closedEpisodeRealizedPnl: materializerState.totals.closedEpisodeRealizedPnl,
+        verifiedRealizedPnl: materializerState.totals.verifiedRealizedPnl,
+        unresolvedClosedLifecycles: materializerState.totals.unresolvedClosedLifecycles,
+        dailyPnl: lifecycleDailyPnl?.dailyPnl ?? {},
+        dailyPnlStatus: lifecycleDailyPnl?.status ?? "UNAVAILABLE",
+        lastVerifiedAt: performanceVerifiedAt,
+      }
+      : cachedProviderPerformance;
+    const lifecycleOutcomes = providerPerformanceOutcomeMetrics(lifecyclePerformance);
+    const performanceAvailability: DashboardSnapshot["performance"]["materialization"] = {
+      status: materializerStatus === "READY"
+        ? "READY"
+        : materializerStatus === "RECONCILIATION_REQUIRED"
+          ? "RECONCILIATION_REQUIRED"
+          : materializerStatus === "SYNCING"
+            ? cachedProviderPerformance ? "STALE" : "SYNCING"
+            : cachedProviderPerformance ? "STALE" : "UNAVAILABLE",
+      phase: materializerStatus === "SYNCING" && materializerState?.phase === "READY" ? "CATCH_UP" : materializerState?.phase ?? "UNKNOWN",
+      lastVerifiedAt: lifecyclePerformance?.lastVerifiedAt ?? null,
+      ...(materializerErrorCode ? { errorCode: materializerErrorCode } : materializerState?.errorCode ? { errorCode: materializerState.errorCode } : {}),
     };
+    let openTrades: number | null = null;
+    let livePerformanceErrorCode: string | undefined;
+    if (livePortfolio) {
+      try {
+        const openPositionIdentities = loadProviderLiveOpeningOrderIdentities(this, PROVIDER_TRADE_LIFECYCLE_CATEGORY, livePortfolio.positions, "/api/snapshot");
+        const liveProviderPerformance = resolveProviderTradeFacts(this, [], PROVIDER_TRADE_LIFECYCLE_CATEGORY, livePortfolio.positions, {
+          histories: [],
+          historyDecisionIds: new Map<string, string>(),
+          openPositionIdentities,
+        });
+        openTrades = liveProviderPerformance.lifecycles.filter((lifecycle) => lifecycle.origin === "DARWIN" && lifecycle.status === "OPEN").length;
+      } catch (error) {
+        livePerformanceErrorCode = canonicalRuntimeErrorCode(error, "PROVIDER_LIVE_PERFORMANCE_UNAVAILABLE");
+      }
+    }
+    const totalTrades = materializerStatus === "READY" && lifecyclePerformance && openTrades !== null ? lifecyclePerformance.closedTrades + openTrades : null;
     const flowCategoryStates = PROVIDER_FINANCIAL_CATEGORIES.map((category) => {
       const sync = syncStates.get(category) ?? null;
       const coverage = sync?.financialRecordCoverage ?? null;
@@ -3023,8 +3147,14 @@ export class TraderAgent extends Agent<Env, AgentState> {
     });
     const financialRecordCategories = flowCategoryStates.map(({ complete: _complete, revision: _revision, updatedAt: _updatedAt, financialRecordCount: _financialRecordCount, ...category }) => category);
     const allFinancialCategoriesComplete = flowCategoryStates.length === PROVIDER_FINANCIAL_CATEGORIES.length && flowCategoryStates.every((category) => category.complete);
-    const flowReadModel = resolveExternalFlowReadModel(this, baselineAt, accountingBase.baselineEquity, flowCategoryStates, PROVIDER_FINANCIAL_CATEGORIES, livePortfolio?.observedAt ?? new Date().toISOString());
-    const flows = flowReadModel.flows;
+    let externalFlowErrorCode: string | undefined;
+    let flows: ReturnType<typeof calculateVerifiedExternalFlows>;
+    try {
+      flows = resolveExternalFlowReadModel(this, baselineAt, accountingBase.baselineEquity, flowCategoryStates, PROVIDER_FINANCIAL_CATEGORIES, livePortfolio?.observedAt ?? performanceVerifiedAt).flows;
+    } catch (error) {
+      externalFlowErrorCode = canonicalRuntimeErrorCode(error, "EXTERNAL_FLOW_READ_MODEL_UNAVAILABLE");
+      flows = calculateVerifiedExternalFlows([], [{ complete: false, lastError: externalFlowErrorCode }]);
+    }
     const netPnlSinceBaseline = calculateNetPnlSinceBaseline(livePortfolio?.portfolioEquity, accountingBase.baselineEquity, flows);
     const accountPerformance: DashboardSnapshot["accountPerformance"] = {
       equitySource: livePortfolio ? "PROVIDER_LIVE" : "UNAVAILABLE",
@@ -3032,66 +3162,84 @@ export class TraderAgent extends Agent<Env, AgentState> {
       externalFlowStatus: flows.status,
       netExternalInflows: flows.netExternalInflows,
       netPnlSinceBaseline,
+      ...(externalFlowErrorCode ? { externalFlowErrorCode } : {}),
       financialRecordCoverage: allFinancialCategoriesComplete ? "COMPLETE" : financialRecordCategories.every((category) => category.status === "NOT_SYNCED") ? "UNAVAILABLE" : "PARTIAL",
       financialRecordCategories,
     };
-    const cacheBase = isPerformanceAggregate(persistedPerformance) ? persistedPerformance : migratePerformanceEquityObservations(persistedPerformance, new Date().toISOString());
-    const providerPerformanceCache: PerformanceAggregate = {
-      ...cacheBase,
-      version: PERFORMANCE_READ_MODEL_VERSION,
-      totalPnl: providerPerformance.verifiedRealizedPnl,
-      totalTrades: livePortfolio ? providerPerformance.totalTrades : providerPerformance.closedTrades,
-      openTrades: livePortfolio ? providerPerformance.openTrades : 0,
-      closedTrades: providerPerformance.closedTrades,
-      wins: providerPerformance.wins,
-      losses: providerPerformance.losses,
-      breakeven: providerPerformance.breakeven,
-      winRate: classifiedWinRate(providerPerformance.wins, providerPerformance.losses, providerPerformance.breakeven),
-      closedEpisodeRealizedPnl: providerPerformance.closedEpisodeRealizedPnl,
-      openEpisodePartialRealizedPnl: "UNAVAILABLE",
-      verifiedRealizedPnl: providerPerformance.verifiedRealizedPnl,
-      providerDailyPnl: providerPerformance.dailyPnl,
-      financialSource: "PROVIDER_LEDGER",
-      providerOpenTradeCountKnown: Boolean(livePortfolio),
-      netExternalInflows: flows.netExternalInflows,
-      externalFlowStatus: flows.status,
-    };
-    if (JSON.stringify(persistedPerformance) !== JSON.stringify(providerPerformanceCache)) savePerformanceAggregate(this, providerPerformanceCache, livePortfolio?.observedAt ?? new Date().toISOString());
+    const cacheBase = isPerformanceAggregate(persistedPerformance) ? persistedPerformance : migratePerformanceEquityObservations(persistedPerformance, performanceVerifiedAt);
+    if (materializerStatus === "READY" && lifecyclePerformance && lifecycleRevisions) {
+      const providerPerformanceCache: PerformanceAggregate = {
+        ...cacheBase,
+        version: PERFORMANCE_READ_MODEL_VERSION,
+        totalPnl: lifecyclePerformance.verifiedRealizedPnl,
+        totalTrades: totalTrades ?? lifecyclePerformance.closedTrades,
+        openTrades: openTrades ?? 0,
+        closedTrades: lifecyclePerformance.closedTrades,
+        wins: lifecyclePerformance.wins,
+        losses: lifecyclePerformance.losses,
+        breakeven: lifecyclePerformance.breakeven,
+        winRate: classifiedWinRate(lifecyclePerformance.wins, lifecyclePerformance.losses, lifecyclePerformance.breakeven),
+        closedEpisodeRealizedPnl: lifecyclePerformance.closedEpisodeRealizedPnl,
+        openEpisodePartialRealizedPnl: "UNAVAILABLE",
+        verifiedRealizedPnl: lifecyclePerformance.verifiedRealizedPnl,
+        providerDailyPnl: lifecyclePerformance.dailyPnl,
+        providerPerformanceVerifiedAt: performanceVerifiedAt,
+        providerLifecycleRevision: lifecycleRevisions.lifecycleRevision,
+        providerIdentityRevision: lifecycleRevisions.identityRevision,
+        providerUnresolvedClosedLifecycles: lifecyclePerformance.unresolvedClosedLifecycles,
+        financialSource: "PROVIDER_LEDGER",
+        providerOpenTradeCountKnown: openTrades !== null,
+        netExternalInflows: flows.netExternalInflows,
+        externalFlowStatus: flows.status,
+      };
+      if (JSON.stringify(persistedPerformance) !== JSON.stringify(providerPerformanceCache)) savePerformanceAggregate(this, providerPerformanceCache, livePortfolio?.observedAt ?? performanceVerifiedAt);
+    }
     const accounting = {
       ...accountingBase,
       netExternalInflows: flows.netExternalInflows,
       externalFlowStatus: flows.status,
       netPnlSinceBaseline,
-      closedEpisodeRealizedPnl: providerPerformance.closedEpisodeRealizedPnl,
+      closedEpisodeRealizedPnl: lifecyclePerformance?.closedEpisodeRealizedPnl ?? "UNAVAILABLE",
       openEpisodePartialRealizedPnl: "UNAVAILABLE",
-      verifiedRealizedPnl: providerPerformance.verifiedRealizedPnl,
-      wins: providerPerformance.wins,
-      losses: providerPerformance.losses,
-      breakeven: providerPerformance.breakeven,
-      classifiedClosedTrades: providerPerformance.wins + providerPerformance.losses + providerPerformance.breakeven,
-      winRatePct: classifiedWinRate(providerPerformance.wins, providerPerformance.losses, providerPerformance.breakeven),
-      source: livePortfolio ? "PROVIDER_LIVE" as const : "UNAVAILABLE" as const,
+      verifiedRealizedPnl: lifecyclePerformance?.verifiedRealizedPnl ?? "UNAVAILABLE",
+      wins: lifecycleOutcomes.wins,
+      losses: lifecycleOutcomes.losses,
+      breakeven: lifecycleOutcomes.breakeven,
+      classifiedClosedTrades: lifecycleOutcomes.classifiedClosedTrades,
+      winRatePct: lifecycleOutcomes.status === "VERIFIED"
+        ? classifiedWinRate(lifecycleOutcomes.wins, lifecycleOutcomes.losses, lifecycleOutcomes.breakeven)
+        : "UNAVAILABLE",
+      source: lifecyclePerformance ? livePortfolio ? "PROVIDER_LIVE" as const : "PERSISTED_LEDGER" as const : "UNAVAILABLE" as const,
+      currentDrawdownPct: accountingBase.currentEquity !== null && accountingBase.peakEquity !== null ? accountingBase.currentDrawdownPct : "UNAVAILABLE",
+      maxDrawdownPct: accountingBase.peakEquity !== null ? accountingBase.maxDrawdownPct : "UNAVAILABLE",
+      peakEquity: accountingBase.peakEquity !== null ? accountingBase.peakEquity : null,
+      peakEquityObservedAt: accountingBase.peakEquity !== null ? accountingBase.peakEquityObservedAt : null,
     };
     const performance = {
-      totalPnl: providerPerformance.verifiedRealizedPnl,
+      totalPnl: lifecyclePerformance?.verifiedRealizedPnl ?? "UNAVAILABLE",
       winRate: accounting.winRatePct,
       dailyDrawdown: drawdownPct,
-      totalTrades: livePortfolio ? providerPerformance.totalTrades : null,
-      openTrades: livePortfolio ? providerPerformance.openTrades : null,
-      closedTrades: providerPerformance.closedTrades,
-      wins: providerPerformance.wins,
-      losses: providerPerformance.losses,
-      breakeven: providerPerformance.breakeven,
-      closedEpisodeRealizedPnl: providerPerformance.closedEpisodeRealizedPnl,
+      totalTrades,
+      openTrades,
+      closedTrades: lifecyclePerformance?.closedTrades ?? null,
+      wins: lifecycleOutcomes.wins,
+      losses: lifecycleOutcomes.losses,
+      breakeven: lifecycleOutcomes.breakeven,
+      closedEpisodeRealizedPnl: lifecyclePerformance?.closedEpisodeRealizedPnl ?? "UNAVAILABLE",
       openEpisodePartialRealizedPnl: "UNAVAILABLE",
-      verifiedRealizedPnl: providerPerformance.verifiedRealizedPnl,
+      verifiedRealizedPnl: lifecyclePerformance?.verifiedRealizedPnl ?? "UNAVAILABLE",
       competitionBaselineEquity: accounting.baselineEquity,
       latestEquity: accounting.currentEquity,
       performanceBaselineAt: accounting.baselineObservedAt,
-      dailyPnl: providerPerformance.dailyPnl,
-      financialSource: "PROVIDER_LEDGER" as const,
+      dailyPnl: lifecyclePerformance?.dailyPnl ?? {},
+      dailyPnlStatus: lifecyclePerformance?.dailyPnlStatus ?? "UNAVAILABLE",
+      ...(lifecyclePerformance ? { financialSource: "PROVIDER_LEDGER" as const } : {}),
       scope: "DARWIN_ATTRIBUTED" as const,
-      unresolvedClosedLifecycles: providerPerformance.unresolvedClosedLifecycles,
+      unresolvedClosedLifecycles: lifecyclePerformance?.unresolvedClosedLifecycles ?? null,
+      materialization: {
+        ...performanceAvailability,
+        ...(livePerformanceErrorCode ? { livePerformanceErrorCode } : {}),
+      },
     };
     return {
       version: config.version ?? "0.2.0",
@@ -3124,7 +3272,7 @@ export class TraderAgent extends Agent<Env, AgentState> {
       activity: events,
       lastPolicyUpdate: events.find((event) => event.type === "POLICY_UPDATED") ?? null,
       // Snapshot scheduler metrics intentionally cover the same bounded recent event window.
-      scheduler: { ...schedulerMetrics(events), ...scheduler, tradingSchedulerHealthy: scheduler.schedulerHealthy, providerSyncSchedulerHealthy: await this.isProviderSyncSchedulerHealthy() },
+      scheduler: { ...schedulerMetrics(events), ...scheduler, tradingSchedulerHealthy: scheduler.schedulerHealthy, providerSyncSchedulerHealthy: await this.isProviderSyncSchedulerHealthy(), providerPerformanceMaterializerSchedulerHealthy: await this.isProviderPerformanceMaterializationSchedulerHealthy() },
     };
   }
 
@@ -3132,6 +3280,15 @@ export class TraderAgent extends Agent<Env, AgentState> {
     try {
       const schedules = (await this.listSchedules()).filter((schedule) => schedule.callback === "runScheduledProviderSync");
       return schedules.length === 1 && schedules[0]?.type === "interval" && schedules[0]?.intervalSeconds === PROVIDER_LEDGER_INTERVAL_SECONDS;
+    } catch {
+      return false;
+    }
+  }
+
+  private async isProviderPerformanceMaterializationSchedulerHealthy(): Promise<boolean> {
+    try {
+      const schedules = (await this.listSchedules()).filter((schedule) => schedule.callback === "runScheduledProviderPerformanceMaterialization");
+      return schedules.length === 1 && schedules[0]?.type === "interval" && schedules[0]?.intervalSeconds === PROVIDER_PERFORMANCE_MATERIALIZATION_INTERVAL_SECONDS;
     } catch {
       return false;
     }
